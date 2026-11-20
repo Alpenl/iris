@@ -2389,6 +2389,7 @@ dependencies = [
  "futures",
  "gpui",
  "iris-mpv",
+ "miniz_oxide 0.8.9",
  "objc",
  "raw-window-handle",
 ]

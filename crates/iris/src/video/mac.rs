@@ -63,6 +63,13 @@ unsafe extern "C" {
 #[link(name = "QuartzCore", kind = "framework")]
 unsafe extern "C" {}
 
+#[link(name = "CoreGraphics", kind = "framework")]
+unsafe extern "C" {
+    static kCGColorSpaceDisplayP3: *const c_void;
+    fn CGColorSpaceCreateWithName(name: *const c_void) -> *mut c_void;
+    fn CGColorSpaceRelease(space: *mut c_void);
+}
+
 unsafe extern "C" {
     fn dlopen(path: *const c_char, mode: c_int) -> *mut c_void;
     fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
@@ -273,6 +280,14 @@ impl VideoSurface {
                 CGLReleasePixelFormat(pf);
                 return Err(anyhow!("CGLCreateContext failed"));
             }
+            // The layer is tagged Display P3 (below), so mpv must output
+            // Display P3 with the sRGB curve. Core Animation then converts to
+            // the screen, as it does for GPUI's layer. Untagged, the layer was
+            // shown as raw screen values: BT.709/sRGB looked oversaturated on
+            // P3 screens.
+            mpv.set_property_string("target-prim", "display-p3")?;
+            mpv.set_property_string("target-trc", "srgb")?;
+
             CGLSetCurrentContext(gl);
             let render = RenderContext::new_gl(mpv, gl_get_proc_address, ptr::null_mut())
                 .context("creating mpv render context")?;
@@ -292,6 +307,9 @@ impl VideoSurface {
             let _: () = msg_send![layer, setAsynchronous: NO];
             let _: () = msg_send![layer, setOpaque: YES];
             let _: () = msg_send![layer, setNeedsDisplayOnBoundsChange: YES];
+            let p3 = CGColorSpaceCreateWithName(kCGColorSpaceDisplayP3);
+            let _: () = msg_send![layer, setColorspace: p3];
+            CGColorSpaceRelease(p3);
             let ns_window: id = msg_send![gpui_view, window];
             let scale: f64 = msg_send![ns_window, backingScaleFactor];
             let _: () = msg_send![layer, setContentsScale: scale];

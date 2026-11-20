@@ -1,0 +1,37 @@
+# cargo-deny: licence gate for the Rust dependency tree.
+#   cargo install cargo-deny && cargo deny check licenses
+#
+# Iris plans a permissive licence (route B, see docs/DECISIONS.md), so every
+# crate must be usable in permissive or closed-source builds. GPL / AGPL /
+# LGPL-only crates are rejected because they are not listed here.
+# MPL-2.0 is file-level copyleft and fine to link (dwrote, option-ext,
+# cbindgen in the GPUI tree). libmpv / FFmpeg are C libraries outside cargo's
+# view; their licence is handled by the LGPL build route, not by this file.
+
+[graph]
+targets = [
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+]
+
+[licenses]
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "MPL-2.0",
+    "CC0-1.0",
+    "BSL-1.0",
+    "NCSA",
+]
+confidence-threshold = 0.9
+
+[licenses.private]
+# The workspace's own crates are unpublished and still UNLICENSED.
+ignore = true

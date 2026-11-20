@@ -18,6 +18,7 @@ use gpui::{
 use iris_mpv::{Event, Mpv, Value};
 
 use crate::library::{self, Entry, Kind};
+use crate::photo;
 use crate::platform;
 use crate::player::{self, prop};
 use crate::settings::{Settings, Side};
@@ -66,8 +67,9 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("j", CycleSub, None),
         KeyBinding::new("pagedown", NextItem, None),
         KeyBinding::new("pageup", PrevItem, None),
-        KeyBinding::new("cmd-o", OpenFile, None),
-        KeyBinding::new("cmd-q", Quit, None),
+        // `secondary` is ⌘ on macOS and Ctrl on Windows.
+        KeyBinding::new("secondary-o", OpenFile, None),
+        KeyBinding::new("secondary-q", Quit, None),
     ]);
 }
 
@@ -300,7 +302,7 @@ impl IrisWindow {
             self.play(i, cx);
         } else if let Some(t) = target {
             // A file we don't list (unknown extension): still try to play it.
-            let _ = self.mpv.command_async(&["loadfile", &t.to_string_lossy()]);
+            self.load(&t, None);
         }
         cx.notify();
     }
@@ -309,11 +311,29 @@ impl IrisWindow {
         let Some(entry) = self.entries.get(index) else {
             return;
         };
-        let _ = self
-            .mpv
-            .command_async(&["loadfile", &entry.path.to_string_lossy()]);
+        let (path, kind) = (entry.path.clone(), entry.kind);
+        self.load(&path, Some(kind));
         self.current = Some(index);
         cx.notify();
+    }
+
+    /// Replaces the current file. Photos carry what mpv misses in their
+    /// header (colour profile, HEIF rotation, oversize) as per-file options,
+    /// which mpv drops again when the file ends. Videos load as they are.
+    fn load(&self, path: &Path, kind: Option<Kind>) {
+        let url = path.to_string_lossy();
+        let opts = (kind == Some(Kind::Photo))
+            .then(|| photo::probe(path).mpv_options())
+            .flatten();
+        let result = match opts {
+            Some(opts) => self
+                .mpv
+                .command_async(&["loadfile", &url, "replace", "-1", &opts]),
+            None => self.mpv.command_async(&["loadfile", &url]),
+        };
+        if let Err(e) = result {
+            eprintln!("[iris] loadfile {url} failed: {e}");
+        }
     }
 
     fn current_kind(&self) -> Option<Kind> {
@@ -1024,7 +1044,11 @@ impl IrisWindow {
                         .justify_center()
                         .text_color(text_dim())
                         .text_size(px(13.))
-                        .child("拖入文件或文件夹，或按 ⌘O 打开"),
+                        .child(if cfg!(target_os = "macos") {
+                            "拖入文件或文件夹，或按 ⌘O 打开"
+                        } else {
+                            "拖入文件或文件夹，或按 Ctrl+O 打开"
+                        }),
                 )
             })
             // Overlay 3: in fullscreen the dock floats over the video and

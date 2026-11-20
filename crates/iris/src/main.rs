@@ -1,7 +1,9 @@
 //! Iris — mpv-based photo/video player (technical spike).
 
 mod debug;
+mod icc;
 mod library;
+mod photo;
 mod platform;
 mod player;
 mod settings;
@@ -18,6 +20,13 @@ use gpui::{
 };
 
 fn main() {
+    // This variable makes GPUI draw into an opaque swap chain, which hides
+    // the video layer underneath (docs/ARCHITECTURE.md).
+    #[cfg(target_os = "windows")]
+    // SAFETY: first thing in main, before any other thread exists.
+    unsafe {
+        std::env::remove_var("GPUI_DISABLE_DIRECT_COMPOSITION")
+    };
     let initial = std::env::args_os().nth(1).map(PathBuf::from);
     Application::new().run(move |cx: &mut App| {
         if let Err(e) = cx.text_system().add_fonts(vec![

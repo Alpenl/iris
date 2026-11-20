@@ -4,11 +4,13 @@ Iris 是一个以 [mpv](https://mpv.io) 为播放核心的高性能照片 / 视�
 
 > **状态：技术验证（spike）。** macOS 版已经可以日常试用；Windows 版的视频层还没写，目前不能编译。
 
+文档：[架构](docs/ARCHITECTURE.md) · [决策与路线图](docs/DECISIONS.md) · [测试与实测记录](docs/TESTING.md)
+
 ## 功能
 
 - **播放**：所有格式交给 mpv，默认硬解（macOS 上是 VideoToolbox，含 4K HEVC 10bit）。
 - **字幕**：内封字幕自动选轨，优先简体中文，其次繁体中文、英文；没有匹配时仍显示一条完整字幕。
-- **目录**：打开文件时扫描所在文件夹，列出其中的视频和照片。
+- **目录**：打开文件时扫描所在文件夹，按自然顺序（`ep2` 在 `ep10` 前）列出其中的视频和照片。
   - 停靠在窗口一侧，可收起成窄条。
   - 左右位置可以切换，设置会保存。
 - **全屏**：工具栏悬浮在画面上。
@@ -47,7 +49,8 @@ NSWindow contentView
 - 视频视图的位置跟随 GPUI 量出来的视频区域，所以字幕和 OSD 永远落在画面内，不会被侧边栏或工具栏挡住。
 - 时间显示每秒最多重绘 4 次；暂停时整个应用 CPU 约 0.5%。
 - mpv 自带的 Lua 脚本（OSC、stats、console 等）全部关闭，界面完全由 Iris 自己画。
-- **Windows（计划）**：GPUI 在 Windows 上用 DirectComposition，能画在子窗口之上；mpv 的 render API 有 D3D11 后端，不需要 ANGLE。
+- **色彩**：视频图层标注为 Display P3，mpv 按 Display P3 输出，再由系统转换到实际屏幕，和 GPUI 界面走同一条色彩管理路径。
+- **Windows（计划）**：GPUI 在 Windows 上用 DirectComposition 占窗口的 topmost 合成目标；Iris 计划在同一窗口的非 topmost 目标上放 mpv 的 D3D11 画面，不需要 ANGLE。方案和风险见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)。
 
 ### 性能（macOS，Apple Silicon，release 构建，1440×900 窗口）
 
@@ -57,7 +60,7 @@ NSWindow contentView
 | 4K30 HEVC 10bit | 约 17% | 约 17.5% |
 | 暂停 | 约 0.5% | — |
 
-测试中没有丢帧。
+测试中没有丢帧。之后的测法和数据见 [docs/TESTING.md](docs/TESTING.md)。
 
 ## 构建（macOS）
 
@@ -91,6 +94,14 @@ scripts/make-test-media.sh
 ./target/release/iris test-media
 ```
 
+照片边界测试（EXIF / HEIC 方向、内嵌 ICC、超大图、翻页延迟）另有素材脚本和自动测量脚本，用法见 [docs/TESTING.md](docs/TESTING.md)：
+
+```bash
+scripts/make-photo-test-media.sh                       # 素材 → test-media/photo/
+python3 scripts/photo-harness.py out/ exif heic icc huge flip
+python3 scripts/icc-report.py out/
+```
+
 ## 快捷键
 
 | 按键 | 作用 |
@@ -105,7 +116,7 @@ scripts/make-test-media.sh
 | V | 字幕开关 |
 | J | 切换字幕轨 |
 | PageUp / PageDown | 上一个 / 下一个 |
-| ⌘O | 打开 |
+| ⌘O（Windows：Ctrl+O） | 打开 |
 | ⌘Q | 退出 |
 
 ## 设置
@@ -161,7 +172,9 @@ crates/
     src/platform.rs  原生窗口辅助（拖动、截图、模拟输入）
     src/debug.rs     调试控制管道
 Resources/Fonts/     Space Grotesk、IBM Plex Mono（SIL OFL 1.1）
-scripts/             测试素材生成脚本
+scripts/             测试素材生成、照片实测脚本
+docs/                架构、决策与路线图、测试记录
+deny.toml            依赖许可证检查（cargo-deny）
 ```
 
 ## 已知问题与计划
@@ -174,9 +187,12 @@ scripts/             测试素材生成脚本
 - [ ] 方向键跳转只落在关键帧（尚未开启精确跳转）
 - [ ] 全屏动画进行中第一次按 Esc 可能无效
 - [ ] 目录的“照片”“收藏”标签还只是占位
+- [x] HEIC 的方向标记被忽略，竖拍照片横着显示：已从文件头读出方向交给 mpv
+- [x] 超过 16384 像素的图片显示为蓝屏：长边超过 8192 的图先缩小再显示（4000×40000 解码时内存约 1 GB）
+- [x] 照片内嵌的 ICC 配置文件被忽略（P3 / Adobe RGB 照片偏淡）：已按配置文件逐张覆盖原色，常见配置文件以外的仍按 sRGB
 
 ## 许可
 
-许可证尚未确定，目前不授予开源许可（`Cargo.toml` 中为 `UNLICENSED`）。选择时需要考虑 libmpv / FFmpeg 的 GPL 或 LGPL 构建对分发方式的影响。
+许可证尚未确定，目前不授予开源许可（`Cargo.toml` 中为 `UNLICENSED`）。方向已定为宽松协议（Apache-2.0 或 MIT OR Apache-2.0），分发时动态链接自行构建的 LGPL 版 libmpv / FFmpeg；开发时用的 Homebrew libmpv 是 GPL 构建，不用于分发。详见 [docs/DECISIONS.md](docs/DECISIONS.md)。
 
 `Resources/Fonts/` 中的字体按 SIL Open Font License 1.1 授权，许可全文与字体放在一起。
