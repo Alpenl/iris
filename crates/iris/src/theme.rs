@@ -53,13 +53,16 @@ pub fn accent() -> Rgba {
 pub fn overlay() -> Rgba {
     rgba(0x15171AE6)
 }
+/// Dim backdrop behind centered modal panels.
+pub fn scrim() -> Rgba {
+    rgba(0x00000099)
+}
 
 pub const TITLEBAR_H: f32 = 36.;
 /// The control bar under the picture; floating in fullscreen.
 pub const DOCK_H: f32 = 44.;
 /// Gap between the floating bar or popups and the screen edge in fullscreen.
 pub const FLOAT_GAP: f32 = 16.;
-pub const DIRECTORY_W: f32 = 288.;
 pub const HEADER_H: f32 = 36.;
 pub const ROW_H: f32 = 28.;
 pub const BUTTON: f32 = 28.;

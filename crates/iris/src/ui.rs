@@ -9,23 +9,27 @@ use std::time::{Duration, Instant};
 use futures::StreamExt;
 use gpui::{
     App, Bounds, Context, CursorStyle, ExternalPaths, FocusHandle, InteractiveElement, IntoElement,
-    KeyBinding, MouseButton, MouseMoveEvent, ParentElement, PathPromptOptions, Pixels, Point,
-    Render, SharedString, Styled, Subscription, Task, Window, actions, div, prelude::FluentBuilder,
-    px,
+    KeyBinding, MouseButton, MouseMoveEvent, MouseUpEvent, ParentElement, PathPromptOptions,
+    Pixels, Point, Render, ScrollHandle, SharedString, Styled, Subscription, Task, Window, actions,
+    div, prelude::FluentBuilder, px,
 };
 
 use crate::geometry::ImageView;
 use crate::input::{self, InputContext, PointerCommand, PointerInput};
 use crate::library::{self, Entry, Kind};
 use crate::platform;
-use crate::player::{self, Command, Session, SessionEvent};
-use crate::settings::{Settings, Side};
+use crate::player::{self, Command, Session, SessionEvent, TrackKind};
+use crate::settings::{
+    MAX_DIRECTORY_WIDTH, MIN_DIRECTORY_WIDTH, OnEof, PhotoDefault, Settings, Side, VideoWheel,
+};
 use crate::store::Store;
 use crate::theme::*;
 use crate::video::VideoSurface;
 
 mod controls;
 mod directory;
+mod popover;
+mod settings;
 mod titlebar;
 mod viewport;
 mod widgets;
@@ -41,12 +45,26 @@ enum DirectoryFilter {
     Favorites,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PopoverKind {
+    Subtitles,
+    Audio,
+    Speed,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SettingsTab {
+    Appearance,
+    Playback,
+    Tracks,
+    View,
+    Shortcuts,
+}
+
 /// While a video plays, its position is written to the records this often.
 const SAVE_EVERY: Duration = Duration::from_secs(5);
-
-/// In fullscreen, the control bar, info chip and cursor hide after this long
-/// without mouse movement.
-const HIDE_AFTER: Duration = Duration::from_millis(2000);
+/// Minimum interval between fast seeks while dragging the timeline.
+const SEEK_DRAG_INTERVAL: Duration = Duration::from_millis(40);
 
 actions!(
     iris,
@@ -54,13 +72,22 @@ actions!(
         TogglePause,
         SeekBackwardExact,
         SeekForwardExact,
+        SeekBackwardLarge,
+        SeekForwardLarge,
+        FrameBack,
+        FrameForward,
         VolumeUp,
         VolumeDown,
+        ToggleMute,
         SpeedDown,
         SpeedUp,
+        ResetSpeed,
+        ToggleLoop,
         ToggleDirectory,
+        RefreshDirectory,
         ToggleFullscreen,
         ExitFullscreen,
+        OpenSettings,
         ToggleSubs,
         CycleSub,
         CycleAudio,
@@ -68,6 +95,8 @@ actions!(
         FitImage,
         ZoomIn,
         ZoomOut,
+        RotateCw,
+        RotateCcw,
         OpenNextMedia,
         OpenPreviousMedia,
         OpenFile,
@@ -89,10 +118,25 @@ pub fn bind_keys(cx: &mut App) {
             SeekForwardExact,
             Some("Viewport && media == video"),
         ),
+        KeyBinding::new(
+            "shift-left",
+            SeekBackwardLarge,
+            Some("Viewport && media == video"),
+        ),
+        KeyBinding::new(
+            "shift-right",
+            SeekForwardLarge,
+            Some("Viewport && media == video"),
+        ),
+        KeyBinding::new(",", FrameBack, Some("Viewport && media == video")),
+        KeyBinding::new(".", FrameForward, Some("Viewport && media == video")),
         KeyBinding::new("up", VolumeUp, Some("Viewport && media == video")),
         KeyBinding::new("down", VolumeDown, Some("Viewport && media == video")),
+        KeyBinding::new("m", ToggleMute, Some("Viewport && media == video")),
         KeyBinding::new("[", SpeedDown, Some("Viewport && media == video")),
         KeyBinding::new("]", SpeedUp, Some("Viewport && media == video")),
+        KeyBinding::new("backspace", ResetSpeed, Some("Viewport && media == video")),
+        KeyBinding::new("l", ToggleLoop, Some("Viewport && media == video")),
         KeyBinding::new("v", ToggleSubs, Some("Viewport && media == video")),
         KeyBinding::new("j", CycleSub, Some("Viewport && media == video")),
         KeyBinding::new("a", CycleAudio, Some("Viewport && media == video")),
@@ -100,6 +144,8 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("0", FitImage, Some("Viewport && media == image")),
         KeyBinding::new("=", ZoomIn, Some("Viewport && media == image")),
         KeyBinding::new("-", ZoomOut, Some("Viewport && media == image")),
+        KeyBinding::new("r", RotateCw, Some("Viewport && media == image")),
+        KeyBinding::new("shift-r", RotateCcw, Some("Viewport && media == image")),
         KeyBinding::new(
             "left",
             OpenPreviousMedia,
@@ -113,6 +159,8 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("pageup", OpenPreviousMedia, Some("Viewport")),
         KeyBinding::new("s", ToggleFavorite, Some("Workspace")),
         KeyBinding::new("secondary-o", OpenFile, Some("Workspace")),
+        KeyBinding::new("secondary-r", RefreshDirectory, Some("Workspace")),
+        KeyBinding::new("secondary-,", OpenSettings, Some("Workspace")),
         KeyBinding::new("secondary-q", Quit, Some("Workspace")),
     ]);
 }
@@ -134,12 +182,32 @@ pub struct IrisWindow {
     load_generation: u64,
     /// The path being prepared in the background, for stepping before it loads.
     pending_path: Option<PathBuf>,
+    /// Delayed loading indicator when background preparation takes >150ms.
+    loading_visible: bool,
+    /// When a photo opens with `PhotoDefault::Actual`, apply 1:1 once its size arrives.
+    pending_photo_actual: bool,
     last_save: Instant,
     shutdown_done: bool,
     /// Mirrors `window.is_fullscreen()`, updated at the start of each render.
     fullscreen: bool,
     /// Fullscreen only: the directory floating over the video.
     dir_popup: bool,
+    /// Centered settings modal overlay.
+    settings_open: bool,
+    settings_tab: SettingsTab,
+    /// Upward-floating menu above the control bar.
+    popover: Option<PopoverKind>,
+    /// Toggle between total duration and remaining time on the clock readout.
+    show_remaining: bool,
+    /// Active directory width drag: `(start_pointer_x, start_width)`.
+    resizing_dir: Option<(f32, f32)>,
+    /// Scroll handle for keeping the active file visible in the directory.
+    dir_scroll: ScrollHandle,
+    /// Last recorded windowed viewport size, persisted on exit.
+    last_window_size: Option<(f32, f32)>,
+    /// Announce track change via toast after a keyboard cycle.
+    announce_audio: bool,
+    announce_sub: bool,
     /// Fullscreen only: whether the control bar, info chip and cursor are shown.
     chrome_visible: bool,
     last_activity: Instant,
@@ -153,6 +221,7 @@ pub struct IrisWindow {
     timeline_hover: bool,
     /// A seek drag started on the timeline and the button is still down.
     seeking: bool,
+    last_seek_drag: Instant,
     _quit: Subscription,
     _events: Task<()>,
 }
@@ -160,6 +229,7 @@ pub struct IrisWindow {
 impl IrisWindow {
     pub fn new(
         session: Session,
+        settings: Settings,
         initial: Option<PathBuf>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -227,6 +297,7 @@ impl IrisWindow {
             .detach();
         }
 
+        let show_directory = settings.directory_open;
         let mut this = Self {
             focus,
             viewports: vec![Viewport {
@@ -236,20 +307,31 @@ impl IrisWindow {
                 image: ImageView::default(),
                 drag_origin: None,
             }],
-            show_directory: true,
+            show_directory,
             tick: -1,
             toast: None,
             toast_seq: 0,
             progress_bounds: Rc::new(Cell::new(None)),
-            settings: Settings::load(),
+            settings,
             store: Store::load(),
             filter: DirectoryFilter::All,
             load_generation: 0,
             pending_path: None,
+            loading_visible: false,
+            pending_photo_actual: false,
             last_save: Instant::now(),
             shutdown_done: false,
             fullscreen: false,
             dir_popup: false,
+            settings_open: false,
+            settings_tab: SettingsTab::Appearance,
+            popover: None,
+            show_remaining: false,
+            resizing_dir: None,
+            dir_scroll: ScrollHandle::new(),
+            last_window_size: None,
+            announce_audio: false,
+            announce_sub: false,
             chrome_visible: true,
             last_activity: Instant::now(),
             hide_armed: false,
@@ -257,13 +339,17 @@ impl IrisWindow {
             dock_bounds: Rc::new(Cell::new(None)),
             timeline_hover: false,
             seeking: false,
+            last_seek_drag: Instant::now(),
             _quit: quit,
             _events: events,
         };
+        this.viewports[0].session.apply_settings(&this.settings);
         if let Some(v) = this.settings.volume {
             this.command(Command::SetVolume(v), cx);
         }
-        if let Some(v) = this.settings.speed {
+        if this.settings.remember_speed
+            && let Some(v) = this.settings.speed
+        {
             this.command(Command::SetSpeed(v), cx);
         }
         if let Some(path) = initial {
@@ -302,17 +388,22 @@ impl IrisWindow {
                 cx.notify();
             }
             "state" => eprintln!(
-                "[iris/control] state pos={:.2} dur={:.2} paused={} vol={} speed={:.2} video={:?} hwdec={} dir={} side={:?} popup={} chrome={} fullscreen={} video_rect={:?} dock={:?} filter={:?} favorite={}",
+                "[iris/control] state pos={:.2} dur={:.2} paused={} vol={} muted={} speed={:.2} loop={} video={:?} hwdec={} dir={} dir_w={:.0} side={:?} popup={} settings={} popover={:?} chrome={} fullscreen={} video_rect={:?} dock={:?} filter={:?} favorite={}",
                 self.viewports[0].session.state.time_pos,
                 self.viewports[0].session.state.duration,
                 self.viewports[0].session.state.paused,
                 self.viewports[0].session.state.volume,
+                self.viewports[0].session.state.muted,
                 self.viewports[0].session.state.speed,
+                self.viewports[0].session.state.loop_file,
                 self.viewports[0].session.state.video_size,
                 self.viewports[0].session.state.hwdec,
                 self.show_directory,
+                self.settings.directory_width,
                 self.settings.directory_side,
                 self.dir_popup,
+                self.settings_open,
+                self.popover,
                 self.chrome_visible,
                 window.is_fullscreen(),
                 self.viewports[0].rect.get().map(|r| r.0),
@@ -356,7 +447,16 @@ impl IrisWindow {
         let state = &self.viewports[0].session.state;
         // mpv may boost past 100 (volume-max); the saved setting stays in 0–100.
         self.settings.volume = Some(state.volume.clamp(0., 100.));
-        self.settings.speed = Some(state.speed.clamp(0.1, 8.));
+        if self.settings.remember_speed {
+            self.settings.speed = Some(state.speed.clamp(0.25, 4.));
+        }
+        self.settings.directory_open = self.show_directory;
+        if self.settings.remember_window_size
+            && let Some((w, h)) = self.last_window_size
+        {
+            self.settings.window_width = Some(w);
+            self.settings.window_height = Some(h);
+        }
         self.settings.save();
         // Free the render context before mpv goes away, then stop mpv.
         drop(self.viewports[0].video.borrow_mut().take());
@@ -365,6 +465,10 @@ impl IrisWindow {
 
     /// Records the loaded video's position; finished files resume from the start.
     fn save_progress(&mut self) {
+        if !self.settings.resume_playback {
+            self.last_save = Instant::now();
+            return;
+        }
         if let Some((path, position, duration, ended)) = self.viewports[0].session.progress() {
             self.store.remember(path, position, duration, ended);
             self.store.save();
@@ -376,11 +480,13 @@ impl IrisWindow {
     /// drives can be slow), then loads on the UI thread unless a newer request won.
     pub(crate) fn open_path(&mut self, path: &Path, cx: &mut Context<Self>) {
         self.save_progress();
+        self.popover = None;
         self.load_generation += 1;
         let generation = self.load_generation;
         // No filesystem access here: `absolute` is lexical. A symlinked path
         // just misses the cache and gets a fresh scan.
         self.pending_path = std::path::absolute(path).ok();
+        self.loading_visible = false;
         let session = &self.viewports[0].session;
         let cached = session
             .folder
@@ -393,6 +499,21 @@ impl IrisWindow {
         let task = cx
             .background_executor()
             .spawn(async move { player::prepare(&path, cached) });
+
+        // Show a subtle loading indicator only if preparation takes > 150ms.
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(150))
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if this.load_generation == generation && this.pending_path.is_some() {
+                    this.loading_visible = true;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+
         cx.spawn(async move |this, cx| {
             let prepared = task.await;
             let _ = this.update(cx, |this, cx| {
@@ -400,18 +521,41 @@ impl IrisWindow {
                     return;
                 }
                 this.pending_path = None;
+                this.loading_visible = false;
                 let result = prepared.and_then(|prepared| {
-                    let resume = prepared.target().map_or(0., |p| this.store.resume(p));
+                    let resume = if this.settings.resume_playback {
+                        prepared.target().map_or(0., |p| this.store.resume(p))
+                    } else {
+                        0.
+                    };
                     this.viewports[0].session.open(prepared, resume)
                 });
-                if let Err(e) = result {
-                    this.show_toast(format!("无法打开 · {e}"), cx);
+                match result {
+                    Ok(()) => {
+                        this.pending_photo_actual = this.viewports[0].session.kind()
+                            == Some(Kind::Photo)
+                            && this.settings.photo_default == PhotoDefault::Actual;
+                        this.scroll_directory_to_current();
+                    }
+                    Err(e) => {
+                        this.show_toast(format!("无法打开 · {e}"), cx);
+                    }
                 }
                 this.viewports[0].image.reset();
                 cx.notify();
             });
         })
         .detach();
+    }
+
+    fn scroll_directory_to_current(&self) {
+        let Some(current) = self.viewports[0].session.current.as_ref() else {
+            return;
+        };
+        let entries = self.display_entries();
+        if let Some(ix) = entries.iter().position(|e| &e.path == current) {
+            self.dir_scroll.scroll_to_item(ix);
+        }
     }
 
     /// The directory listing under the current filter, in display order.
@@ -467,6 +611,24 @@ impl IrisWindow {
         self.open_path(&entries[next].path, cx);
     }
 
+    /// Advances to the next file on EOF without wrapping back to the first item.
+    fn step_next_no_wrap(&mut self, cx: &mut Context<Self>) {
+        let entries = self.display_entries();
+        let current = self
+            .viewports[0]
+            .session
+            .current
+            .as_ref()
+            .and_then(|p| entries.iter().position(|e| &e.path == p));
+        if let Some(i) = current
+            && i + 1 < entries.len()
+        {
+            self.open_path(&entries[i + 1].path, cx);
+        } else {
+            self.show_toast("已播完当前列表", cx);
+        }
+    }
+
     fn toggle_favorite(&mut self, _: &ToggleFavorite, _: &mut Window, cx: &mut Context<Self>) {
         let Some(path) = self.viewports[0].session.current.clone() else {
             return;
@@ -507,7 +669,11 @@ impl IrisWindow {
         cx.notify();
     }
 
-    // ---- fullscreen chrome ----
+    // ---- fullscreen chrome & overlays ----
+
+    fn hide_after(&self) -> Duration {
+        Duration::from_millis(self.settings.fullscreen_hide_ms.clamp(1000, 10000))
+    }
 
     /// Picks up fullscreen changes; called at the start of every render, so
     /// the rest of this frame sees the new state.
@@ -518,6 +684,7 @@ impl IrisWindow {
         }
         self.fullscreen = fs;
         self.dir_popup = false;
+        self.popover = None;
         self.chrome_visible = true;
         if fs {
             self.bump_activity(cx);
@@ -543,21 +710,26 @@ impl IrisWindow {
         }
     }
 
-    /// Hides the chrome once the mouse has been idle for `HIDE_AFTER`, unless
-    /// it rests on the control bar, a seek drag is running or the directory
-    /// popup is open. Returns how long
-    /// to wait before checking again, or `None` when the timer should stop
-    /// (the next `bump_activity` starts a new one).
+    /// Hides the chrome once the mouse has been idle for `hide_after()`, unless
+    /// it rests on the control bar, a seek drag is running or an overlay is open.
     fn hide_check(&mut self, cx: &mut Context<Self>) -> Option<Duration> {
         let over_dock = match (self.mouse_pos, self.dock_bounds.get()) {
             (Some(p), Some(b)) => b.contains(&p),
             _ => false,
         };
-        if self.fullscreen && self.chrome_visible && !self.dir_popup && !self.seeking && !over_dock
+        if self.fullscreen
+            && self.chrome_visible
+            && !self.dir_popup
+            && !self.settings_open
+            && self.popover.is_none()
+            && self.resizing_dir.is_none()
+            && !self.seeking
+            && !over_dock
         {
+            let delay = self.hide_after();
             let idle = self.last_activity.elapsed();
-            if idle < HIDE_AFTER {
-                return Some(HIDE_AFTER - idle);
+            if idle < delay {
+                return Some(delay - idle);
             }
             self.chrome_visible = false;
             cx.notify();
@@ -570,8 +742,25 @@ impl IrisWindow {
         !self.fullscreen || self.chrome_visible
     }
 
-    fn close_popup(&mut self, cx: &mut Context<Self>) {
+    fn has_overlay(&self) -> bool {
+        self.dir_popup || self.popover.is_some() || self.settings_open
+    }
+
+    fn close_overlays(&mut self, cx: &mut Context<Self>) {
         self.dir_popup = false;
+        self.popover = None;
+        self.settings_open = false;
+        self.bump_activity(cx);
+        cx.notify();
+    }
+
+    fn toggle_popover(&mut self, kind: PopoverKind, cx: &mut Context<Self>) {
+        if self.popover == Some(kind) {
+            self.popover = None;
+        } else {
+            self.popover = Some(kind);
+            self.settings_open = false;
+        }
         self.bump_activity(cx);
         cx.notify();
     }
@@ -593,6 +782,7 @@ impl IrisWindow {
     }
 
     fn on_event(&mut self, event: SessionEvent, cx: &mut Context<Self>) {
+        let was_ended = self.viewports[0].session.state.ended;
         self.viewports[0].session.apply(&event);
         if self.last_save.elapsed() >= SAVE_EVERY {
             self.save_progress();
@@ -607,6 +797,35 @@ impl IrisWindow {
                     }
                 }
             }
+            SessionEvent::Ended(true) if !was_ended => {
+                self.save_progress();
+                if self.viewports[0].session.kind() == Some(Kind::Video)
+                    && self.settings.on_eof == OnEof::Next
+                    && !self.viewports[0].session.state.loop_file
+                {
+                    self.step_next_no_wrap(cx);
+                } else {
+                    cx.notify();
+                }
+            }
+            SessionEvent::Audio(_) if self.announce_audio => {
+                self.announce_audio = false;
+                let label = self.viewports[0]
+                    .session
+                    .selected_track(TrackKind::Audio)
+                    .map(|t| t.label())
+                    .unwrap_or_else(|| "无音轨".into());
+                self.show_toast(format!("音轨 · {label}"), cx);
+            }
+            SessionEvent::SubtitleTrack(_) if self.announce_sub => {
+                self.announce_sub = false;
+                let label = self.viewports[0]
+                    .session
+                    .selected_track(TrackKind::Sub)
+                    .map(|t| t.label())
+                    .unwrap_or_else(|| "无字幕".into());
+                self.show_toast(format!("字幕 · {label}"), cx);
+            }
             SessionEvent::Error(code) => self.show_toast(format!("无法播放 · 错误 {code}"), cx),
             _ => cx.notify(),
         }
@@ -618,11 +837,40 @@ impl IrisWindow {
         self.command(Command::TogglePlayback, cx);
     }
     fn seek_back(&mut self, _: &SeekBackwardExact, _: &mut Window, cx: &mut Context<Self>) {
-        self.command(Command::SeekRelative(-5.), cx);
+        let step = self.settings.seek_step;
+        self.command(Command::SeekRelative(-step), cx);
         self.bump_activity(cx);
     }
     fn seek_forward(&mut self, _: &SeekForwardExact, _: &mut Window, cx: &mut Context<Self>) {
-        self.command(Command::SeekRelative(5.), cx);
+        let step = self.settings.seek_step;
+        self.command(Command::SeekRelative(step), cx);
+        self.bump_activity(cx);
+    }
+    fn seek_back_large(&mut self, _: &SeekBackwardLarge, _: &mut Window, cx: &mut Context<Self>) {
+        let step = (self.settings.seek_step * 6.).clamp(15., 120.);
+        self.command(Command::SeekRelative(-step), cx);
+        self.show_toast(format!("后退 {step:.0} 秒"), cx);
+        self.bump_activity(cx);
+    }
+    fn seek_forward_large(
+        &mut self,
+        _: &SeekForwardLarge,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let step = (self.settings.seek_step * 6.).clamp(15., 120.);
+        self.command(Command::SeekRelative(step), cx);
+        self.show_toast(format!("前进 {step:.0} 秒"), cx);
+        self.bump_activity(cx);
+    }
+    fn frame_back(&mut self, _: &FrameBack, _: &mut Window, cx: &mut Context<Self>) {
+        self.command(Command::FrameBackStep, cx);
+        self.show_toast("上一帧", cx);
+        self.bump_activity(cx);
+    }
+    fn frame_forward(&mut self, _: &FrameForward, _: &mut Window, cx: &mut Context<Self>) {
+        self.command(Command::FrameStep, cx);
+        self.show_toast("下一帧", cx);
         self.bump_activity(cx);
     }
     fn volume_up(&mut self, _: &VolumeUp, _: &mut Window, cx: &mut Context<Self>) {
@@ -633,15 +881,42 @@ impl IrisWindow {
         self.command(Command::VolumeBy(-2.), cx);
         self.bump_activity(cx);
     }
+    fn toggle_mute(&mut self, _: &ToggleMute, _: &mut Window, cx: &mut Context<Self>) {
+        let next = !self.viewports[0].session.state.muted;
+        self.command(Command::ToggleMute, cx);
+        self.show_toast(if next { "已静音" } else { "已取消静音" }, cx);
+        self.bump_activity(cx);
+    }
     fn speed_down(&mut self, _: &SpeedDown, _: &mut Window, cx: &mut Context<Self>) {
-        self.command(Command::SpeedBy(1. / 1.1), cx);
+        let next = player::step_speed(self.viewports[0].session.state.speed, -1);
+        self.command(Command::SetSpeed(next), cx);
+        self.show_toast(format!("倍速 · {next:.2}×"), cx);
     }
     fn speed_up(&mut self, _: &SpeedUp, _: &mut Window, cx: &mut Context<Self>) {
-        self.command(Command::SpeedBy(1.1), cx);
+        let next = player::step_speed(self.viewports[0].session.state.speed, 1);
+        self.command(Command::SetSpeed(next), cx);
+        self.show_toast(format!("倍速 · {next:.2}×"), cx);
+    }
+    fn reset_speed(&mut self, _: &ResetSpeed, _: &mut Window, cx: &mut Context<Self>) {
+        self.command(Command::SetSpeed(1.), cx);
+        self.show_toast("倍速 · 1.00×", cx);
+    }
+    fn toggle_loop(&mut self, _: &ToggleLoop, _: &mut Window, cx: &mut Context<Self>) {
+        let next = !self.viewports[0].session.state.loop_file;
+        self.command(Command::SetLoop(next), cx);
+        self.show_toast(
+            if next {
+                "单曲循环已开启"
+            } else {
+                "单曲循环已关闭"
+            },
+            cx,
+        );
     }
     /// Windowed: show or collapse the docked directory. Fullscreen: open or
     /// close the directory popup over the video.
     fn toggle_directory(&mut self, _: &ToggleDirectory, _: &mut Window, cx: &mut Context<Self>) {
+        self.popover = None;
         if self.fullscreen {
             self.dir_popup = !self.dir_popup;
             self.bump_activity(cx);
@@ -649,11 +924,40 @@ impl IrisWindow {
             return;
         }
         self.show_directory = !self.show_directory;
+        self.settings.directory_open = self.show_directory;
+        self.settings.save();
         if self.show_directory {
+            self.scroll_directory_to_current();
             cx.notify();
         } else {
             self.show_toast("目录已收起 · Tab 展开", cx);
         }
+    }
+    fn refresh_directory(&mut self, _: &RefreshDirectory, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(folder) = self.viewports[0].session.folder.clone() else {
+            return;
+        };
+        let task = cx
+            .background_executor()
+            .spawn(async move { library::scan(&folder) });
+        cx.spawn(async move |this, cx| {
+            let entries = task.await;
+            let _ = this.update(cx, |this, cx| {
+                this.viewports[0].session.entries = entries;
+                this.scroll_directory_to_current();
+                this.show_toast("目录已刷新", cx);
+            });
+        })
+        .detach();
+    }
+    fn open_settings(&mut self, _: &OpenSettings, _: &mut Window, cx: &mut Context<Self>) {
+        self.settings_open = !self.settings_open;
+        if self.settings_open {
+            self.popover = None;
+            self.dir_popup = false;
+        }
+        self.bump_activity(cx);
+        cx.notify();
     }
     fn toggle_fullscreen(
         &mut self,
@@ -663,22 +967,50 @@ impl IrisWindow {
     ) {
         window.toggle_fullscreen();
     }
-    /// Esc closes the directory popup first, then leaves fullscreen.
+    /// Esc closes overlays in order (settings → popover → directory popup),
+    /// then leaves fullscreen.
     fn exit_fullscreen(&mut self, _: &ExitFullscreen, window: &mut Window, cx: &mut Context<Self>) {
-        if self.dir_popup {
-            self.close_popup(cx);
+        if self.settings_open {
+            self.settings_open = false;
+            self.bump_activity(cx);
+            cx.notify();
+        } else if self.popover.is_some() {
+            self.popover = None;
+            self.bump_activity(cx);
+            cx.notify();
+        } else if self.dir_popup {
+            self.dir_popup = false;
+            self.bump_activity(cx);
+            cx.notify();
         } else if window.is_fullscreen() {
             window.toggle_fullscreen();
         }
     }
     fn toggle_subs(&mut self, _: &ToggleSubs, _: &mut Window, cx: &mut Context<Self>) {
+        let next = !self.viewports[0].session.state.subs_visible;
         self.command(Command::ToggleSubtitles, cx);
+        self.show_toast(if next { "字幕已显示" } else { "字幕已隐藏" }, cx);
     }
     fn cycle_sub(&mut self, _: &CycleSub, _: &mut Window, cx: &mut Context<Self>) {
+        if self.viewports[0].session.tracks_of(TrackKind::Sub).is_empty() {
+            self.show_toast("当前视频没有字幕轨", cx);
+            return;
+        }
+        self.announce_sub = true;
         self.command(Command::NextSubtitle, cx);
     }
 
     fn cycle_audio(&mut self, _: &CycleAudio, _: &mut Window, cx: &mut Context<Self>) {
+        if self.viewports[0]
+            .session
+            .tracks_of(TrackKind::Audio)
+            .len()
+            <= 1
+        {
+            self.show_toast("当前视频没有其他音轨", cx);
+            return;
+        }
+        self.announce_audio = true;
         self.command(Command::NextAudio, cx);
     }
 
@@ -718,6 +1050,20 @@ impl IrisWindow {
         self.apply_image_view(cx);
     }
 
+    fn rotate_cw(&mut self, _: &RotateCw, _: &mut Window, cx: &mut Context<Self>) {
+        self.viewports[0].image.reset();
+        self.command(Command::RotatePhoto(90), cx);
+        self.apply_image_view(cx);
+        self.show_toast("顺时针旋转 90°", cx);
+    }
+
+    fn rotate_ccw(&mut self, _: &RotateCcw, _: &mut Window, cx: &mut Context<Self>) {
+        self.viewports[0].image.reset();
+        self.command(Command::RotatePhoto(-90), cx);
+        self.apply_image_view(cx);
+        self.show_toast("逆时针旋转 90°", cx);
+    }
+
     fn zoom_at(&mut self, delta: f64, point: Option<Point<Pixels>>, cx: &mut Context<Self>) {
         let (viewport, media) = self.image_geometry();
         let rect = self.viewports[0].rect.get().map(|r| r.0).unwrap_or([0.; 4]);
@@ -746,7 +1092,8 @@ impl IrisWindow {
         InputContext {
             media: self.viewports[0].session.kind(),
             zoomed: self.viewports[0].image.zoomed(),
-            overlay: self.dir_popup,
+            overlay: self.has_overlay(),
+            video_wheel_volume: self.settings.video_wheel == VideoWheel::Volume,
         }
     }
     fn next_item(&mut self, _: &OpenNextMedia, _: &mut Window, cx: &mut Context<Self>) {
@@ -774,7 +1121,8 @@ impl IrisWindow {
         .detach();
     }
 
-    /// Picture size, plus the decoder for videos: `1920×1080 · 硬解 videotoolbox`.
+    /// Picture size, plus decoder for videos or colour profile for photos:
+    /// `1920×1080 · 硬解 videotoolbox`, `4032×3024 · Display P3`.
     fn media_info(&self) -> Option<String> {
         let session = &self.viewports[0].session;
         let kind = session.kind()?;
@@ -784,17 +1132,24 @@ impl IrisWindow {
         if w > 0 && h > 0 {
             parts.push(format!("{w}×{h}"));
         }
-        if kind == Kind::Video {
-            parts.push(if state.hwdec.is_empty() || state.hwdec == "no" {
-                "软解".into()
-            } else {
-                format!("硬解 {}", state.hwdec)
-            });
+        match kind {
+            Kind::Video => {
+                parts.push(if state.hwdec.is_empty() || state.hwdec == "no" {
+                    "软解".into()
+                } else {
+                    format!("硬解 {}", state.hwdec)
+                });
+            }
+            Kind::Photo => {
+                if let Some(colour) = state.photo_colour {
+                    parts.push(colour.to_string());
+                }
+            }
         }
         (!parts.is_empty()).then(|| parts.join(" · "))
     }
 
-    fn seek_to_x(&self, x: Pixels) {
+    fn seek_to_x(&mut self, x: Pixels, exact: bool) {
         let Some(b) = self.progress_bounds.get() else {
             return;
         };
@@ -802,10 +1157,12 @@ impl IrisWindow {
             return;
         }
         let ratio = ((x - b.origin.x) / b.size.width).clamp(0., 1.) as f64;
-        if let Err(e) = self.viewports[0]
-            .session
-            .execute(Command::SeekPercent(ratio * 100.))
-        {
+        let cmd = if exact {
+            Command::SeekPercent(ratio * 100.)
+        } else {
+            Command::SeekPercentFast(ratio * 100.)
+        };
+        if let Err(e) = self.viewports[0].session.execute(cmd) {
             log::error!("seek: {e}");
         }
     }
@@ -824,6 +1181,28 @@ impl Render for IrisWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_fullscreen(window, cx);
         let fullscreen = self.fullscreen;
+        if !fullscreen && !window.is_maximized() {
+            let sz = window.viewport_size();
+            let (w, h) = (f32::from(sz.width), f32::from(sz.height));
+            if w >= 960. && h >= 600. {
+                self.last_window_size = Some((w, h));
+            }
+        }
+        // Apply PhotoDefault::Actual once photo dimensions and viewport are known.
+        if self.pending_photo_actual
+            && self.viewports[0].session.kind() == Some(Kind::Photo)
+            && self.viewports[0].session.state.video_size.0 > 0
+            && self.viewports[0].rect.get().is_some()
+        {
+            self.pending_photo_actual = false;
+            let (viewport, media) = self.image_geometry();
+            self.viewports[0]
+                .image
+                .toggle_actual_size(viewport, media, window.scale_factor() as f64);
+            let view = &self.viewports[0];
+            let _ = view.session.transform(view.image.zoom, view.image.pan);
+        }
+
         if let Some(v) = self.viewports[0].video.borrow_mut().as_mut() {
             v.set_scale(window.scale_factor() as f64);
         }
@@ -849,6 +1228,7 @@ impl Render for IrisWindow {
         // underneath shows through.
         div()
             .id("root")
+            .relative()
             .key_context("Workspace")
             .capture_any_mouse_up(cx.listener(|this, _, window, _| this.focus.focus(window)))
             .on_any_mouse_down(cx.listener(|this, _, window, _| this.focus.focus(window)))
@@ -860,11 +1240,20 @@ impl Render for IrisWindow {
             .on_action(cx.listener(Self::toggle_pause))
             .on_action(cx.listener(Self::seek_back))
             .on_action(cx.listener(Self::seek_forward))
+            .on_action(cx.listener(Self::seek_back_large))
+            .on_action(cx.listener(Self::seek_forward_large))
+            .on_action(cx.listener(Self::frame_back))
+            .on_action(cx.listener(Self::frame_forward))
             .on_action(cx.listener(Self::volume_up))
             .on_action(cx.listener(Self::volume_down))
+            .on_action(cx.listener(Self::toggle_mute))
             .on_action(cx.listener(Self::speed_down))
             .on_action(cx.listener(Self::speed_up))
+            .on_action(cx.listener(Self::reset_speed))
+            .on_action(cx.listener(Self::toggle_loop))
             .on_action(cx.listener(Self::toggle_directory))
+            .on_action(cx.listener(Self::refresh_directory))
+            .on_action(cx.listener(Self::open_settings))
             .on_action(cx.listener(Self::toggle_fullscreen))
             .on_action(cx.listener(Self::exit_fullscreen))
             .on_action(cx.listener(Self::toggle_subs))
@@ -874,20 +1263,63 @@ impl Render for IrisWindow {
             .on_action(cx.listener(Self::fit_image))
             .on_action(cx.listener(Self::zoom_in))
             .on_action(cx.listener(Self::zoom_out))
+            .on_action(cx.listener(Self::rotate_cw))
+            .on_action(cx.listener(Self::rotate_ccw))
             .on_action(cx.listener(Self::next_item))
             .on_action(cx.listener(Self::prev_item))
             .on_action(cx.listener(Self::open_file))
             .on_action(cx.listener(Self::toggle_favorite))
             .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| {
-                if let Some(p) = paths.paths().first() {
-                    this.open_path(p, cx);
+                let is_video = this.viewports[0].session.kind() == Some(Kind::Video);
+                let mut opened = false;
+                for p in paths.paths() {
+                    if is_video && library::is_subtitle(p) {
+                        this.command(Command::LoadSubtitle(p.clone()), cx);
+                        let name = p
+                            .file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_default();
+                        this.show_toast(format!("已加载字幕 · {name}"), cx);
+                        return;
+                    }
+                    if !opened {
+                        this.open_path(p, cx);
+                        opened = true;
+                    }
                 }
             }))
-            .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _, cx| {
+            .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, window, cx| {
                 this.mouse_pos = Some(ev.position);
+                if let Some((start_x, start_w)) = this.resizing_dir {
+                    if ev.pressed_button == Some(MouseButton::Left) {
+                        let dx = f32::from(ev.position.x) - start_x;
+                        let signed = if this.settings.directory_side == Side::Left {
+                            dx
+                        } else {
+                            -dx
+                        };
+                        let vw = f32::from(window.viewport_size().width);
+                        let max = if vw > 0. {
+                            (vw * 0.45).clamp(MIN_DIRECTORY_WIDTH, MAX_DIRECTORY_WIDTH)
+                        } else {
+                            MAX_DIRECTORY_WIDTH
+                        };
+                        this.settings.directory_width =
+                            (start_w + signed).clamp(MIN_DIRECTORY_WIDTH, max);
+                        cx.notify();
+                    } else {
+                        this.resizing_dir = None;
+                        this.settings.save();
+                        cx.notify();
+                    }
+                    return;
+                }
                 if this.seeking {
                     if ev.pressed_button == Some(MouseButton::Left) {
-                        this.seek_to_x(ev.position.x);
+                        if this.last_seek_drag.elapsed() >= SEEK_DRAG_INTERVAL {
+                            this.last_seek_drag = Instant::now();
+                            this.seek_to_x(ev.position.x, false);
+                        }
                     } else {
                         this.seeking = false;
                     }
@@ -907,8 +1339,8 @@ impl Render for IrisWindow {
                         this.viewports[0].image.pan_by(delta, viewport, media);
                         this.apply_image_view(cx);
                     }
-                } else {
-                    this.viewports[0].drag_origin = None;
+                } else if this.viewports[0].drag_origin.take().is_some() {
+                    cx.notify();
                 }
                 if this.fullscreen {
                     this.bump_activity(cx);
@@ -916,22 +1348,32 @@ impl Render for IrisWindow {
             }))
             .on_mouse_up(
                 MouseButton::Left,
-                cx.listener(|this, _, _, cx| {
-                    this.viewports[0].drag_origin = None;
+                cx.listener(|this, ev: &MouseUpEvent, _, cx| {
+                    if this.resizing_dir.take().is_some() {
+                        this.settings.save();
+                        cx.notify();
+                    }
+                    if this.viewports[0].drag_origin.take().is_some() {
+                        cx.notify();
+                    }
                     if this.seeking {
                         this.seeking = false;
+                        this.seek_to_x(ev.position.x, true);
                         cx.notify();
                     }
                 }),
             )
-            // Hidden until the mouse moves (macOS) / no cursor (Windows).
+            // Cursor overrides during active resize drag or hidden fullscreen chrome.
+            .when(self.resizing_dir.is_some(), |d| {
+                d.cursor(CursorStyle::ResizeLeftRight)
+            })
             .when(!self.chrome_shown(), |d| d.cursor(CursorStyle::None))
             .when(!fullscreen, |d| d.child(self.render_titlebar(cx)))
             // Two modules side by side: the directory, full height, and the
             // player (picture over its control bar).
             .child({
                 let directory = (!fullscreen && self.show_directory)
-                    .then(|| self.render_directory(false, cx).into_any_element());
+                    .then(|| self.render_directory(false, window, cx).into_any_element());
                 let player = div()
                     .flex_1()
                     .min_w(px(0.))
@@ -949,6 +1391,9 @@ impl Render for IrisWindow {
                 } else {
                     row.child(player).children(directory)
                 }
+            })
+            .when(self.settings_open, |d| {
+                d.child(self.render_settings_modal(cx))
             })
     }
 }

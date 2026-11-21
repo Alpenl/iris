@@ -1,5 +1,8 @@
-//! Iris — mpv-based photo/video player (technical spike).
-#![cfg_attr(all(target_os = "windows", not(debug_assertions)), windows_subsystem = "windows")]
+//! Iris — mpv-based photo/video player.
+#![cfg_attr(
+    all(target_os = "windows", not(debug_assertions)),
+    windows_subsystem = "windows"
+)]
 
 // Headless modules live in iris-core; re-exported so `crate::player` etc. resolve.
 use iris_core::{geometry, input, library, logging, player, settings, store};
@@ -17,18 +20,24 @@ use std::borrow::Cow;
 use std::path::PathBuf;
 
 use gpui::{
-    App, AppContext as _, Application, Bounds, TitlebarOptions, WindowBackgroundAppearance,
-    WindowBounds, WindowOptions, px, size,
+    App, AppContext as _, Application, Bounds, Menu, MenuItem, TitlebarOptions,
+    WindowBackgroundAppearance, WindowBounds, WindowOptions, px, size,
 };
 
 fn main() {
-    match std::env::args_os().nth(1).as_deref().and_then(|arg| arg.to_str()) {
+    match std::env::args_os()
+        .nth(1)
+        .as_deref()
+        .and_then(|arg| arg.to_str())
+    {
         Some("--version") => {
             println!("Iris {}", env!("CARGO_PKG_VERSION"));
             return;
         }
         Some("--help") => {
-            println!("Iris 照片 / 视频播放器\n用法：iris [本地文件或文件夹]\n  --version  显示版本\n  --help     显示本说明");
+            println!(
+                "Iris 照片 / 视频播放器\n用法：iris [本地文件或文件夹]\n  --version  显示版本\n  --help     显示本说明"
+            );
             return;
         }
         _ => {}
@@ -77,6 +86,7 @@ fn main() {
             log::error!("fonts: {e:#}");
         }
         ui::bind_keys(cx);
+        cx.set_menus(app_menus());
         cx.on_action(|_: &ui::Quit, cx| cx.quit());
 
         let session = match player::Session::new() {
@@ -88,10 +98,20 @@ fn main() {
             }
         };
 
+        let settings = settings::Settings::load();
+        let (win_w, win_h) = if settings.remember_window_size {
+            (
+                settings.window_width.unwrap_or(1440.).clamp(960., 7680.),
+                settings.window_height.unwrap_or(900.).clamp(600., 4320.),
+            )
+        } else {
+            (1440., 900.)
+        };
+
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
                 None,
-                size(px(1440.), px(900.)),
+                size(px(win_w), px(win_h)),
                 cx,
             ))),
             titlebar: Some(TitlebarOptions {
@@ -105,7 +125,7 @@ fn main() {
             ..Default::default()
         };
         let window = match cx.open_window(options, move |window, cx| {
-            cx.new(|cx| ui::IrisWindow::new(session, initial, window, cx))
+            cx.new(|cx| ui::IrisWindow::new(session, settings, initial, window, cx))
         }) {
             Ok(window) => window,
             Err(e) => {
@@ -136,4 +156,42 @@ fn main() {
         .detach();
         cx.activate(true);
     });
+}
+
+fn app_menus() -> Vec<Menu> {
+    vec![
+        Menu {
+            name: "Iris".into(),
+            items: vec![
+                MenuItem::action("设置…", ui::OpenSettings),
+                MenuItem::separator(),
+                MenuItem::action("退出 Iris", ui::Quit),
+            ],
+        },
+        Menu {
+            name: "文件".into(),
+            items: vec![
+                MenuItem::action("打开…", ui::OpenFile),
+                MenuItem::action("刷新目录", ui::RefreshDirectory),
+            ],
+        },
+        Menu {
+            name: "播放".into(),
+            items: vec![
+                MenuItem::action("播放 / 暂停", ui::TogglePause),
+                MenuItem::action("静音", ui::ToggleMute),
+                MenuItem::action("单曲循环", ui::ToggleLoop),
+                MenuItem::separator(),
+                MenuItem::action("上一个", ui::OpenPreviousMedia),
+                MenuItem::action("下一个", ui::OpenNextMedia),
+            ],
+        },
+        Menu {
+            name: "视图".into(),
+            items: vec![
+                MenuItem::action("展开 / 收起目录", ui::ToggleDirectory),
+                MenuItem::action("全屏", ui::ToggleFullscreen),
+            ],
+        },
+    ]
 }

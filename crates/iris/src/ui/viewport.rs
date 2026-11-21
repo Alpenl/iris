@@ -3,8 +3,13 @@
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
-use gpui::{Pixels, Point};
+use gpui::{
+    Context, CursorStyle, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
+    ParentElement, Pixels, Point, StatefulInteractiveElement, Styled, canvas, div,
+    prelude::FluentBuilder, px,
+};
 
+use super::*;
 use crate::geometry::ImageView;
 use crate::player::Session;
 use crate::video::VideoSurface;
@@ -26,13 +31,6 @@ impl Drop for Viewport {
         self.session.shutdown();
     }
 }
-
-use gpui::{
-    Context, InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ParentElement,
-    StatefulInteractiveElement, Styled, canvas, div, prelude::FluentBuilder, px,
-};
-
-use super::*;
 
 impl IrisWindow {
     pub(super) fn render_video_area(
@@ -68,6 +66,10 @@ impl IrisWindow {
         .absolute()
         .size_full();
 
+        let is_photo_zoomed = self.viewports[0].session.kind() == Some(Kind::Photo)
+            && self.viewports[0].image.zoomed();
+        let panning = self.viewports[0].drag_origin.is_some();
+
         div()
             .id("video")
             .relative()
@@ -75,31 +77,53 @@ impl IrisWindow {
             .min_h(px(0.))
             .w_full()
             .overflow_hidden()
+            .when(self.chrome_shown() && is_photo_zoomed && panning, |d| {
+                d.cursor(CursorStyle::ClosedHand)
+            })
+            .when(self.chrome_shown() && is_photo_zoomed && !panning, |d| {
+                d.cursor(CursorStyle::OpenHand)
+            })
             .child(probe)
             .key_context({
                 let mut context = gpui::KeyContext::default();
-                context.add("Viewport");
-                context.set(
-                    "media",
-                    match self.viewports[0].session.kind() {
-                        Some(Kind::Photo) => "image",
-                        Some(Kind::Video) => "video",
-                        None => "none",
-                    },
-                );
-                if self.viewports[0].image.zoomed() {
-                    context.add("zoomed");
+                if self.settings_open {
+                    context.add("Overlay");
+                } else {
+                    context.add("Viewport");
+                    context.set(
+                        "media",
+                        match self.viewports[0].session.kind() {
+                            Some(Kind::Photo) => "image",
+                            Some(Kind::Video) => "video",
+                            None => "none",
+                        },
+                    );
+                    if self.viewports[0].image.zoomed() {
+                        context.add("zoomed");
+                    }
                 }
                 context
             })
             .track_focus(&self.focus)
             .on_scroll_wheel(cx.listener(|this, ev: &gpui::ScrollWheelEvent, _, cx| {
-                let delta = f32::from(ev.delta.pixel_delta(px(20.)).y) as f64 / 240.;
-                if let Some(PointerCommand::Zoom(delta)) =
-                    input::resolve_pointer_input(PointerInput::Wheel(delta), this.input_context())
-                {
-                    this.zoom_at(delta, Some(ev.position), cx);
-                    cx.stop_propagation();
+                let raw_y = f32::from(ev.delta.pixel_delta(px(20.)).y) as f64;
+                if raw_y == 0. {
+                    return;
+                }
+                match input::resolve_pointer_input(
+                    PointerInput::Wheel(raw_y / 240.),
+                    this.input_context(),
+                ) {
+                    Some(PointerCommand::Zoom(delta)) => {
+                        this.zoom_at(delta, Some(ev.position), cx);
+                        cx.stop_propagation();
+                    }
+                    Some(PointerCommand::VolumeBy(_)) => {
+                        this.command(Command::VolumeBy(raw_y / 10.), cx);
+                        this.bump_activity(cx);
+                        cx.stop_propagation();
+                    }
+                    _ => {}
                 }
             }))
             .on_mouse_down(
@@ -111,10 +135,11 @@ impl IrisWindow {
                         PointerInput::BeginDrag
                     };
                     match input::resolve_pointer_input(input, this.input_context()) {
-                        Some(PointerCommand::CloseOverlay) => this.close_popup(cx),
+                        Some(PointerCommand::CloseOverlay) => this.close_overlays(cx),
                         Some(PointerCommand::ToggleFullscreen) => window.toggle_fullscreen(),
                         Some(PointerCommand::BeginPan) => {
-                            this.viewports[0].drag_origin = Some(ev.position)
+                            this.viewports[0].drag_origin = Some(ev.position);
+                            cx.notify();
                         }
                         _ => {}
                     }
@@ -133,7 +158,7 @@ impl IrisWindow {
                     let chip = div()
                         .absolute()
                         .top(px(FLOAT_GAP))
-                        .max_w(px(480.))
+                        .max_w(px(520.))
                         .h(px(28.))
                         .px(px(10.))
                         .flex()
@@ -166,31 +191,36 @@ impl IrisWindow {
                     })
                 })
             })
-            // Toast: top centre, a small accent square before the message.
-            .when_some(self.toast.clone(), |d, msg| {
-                d.child(
-                    div()
-                        .absolute()
-                        .top(px(if fullscreen { FLOAT_GAP } else { 12. }))
-                        .left_0()
-                        .right_0()
-                        .flex()
-                        .justify_center()
-                        .child(
-                            div()
-                                .h(px(28.))
-                                .px(px(10.))
-                                .flex()
-                                .items_center()
-                                .gap(px(8.))
-                                .bg(overlay())
-                                .border_1()
-                                .border_color(line())
-                                .child(div().flex_none().size(px(6.)).bg(accent()))
-                                .child(div().text_size(px(12.)).child(msg)),
-                        ),
-                )
-            })
+            // Toast (or delayed loading indicator): top centre.
+            .when_some(
+                self.toast
+                    .clone()
+                    .or_else(|| self.loading_visible.then(|| SharedString::from("加载中…"))),
+                |d, msg| {
+                    d.child(
+                        div()
+                            .absolute()
+                            .top(px(if fullscreen { FLOAT_GAP } else { 12. }))
+                            .left_0()
+                            .right_0()
+                            .flex()
+                            .justify_center()
+                            .child(
+                                div()
+                                    .h(px(28.))
+                                    .px(px(10.))
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(8.))
+                                    .bg(overlay())
+                                    .border_1()
+                                    .border_color(line())
+                                    .child(div().flex_none().size(px(6.)).bg(accent()))
+                                    .child(div().text_size(px(12.)).child(msg)),
+                            ),
+                    )
+                },
+            )
             .when(
                 self.viewports[0].session.current.is_none() && self.pending_path.is_none(),
                 |d| {
@@ -276,6 +306,10 @@ impl IrisWindow {
                         .child(self.render_dock(true, window, cx)),
                 )
             })
+            // Floating track / speed popover above the control bar.
+            .when_some(self.popover, |d, pop| {
+                d.child(self.render_popover(pop, fullscreen, cx))
+            })
             // The directory popup, on the chosen edge, between the top of the
             // screen and the floating bar.
             .when(fullscreen && self.dir_popup, |d| {
@@ -287,7 +321,7 @@ impl IrisWindow {
                     .border_color(line())
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
-                    .child(self.render_directory(true, cx));
+                    .child(self.render_directory(true, window, cx));
                 d.child(if self.settings.directory_side == Side::Left {
                     popup.left(px(FLOAT_GAP))
                 } else {

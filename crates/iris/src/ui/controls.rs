@@ -9,6 +9,7 @@ use gpui::{
 use super::widgets::{ghost, icon, icon_button, icon_on_ghost, separator, text_button, tip};
 use super::*;
 use crate::assets::Icon;
+use crate::player::TrackKind;
 
 /// Height of the timeline's hit area, which straddles the bar's top edge.
 const SEAM_HIT: f32 = 14.;
@@ -101,6 +102,7 @@ impl IrisWindow {
                     .bg(window_bg())
                     .when(!seam, |d| d.border_t_1().border_color(line()))
             })
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .child(row)
             // Last, so the part above the bar is on top of the picture.
             .children(timeline)
@@ -124,6 +126,15 @@ impl IrisWindow {
     fn video_transport(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let state = &self.viewports[0].session.state;
         let paused = state.paused;
+        let second_time = if state.duration > 0. {
+            if self.show_remaining {
+                format!("-{}", fmt_time((state.duration - state.time_pos).max(0.)))
+            } else {
+                fmt_time(state.duration)
+            }
+        } else {
+            "--:--".into()
+        };
         div()
             .flex()
             .items_center()
@@ -141,77 +152,146 @@ impl IrisWindow {
             .child(self.step_button("next", 1, cx))
             .child(
                 div()
-                    .pl(px(10.))
+                    .id(("time-readout", usize::from(self.show_remaining)))
+                    .h(px(BUTTON))
+                    .ml(px(6.))
+                    .px(px(6.))
                     .flex()
                     .items_center()
                     .gap(px(6.))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(hover()))
                     .font_family(FONT_MONO)
                     .text_size(px(12.))
+                    .tooltip(tip(
+                        if self.show_remaining {
+                            "点击显示总时长"
+                        } else {
+                            "点击显示剩余时间"
+                        },
+                        None,
+                    ))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.show_remaining = !this.show_remaining;
+                        cx.notify();
+                    }))
                     .child(div().text_color(text()).child(fmt_time(state.time_pos)))
                     .child(div().text_color(text_faint()).child("/"))
-                    .child(div().text_color(text_dim()).child(if state.duration > 0. {
-                        fmt_time(state.duration)
-                    } else {
-                        "--:--".into()
-                    })),
+                    .child(div().text_color(text_dim()).child(second_time)),
             )
     }
 
     fn video_fields(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let state = &self.viewports[0].session.state;
+        let session = &self.viewports[0].session;
+        let state = &session.state;
         let subs = state.subs_visible;
-        let audio = match state.audio.as_str() {
-            "" | "no" => "—".to_string(),
-            track => track.to_string(),
-        };
+        let looping = state.loop_file;
+        let audio = session
+            .selected_track(TrackKind::Audio)
+            .map(|t| {
+                if !t.lang.is_empty() {
+                    t.lang.to_ascii_uppercase()
+                } else {
+                    t.id.to_string()
+                }
+            })
+            .unwrap_or_else(|| match state.audio.as_str() {
+                "" | "no" => "—".to_string(),
+                track => track.to_string(),
+            });
         let speed = state.speed;
+        let sub_pop = self.popover == Some(PopoverKind::Subtitles);
+        let audio_pop = self.popover == Some(PopoverKind::Audio);
+        let speed_pop = self.popover == Some(PopoverKind::Speed);
         div()
             .flex()
             .items_center()
             .gap(px(2.))
             .child(
-                icon_button(("subs", usize::from(subs)), Icon::Subtitles, subs)
-                    .tooltip(tip(if subs { "隐藏字幕" } else { "显示字幕" }, Some("V")))
-                    .on_click(
-                        cx.listener(|this, _, _, cx| this.command(Command::ToggleSubtitles, cx)),
-                    ),
+                icon_button(("loop", usize::from(looping)), Icon::Repeat, looping)
+                    .tooltip(tip(
+                        if looping {
+                            "关闭单曲循环"
+                        } else {
+                            "单曲循环"
+                        },
+                        Some("L"),
+                    ))
+                    .on_click(cx.listener(|this, _, w, cx| this.toggle_loop(&ToggleLoop, w, cx))),
             )
             .child(
-                ghost("audio", false)
+                icon_button(
+                    ("subs", usize::from(subs) * 2 + usize::from(sub_pop)),
+                    Icon::Subtitles,
+                    subs || sub_pop,
+                )
+                .tooltip(tip("字幕 · 点击选轨，V 显隐", Some("J / V")))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.toggle_popover(PopoverKind::Subtitles, cx);
+                })),
+            )
+            .child(
+                ghost(("audio", usize::from(audio_pop)), audio_pop)
                     .px(px(6.))
                     .gap(px(6.))
-                    .child(icon_on_ghost(Icon::Audio, text_dim()))
+                    .child(icon_on_ghost(
+                        Icon::Audio,
+                        if audio_pop { text() } else { text_dim() },
+                    ))
                     .child(div().font_family(FONT_MONO).text_size(px(11.)).child(audio))
-                    .tooltip(tip("切换音轨", Some("A")))
-                    .on_click(cx.listener(|this, _, _, cx| this.command(Command::NextAudio, cx))),
+                    .tooltip(tip("音轨 · 点击选轨", Some("A")))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.toggle_popover(PopoverKind::Audio, cx);
+                    })),
             )
             .child(
-                text_button("speed", format!("{speed:.2}×"))
+                text_button(("speed", usize::from(speed_pop)), format!("{speed:.2}×"))
+                    .when(speed_pop, |d| d.bg(selected()).text_color(text()))
                     .when((speed - 1.).abs() > 0.001, |d| d.text_color(text()))
-                    .tooltip(tip("速度 · 点按恢复 1.0×", Some("[ ]")))
-                    .on_click(
-                        cx.listener(|this, _, _, cx| this.command(Command::SetSpeed(1.), cx)),
-                    ),
+                    .tooltip(tip("播放速度 · 点击选择，滚轮调节，右键还原", Some("[ ]")))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.toggle_popover(PopoverKind::Speed, cx);
+                    }))
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(|this, _, _, cx| {
+                            this.popover = None;
+                            this.command(Command::SetSpeed(1.), cx);
+                            this.show_toast("倍速 · 1.00×", cx);
+                            cx.stop_propagation();
+                        }),
+                    )
+                    .on_scroll_wheel(cx.listener(|this, ev: &ScrollWheelEvent, _, cx| {
+                        let dy = f32::from(ev.delta.pixel_delta(px(20.)).y);
+                        if dy != 0. {
+                            this.command(Command::SpeedStep(if dy > 0. { 1 } else { -1 }), cx);
+                        }
+                        cx.stop_propagation();
+                    })),
             )
             .child(separator())
             .child(self.render_volume(cx))
             .child(separator())
     }
 
-    /// Speaker, ten segments (click to set, wheel to nudge) and the value.
-    /// Grey rather than the accent: the accent is kept for where playback is.
+    /// Clickable speaker (mute toggle), ten segments (click to set, wheel to
+    /// nudge) and the value. Grey rather than accent.
     fn render_volume(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let volume = self.viewports[0].session.state.volume;
-        let filled = (volume / 10.).round().clamp(0., 10.) as usize;
+        let state = &self.viewports[0].session.state;
+        let volume = state.volume;
+        let muted = state.muted;
+        let filled = if muted {
+            0
+        } else {
+            (volume / 10.).round().clamp(0., 10.) as usize
+        };
         div()
             .id("volume")
             .group("volume")
             .h(px(BUTTON))
             .flex()
             .items_center()
-            .gap(px(6.))
-            .pl(px(4.))
-            .tooltip(tip("音量 · 滚轮调节", Some("↑ ↓")))
+            .gap(px(4.))
             .on_scroll_wheel(cx.listener(|this, ev: &ScrollWheelEvent, _, cx| {
                 let dy = f32::from(ev.delta.pixel_delta(px(20.)).y) as f64;
                 if dy != 0. {
@@ -219,40 +299,64 @@ impl IrisWindow {
                 }
                 cx.stop_propagation();
             }))
-            .child(icon(Icon::Volume, 16., text_faint()))
-            .child(div().flex().items_center().children((0..10).map(|i| {
-                let on = i < filled;
+            .child(
+                icon_button(
+                    ("mute", usize::from(muted)),
+                    if muted || volume <= 0.5 {
+                        Icon::VolumeMute
+                    } else {
+                        Icon::Volume
+                    },
+                    muted,
+                )
+                .tooltip(tip(if muted { "取消静音" } else { "静音" }, Some("M")))
+                .on_click(cx.listener(|this, _, w, cx| this.toggle_mute(&ToggleMute, w, cx))),
+            )
+            .child(
                 div()
-                    .id(("vol", i))
-                    .group("vol")
-                    .w(px(6.))
-                    .h(px(BUTTON))
+                    .id("vol-bars")
                     .flex()
                     .items_center()
-                    .cursor_pointer()
-                    .child(
+                    .tooltip(tip("音量 · 点击或滚轮调节", Some("↑ ↓")))
+                    .children((0..10).map(|i| {
+                        let on = i < filled;
                         div()
-                            .w(px(4.))
-                            .h(px(10.))
-                            .when(on, |d| {
-                                d.bg(text_dim()).group_hover("volume", |s| s.bg(text()))
-                            })
-                            .when(!on, |d| {
-                                d.bg(line_strong())
-                                    .group_hover("vol", |s| s.bg(text_faint()))
-                            }),
-                    )
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.command(Command::SetVolume(((i + 1) * 10) as f64), cx)
-                    }))
-            })))
+                            .id(("vol", i))
+                            .group("vol")
+                            .w(px(6.))
+                            .h(px(BUTTON))
+                            .flex()
+                            .items_center()
+                            .cursor_pointer()
+                            .child(
+                                div()
+                                    .w(px(4.))
+                                    .h(px(10.))
+                                    .when(on, |d| {
+                                        d.bg(text_dim()).group_hover("volume", |s| s.bg(text()))
+                                    })
+                                    .when(!on, |d| {
+                                        d.bg(line_strong())
+                                            .group_hover("vol", |s| s.bg(text_faint()))
+                                    }),
+                            )
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.command(Command::SetVolume(((i + 1) * 10) as f64), cx)
+                            }))
+                    })),
+            )
             .child(
                 div()
                     .w(px(24.))
+                    .pl(px(2.))
                     .font_family(FONT_MONO)
                     .text_size(px(11.))
-                    .text_color(text_dim())
-                    .child(format!("{volume:.0}")),
+                    .text_color(if muted { text_faint() } else { text_dim() })
+                    .child(if muted {
+                        "0".to_string()
+                    } else {
+                        format!("{volume:.0}")
+                    }),
             )
     }
 
@@ -303,6 +407,12 @@ impl IrisWindow {
             .items_center()
             .gap(px(2.))
             .child(
+                icon_button("rotate", Icon::Rotate, false)
+                    .tooltip(tip("临时顺时针旋转 90°", Some("R")))
+                    .on_click(cx.listener(|this, _, w, cx| this.rotate_cw(&RotateCw, w, cx))),
+            )
+            .child(separator())
+            .child(
                 icon_button("zoom-out", Icon::Minus, false)
                     .tooltip(tip("缩小", Some("-")))
                     .on_click(cx.listener(|this, _, w, cx| this.zoom_out(&ZoomOut, w, cx))),
@@ -337,10 +447,15 @@ impl IrisWindow {
             .child(separator())
     }
 
-    /// Favorite and fullscreen: about the file and the window, not playback.
+    /// Favorite, settings and fullscreen: about the file and the window.
     fn window_buttons(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let current = self.viewports[0].session.current.as_deref();
         let favorite = current.is_some_and(|p| self.store.favorite(p));
+        let set_key = if cfg!(target_os = "macos") {
+            "⌘,"
+        } else {
+            "Ctrl+,"
+        };
         div()
             .flex()
             .items_center()
@@ -359,6 +474,15 @@ impl IrisWindow {
                         })),
                 )
             })
+            .child(
+                icon_button(
+                    ("settings", usize::from(self.settings_open)),
+                    Icon::Settings,
+                    self.settings_open,
+                )
+                .tooltip(tip("设置", Some(set_key)))
+                .on_click(cx.listener(|this, _, w, cx| this.open_settings(&OpenSettings, w, cx))),
+            )
             .child(
                 icon_button(
                     ("fullscreen", usize::from(self.fullscreen)),
@@ -447,7 +571,8 @@ impl IrisWindow {
                 MouseButton::Left,
                 cx.listener(|this, ev: &MouseDownEvent, _, cx| {
                     this.seeking = true;
-                    this.seek_to_x(ev.position.x);
+                    this.last_seek_drag = Instant::now();
+                    this.seek_to_x(ev.position.x, true);
                     cx.stop_propagation();
                     cx.notify();
                 }),

@@ -97,6 +97,42 @@ impl Store {
         self.save();
         favorite
     }
+    pub fn remove_favorite(&mut self, path: &Path) -> bool {
+        if let Some(r) = self.records.get_mut(path)
+            && r.favorite
+        {
+            r.favorite = false;
+            if r.position <= 0. && r.duration <= 0. {
+                self.records.remove(path);
+            }
+            self.save();
+            return true;
+        }
+        false
+    }
+    pub fn progress_ratio(&self, path: &Path) -> Option<f32> {
+        let r = self.records.get(path)?;
+        if r.duration > 0. && r.position >= 5. && r.position < r.duration - 5. {
+            Some((r.position / r.duration).clamp(0., 1.) as f32)
+        } else {
+            None
+        }
+    }
+    pub fn clear_progress(&mut self) -> usize {
+        let mut cleared = 0;
+        self.records.retain(|_, r| {
+            if r.position > 0. || r.duration > 0. {
+                cleared += 1;
+                r.position = 0.;
+                r.duration = 0.;
+            }
+            r.favorite
+        });
+        if cleared > 0 {
+            self.save();
+        }
+        cleared
+    }
     pub fn resume(&self, path: &Path) -> f64 {
         self.records
             .get(path)
@@ -217,5 +253,34 @@ mod tests {
         s.remember(p, 60., 60., true);
         assert_eq!(s.resume(p), 0.);
         assert!(s.favorite(p));
+    }
+    #[test]
+    fn progress_ratio_and_clear_progress_preserve_favorites() {
+        let fav = Path::new("fav.mp4");
+        let plain = Path::new("plain.mp4");
+        let mut s = Store::default();
+        s.records.insert(
+            fav.into(),
+            Record {
+                favorite: true,
+                position: 30.,
+                duration: 60.,
+            },
+        );
+        s.records.insert(
+            plain.into(),
+            Record {
+                favorite: false,
+                position: 15.,
+                duration: 60.,
+            },
+        );
+        assert_eq!(s.progress_ratio(fav), Some(0.5));
+        assert_eq!(s.progress_ratio(plain), Some(0.25));
+        // Clear progress keeps fav's star and removes non-favorite progress-only row.
+        assert_eq!(s.clear_progress(), 2);
+        assert!(s.favorite(fav));
+        assert_eq!(s.progress_ratio(fav), None);
+        assert!(!s.records.contains_key(plain));
     }
 }

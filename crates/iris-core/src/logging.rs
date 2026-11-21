@@ -18,17 +18,26 @@ impl Write for LogOutput {
     fn flush(&mut self) -> io::Result<()> { self.file.flush() }
 }
 
+pub fn log_path() -> Option<PathBuf> {
+    std::env::var_os("IRIS_LOG").map(PathBuf::from).or_else(|| {
+        #[cfg(target_os = "windows")]
+        let base = std::env::var_os("LOCALAPPDATA")
+            .map(PathBuf::from)
+            .map(|p| p.join("Iris"));
+        #[cfg(target_os = "macos")]
+        let base = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .map(|p| p.join("Library/Logs/Iris"));
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        let base: Option<PathBuf> = None;
+        base.map(|p| p.join("iris.log"))
+    })
+}
+
 pub fn init() {
     let mut builder = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("iris=info"));
     builder.format_timestamp_millis();
-    let path = std::env::var_os("IRIS_LOG").map(PathBuf::from).or_else(|| {
-        #[cfg(target_os = "windows")]
-        let base = std::env::var_os("LOCALAPPDATA").map(PathBuf::from).map(|p| p.join("Iris"));
-        #[cfg(target_os = "macos")]
-        let base = std::env::var_os("HOME").map(PathBuf::from).map(|p| p.join("Library/Logs/Iris"));
-        base.map(|p| p.join("iris.log"))
-    });
-    if let Some(path) = path {
+    if let Some(path) = log_path() {
         let opened = path.parent().map_or(Ok(()), std::fs::create_dir_all)
             .and_then(|_| OpenOptions::new().create(true).truncate(true).write(true).open(&path));
         match opened {

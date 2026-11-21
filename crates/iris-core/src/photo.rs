@@ -33,7 +33,7 @@ pub enum Mirror {
 }
 
 /// What a photo's header says.
-#[derive(Debug, Default, PartialEq)]
+#[derive(Debug, Default, Clone, PartialEq)]
 pub struct Photo {
     pub colour: Option<Colour>,
     /// Stored pixel size, before any rotation.
@@ -45,9 +45,8 @@ pub struct Photo {
 }
 
 impl Photo {
-    /// The `loadfile` per-file options, or `None` when mpv's defaults are
-    /// right. mpv drops them again when the file ends.
-    pub fn mpv_options(&self) -> Option<String> {
+    /// Video filter chain with an optional extra clockwise rotation (0/90/180/270).
+    pub fn vf_chain(&self, extra_rotate_cw: u16) -> Option<String> {
         let mut vf = Vec::new();
         // Scale first, so later filters work on the small image.
         if let Some((w, h)) = self.size
@@ -72,20 +71,25 @@ impl Photo {
         // does nothing for tiled HEIC, which mpv stitches in a separate
         // filter graph.)
         let colour = self.colour.and_then(|c| c.mpv_format());
-        let clip = colour.is_some();
         let mut format: Vec<String> = colour.into_iter().collect();
-        if self.rotate_cw != 0 {
-            format.push(format!("rotate={}", self.rotate_cw));
+        let rot = (self.rotate_cw + extra_rotate_cw) % 360;
+        if rot != 0 {
+            format.push(format!("rotate={rot}"));
         }
         if !format.is_empty() {
             vf.push(format!("format={}", format.join(":")));
         }
+        (!vf.is_empty()).then(|| vf.join(","))
+    }
 
+    /// The `loadfile` per-file options, or `None` when mpv's defaults are
+    /// right. mpv drops them again when the file ends.
+    pub fn mpv_options(&self) -> Option<String> {
+        let clip = self.colour.and_then(|c| c.mpv_format()).is_some();
         let mut opts = Vec::new();
-        if !vf.is_empty() {
+        if let Some(chain) = self.vf_chain(0) {
             // The option list is comma separated, and so is a filter chain:
             // `%len%` quotes the value for mpv.
-            let chain = vf.join(",");
             opts.push(format!("vf=%{}%{chain}", chain.len()));
         }
         if clip {

@@ -44,12 +44,22 @@ icons! {
     Subtitles => "subtitles",
     Audio => "audio",
     Volume => "volume",
+    VolumeMute => "volume-mute",
     Video => "video",
     Photo => "photo",
     Swap => "swap",
     Fit => "fit",
     Plus => "plus",
     Minus => "minus",
+    Settings => "settings",
+    FolderOpen => "folder-open",
+    Refresh => "refresh",
+    Repeat => "repeat",
+    Rotate => "rotate",
+    Close => "close",
+    Minimize => "minimize",
+    Maximize => "maximize",
+    Check => "check",
 }
 
 pub struct Assets;

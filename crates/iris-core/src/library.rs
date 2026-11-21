@@ -22,6 +22,14 @@ const VIDEO_EXT: &[&str] = &[
 const PHOTO_EXT: &[&str] = &[
     "jpg", "jpeg", "png", "webp", "gif", "heic", "heif", "avif", "tif", "tiff", "bmp",
 ];
+const SUBTITLE_EXT: &[&str] = &["srt", "ass", "ssa", "vtt", "sub", "sup", "idx", "lrc"];
+
+pub fn is_subtitle(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| SUBTITLE_EXT.contains(&e.to_ascii_lowercase().as_str()))
+        .unwrap_or(false)
+}
 
 pub fn kind_of(path: &Path) -> Option<Kind> {
     let ext = path.extension()?.to_str()?.to_ascii_lowercase();

@@ -16,6 +16,18 @@ pub struct Colour {
 }
 
 impl Colour {
+    /// Human-readable colour space label for media info chips.
+    pub fn display_name(&self) -> &'static str {
+        match self.primaries {
+            "bt.709" => "sRGB",
+            "display-p3" => "Display P3",
+            "adobe" => "Adobe RGB",
+            "bt.2020" => "BT.2020",
+            "prophoto" => "ProPhoto",
+            other => other,
+        }
+    }
+
     /// Parameters for mpv's `format` video filter, or `None` when mpv's
     /// default (BT.709 primaries, sRGB curve) is already right.
     pub fn mpv_format(&self) -> Option<String> {
