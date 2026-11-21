@@ -101,8 +101,8 @@ fn main() {
         let settings = settings::Settings::load();
         let (win_w, win_h) = if settings.remember_window_size {
             (
-                settings.window_width.unwrap_or(1440.).clamp(960., 7680.),
-                settings.window_height.unwrap_or(900.).clamp(600., 4320.),
+                settings.window_width.unwrap_or(1440.).clamp(480., 7680.),
+                settings.window_height.unwrap_or(900.).clamp(300., 4320.),
             )
         } else {
             (1440., 900.)
@@ -119,7 +119,7 @@ fn main() {
                 appears_transparent: true,
                 traffic_light_position: None,
             }),
-            window_min_size: Some(size(px(960.), px(600.))),
+            window_min_size: Some(size(px(480.), px(300.))),
             window_background: WindowBackgroundAppearance::Opaque,
             app_id: Some("app.iris.player".into()),
             ..Default::default()
@@ -172,7 +172,10 @@ fn app_menus() -> Vec<Menu> {
             name: "文件".into(),
             items: vec![
                 MenuItem::action("打开…", ui::OpenFile),
+                MenuItem::action("搜索目录", ui::ToggleSearch),
                 MenuItem::action("刷新目录", ui::RefreshDirectory),
+                MenuItem::separator(),
+                MenuItem::action("截图保存", ui::TakeScreenshot),
             ],
         },
         Menu {
@@ -182,6 +185,9 @@ fn app_menus() -> Vec<Menu> {
                 MenuItem::action("静音", ui::ToggleMute),
                 MenuItem::action("单曲循环", ui::ToggleLoop),
                 MenuItem::separator(),
+                MenuItem::action("上一章节", ui::PrevChapter),
+                MenuItem::action("下一章节", ui::NextChapter),
+                MenuItem::separator(),
                 MenuItem::action("上一个", ui::OpenPreviousMedia),
                 MenuItem::action("下一个", ui::OpenNextMedia),
             ],
@@ -190,6 +196,10 @@ fn app_menus() -> Vec<Menu> {
             name: "视图".into(),
             items: vec![
                 MenuItem::action("展开 / 收起目录", ui::ToggleDirectory),
+                MenuItem::action("媒体详情", ui::ToggleInfo),
+                MenuItem::action("窗口置顶", ui::ToggleAlwaysOnTop),
+                MenuItem::action("切换画面比例", ui::CycleAspect),
+                MenuItem::separator(),
                 MenuItem::action("全屏", ui::ToggleFullscreen),
             ],
         },

@@ -11,16 +11,90 @@ pub struct Record {
     pub duration: f64,
 }
 
+const MAX_RECENT: usize = 20;
+
 #[derive(Default)]
 pub struct Store {
     pub records: BTreeMap<PathBuf, Record>,
+    pub recent: Vec<PathBuf>,
 }
 
 impl Store {
     pub fn load() -> Self {
-        crate::settings::path()
-            .map(|p| Self::read(&p.with_file_name("records.tsv")))
-            .unwrap_or_default()
+        let Some(cfg) = crate::settings::path() else {
+            return Self::default();
+        };
+        let mut this = Self::read(&cfg.with_file_name("records.tsv"));
+        this.recent = Self::read_recent(&cfg.with_file_name("recent.tsv"));
+        this
+    }
+    fn read_recent(path: &Path) -> Vec<PathBuf> {
+        let Ok(text) = std::fs::read_to_string(path) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for line in text.lines() {
+            if let Some(p) = decode_path(line.trim())
+                && !out.contains(&p)
+            {
+                out.push(p);
+                if out.len() >= MAX_RECENT {
+                    break;
+                }
+            }
+        }
+        out
+    }
+    fn save_recent(&self) {
+        let Some(path) = crate::settings::path().map(|p| p.with_file_name("recent.tsv")) else {
+            return;
+        };
+        if let Err(e) = self.write_recent(&path) {
+            log::error!("saving recent list failed: {e}");
+        }
+    }
+    fn write_recent(&self, path: &Path) -> std::io::Result<()> {
+        let text: String = self
+            .recent
+            .iter()
+            .take(MAX_RECENT)
+            .map(|p| format!("{}\n", encode_path(p)))
+            .collect();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
+        std::fs::write(&tmp, text)?;
+        std::fs::rename(tmp, path)
+    }
+    pub fn push_recent(&mut self, path: &Path) {
+        let p = path.to_path_buf();
+        self.recent.retain(|x| x != &p);
+        self.recent.insert(0, p);
+        self.recent.truncate(MAX_RECENT);
+        self.save_recent();
+    }
+    pub fn clear_recent(&mut self) {
+        if self.recent.is_empty() {
+            return;
+        }
+        self.recent.clear();
+        self.save_recent();
+    }
+    pub fn reset_progress(&mut self, path: &Path) -> bool {
+        let Some(r) = self.records.get_mut(path) else {
+            return false;
+        };
+        if r.position <= 0. && r.duration <= 0. {
+            return false;
+        }
+        r.position = 0.;
+        r.duration = 0.;
+        if !r.favorite {
+            self.records.remove(path);
+        }
+        self.save();
+        true
     }
     fn read(path: &Path) -> Self {
         let mut this = Self::default();

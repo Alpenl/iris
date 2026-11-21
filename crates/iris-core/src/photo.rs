@@ -32,6 +32,30 @@ pub enum Mirror {
     Vertical,
 }
 
+/// Lightweight EXIF summary extracted from file headers (no full decode).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ExifSummary {
+    pub camera: Option<String>,
+    pub lens: Option<String>,
+    pub focal_length: Option<String>,
+    pub aperture: Option<String>,
+    pub exposure: Option<String>,
+    pub iso: Option<u32>,
+    pub date_taken: Option<String>,
+}
+
+impl ExifSummary {
+    pub fn is_empty(&self) -> bool {
+        self.camera.is_none()
+            && self.lens.is_none()
+            && self.focal_length.is_none()
+            && self.aperture.is_none()
+            && self.exposure.is_none()
+            && self.iso.is_none()
+            && self.date_taken.is_none()
+    }
+}
+
 /// What a photo's header says.
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct Photo {
@@ -42,6 +66,7 @@ pub struct Photo {
     /// (a pixel filter), then rotate clockwise (in the renderer).
     pub mirror: Option<Mirror>,
     pub rotate_cw: u16,
+    pub exif: Option<ExifSummary>,
 }
 
 impl Photo {
@@ -134,6 +159,7 @@ pub fn probe(path: &Path) -> Photo {
         size: h.size,
         mirror: h.mirror,
         rotate_cw: h.rotate_cw,
+        exif: h.exif.filter(|e| !e.is_empty()),
     }
 }
 
@@ -145,6 +171,7 @@ struct Header {
     size: Option<(u32, u32)>,
     mirror: Option<Mirror>,
     rotate_cw: u16,
+    exif: Option<ExifSummary>,
 }
 
 enum ColourTag {
@@ -195,6 +222,11 @@ fn jpeg<R: Read + Seek>(r: &mut R, h: &mut Header) -> Option<()> {
         if sof && body >= 5 {
             let seg = read_n(r, body)?;
             h.size = Some((be16(&seg[3..]) as u32, be16(&seg[1..]) as u32));
+        } else if marker == 0xE1 && body > 14 && body <= 256 * 1024 && h.exif.is_none() {
+            let seg = read_n(r, body)?;
+            if &seg[..6] == b"Exif\0\0" {
+                h.exif = parse_exif_tiff(&seg[6..]);
+            }
         } else if marker == 0xE2 && body > 14 {
             let seg = read_n(r, body)?;
             if &seg[..12] == b"ICC_PROFILE\0" {
@@ -512,6 +544,141 @@ fn tiff<R: Read + Seek>(r: &mut R, h: &mut Header) -> Option<()> {
         h.colour = Some(ColourTag::Icc(read_n(r, count)?));
     }
     Some(())
+}
+
+/// Parses IFD0 + ExifIFD from a TIFF-formatted EXIF payload (e.g. JPEG APP1).
+fn parse_exif_tiff(buf: &[u8]) -> Option<ExifSummary> {
+    if buf.len() < 8 {
+        return None;
+    }
+    let le = match &buf[..4] {
+        b"II*\0" => true,
+        b"MM\0*" => false,
+        _ => return None,
+    };
+    let u16_ = |off: usize| -> Option<u16> {
+        let s = buf.get(off..off + 2)?;
+        Some(if le {
+            u16::from_le_bytes([s[0], s[1]])
+        } else {
+            be16(s)
+        })
+    };
+    let u32_ = |off: usize| -> Option<u32> {
+        let s = buf.get(off..off + 4)?;
+        Some(if le {
+            u32::from_le_bytes([s[0], s[1], s[2], s[3]])
+        } else {
+            be32(s)
+        })
+    };
+    let read_ascii = |entry_off: usize, count: usize| -> Option<String> {
+        if count == 0 || count > 256 {
+            return None;
+        }
+        let start = if count <= 4 {
+            entry_off + 8
+        } else {
+            u32_(entry_off + 8)? as usize
+        };
+        let bytes = buf.get(start..start + count)?;
+        let trimmed = bytes.split(|&b| b == 0).next().unwrap_or(bytes);
+        let text = String::from_utf8_lossy(trimmed).trim().to_string();
+        (!text.is_empty()).then_some(text)
+    };
+    let read_rational = |entry_off: usize| -> Option<(u32, u32)> {
+        let off = u32_(entry_off + 8)? as usize;
+        let num = u32_(off)?;
+        let den = u32_(off + 4)?;
+        (den != 0).then_some((num, den))
+    };
+
+    let mut summary = ExifSummary::default();
+    let mut make: Option<String> = None;
+    let mut model: Option<String> = None;
+    let mut exif_ifd_off: Option<usize> = None;
+
+    let ifd0 = u32_(4)? as usize;
+    let count0 = u16_(ifd0)?.min(128) as usize;
+    for i in 0..count0 {
+        let off = ifd0 + 2 + i * 12;
+        let (Some(tag), Some(ty), Some(cnt)) = (u16_(off), u16_(off + 2), u32_(off + 4)) else {
+            break;
+        };
+        match (tag, ty) {
+            (0x010F, 2) => make = read_ascii(off, cnt as usize),
+            (0x0110, 2) => model = read_ascii(off, cnt as usize),
+            (0x0132, 2) if summary.date_taken.is_none() => {
+                summary.date_taken = read_ascii(off, cnt as usize);
+            }
+            (0x8769, 4) => exif_ifd_off = u32_(off + 8).map(|v| v as usize),
+            _ => {}
+        }
+    }
+
+    summary.camera = match (make, model) {
+        (Some(mk), Some(md)) => {
+            if md.to_ascii_lowercase().starts_with(&mk.to_ascii_lowercase()) {
+                Some(md)
+            } else {
+                Some(format!("{mk} {md}"))
+            }
+        }
+        (None, Some(md)) => Some(md),
+        (Some(mk), None) => Some(mk),
+        (None, None) => None,
+    };
+
+    if let Some(exif_off) = exif_ifd_off
+        && let Some(count_e) = u16_(exif_off)
+    {
+        for i in 0..count_e.min(128) as usize {
+            let off = exif_off + 2 + i * 12;
+            let (Some(tag), Some(ty), Some(cnt)) = (u16_(off), u16_(off + 2), u32_(off + 4)) else {
+                break;
+            };
+            match (tag, ty) {
+                (0x829A, 5) => {
+                    if let Some((num, den)) = read_rational(off) {
+                        summary.exposure = Some(if num >= den {
+                            format!("{:.1}s", num as f64 / den as f64)
+                        } else if num > 0 {
+                            format!("1/{:.0}s", (den as f64 / num as f64).round())
+                        } else {
+                            "0s".into()
+                        });
+                    }
+                }
+                (0x829D, 5) => {
+                    if let Some((num, den)) = read_rational(off) {
+                        summary.aperture = Some(format!("f/{:.1}", num as f64 / den as f64));
+                    }
+                }
+                (0x8827, 3) => {
+                    summary.iso = u16_(off + 8).map(u32::from);
+                }
+                (0x9003, 2) => {
+                    summary.date_taken = read_ascii(off, cnt as usize);
+                }
+                (0x920A, 5) => {
+                    if let Some((num, den)) = read_rational(off) {
+                        let mm = num as f64 / den as f64;
+                        summary.focal_length = Some(if (mm - mm.round()).abs() < 0.05 {
+                            format!("{:.0}mm", mm.round())
+                        } else {
+                            format!("{mm:.1}mm")
+                        });
+                    }
+                }
+                (0xA434, 2) => {
+                    summary.lens = read_ascii(off, cnt as usize);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    (!summary.is_empty()).then_some(summary)
 }
 
 #[cfg(test)]

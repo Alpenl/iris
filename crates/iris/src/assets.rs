@@ -60,6 +60,18 @@ icons! {
     Minimize => "minimize",
     Maximize => "maximize",
     Check => "check",
+    Pin => "pin",
+    Search => "search",
+    Sort => "sort",
+    Camera => "camera",
+    Info => "info",
+    More => "more",
+    Folder => "folder",
+    ArrowUp => "arrow-up",
+    Filmstrip => "filmstrip",
+    Music => "music",
+    FlipH => "flip-h",
+    Aspect => "aspect",
 }
 
 pub struct Assets;

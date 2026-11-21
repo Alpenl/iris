@@ -1,8 +1,9 @@
 //! The control bar: under the picture when windowed, floating over it in
-//! fullscreen. A video's timeline runs along the bar's top edge.
+//! fullscreen. Adapts cleanly to narrow mini-windows, anchors popovers directly
+//! above their buttons, and supports 60fps timeline + continuous volume dragging.
 use gpui::{
-    AnyElement, Context, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
-    ParentElement, ScrollWheelEvent, StatefulInteractiveElement, Styled, canvas, div,
+    AnyElement, Bounds, Context, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
+    ParentElement, Pixels, ScrollWheelEvent, StatefulInteractiveElement, Styled, canvas, div,
     prelude::FluentBuilder, px, relative,
 };
 
@@ -16,7 +17,36 @@ const SEAM_HIT: f32 = 14.;
 /// How much of that hit area lies above the bar, over the picture.
 const SEAM_ABOVE: f32 = 6.;
 
+/// Wraps a control button with a zero-cost layout probe so popovers anchor
+/// directly above it.
+fn anchor_wrap(
+    slot: Rc<Cell<Option<Bounds<Pixels>>>>,
+    child: impl IntoElement,
+) -> impl IntoElement {
+    div()
+        .relative()
+        .flex_none()
+        .child(child)
+        .child(
+            canvas(move |b, _, _| slot.set(Some(b)), |_, _, _, _| {})
+                .absolute()
+                .size_full(),
+        )
+}
+
 impl IrisWindow {
+    /// Width available to the dock row (excluding docked directory when windowed).
+    fn dock_available_width(&self, floating: bool, window: &Window) -> f32 {
+        let total = f32::from(window.viewport_size().width);
+        if floating {
+            (total - FLOAT_GAP * 2.).max(0.)
+        } else if self.show_directory {
+            (total - self.effective_directory_width(window)).max(0.)
+        } else {
+            total
+        }
+    }
+
     /// One row of controls; the directory toggle sits at the end next to the
     /// directory. `floating` is the fullscreen variant, sized by its frame.
     pub(super) fn render_dock(
@@ -27,6 +57,9 @@ impl IrisWindow {
     ) -> impl IntoElement {
         let kind = self.viewports[0].session.kind();
         let left = self.settings.directory_side == Side::Left;
+        let avail_w = self.dock_available_width(floating, window);
+        let narrow = avail_w < 640.;
+        let tiny = avail_w < 500.;
         let dir_open = if self.fullscreen {
             self.dir_popup
         } else {
@@ -54,19 +87,19 @@ impl IrisWindow {
         );
         let (start, end): (Option<AnyElement>, Option<AnyElement>) = match kind {
             Some(Kind::Video) => (
-                Some(self.video_transport(cx).into_any_element()),
-                Some(self.video_fields(cx).into_any_element()),
+                Some(self.video_transport(tiny, cx).into_any_element()),
+                Some(self.video_fields(narrow, tiny, cx).into_any_element()),
+            ),
+            Some(Kind::Audio) => (
+                Some(self.video_transport(tiny, cx).into_any_element()),
+                Some(self.audio_fields(narrow, cx).into_any_element()),
             ),
             Some(Kind::Photo) => (
                 Some(self.photo_transport(cx).into_any_element()),
-                Some(self.photo_fields(window, cx).into_any_element()),
+                Some(self.photo_fields(narrow, window, cx).into_any_element()),
             ),
             None => (None, None),
         };
-        // GPUI keeps a tooltip, built from the label of that moment, in the
-        // element's state, and still shows it when the click lands before the
-        // tooltip delay is over. Keying the row on where its buttons sit, and
-        // each toggle on what it shows, drops that tooltip when either changes.
         let layout = kind.map_or(0, |k| k as usize + 1) * 4
             + usize::from(left) * 2
             + usize::from(self.show_directory && !floating);
@@ -85,12 +118,13 @@ impl IrisWindow {
             .children(start)
             .child(div().flex_1())
             .children(end)
-            .child(self.window_buttons(cx));
+            .child(self.window_buttons(tiny, cx));
         if let Some(dir) = dir {
             row = row.child(separator()).child(dir);
         }
 
-        let timeline = (kind == Some(Kind::Video)).then(|| self.render_timeline(cx));
+        let timeline =
+            matches!(kind, Some(Kind::Video | Kind::Audio)).then(|| self.render_timeline(cx));
         let seam = timeline.is_some();
         div()
             .relative()
@@ -123,12 +157,16 @@ impl IrisWindow {
             .on_click(cx.listener(move |this, _, _, cx| this.step(delta, cx)))
     }
 
-    fn video_transport(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn video_transport(&self, tiny: bool, cx: &mut Context<Self>) -> impl IntoElement {
         let state = &self.viewports[0].session.state;
         let paused = state.paused;
+        let shown_pos = self
+            .seek_preview_ratio
+            .filter(|_| self.seeking && state.duration > 0.)
+            .map_or(state.time_pos, |r| r as f64 * state.duration);
         let second_time = if state.duration > 0. {
             if self.show_remaining {
-                format!("-{}", fmt_time((state.duration - state.time_pos).max(0.)))
+                format!("-{}", fmt_time((state.duration - shown_pos).max(0.)))
             } else {
                 fmt_time(state.duration)
             }
@@ -139,7 +177,7 @@ impl IrisWindow {
             .flex()
             .items_center()
             .gap(px(2.))
-            .child(self.step_button("prev", -1, cx))
+            .when(!tiny, |d| d.child(self.step_button("prev", -1, cx)))
             .child(
                 ghost(("play", usize::from(paused)), false)
                     .child(icon_on_ghost(
@@ -149,16 +187,16 @@ impl IrisWindow {
                     .tooltip(tip(if paused { "播放" } else { "暂停" }, Some("Space")))
                     .on_click(cx.listener(|this, _, w, cx| this.toggle_pause(&TogglePause, w, cx))),
             )
-            .child(self.step_button("next", 1, cx))
+            .when(!tiny, |d| d.child(self.step_button("next", 1, cx)))
             .child(
                 div()
                     .id(("time-readout", usize::from(self.show_remaining)))
                     .h(px(BUTTON))
-                    .ml(px(6.))
+                    .ml(px(4.))
                     .px(px(6.))
                     .flex()
                     .items_center()
-                    .gap(px(6.))
+                    .gap(px(5.))
                     .cursor_pointer()
                     .hover(|s| s.bg(hover()))
                     .font_family(FONT_MONO)
@@ -175,13 +213,15 @@ impl IrisWindow {
                         this.show_remaining = !this.show_remaining;
                         cx.notify();
                     }))
-                    .child(div().text_color(text()).child(fmt_time(state.time_pos)))
-                    .child(div().text_color(text_faint()).child("/"))
-                    .child(div().text_color(text_dim()).child(second_time)),
+                    .child(div().text_color(text()).child(fmt_time(shown_pos)))
+                    .when(!tiny, |d| {
+                        d.child(div().text_color(text_faint()).child("/"))
+                            .child(div().text_color(text_dim()).child(second_time))
+                    }),
             )
     }
 
-    fn video_fields(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn video_fields(&self, narrow: bool, tiny: bool, cx: &mut Context<Self>) -> impl IntoElement {
         let session = &self.viewports[0].session;
         let state = &session.state;
         let subs = state.subs_visible;
@@ -203,6 +243,106 @@ impl IrisWindow {
         let sub_pop = self.popover == Some(PopoverKind::Subtitles);
         let audio_pop = self.popover == Some(PopoverKind::Audio);
         let speed_pop = self.popover == Some(PopoverKind::Speed);
+        let more_pop = self.popover == Some(PopoverKind::More);
+
+        div()
+            .flex()
+            .items_center()
+            .gap(px(2.))
+            .when(!narrow, |d| {
+                d.child(
+                    icon_button(("loop", usize::from(looping)), Icon::Repeat, looping)
+                        .tooltip(tip(
+                            if looping {
+                                "关闭单曲循环"
+                            } else {
+                                "单曲循环"
+                            },
+                            Some("L"),
+                        ))
+                        .on_click(cx.listener(|this, _, w, cx| this.toggle_loop(&ToggleLoop, w, cx))),
+                )
+            })
+            .child(anchor_wrap(
+                self.anchor_sub.clone(),
+                icon_button(
+                    ("subs", usize::from(subs) * 2 + usize::from(sub_pop)),
+                    Icon::Subtitles,
+                    subs || sub_pop,
+                )
+                .tooltip(tip("字幕 · 点击选轨与偏移", Some("J / V")))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.toggle_popover(PopoverKind::Subtitles, cx);
+                })),
+            ))
+            .when(!tiny, |d| {
+                d.child(anchor_wrap(
+                    self.anchor_audio.clone(),
+                    ghost(("audio", usize::from(audio_pop)), audio_pop)
+                        .px(px(6.))
+                        .gap(px(5.))
+                        .child(icon_on_ghost(
+                            Icon::Audio,
+                            if audio_pop { text() } else { text_dim() },
+                        ))
+                        .when(!narrow, |d| {
+                            d.child(div().font_family(FONT_MONO).text_size(px(11.)).child(audio))
+                        })
+                        .tooltip(tip("音轨 · 点击选轨", Some("A")))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.toggle_popover(PopoverKind::Audio, cx);
+                        })),
+                ))
+            })
+            .child(anchor_wrap(
+                self.anchor_speed.clone(),
+                text_button(("speed", usize::from(speed_pop)), format!("{speed:.2}×"))
+                    .when(speed_pop, |d| d.bg(selected()).text_color(text()))
+                    .when((speed - 1.).abs() > 0.001, |d| d.text_color(text()))
+                    .tooltip(tip("播放速度 · 点击选择，右键还原 1.0×", Some("[ ]")))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.toggle_popover(PopoverKind::Speed, cx);
+                    }))
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(|this, _, _, cx| {
+                            this.popover = None;
+                            this.command(Command::SetSpeed(1.), cx);
+                            this.show_osd("倍速 · 1.00×", cx);
+                            cx.stop_propagation();
+                        }),
+                    )
+                    .on_scroll_wheel(cx.listener(|this, ev: &ScrollWheelEvent, _, cx| {
+                        let step = this.damped_wheel_steps(ev, 36.);
+                        if step != 0 {
+                            let next = player::step_speed(
+                                this.viewports[0].session.state.speed,
+                                step.signum(),
+                            );
+                            this.command(Command::SetSpeed(next), cx);
+                            this.show_osd(format!("倍速 · {next:.2}×"), cx);
+                        }
+                        cx.stop_propagation();
+                    })),
+            ))
+            .child(anchor_wrap(
+                self.anchor_more.clone(),
+                icon_button(("more", usize::from(more_pop)), Icon::More, more_pop)
+                    .tooltip(tip("画面比例 / 旋转 / 截图 / 章节 / 详情", None))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.toggle_popover(PopoverKind::More, cx);
+                    })),
+            ))
+            .child(separator())
+            .child(self.render_volume(narrow, cx))
+            .child(separator())
+    }
+
+    fn audio_fields(&self, narrow: bool, cx: &mut Context<Self>) -> impl IntoElement {
+        let state = &self.viewports[0].session.state;
+        let looping = state.loop_file;
+        let speed = state.speed;
+        let speed_pop = self.popover == Some(PopoverKind::Speed);
         div()
             .flex()
             .items_center()
@@ -219,64 +359,24 @@ impl IrisWindow {
                     ))
                     .on_click(cx.listener(|this, _, w, cx| this.toggle_loop(&ToggleLoop, w, cx))),
             )
-            .child(
-                icon_button(
-                    ("subs", usize::from(subs) * 2 + usize::from(sub_pop)),
-                    Icon::Subtitles,
-                    subs || sub_pop,
-                )
-                .tooltip(tip("字幕 · 点击选轨，V 显隐", Some("J / V")))
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.toggle_popover(PopoverKind::Subtitles, cx);
-                })),
-            )
-            .child(
-                ghost(("audio", usize::from(audio_pop)), audio_pop)
-                    .px(px(6.))
-                    .gap(px(6.))
-                    .child(icon_on_ghost(
-                        Icon::Audio,
-                        if audio_pop { text() } else { text_dim() },
-                    ))
-                    .child(div().font_family(FONT_MONO).text_size(px(11.)).child(audio))
-                    .tooltip(tip("音轨 · 点击选轨", Some("A")))
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.toggle_popover(PopoverKind::Audio, cx);
-                    })),
-            )
-            .child(
+            .child(anchor_wrap(
+                self.anchor_speed.clone(),
                 text_button(("speed", usize::from(speed_pop)), format!("{speed:.2}×"))
                     .when(speed_pop, |d| d.bg(selected()).text_color(text()))
                     .when((speed - 1.).abs() > 0.001, |d| d.text_color(text()))
-                    .tooltip(tip("播放速度 · 点击选择，滚轮调节，右键还原", Some("[ ]")))
+                    .tooltip(tip("播放速度 · 点击选择", Some("[ ]")))
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.toggle_popover(PopoverKind::Speed, cx);
-                    }))
-                    .on_mouse_down(
-                        MouseButton::Right,
-                        cx.listener(|this, _, _, cx| {
-                            this.popover = None;
-                            this.command(Command::SetSpeed(1.), cx);
-                            this.show_toast("倍速 · 1.00×", cx);
-                            cx.stop_propagation();
-                        }),
-                    )
-                    .on_scroll_wheel(cx.listener(|this, ev: &ScrollWheelEvent, _, cx| {
-                        let dy = f32::from(ev.delta.pixel_delta(px(20.)).y);
-                        if dy != 0. {
-                            this.command(Command::SpeedStep(if dy > 0. { 1 } else { -1 }), cx);
-                        }
-                        cx.stop_propagation();
                     })),
-            )
+            ))
             .child(separator())
-            .child(self.render_volume(cx))
+            .child(self.render_volume(narrow, cx))
             .child(separator())
     }
 
-    /// Clickable speaker (mute toggle), ten segments (click to set, wheel to
-    /// nudge) and the value. Grey rather than accent.
-    fn render_volume(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    /// Clickable speaker (mute toggle), continuously draggable 0–100% volume
+    /// bar (plus wheel damping), and numeric readout.
+    fn render_volume(&self, narrow: bool, cx: &mut Context<Self>) -> impl IntoElement {
         let state = &self.viewports[0].session.state;
         let volume = state.volume;
         let muted = state.muted;
@@ -285,6 +385,7 @@ impl IrisWindow {
         } else {
             (volume / 10.).round().clamp(0., 10.) as usize
         };
+        let vol_slot = self.vol_bounds.clone();
         div()
             .id("volume")
             .group("volume")
@@ -293,9 +394,11 @@ impl IrisWindow {
             .items_center()
             .gap(px(4.))
             .on_scroll_wheel(cx.listener(|this, ev: &ScrollWheelEvent, _, cx| {
-                let dy = f32::from(ev.delta.pixel_delta(px(20.)).y) as f64;
-                if dy != 0. {
-                    this.command(Command::VolumeBy(dy / 10.), cx);
+                let delta = this.damped_volume_delta(ev);
+                if delta.abs() >= 0.5 {
+                    this.command(Command::VolumeBy(delta), cx);
+                    let next = (this.viewports[0].session.state.volume + delta).clamp(0., 100.);
+                    this.show_osd(format!("音量 · {next:.0}%"), cx);
                 }
                 cx.stop_propagation();
             }))
@@ -312,52 +415,62 @@ impl IrisWindow {
                 .tooltip(tip(if muted { "取消静音" } else { "静音" }, Some("M")))
                 .on_click(cx.listener(|this, _, w, cx| this.toggle_mute(&ToggleMute, w, cx))),
             )
-            .child(
-                div()
-                    .id("vol-bars")
-                    .flex()
-                    .items_center()
-                    .tooltip(tip("音量 · 点击或滚轮调节", Some("↑ ↓")))
-                    .children((0..10).map(|i| {
-                        let on = i < filled;
-                        div()
-                            .id(("vol", i))
-                            .group("vol")
-                            .w(px(6.))
-                            .h(px(BUTTON))
-                            .flex()
-                            .items_center()
-                            .cursor_pointer()
-                            .child(
-                                div()
-                                    .w(px(4.))
-                                    .h(px(10.))
-                                    .when(on, |d| {
-                                        d.bg(text_dim()).group_hover("volume", |s| s.bg(text()))
-                                    })
-                                    .when(!on, |d| {
-                                        d.bg(line_strong())
-                                            .group_hover("vol", |s| s.bg(text_faint()))
-                                    }),
-                            )
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.command(Command::SetVolume(((i + 1) * 10) as f64), cx)
-                            }))
-                    })),
-            )
-            .child(
-                div()
-                    .w(px(24.))
-                    .pl(px(2.))
-                    .font_family(FONT_MONO)
-                    .text_size(px(11.))
-                    .text_color(if muted { text_faint() } else { text_dim() })
-                    .child(if muted {
-                        "0".to_string()
-                    } else {
-                        format!("{volume:.0}")
-                    }),
-            )
+            .when(!narrow, |d| {
+                d.child(
+                    div()
+                        .id("vol-bars")
+                        .relative()
+                        .flex()
+                        .items_center()
+                        .h(px(BUTTON))
+                        .cursor_pointer()
+                        .tooltip(tip("音量 · 点击或按住拖动调节", Some("↑ ↓")))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, ev: &MouseDownEvent, _, cx| {
+                                this.dragging_volume = true;
+                                this.set_volume_from_x(ev.position.x, cx);
+                                cx.stop_propagation();
+                            }),
+                        )
+                        .child(
+                            canvas(move |b, _, _| vol_slot.set(Some(b)), |_, _, _, _| {})
+                                .absolute()
+                                .size_full(),
+                        )
+                        .children((0..10).map(|i| {
+                            let on = i < filled;
+                            div()
+                                .w(px(6.))
+                                .h(px(BUTTON))
+                                .flex()
+                                .items_center()
+                                .child(
+                                    div()
+                                        .w(px(4.))
+                                        .h(px(10.))
+                                        .when(on, |d| {
+                                            d.bg(text_dim())
+                                                .group_hover("volume", |s| s.bg(text()))
+                                        })
+                                        .when(!on, |d| d.bg(line_strong())),
+                                )
+                        })),
+                )
+                .child(
+                    div()
+                        .w(px(24.))
+                        .pl(px(2.))
+                        .font_family(FONT_MONO)
+                        .text_size(px(11.))
+                        .text_color(if muted { text_faint() } else { text_dim() })
+                        .child(if muted {
+                            "0".to_string()
+                        } else {
+                            format!("{volume:.0}")
+                        }),
+                )
+            })
     }
 
     fn photo_transport(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -395,9 +508,15 @@ impl IrisWindow {
             )
     }
 
-    fn photo_fields(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn photo_fields(
+        &self,
+        narrow: bool,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let view = &self.viewports[0].image;
-        // Relative to the image's own pixels, so 1:1 reads 100%.
+        let hflip = self.viewports[0].session.state.hflip;
+        let strip_on = self.settings.photo_filmstrip;
         let (viewport, media) = self.image_geometry();
         let known = viewport[0] > 0. && self.viewports[0].session.state.video_size.0 > 0;
         let percent =
@@ -406,9 +525,36 @@ impl IrisWindow {
             .flex()
             .items_center()
             .gap(px(2.))
+            .when(!narrow, |d| {
+                d.child(
+                    icon_button(
+                        ("filmstrip", usize::from(strip_on)),
+                        Icon::Filmstrip,
+                        strip_on,
+                    )
+                    .tooltip(tip(
+                        if strip_on {
+                            "隐藏缩略图条"
+                        } else {
+                            "显示缩略图条"
+                        },
+                        Some("G"),
+                    ))
+                    .on_click(
+                        cx.listener(|this, _, w, cx| this.toggle_filmstrip(&ToggleFilmstrip, w, cx)),
+                    ),
+                )
+                .child(
+                    icon_button(("hflip", usize::from(hflip)), Icon::FlipH, hflip)
+                        .tooltip(tip("水平镜像翻转", Some("H")))
+                        .on_click(
+                            cx.listener(|this, _, w, cx| this.toggle_hflip(&ToggleHFlip, w, cx)),
+                        ),
+                )
+            })
             .child(
                 icon_button("rotate", Icon::Rotate, false)
-                    .tooltip(tip("临时顺时针旋转 90°", Some("R")))
+                    .tooltip(tip("顺时针旋转 90°", Some("R")))
                     .on_click(cx.listener(|this, _, w, cx| this.rotate_cw(&RotateCw, w, cx))),
             )
             .child(separator())
@@ -419,7 +565,7 @@ impl IrisWindow {
             )
             .child(
                 div()
-                    .w(px(48.))
+                    .w(px(46.))
                     .flex()
                     .justify_center()
                     .font_family(FONT_MONO)
@@ -437,18 +583,20 @@ impl IrisWindow {
                     .tooltip(tip("适应窗口", Some("0")))
                     .on_click(cx.listener(|this, _, w, cx| this.fit_image(&FitImage, w, cx))),
             )
-            .child(
-                text_button("actual", "1:1")
-                    .tooltip(tip("原始大小", Some("Space")))
-                    .on_click(cx.listener(|this, _, w, cx| {
-                        this.toggle_image_size(&ToggleImageSize, w, cx)
-                    })),
-            )
+            .when(!narrow, |d| {
+                d.child(
+                    text_button("actual", "1:1")
+                        .tooltip(tip("原始大小", Some("Space")))
+                        .on_click(cx.listener(|this, _, w, cx| {
+                            this.toggle_image_size(&ToggleImageSize, w, cx)
+                        })),
+                )
+            })
             .child(separator())
     }
 
-    /// Favorite, settings and fullscreen: about the file and the window.
-    fn window_buttons(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    /// Info, favorite, settings and fullscreen: about the file and the window.
+    fn window_buttons(&self, tiny: bool, cx: &mut Context<Self>) -> impl IntoElement {
         let current = self.viewports[0].session.current.as_deref();
         let favorite = current.is_some_and(|p| self.store.favorite(p));
         let set_key = if cfg!(target_os = "macos") {
@@ -460,6 +608,17 @@ impl IrisWindow {
             .flex()
             .items_center()
             .gap(px(2.))
+            .when(current.is_some() && !tiny, |d| {
+                d.child(
+                    icon_button(
+                        ("info", usize::from(self.info_open)),
+                        Icon::Info,
+                        self.info_open,
+                    )
+                    .tooltip(tip("媒体详情", Some("I")))
+                    .on_click(cx.listener(|this, _, w, cx| this.toggle_info(&ToggleInfo, w, cx))),
+                )
+            })
             .when(current.is_some(), |d| {
                 d.child(
                     ghost(("favorite", usize::from(favorite)), false)
@@ -504,12 +663,17 @@ impl IrisWindow {
             )
     }
 
-    /// A 2px line on the bar's top edge with a tick for the playhead. Hovering
-    /// or dragging thickens it and shows the time under the pointer.
+    /// A 2px line on the bar's top edge with chapter ticks and a playhead.
+    /// While dragging, the visual bar locks 1:1 to the pointer at display refresh rate.
     fn render_timeline(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let state = &self.viewports[0].session.state;
+        let session = &self.viewports[0].session;
+        let state = &session.state;
         let duration = state.duration;
-        let pct = if duration > 0. {
+        let pct = if let Some(r) = self.seek_preview_ratio
+            && self.seeking
+        {
+            r.clamp(0., 1.)
+        } else if duration > 0. {
             (state.time_pos / duration).clamp(0., 1.) as f32
         } else {
             0.
@@ -517,6 +681,29 @@ impl IrisWindow {
         let active = self.timeline_hover || self.seeking;
         let track = if active { 4. } else { 2. };
         let slot = self.progress_bounds.clone();
+
+        // Subtle chapter markers along the timeline track.
+        let chapter_marks: Vec<AnyElement> = if duration > 0. {
+            state
+                .chapters
+                .iter()
+                .filter(|c| c.time > 0.5 && c.time < duration - 0.5)
+                .map(|c| {
+                    let ratio = (c.time / duration).clamp(0., 1.) as f32;
+                    div()
+                        .absolute()
+                        .top(px(SEAM_ABOVE - 1.))
+                        .left(relative(ratio))
+                        .w(px(1.))
+                        .h(px(track + 2.))
+                        .bg(window_bg())
+                        .into_any_element()
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
         let label = active
             .then(|| {
                 let b = self.progress_bounds.get()?;
@@ -526,33 +713,48 @@ impl IrisWindow {
                     return None;
                 }
                 let x = f32::from(p.x - b.origin.x).clamp(0., width);
-                const W: f32 = 72.;
-                let left = (x - W / 2.).clamp(0., (width - W).max(0.));
+                let hover_t = x as f64 / width as f64 * duration;
+                let chapter_title = session.chapter_at(hover_t).map(|c| c.title.clone());
+                let box_w: f32 = if chapter_title.is_some() { 180. } else { 76. };
+                let left = (x - box_w / 2.).clamp(0., (width - box_w).max(0.));
                 Some(
                     div()
                         .absolute()
                         .left(px(left))
                         .bottom(px(SEAM_HIT + 4.))
-                        .w(px(W))
+                        .w(px(box_w))
                         .flex()
                         .justify_center()
                         .child(
                             div()
-                                .h(px(20.))
+                                .h(px(22.))
+                                .max_w(px(box_w))
                                 .px(px(6.))
                                 .flex()
                                 .items_center()
+                                .gap(px(6.))
                                 .bg(panel())
                                 .border_1()
                                 .border_color(line_strong())
                                 .font_family(FONT_MONO)
                                 .text_size(px(11.))
                                 .text_color(text())
-                                .child(fmt_time(x as f64 / width as f64 * duration)),
+                                .child(fmt_time(hover_t))
+                                .when_some(chapter_title, |d, ch| {
+                                    d.child(
+                                        div()
+                                            .font_family(FONT_UI)
+                                            .text_size(px(10.))
+                                            .text_color(text_dim())
+                                            .truncate()
+                                            .child(ch),
+                                    )
+                                }),
                         ),
                 )
             })
             .flatten();
+
         div()
             .id("timeline")
             .absolute()
@@ -565,13 +767,12 @@ impl IrisWindow {
                 this.timeline_hover = *hovered;
                 cx.notify();
             }))
-            // Dragging continues in the root's mouse-move handler, so it keeps
-            // working when the pointer drifts off this thin strip.
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, ev: &MouseDownEvent, _, cx| {
                     this.seeking = true;
                     this.last_seek_drag = Instant::now();
+                    this.update_seek_preview(ev.position.x);
                     this.seek_to_x(ev.position.x, true);
                     cx.stop_propagation();
                     cx.notify();
@@ -600,6 +801,7 @@ impl IrisWindow {
                     .h(px(track))
                     .bg(accent()),
             )
+            .children(chapter_marks)
             .child(
                 div()
                     .absolute()

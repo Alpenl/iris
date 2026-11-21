@@ -7,8 +7,8 @@ use anyhow::Result;
 use futures::channel::mpsc::{UnboundedReceiver, unbounded};
 use iris_mpv::{Event, Format, Mpv, Value};
 
-use crate::library::{self, Entry, Kind};
-use crate::photo::{self, Photo};
+use crate::library::{self, Entry, FolderEntry, Kind, ScanResult};
+use crate::photo::{self, ExifSummary, Photo};
 use crate::settings::{OnEof, Settings};
 
 pub const SPEED_STEPS: &[f64] = &[0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0];
@@ -29,6 +29,49 @@ pub fn step_speed(current: f64, dir: isize) -> f64 {
             .unwrap_or(SPEED_STEPS[0])
     } else {
         current
+    }
+}
+
+pub fn friendly_error(code: i32) -> &'static str {
+    match code {
+        -13 => "无法打开或读取文件",
+        -14 => "未识别的媒体格式",
+        -9 | -10 => "不支持的解码格式或操作",
+        -1 => "事件队列溢出",
+        -2 => "内存不足",
+        _ => "解码或播放失败",
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum AspectMode {
+    #[default]
+    Original,
+    Ratio16x9,
+    Ratio4x3,
+    Ratio21x9,
+    FillCrop,
+}
+
+impl AspectMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            AspectMode::Original => "原始比例",
+            AspectMode::Ratio16x9 => "16:9",
+            AspectMode::Ratio4x3 => "4:3",
+            AspectMode::Ratio21x9 => "21:9",
+            AspectMode::FillCrop => "铺满裁剪",
+        }
+    }
+
+    pub fn next(self) -> Self {
+        match self {
+            AspectMode::Original => AspectMode::Ratio16x9,
+            AspectMode::Ratio16x9 => AspectMode::Ratio4x3,
+            AspectMode::Ratio4x3 => AspectMode::Ratio21x9,
+            AspectMode::Ratio21x9 => AspectMode::FillCrop,
+            AspectMode::FillCrop => AspectMode::Original,
+        }
     }
 }
 
@@ -77,6 +120,32 @@ impl Track {
     }
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct Chapter {
+    pub title: String,
+    pub time: f64,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct MediaStats {
+    pub file_name: String,
+    pub file_size: u64,
+    pub file_format: String,
+    pub resolution: Option<(i64, i64)>,
+    pub video_codec: String,
+    pub video_fps: Option<f64>,
+    pub video_bitrate: Option<f64>,
+    pub pixel_format: String,
+    pub hwdec: String,
+    pub dropped_frames: Option<i64>,
+    pub audio_codec: String,
+    pub audio_channels: String,
+    pub audio_sample_rate: Option<i64>,
+    pub audio_bitrate: Option<f64>,
+    pub photo_colour: Option<&'static str>,
+    pub photo_exif: Option<ExifSummary>,
+}
+
 mod prop {
     pub const TIME_POS: u64 = 1;
     pub const DURATION: u64 = 2;
@@ -94,6 +163,9 @@ mod prop {
     pub const SUB: u64 = 14;
     pub const TRACK_COUNT: u64 = 15;
     pub const LOOP_FILE: u64 = 16;
+    pub const SUB_DELAY: u64 = 17;
+    pub const CHAPTER: u64 = 18;
+    pub const CHAPTER_COUNT: u64 = 19;
 }
 
 fn create() -> Result<Arc<Mpv>> {
@@ -108,6 +180,8 @@ fn create() -> Result<Arc<Mpv>> {
         ("input-vo-keyboard", "no"),
         ("config", "no"),
         ("terminal", "no"),
+        // Auto-load matching external subtitle files (e.g. movie.chs.ass).
+        ("sub-auto", "fuzzy"),
         // Pick Chinese subtitles first, then English; with no match, still show
         // a full (non-forced) track, as PotPlayer does.
         (
@@ -158,6 +232,9 @@ fn create() -> Result<Arc<Mpv>> {
         (prop::SUB, "sid", Format::Str),
         (prop::TRACK_COUNT, "track-list/count", Format::Int),
         (prop::LOOP_FILE, "loop-file", Format::Str),
+        (prop::SUB_DELAY, "sub-delay", Format::Double),
+        (prop::CHAPTER, "chapter", Format::Int),
+        (prop::CHAPTER_COUNT, "chapter-list/count", Format::Int),
     ] {
         mpv.observe_property(id, name, format)?;
     }
@@ -209,10 +286,13 @@ pub enum SessionEvent {
     Hardware(String),
     Subtitles(bool),
     SubtitleTrack(String),
+    SubDelay(f64),
     Ended(bool),
     Audio(String),
     Rotation(i64),
     LoopFile(bool),
+    Chapter(i64),
+    ChaptersChanged,
     TracksChanged,
     Loaded,
     Reconfigured,
@@ -237,12 +317,16 @@ impl SessionEvent {
                 (prop::SUB_VISIBLE, Value::Flag(v)) => Self::Subtitles(v),
                 (prop::SUB, Value::Str(v)) => Self::SubtitleTrack(v),
                 (prop::SUB, Value::None) => Self::SubtitleTrack(String::new()),
+                (prop::SUB_DELAY, Value::Double(v)) => Self::SubDelay(v),
                 (prop::EOF, Value::Flag(v)) => Self::Ended(v),
                 (prop::AUDIO, Value::Str(v)) => Self::Audio(v),
                 (prop::AUDIO, Value::None) => Self::Audio(String::new()),
                 (prop::ROTATION, Value::Int(v)) => Self::Rotation(v),
                 (prop::TRACK_COUNT, Value::Int(_)) => Self::TracksChanged,
                 (prop::LOOP_FILE, Value::Str(v)) => Self::LoopFile(v == "inf" || v == "yes"),
+                (prop::CHAPTER, Value::Int(v)) => Self::Chapter(v),
+                (prop::CHAPTER, Value::None) => Self::Chapter(-1),
+                (prop::CHAPTER_COUNT, Value::Int(_)) => Self::ChaptersChanged,
                 _ => return None,
             },
             Event::FileLoaded => Self::Loaded,
@@ -267,12 +351,19 @@ pub struct PlaybackState {
     pub hwdec: String,
     pub subs_visible: bool,
     pub sub_id: String,
+    pub sub_delay: f64,
     pub ended: bool,
     pub audio: String,
     pub rotation: i64,
     pub loop_file: bool,
+    pub aspect: AspectMode,
+    pub hflip: bool,
+    pub vflip: bool,
     pub tracks: Vec<Track>,
+    pub chapters: Vec<Chapter>,
+    pub current_chapter: i64,
     pub photo_colour: Option<&'static str>,
+    pub photo_exif: Option<ExifSummary>,
     /// The current path has finished loading; positions now belong to it.
     pub loaded: bool,
 }
@@ -280,6 +371,7 @@ pub struct PlaybackState {
 pub enum Command {
     TogglePlayback,
     SeekRelative(f64),
+    SeekAbsolute(f64),
     SeekPercent(f64),
     SeekPercentFast(f64),
     FrameStep,
@@ -292,18 +384,28 @@ pub enum Command {
     ToggleSubtitles,
     NextSubtitle,
     SelectSubtitle(Option<i64>),
+    SubDelayBy(f64),
+    SetSubDelay(f64),
     LoadSubtitle(PathBuf),
     NextAudio,
     SelectAudio(Option<i64>),
     ToggleLoop,
     SetLoop(bool),
-    RotatePhoto(i64),
+    SetAspect(AspectMode),
+    RotateMedia(i64),
+    ToggleHFlip,
+    ToggleVFlip,
+    NextChapter,
+    PrevChapter,
+    SelectChapter(usize),
+    Screenshot { path: PathBuf, with_subs: bool },
 }
 
 /// A folder scan and photo probe done off the UI thread, ready to load.
 pub struct Prepared {
     folder: PathBuf,
     entries: Vec<Entry>,
+    subfolders: Vec<FolderEntry>,
     target: Option<PathBuf>,
     kind: Option<Kind>,
     photo: Option<Photo>,
@@ -320,7 +422,7 @@ impl Prepared {
 /// Resolves `path` to its folder listing and load options. Blocking file I/O
 /// only (directory scan, photo headers); safe to run on a background thread.
 /// `cached` reuses an existing listing of the same folder instead of rescanning.
-pub fn prepare(path: &Path, cached: Option<(PathBuf, Vec<Entry>)>) -> Result<Prepared> {
+pub fn prepare(path: &Path, cached: Option<(PathBuf, ScanResult)>) -> Result<Prepared> {
     let path = path.canonicalize()?;
     let (folder, file) = if path.is_dir() {
         (path, None)
@@ -330,9 +432,12 @@ pub fn prepare(path: &Path, cached: Option<(PathBuf, Vec<Entry>)>) -> Result<Pre
             Some(path),
         )
     };
-    let entries = match cached {
-        Some((dir, entries)) if dir == folder => entries,
-        _ => library::scan(&folder),
+    let ScanResult {
+        entries,
+        subfolders,
+    } = match cached {
+        Some((dir, scan)) if dir == folder => scan,
+        _ => library::scan_dir(&folder),
     };
     let (target, kind) = match file {
         Some(file) => {
@@ -350,6 +455,7 @@ pub fn prepare(path: &Path, cached: Option<(PathBuf, Vec<Entry>)>) -> Result<Pre
     Ok(Prepared {
         folder,
         entries,
+        subfolders,
         target,
         kind,
         photo,
@@ -362,6 +468,7 @@ pub struct Session {
     pub state: PlaybackState,
     pub folder: Option<PathBuf>,
     pub entries: Vec<Entry>,
+    pub subfolders: Vec<FolderEntry>,
     /// The absolute filesystem path is the identity, never an index or content hash.
     pub current: Option<PathBuf>,
     kind: Option<Kind>,
@@ -385,16 +492,24 @@ impl Session {
                 hwdec: String::new(),
                 subs_visible: true,
                 sub_id: String::new(),
+                sub_delay: 0.,
                 ended: false,
                 audio: String::new(),
                 rotation: 0,
                 loop_file: false,
+                aspect: AspectMode::Original,
+                hflip: false,
+                vflip: false,
                 tracks: Vec::new(),
+                chapters: Vec::new(),
+                current_chapter: -1,
                 photo_colour: None,
+                photo_exif: None,
                 loaded: false,
             },
             folder: None,
             entries: Vec::new(),
+            subfolders: Vec::new(),
             current: None,
             kind: None,
             photo_meta: None,
@@ -411,6 +526,9 @@ impl Session {
     }
     pub fn kind(&self) -> Option<Kind> {
         self.kind
+    }
+    pub fn is_actively_playing_video(&self) -> bool {
+        self.kind == Some(Kind::Video) && self.state.loaded && !self.state.paused && !self.state.ended
     }
     pub fn index(&self) -> Option<usize> {
         self.current
@@ -431,6 +549,52 @@ impl Session {
             .tracks
             .iter()
             .find(|t| t.kind == kind && t.selected)
+    }
+
+    pub fn chapter_at(&self, time: f64) -> Option<&Chapter> {
+        self.state
+            .chapters
+            .iter()
+            .rfind(|c| c.time <= time + 0.05)
+    }
+
+    /// Queries detailed media / decoder stats on demand (only when Info panel is open).
+    pub fn media_stats(&self) -> MediaStats {
+        let path = self.current.as_deref();
+        let file_name = path
+            .and_then(Path::file_name)
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let file_size = path
+            .and_then(|p| std::fs::metadata(p).ok())
+            .map_or(0, |m| m.len());
+        let prop_str = |name: &str| self.mpv.get_property_string(name).unwrap_or_default();
+        let prop_f64 = |name: &str| self.mpv.get_property_f64(name).ok().filter(|v| v.is_finite());
+        let prop_i64 = |name: &str| {
+            self.mpv
+                .get_property_string(name)
+                .ok()
+                .and_then(|s| s.parse::<i64>().ok())
+        };
+        let (w, h) = self.state.video_size;
+        MediaStats {
+            file_name,
+            file_size,
+            file_format: prop_str("file-format"),
+            resolution: (w > 0 && h > 0).then_some((w, h)),
+            video_codec: prop_str("video-codec"),
+            video_fps: prop_f64("estimated-vf-fps").or_else(|| prop_f64("container-fps")),
+            video_bitrate: prop_f64("video-bitrate"),
+            pixel_format: prop_str("video-params/pixelformat"),
+            hwdec: self.state.hwdec.clone(),
+            dropped_frames: prop_i64("frame-drop-count"),
+            audio_codec: prop_str("audio-codec-name"),
+            audio_channels: prop_str("audio-params/channels"),
+            audio_sample_rate: prop_i64("audio-params/samplerate"),
+            audio_bitrate: prop_f64("audio-bitrate"),
+            photo_colour: self.state.photo_colour,
+            photo_exif: self.state.photo_exif.clone(),
+        }
     }
 
     /// Applies user preferences that map to live backend properties.
@@ -457,12 +621,14 @@ impl Session {
         let Prepared {
             folder,
             entries,
+            subfolders,
             target,
             kind,
             photo,
             options,
         } = prepared;
         self.entries = entries;
+        self.subfolders = subfolders;
         self.folder = Some(folder);
         match target {
             Some(path) => self.load(&path, kind, photo, options, resume)?,
@@ -473,11 +639,31 @@ impl Session {
                 self.photo_meta = None;
                 self.extra_rotate = 0;
                 self.state.photo_colour = None;
+                self.state.photo_exif = None;
                 self.state.tracks.clear();
+                self.state.chapters.clear();
                 self.state.loaded = false;
             }
         }
         Ok(())
+    }
+
+    /// Opens an explicit multi-file drop queue as the active playlist.
+    pub fn open_queue(&mut self, entries: Vec<Entry>, resume: f64) -> Result<()> {
+        let Some(first) = entries.first().cloned() else {
+            return Ok(());
+        };
+        let folder = first
+            .path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."));
+        let photo = (first.kind == Kind::Photo).then(|| photo::probe(&first.path));
+        let options = photo.as_ref().and_then(Photo::mpv_options);
+        self.folder = Some(folder);
+        self.entries = entries;
+        self.subfolders.clear();
+        self.load(&first.path, Some(first.kind), photo, options, resume)
     }
 
     fn load(
@@ -493,13 +679,20 @@ impl Session {
         let kind = kind.or(Some(Kind::Video));
         let opts = match photo_options {
             Some(opts) => Some(opts),
-            None if kind == Some(Kind::Video) && resume.is_finite() && resume > 0. => {
+            None if matches!(kind, Some(Kind::Video | Kind::Audio))
+                && resume.is_finite()
+                && resume > 0. =>
+            {
                 Some(format!("start={resume:.3}"))
             }
             None => None,
         };
         self.reset_transform()?;
         let _ = self.mpv.command_async(&["set", "video-rotate", "0"]);
+        let _ = self.mpv.command_async(&["set", "video-aspect-override", "-1"]);
+        let _ = self.mpv.set_property_f64_async("panscan", 0.);
+        let _ = self.mpv.set_property_f64_async("sub-delay", 0.);
+        let _ = self.mpv.command_async(&["set", "vf", ""]);
         match opts {
             Some(opts) => self
                 .mpv
@@ -512,26 +705,59 @@ impl Session {
             .as_ref()
             .and_then(|p| p.colour)
             .map(|c| c.display_name());
+        self.state.photo_exif = photo.as_ref().and_then(|p| p.exif.clone());
         self.photo_meta = photo;
         self.extra_rotate = 0;
+        self.state.aspect = AspectMode::Original;
+        self.state.hflip = false;
+        self.state.vflip = false;
+        self.state.sub_delay = 0.;
         self.state.ended = false;
         self.state.loaded = false;
         self.state.time_pos = 0.;
         self.state.duration = 0.;
         self.state.tracks.clear();
+        self.state.chapters.clear();
+        self.state.current_chapter = -1;
         Ok(())
     }
 
-    /// Playback progress of the loaded video, for path-keyed records:
+    /// Playback progress of the loaded video/audio, for path-keyed records:
     /// `(path, position, duration, ended)`. None while loading or for photos.
     pub fn progress(&self) -> Option<(&Path, f64, f64, bool)> {
         let path = self.current.as_deref()?;
-        (self.kind == Some(Kind::Video) && self.state.loaded).then_some((
+        (matches!(self.kind, Some(Kind::Video | Kind::Audio)) && self.state.loaded).then_some((
             path,
             self.state.time_pos,
             self.state.duration,
             self.state.ended,
         ))
+    }
+
+    fn apply_vf_filters(&self) -> Result<()> {
+        let mut chain = Vec::new();
+        if self.kind == Some(Kind::Photo) {
+            let is_heif = self
+                .current
+                .as_deref()
+                .and_then(|p| p.extension())
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| matches!(e.to_ascii_lowercase().as_str(), "heic" | "heif"));
+            if let Some(meta) = &self.photo_meta
+                && let Some(base) = meta.vf_chain(if is_heif { self.extra_rotate } else { 0 })
+            {
+                chain.push(base);
+            }
+        }
+        if self.state.hflip {
+            chain.push("hflip".into());
+        }
+        if self.state.vflip {
+            chain.push("vflip".into());
+        }
+        let joined = chain.join(",");
+        self.mpv.command_async(&["set", "vf", &joined])?;
+        Ok(())
     }
 
     pub fn execute(&mut self, command: Command) -> Result<()> {
@@ -548,6 +774,11 @@ impl Session {
                 self.mpv
                     .command_async(&["seek", &seconds.to_string(), "relative+exact"])?
             }
+            Command::SeekAbsolute(seconds) => self.mpv.command_async(&[
+                "seek",
+                &seconds.max(0.).to_string(),
+                "absolute+exact",
+            ])?,
             Command::SeekPercent(percent) => self.mpv.command_async(&[
                 "seek",
                 &percent.clamp(0., 100.).to_string(),
@@ -598,6 +829,15 @@ impl Session {
                     self.mpv.command_async(&["set", "sub-visibility", "no"])?;
                 }
             },
+            Command::SubDelayBy(delta) => {
+                let next = ((self.state.sub_delay + delta) * 100.).round() / 100.;
+                self.mpv
+                    .set_property_f64_async("sub-delay", next.clamp(-60., 60.))?;
+            }
+            Command::SetSubDelay(delay) => {
+                self.mpv
+                    .set_property_f64_async("sub-delay", delay.clamp(-60., 60.))?;
+            }
             Command::LoadSubtitle(path) => {
                 // `sub-add` takes a path argument via argv; never interpreted as options.
                 let url = path.to_string_lossy();
@@ -617,25 +857,53 @@ impl Session {
                 self.mpv
                     .command_async(&["set", "loop-file", if enable { "inf" } else { "no" }])?;
             }
-            Command::RotatePhoto(delta_deg) => {
-                if self.kind != Some(Kind::Photo) {
+            Command::SetAspect(mode) => {
+                self.state.aspect = mode;
+                match mode {
+                    AspectMode::Original => {
+                        self.mpv
+                            .command_async(&["set", "video-aspect-override", "-1"])?;
+                        self.mpv.set_property_f64_async("panscan", 0.)?;
+                    }
+                    AspectMode::Ratio16x9 => {
+                        self.mpv
+                            .command_async(&["set", "video-aspect-override", "16:9"])?;
+                        self.mpv.set_property_f64_async("panscan", 0.)?;
+                    }
+                    AspectMode::Ratio4x3 => {
+                        self.mpv
+                            .command_async(&["set", "video-aspect-override", "4:3"])?;
+                        self.mpv.set_property_f64_async("panscan", 0.)?;
+                    }
+                    AspectMode::Ratio21x9 => {
+                        self.mpv
+                            .command_async(&["set", "video-aspect-override", "21:9"])?;
+                        self.mpv.set_property_f64_async("panscan", 0.)?;
+                    }
+                    AspectMode::FillCrop => {
+                        self.mpv
+                            .command_async(&["set", "video-aspect-override", "-1"])?;
+                        self.mpv.set_property_f64_async("panscan", 1.)?;
+                    }
+                }
+            }
+            Command::RotateMedia(delta_deg) => {
+                if !matches!(self.kind, Some(Kind::Photo | Kind::Video)) {
                     return Ok(());
                 }
                 self.extra_rotate =
                     ((self.extra_rotate as i64 + delta_deg).rem_euclid(360)) as u16;
-                let is_heif = self
-                    .current
-                    .as_deref()
-                    .and_then(|p| p.extension())
-                    .and_then(|e| e.to_str())
-                    .is_some_and(|e| matches!(e.to_ascii_lowercase().as_str(), "heic" | "heif"));
+                let is_heif = self.kind == Some(Kind::Photo)
+                    && self
+                        .current
+                        .as_deref()
+                        .and_then(|p| p.extension())
+                        .and_then(|e| e.to_str())
+                        .is_some_and(|e| {
+                            matches!(e.to_ascii_lowercase().as_str(), "heic" | "heif")
+                        });
                 if is_heif {
-                    let chain = self
-                        .photo_meta
-                        .as_ref()
-                        .and_then(|p| p.vf_chain(self.extra_rotate))
-                        .unwrap_or_default();
-                    self.mpv.command_async(&["set", "vf", &chain])?;
+                    self.apply_vf_filters()?;
                 } else {
                     self.mpv.command_async(&[
                         "set",
@@ -643,6 +911,30 @@ impl Session {
                         &self.extra_rotate.to_string(),
                     ])?;
                 }
+            }
+            Command::ToggleHFlip => {
+                self.state.hflip = !self.state.hflip;
+                self.apply_vf_filters()?;
+            }
+            Command::ToggleVFlip => {
+                self.state.vflip = !self.state.vflip;
+                self.apply_vf_filters()?;
+            }
+            Command::NextChapter => {
+                self.mpv.command_async(&["add", "chapter", "1"])?;
+            }
+            Command::PrevChapter => {
+                self.mpv.command_async(&["add", "chapter", "-1"])?;
+            }
+            Command::SelectChapter(ix) => {
+                self.mpv
+                    .command_async(&["set", "chapter", &ix.to_string()])?;
+            }
+            Command::Screenshot { path, with_subs } => {
+                let target = path.to_string_lossy();
+                let flags = if with_subs { "subtitles" } else { "video" };
+                self.mpv
+                    .command_async(&["screenshot-to-file", &target, flags])?;
             }
         }
         Ok(())
@@ -664,6 +956,7 @@ impl Session {
                 self.state.sub_id.clone_from(v);
                 self.refresh_tracks();
             }
+            SessionEvent::SubDelay(v) => self.state.sub_delay = *v,
             SessionEvent::Ended(v) => self.state.ended = *v,
             SessionEvent::Audio(v) => {
                 self.state.audio.clone_from(v);
@@ -671,6 +964,8 @@ impl Session {
             }
             SessionEvent::Rotation(v) => self.state.rotation = *v,
             SessionEvent::LoopFile(v) => self.state.loop_file = *v,
+            SessionEvent::Chapter(v) => self.state.current_chapter = *v,
+            SessionEvent::ChaptersChanged => self.refresh_chapters(),
             SessionEvent::TracksChanged => self.refresh_tracks(),
             // A late event from the previous file must not mark this one loaded.
             SessionEvent::Loaded => {
@@ -681,10 +976,36 @@ impl Session {
                 self.state.loaded = self.mpv.get_property_string("path").ok() == current;
                 if self.state.loaded {
                     self.refresh_tracks();
+                    self.refresh_chapters();
                 }
             }
             _ => {}
         }
+    }
+
+    fn refresh_chapters(&mut self) {
+        let count = self
+            .mpv
+            .get_property_string("chapter-list/count")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(0)
+            .min(128);
+        let mut chapters = Vec::with_capacity(count);
+        for i in 0..count {
+            let time = self
+                .mpv
+                .get_property_f64(&format!("chapter-list/{i}/time"))
+                .unwrap_or(0.);
+            let title = self
+                .mpv
+                .get_property_string(&format!("chapter-list/{i}/title"))
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| format!("第 {} 章", i + 1));
+            chapters.push(Chapter { title, time });
+        }
+        self.state.chapters = chapters;
     }
 
     fn refresh_tracks(&mut self) {
@@ -818,14 +1139,17 @@ mod tests {
         );
 
         // A cached listing of the same folder is reused as-is, even if stale.
-        let cached = vec![opened.entries[1].clone()];
+        let cached = ScanResult {
+            entries: vec![opened.entries[1].clone()],
+            subfolders: Vec::new(),
+        };
         let file = prepare(&dir.join("ep10.mp4"), Some((folder.clone(), cached))).unwrap();
         assert_eq!(file.target(), Some(folder.join("ep10.mp4").as_path()));
         assert_eq!(file.entries.len(), 1);
         // A listing of another folder is not.
         let other = prepare(
             &dir.join("ep10.mp4"),
-            Some((PathBuf::from("/elsewhere"), Vec::new())),
+            Some((PathBuf::from("/elsewhere"), ScanResult::default())),
         )
         .unwrap();
         assert_eq!(other.entries.len(), 2);

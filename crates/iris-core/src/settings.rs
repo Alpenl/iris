@@ -4,6 +4,8 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::library::{SortBy, SortOrder};
+
 pub const DEFAULT_DIRECTORY_WIDTH: f32 = 288.;
 pub const MIN_DIRECTORY_WIDTH: f32 = 220.;
 pub const MAX_DIRECTORY_WIDTH: f32 = 520.;
@@ -104,10 +106,25 @@ pub struct Settings {
     pub sub_scale: f64,
     /// Mouse wheel action over the video viewport.
     pub video_wheel: VideoWheel,
+    /// Single-click on the video viewport pauses / resumes playback.
+    pub single_click_pause: bool,
+    /// Double-clicking a photo toggles 1:1 actual size (otherwise fullscreen).
+    pub photo_double_click_actual: bool,
     /// Milliseconds of idle mouse before hiding fullscreen chrome.
     pub fullscreen_hide_ms: u64,
     /// Default view when opening a photo.
     pub photo_default: PhotoDefault,
+    /// Directory sort criterion and direction.
+    pub sort_by: SortBy,
+    pub sort_order: SortOrder,
+    /// Include subtitles when taking screenshots.
+    pub screenshot_subs: bool,
+    /// Keep window floating above other apps.
+    pub always_on_top: bool,
+    /// Show bottom thumbnail filmstrip when browsing photos.
+    pub photo_filmstrip: bool,
+    /// Plugin IDs explicitly disabled by the user.
+    pub disabled_plugins: Vec<String>,
 }
 
 impl Default for Settings {
@@ -129,8 +146,16 @@ impl Default for Settings {
             sub_lang: SubLang::ZhHans,
             sub_scale: 1.0,
             video_wheel: VideoWheel::Volume,
+            single_click_pause: true,
+            photo_double_click_actual: true,
             fullscreen_hide_ms: 2000,
             photo_default: PhotoDefault::Fit,
+            sort_by: SortBy::Name,
+            sort_order: SortOrder::Asc,
+            screenshot_subs: true,
+            always_on_top: false,
+            photo_filmstrip: true,
+            disabled_plugins: Vec::new(),
         }
     }
 }
@@ -150,6 +175,10 @@ pub fn path() -> Option<PathBuf> {
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
         .map(|d| d.join("iris"));
     dir.map(|d| d.join("settings.conf"))
+}
+
+pub fn data_dir() -> Option<PathBuf> {
+    path().and_then(|p| p.parent().map(Path::to_path_buf))
 }
 
 impl Settings {
@@ -194,13 +223,13 @@ impl Settings {
                     s.window_width = v
                         .parse::<f32>()
                         .ok()
-                        .filter(|w| w.is_finite() && (960. ..=7680.).contains(w));
+                        .filter(|w| w.is_finite() && (480. ..=7680.).contains(w));
                 }
                 ("window_height", v) => {
                     s.window_height = v
                         .parse::<f32>()
                         .ok()
-                        .filter(|h| h.is_finite() && (600. ..=4320.).contains(h));
+                        .filter(|h| h.is_finite() && (300. ..=4320.).contains(h));
                 }
                 ("volume", v) => {
                     s.volume = v
@@ -250,6 +279,16 @@ impl Settings {
                 }
                 ("video_wheel", "volume") => s.video_wheel = VideoWheel::Volume,
                 ("video_wheel", "none") => s.video_wheel = VideoWheel::None,
+                ("single_click_pause", v) => {
+                    if let Some(b) = parse_bool(v) {
+                        s.single_click_pause = b;
+                    }
+                }
+                ("photo_double_click_actual", v) => {
+                    if let Some(b) = parse_bool(v) {
+                        s.photo_double_click_actual = b;
+                    }
+                }
                 ("fullscreen_hide_ms", v) => {
                     if let Ok(ms) = v.parse::<u64>() {
                         s.fullscreen_hide_ms = ms.clamp(1000, 10000);
@@ -257,6 +296,34 @@ impl Settings {
                 }
                 ("photo_default", "fit") => s.photo_default = PhotoDefault::Fit,
                 ("photo_default", "actual") => s.photo_default = PhotoDefault::Actual,
+                ("sort_by", "name") => s.sort_by = SortBy::Name,
+                ("sort_by", "modified") => s.sort_by = SortBy::Modified,
+                ("sort_by", "size") => s.sort_by = SortBy::Size,
+                ("sort_order", "asc") => s.sort_order = SortOrder::Asc,
+                ("sort_order", "desc") => s.sort_order = SortOrder::Desc,
+                ("screenshot_subs", v) => {
+                    if let Some(b) = parse_bool(v) {
+                        s.screenshot_subs = b;
+                    }
+                }
+                ("always_on_top", v) => {
+                    if let Some(b) = parse_bool(v) {
+                        s.always_on_top = b;
+                    }
+                }
+                ("photo_filmstrip", v) => {
+                    if let Some(b) = parse_bool(v) {
+                        s.photo_filmstrip = b;
+                    }
+                }
+                ("disabled_plugins", v) => {
+                    s.disabled_plugins = v
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|id| !id.is_empty())
+                        .map(String::from)
+                        .collect();
+                }
                 _ => {}
             }
         }
@@ -295,6 +362,15 @@ impl Settings {
             PhotoDefault::Fit => "fit",
             PhotoDefault::Actual => "actual",
         };
+        let sort_by = match self.sort_by {
+            SortBy::Name => "name",
+            SortBy::Modified => "modified",
+            SortBy::Size => "size",
+        };
+        let sort_order = match self.sort_order {
+            SortOrder::Asc => "asc",
+            SortOrder::Desc => "desc",
+        };
         let mut text = String::new();
         text.push_str(&format!("directory_side = {side}\n"));
         text.push_str(&format!(
@@ -311,8 +387,8 @@ impl Settings {
             && w.is_finite()
             && h.is_finite()
         {
-            text.push_str(&format!("window_width = {:.0}\n", w.clamp(960., 7680.)));
-            text.push_str(&format!("window_height = {:.0}\n", h.clamp(600., 4320.)));
+            text.push_str(&format!("window_width = {:.0}\n", w.clamp(480., 7680.)));
+            text.push_str(&format!("window_height = {:.0}\n", h.clamp(300., 4320.)));
         }
         if let Some(v) = self.volume
             && v.is_finite()
@@ -339,10 +415,29 @@ impl Settings {
         ));
         text.push_str(&format!("video_wheel = {video_wheel}\n"));
         text.push_str(&format!(
+            "single_click_pause = {}\n",
+            self.single_click_pause
+        ));
+        text.push_str(&format!(
+            "photo_double_click_actual = {}\n",
+            self.photo_double_click_actual
+        ));
+        text.push_str(&format!(
             "fullscreen_hide_ms = {}\n",
             self.fullscreen_hide_ms.clamp(1000, 10000)
         ));
         text.push_str(&format!("photo_default = {photo_default}\n"));
+        text.push_str(&format!("sort_by = {sort_by}\n"));
+        text.push_str(&format!("sort_order = {sort_order}\n"));
+        text.push_str(&format!("screenshot_subs = {}\n", self.screenshot_subs));
+        text.push_str(&format!("always_on_top = {}\n", self.always_on_top));
+        text.push_str(&format!("photo_filmstrip = {}\n", self.photo_filmstrip));
+        if !self.disabled_plugins.is_empty() {
+            text.push_str(&format!(
+                "disabled_plugins = {}\n",
+                self.disabled_plugins.join(",")
+            ));
+        }
 
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -388,8 +483,16 @@ mod tests {
             sub_lang: SubLang::En,
             sub_scale: 1.25,
             video_wheel: VideoWheel::None,
+            single_click_pause: false,
+            photo_double_click_actual: false,
             fullscreen_hide_ms: 3000,
             photo_default: PhotoDefault::Actual,
+            sort_by: SortBy::Modified,
+            sort_order: SortOrder::Desc,
+            screenshot_subs: false,
+            always_on_top: true,
+            photo_filmstrip: false,
+            disabled_plugins: vec!["foo".into(), "bar".into()],
         };
         custom.save_to(&file).unwrap();
         let loaded = Settings::load_from(&file);

@@ -1,15 +1,20 @@
 //! A viewport: one session and native video surface, plus the area that
-//! measures where the surface goes and the overlays drawn over it.
+//! measures where the surface goes and the overlays drawn over it (OSD, audio
+//! card, photo filmstrip, recent items, media info, popovers, fullscreen dock).
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use gpui::{
-    Context, CursorStyle, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
-    ParentElement, Pixels, Point, StatefulInteractiveElement, Styled, canvas, div,
-    prelude::FluentBuilder, px,
+    Context, CursorStyle, InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ObjectFit,
+    ParentElement, Pixels, Point, StatefulInteractiveElement, Styled, StyledImage, canvas, div,
+    img, prelude::FluentBuilder, px,
 };
 
+use super::context_menu::{ContextMenu, ContextTarget};
+use super::controls::fmt_time;
+use super::widgets::icon;
 use super::*;
+use crate::assets::Icon;
 use crate::geometry::ImageView;
 use crate::player::Session;
 use crate::video::VideoSurface;
@@ -41,9 +46,6 @@ impl IrisWindow {
     ) -> impl IntoElement {
         let last_rect = self.viewports[0].rect.clone();
         let video = self.viewports[0].video.clone();
-        // Measures where the video area is and moves the native video view
-        // there. Between layouts (live resize) AppKit's autoresizing keeps the
-        // view's left/top/bottom insets fixed, which matches this layout.
         let probe = canvas(
             move |bounds, _, _| {
                 let r = VideoRect([
@@ -66,9 +68,19 @@ impl IrisWindow {
         .absolute()
         .size_full();
 
-        let is_photo_zoomed = self.viewports[0].session.kind() == Some(Kind::Photo)
-            && self.viewports[0].image.zoomed();
+        let kind = self.viewports[0].session.kind();
+        let is_photo_zoomed = kind == Some(Kind::Photo) && self.viewports[0].image.zoomed();
         let panning = self.viewports[0].drag_origin.is_some();
+        let show_filmstrip = kind == Some(Kind::Photo)
+            && self.settings.photo_filmstrip
+            && (!fullscreen || self.chrome_visible);
+
+        // Top-centre pill: priority order Toast > OSD > delayed Loading.
+        let top_pill = self
+            .toast
+            .clone()
+            .or_else(|| self.osd.clone())
+            .or_else(|| self.loading_visible.then(|| SharedString::from("加载中…")));
 
         div()
             .id("video")
@@ -86,15 +98,16 @@ impl IrisWindow {
             .child(probe)
             .key_context({
                 let mut context = gpui::KeyContext::default();
-                if self.settings_open {
+                if self.settings_open || self.context_menu.is_some() {
                     context.add("Overlay");
                 } else {
                     context.add("Viewport");
                     context.set(
                         "media",
-                        match self.viewports[0].session.kind() {
+                        match kind {
                             Some(Kind::Photo) => "image",
                             Some(Kind::Video) => "video",
+                            Some(Kind::Audio) => "audio",
                             None => "none",
                         },
                     );
@@ -115,36 +128,85 @@ impl IrisWindow {
                     this.input_context(),
                 ) {
                     Some(PointerCommand::Zoom(delta)) => {
-                        this.zoom_at(delta, Some(ev.position), cx);
+                        let scale = if ev.delta.precise() { 0.45 } else { 1.0 };
+                        this.zoom_at(delta * scale, Some(ev.position), cx);
                         cx.stop_propagation();
                     }
                     Some(PointerCommand::VolumeBy(_)) => {
-                        this.command(Command::VolumeBy(raw_y / 10.), cx);
-                        this.bump_activity(cx);
+                        let delta = this.damped_volume_delta(ev);
+                        if delta.abs() >= 0.5 {
+                            this.command(Command::VolumeBy(delta), cx);
+                            let next =
+                                (this.viewports[0].session.state.volume + delta).clamp(0., 100.);
+                            this.show_osd(format!("音量 · {next:.0}%"), cx);
+                        }
                         cx.stop_propagation();
                     }
                     _ => {}
                 }
             }))
             .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(|this, ev: &MouseDownEvent, _, cx| {
+                    this.popover = None;
+                    this.context_menu = Some(ContextMenu {
+                        pos: ev.position,
+                        target: ContextTarget::Viewport,
+                    });
+                    cx.stop_propagation();
+                    cx.notify();
+                }),
+            )
+            .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, ev: &MouseDownEvent, window, cx| {
-                    let input = if ev.click_count == 2 {
-                        PointerInput::DoubleClick
-                    } else {
-                        PointerInput::BeginDrag
-                    };
-                    match input::resolve_pointer_input(input, this.input_context()) {
-                        Some(PointerCommand::CloseOverlay) => this.close_overlays(cx),
-                        Some(PointerCommand::ToggleFullscreen) => window.toggle_fullscreen(),
-                        Some(PointerCommand::BeginPan) => {
-                            this.viewports[0].drag_origin = Some(ev.position);
-                            cx.notify();
+                    let ctx = this.input_context();
+                    if ev.click_count >= 2 {
+                        // Cancel any pending single-click pause timer.
+                        this.click_seq += 1;
+                        match input::resolve_pointer_input(PointerInput::DoubleClick, ctx) {
+                            Some(PointerCommand::CloseOverlay) => this.close_overlays(cx),
+                            Some(PointerCommand::ToggleFullscreen) => window.toggle_fullscreen(),
+                            Some(PointerCommand::ToggleActualAtCursor) => {
+                                this.toggle_image_size_at(ev.position, window, cx);
+                            }
+                            _ => {}
                         }
-                        _ => {}
+                    } else if let Some(PointerCommand::CloseOverlay) =
+                        input::resolve_pointer_input(PointerInput::BeginDrag, ctx)
+                    {
+                        this.close_overlays(cx);
+                    } else if let Some(PointerCommand::BeginPan) =
+                        input::resolve_pointer_input(PointerInput::BeginDrag, ctx)
+                    {
+                        this.viewports[0].drag_origin = Some(ev.position);
+                        cx.notify();
+                    } else if let Some(PointerCommand::TogglePlayback) =
+                        input::resolve_pointer_input(PointerInput::SingleClick, ctx)
+                    {
+                        // Short delay so double-click fullscreen doesn't pause first.
+                        this.click_seq += 1;
+                        let seq = this.click_seq;
+                        cx.spawn(async move |this, cx| {
+                            cx.background_executor()
+                                .timer(Duration::from_millis(200))
+                                .await;
+                            let _ = this.update(cx, |this, cx| {
+                                if this.click_seq == seq {
+                                    let next_paused = !this.viewports[0].session.state.paused;
+                                    this.command(Command::TogglePlayback, cx);
+                                    this.show_osd(if next_paused { "暂停" } else { "播放" }, cx);
+                                }
+                            });
+                        })
+                        .detach();
                     }
                 }),
             )
+            // Audio playback card (when playing pure audio files).
+            .when(kind == Some(Kind::Audio), |d| {
+                d.child(self.render_audio_card())
+            })
             // Fullscreen: file name and media info at the top, on the edge
             // away from the directory so the popup never covers it.
             .when(fullscreen && self.chrome_visible, |d| {
@@ -191,97 +253,53 @@ impl IrisWindow {
                     })
                 })
             })
-            // Toast (or delayed loading indicator): top centre.
-            .when_some(
-                self.toast
-                    .clone()
-                    .or_else(|| self.loading_visible.then(|| SharedString::from("加载中…"))),
-                |d, msg| {
-                    d.child(
-                        div()
-                            .absolute()
-                            .top(px(if fullscreen { FLOAT_GAP } else { 12. }))
-                            .left_0()
-                            .right_0()
-                            .flex()
-                            .justify_center()
-                            .child(
-                                div()
-                                    .h(px(28.))
-                                    .px(px(10.))
-                                    .flex()
-                                    .items_center()
-                                    .gap(px(8.))
-                                    .bg(overlay())
-                                    .border_1()
-                                    .border_color(line())
-                                    .child(div().flex_none().size(px(6.)).bg(accent()))
-                                    .child(div().text_size(px(12.)).child(msg)),
-                            ),
-                    )
-                },
-            )
+            // Top-centre pill: toast / lightweight OSD / delayed loading indicator.
+            .when_some(top_pill, |d, msg| {
+                d.child(
+                    div()
+                        .absolute()
+                        .top(px(if fullscreen { FLOAT_GAP } else { 12. }))
+                        .left_0()
+                        .right_0()
+                        .flex()
+                        .justify_center()
+                        .child(
+                            div()
+                                .h(px(28.))
+                                .px(px(10.))
+                                .flex()
+                                .items_center()
+                                .gap(px(8.))
+                                .bg(overlay())
+                                .border_1()
+                                .border_color(line())
+                                .child(div().flex_none().size(px(6.)).bg(accent()))
+                                .child(
+                                    div()
+                                        .font_family(FONT_MONO)
+                                        .text_size(px(12.))
+                                        .child(msg),
+                                ),
+                        ),
+                )
+            })
+            // Media info inspector panel (`I` / `⌘I`).
+            .when(self.info_open && self.viewports[0].session.current.is_some(), |d| {
+                d.child(self.render_info_overlay(fullscreen, cx))
+            })
+            // Empty state: open CTA + Recent files/folders list.
             .when(
                 self.viewports[0].session.current.is_none() && self.pending_path.is_none(),
-                |d| {
-                    d.child(
-                        div()
-                            .absolute()
-                            .size_full()
-                            .flex()
-                            .flex_col()
-                            .items_center()
-                            .justify_center()
-                            .gap(px(16.))
-                            .child(
-                                div()
-                                    .text_size(px(13.))
-                                    .text_color(text_dim())
-                                    .child("拖入文件或文件夹"),
-                            )
-                            .child(
-                                div()
-                                    .id("open-file")
-                                    .h(px(BUTTON))
-                                    .px(px(12.))
-                                    .flex()
-                                    .items_center()
-                                    .gap(px(10.))
-                                    .border_1()
-                                    .border_color(line_strong())
-                                    .text_size(px(12.))
-                                    .cursor_pointer()
-                                    .hover(|s| s.bg(hover()))
-                                    .active(|s| s.bg(selected()))
-                                    .child("打开…")
-                                    .child(
-                                        div()
-                                            .font_family(FONT_MONO)
-                                            .text_size(px(11.))
-                                            .text_color(text_dim())
-                                            .child(if cfg!(target_os = "macos") {
-                                                "⌘O"
-                                            } else {
-                                                "Ctrl+O"
-                                            }),
-                                    )
-                                    // Not a click on the picture.
-                                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                                        cx.stop_propagation()
-                                    })
-                                    .on_click(cx.listener(|this, _, w, cx| {
-                                        this.open_file(&OpenFile, w, cx)
-                                    })),
-                            ),
-                    )
-                },
+                |d| d.child(self.render_empty_state(cx)),
             )
-            // In fullscreen the control bar floats over the video and hides
-            // with the rest of the chrome. A video's timeline replaces the
-            // frame's top edge.
+            // Photo thumbnail filmstrip along the bottom edge.
+            .when(show_filmstrip, |d| {
+                d.children(self.render_photo_filmstrip(fullscreen, cx))
+            })
+            // Fullscreen floating control bar.
             .when(fullscreen && self.chrome_visible, |d| {
                 let slot = self.dock_bounds.clone();
-                let seam = self.viewports[0].session.kind() == Some(Kind::Video);
+                let seam = matches!(kind, Some(Kind::Video | Kind::Audio));
                 d.child(
                     div()
                         .absolute()
@@ -295,7 +313,6 @@ impl IrisWindow {
                         .border_r_1()
                         .border_b_1()
                         .when(!seam, |d| d.border_t_1())
-                        // Clicks here are not clicks on the picture.
                         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                         .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
                         .child(
@@ -306,12 +323,11 @@ impl IrisWindow {
                         .child(self.render_dock(true, window, cx)),
                 )
             })
-            // Floating track / speed popover above the control bar.
+            // Button-anchored popover above the control bar.
             .when_some(self.popover, |d, pop| {
                 d.child(self.render_popover(pop, fullscreen, cx))
             })
-            // The directory popup, on the chosen edge, between the top of the
-            // screen and the floating bar.
+            // Fullscreen directory popup.
             .when(fullscreen && self.dir_popup, |d| {
                 let popup = div()
                     .absolute()
@@ -328,5 +344,270 @@ impl IrisWindow {
                     popup.right(px(FLOAT_GAP))
                 })
             })
+    }
+
+    fn render_audio_card(&self) -> impl IntoElement {
+        let session = &self.viewports[0].session;
+        let state = &session.state;
+        let name = session
+            .current
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "音频".into());
+        div()
+            .absolute()
+            .inset_0()
+            .bg(window_bg())
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(
+                div()
+                    .w(px(360.))
+                    .p(px(20.))
+                    .bg(panel())
+                    .border_1()
+                    .border_color(line())
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .gap(px(12.))
+                    .child(
+                        div()
+                            .size(px(48.))
+                            .bg(window_bg())
+                            .border_1()
+                            .border_color(line_strong())
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(icon(Icon::Music, 22., accent())),
+                    )
+                    .child(
+                        div()
+                            .max_w(px(320.))
+                            .truncate()
+                            .text_size(px(14.))
+                            .text_color(text())
+                            .child(name),
+                    )
+                    .child(
+                        div()
+                            .font_family(FONT_MONO)
+                            .text_size(px(12.))
+                            .text_color(text_dim())
+                            .child(format!(
+                                "{} / {} · {}",
+                                fmt_time(state.time_pos),
+                                if state.duration > 0. {
+                                    fmt_time(state.duration)
+                                } else {
+                                    "--:--".into()
+                                },
+                                if state.paused { "已暂停" } else { "播放中" }
+                            )),
+                    ),
+            )
+    }
+
+    fn render_empty_state(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let recent: Vec<_> = self.store.recent.iter().take(6).cloned().collect();
+        div()
+            .absolute()
+            .size_full()
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap(px(16.))
+            .child(
+                div()
+                    .text_size(px(13.))
+                    .text_color(text_dim())
+                    .child("拖入文件或文件夹"),
+            )
+            .child(
+                div()
+                    .id("open-file")
+                    .h(px(BUTTON))
+                    .px(px(12.))
+                    .flex()
+                    .items_center()
+                    .gap(px(10.))
+                    .border_1()
+                    .border_color(line_strong())
+                    .text_size(px(12.))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(hover()))
+                    .active(|s| s.bg(selected()))
+                    .child("打开…")
+                    .child(
+                        div()
+                            .font_family(FONT_MONO)
+                            .text_size(px(11.))
+                            .text_color(text_dim())
+                            .child(if cfg!(target_os = "macos") {
+                                "⌘O"
+                            } else {
+                                "Ctrl+O"
+                            }),
+                    )
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(cx.listener(|this, _, w, cx| this.open_file(&OpenFile, w, cx))),
+            )
+            .when(!recent.is_empty(), |d| {
+                d.child(
+                    div()
+                        .mt(px(8.))
+                        .w(px(340.))
+                        .bg(panel())
+                        .border_1()
+                        .border_color(line())
+                        .flex()
+                        .flex_col()
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .child(
+                            div()
+                                .h(px(28.))
+                                .px(px(10.))
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .border_b_1()
+                                .border_color(line())
+                                .child(
+                                    div()
+                                        .text_size(px(11.))
+                                        .text_color(text_dim())
+                                        .child("最近打开"),
+                                )
+                                .child(
+                                    div()
+                                        .id("clear-recent")
+                                        .text_size(px(10.))
+                                        .text_color(text_faint())
+                                        .cursor_pointer()
+                                        .hover(|s| s.text_color(text()))
+                                        .child("清空")
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.store.clear_recent();
+                                            cx.notify();
+                                        })),
+                                ),
+                        )
+                        .children(recent.into_iter().enumerate().map(|(i, p)| {
+                            let label = p
+                                .file_name()
+                                .map(|n| n.to_string_lossy().into_owned())
+                                .unwrap_or_else(|| p.display().to_string());
+                            let glyph = match library::kind_of(&p) {
+                                Some(Kind::Video) => Icon::Video,
+                                Some(Kind::Photo) => Icon::Photo,
+                                Some(Kind::Audio) => Icon::Music,
+                                None => Icon::Folder,
+                            };
+                            div()
+                                .id(("recent", i))
+                                .h(px(26.))
+                                .px(px(10.))
+                                .flex()
+                                .items_center()
+                                .gap(px(8.))
+                                .cursor_pointer()
+                                .text_size(px(12.))
+                                .text_color(text_muted())
+                                .hover(|s| s.bg(hover()).text_color(text()))
+                                .child(icon(glyph, 13., text_faint()))
+                                .child(div().flex_1().min_w(px(0.)).truncate().child(label))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.open_path(&p, cx);
+                                }))
+                        })),
+                )
+            })
+    }
+
+    /// Lightweight bottom thumbnail filmstrip for quick visual photo browsing.
+    fn render_photo_filmstrip(
+        &self,
+        fullscreen: bool,
+        cx: &mut Context<Self>,
+    ) -> Option<impl IntoElement> {
+        let photos: Vec<Entry> = self
+            .display_entries()
+            .into_iter()
+            .filter(|e| e.kind == Kind::Photo)
+            .collect();
+        if photos.len() < 2 {
+            return None;
+        }
+        let current = self.viewports[0].session.current.as_ref();
+        let cur_ix = current
+            .and_then(|p| photos.iter().position(|e| &e.path == p))
+            .unwrap_or(0);
+        const WINDOW: usize = 11;
+        let half = WINDOW / 2;
+        let start = cur_ix
+            .saturating_sub(half)
+            .min(photos.len().saturating_sub(WINDOW));
+        let end = (start + WINDOW).min(photos.len());
+        let slice = &photos[start..end];
+        let bottom = if fullscreen {
+            DOCK_H + FLOAT_GAP + 8.
+        } else {
+            10.
+        };
+
+        Some(
+            div()
+                .absolute()
+                .bottom(px(bottom))
+                .left_0()
+                .right_0()
+                .flex()
+                .justify_center()
+                .child(
+                    div()
+                        .id("photo-filmstrip")
+                        .p(px(4.))
+                        .flex()
+                        .items_center()
+                        .gap(px(4.))
+                        .bg(overlay())
+                        .border_1()
+                        .border_color(line())
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+                        .children(slice.iter().enumerate().map(|(offset, e)| {
+                            let is_cur = Some(&e.path) == current;
+                            let path = e.path.clone();
+                            let thumb = self.thumb_cache.get(&e.path).cloned();
+                            div()
+                                .id(("thumb", start + offset))
+                                .w(px(56.))
+                                .h(px(38.))
+                                .flex_none()
+                                .overflow_hidden()
+                                .bg(window_bg())
+                                .border_1()
+                                .border_color(if is_cur { accent() } else { line() })
+                                .cursor_pointer()
+                                .hover(|s| s.border_color(if is_cur { accent() } else { text_dim() }))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.open_path(&path, cx);
+                                }))
+                                .when_some(thumb.clone(), |d, t| {
+                                    d.child(img(t).size_full().object_fit(ObjectFit::Cover))
+                                })
+                                .when(thumb.is_none(), |d| {
+                                    d.child(icon(Icon::Photo, 14., text_faint()))
+                                })
+                        })),
+                ),
+        )
     }
 }

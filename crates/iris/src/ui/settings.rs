@@ -1,8 +1,9 @@
 //! In-window centered modal settings panel (Direction C: 1px borders, sharp
-//! corners, hand-written toggle / segmented / stepper controls).
+//! corners, hand-written toggle / segmented / stepper controls, responsive on
+//! mini-windows).
 use gpui::{
     AnyElement, Context, FontWeight, InteractiveElement, IntoElement, MouseButton, ParentElement,
-    StatefulInteractiveElement, Styled, div, prelude::FluentBuilder, px,
+    StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder, px,
 };
 
 use super::widgets::{icon, icon_button, tip};
@@ -15,7 +16,15 @@ use crate::settings::{
 };
 
 impl IrisWindow {
-    pub(super) fn render_settings_modal(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(super) fn render_settings_modal(
+        &self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let vp = window.viewport_size();
+        let modal_w = (f32::from(vp.width) - 24.).clamp(420., 660.);
+        let modal_h = (f32::from(vp.height) - 24.).clamp(260., 496.);
+
         let body: AnyElement = match self.settings_tab {
             SettingsTab::Appearance => self.settings_appearance(cx).into_any_element(),
             SettingsTab::Playback => self.settings_playback(cx).into_any_element(),
@@ -58,7 +67,6 @@ impl IrisWindow {
                 }))
         };
 
-        // Full-window backdrop; clicking outside the dialog closes it.
         div()
             .id("settings-backdrop")
             .absolute()
@@ -80,10 +88,8 @@ impl IrisWindow {
             .child(
                 div()
                     .id("settings-modal")
-                    .w(px(660.))
-                    .max_w(px(660.))
-                    .h(px(480.))
-                    .max_h(px(480.))
+                    .w(px(modal_w))
+                    .h(px(modal_h))
                     .flex()
                     .flex_col()
                     .bg(panel())
@@ -91,7 +97,6 @@ impl IrisWindow {
                     .border_color(line_strong())
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .child(
-                        // Header
                         div()
                             .h(px(40.))
                             .flex_none()
@@ -136,7 +141,6 @@ impl IrisWindow {
                             ),
                     )
                     .child(
-                        // Main split: left nav + right content
                         div()
                             .flex_1()
                             .min_h(px(0.))
@@ -245,6 +249,17 @@ impl IrisWindow {
                     }),
                 ),
             ))
+            .child(setting_row(
+                "窗口置顶",
+                "使播放器窗口悬浮在其他应用上方（快捷键 T）",
+                toggle(
+                    "set-top",
+                    s.always_on_top,
+                    cx.listener(|this, _, w, cx| {
+                        this.toggle_always_on_top(&ToggleAlwaysOnTop, w, cx);
+                    }),
+                ),
+            ))
     }
 
     fn settings_playback(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -289,6 +304,19 @@ impl IrisWindow {
                 ),
             ))
             .child(setting_row(
+                "单击画面暂停 / 播放",
+                "左键单击视频画面切换播放状态，双击仍为全屏",
+                toggle(
+                    "set-click-pause",
+                    s.single_click_pause,
+                    cx.listener(|this, _, _, cx| {
+                        this.settings.single_click_pause = !this.settings.single_click_pause;
+                        this.settings.save();
+                        cx.notify();
+                    }),
+                ),
+            ))
+            .child(setting_row(
                 "硬件解码",
                 "遇到异常片源花屏时可切换为软解",
                 segmented(
@@ -330,6 +358,19 @@ impl IrisWindow {
                     }),
                 ),
             ))
+            .child(setting_row(
+                "截图包含字幕",
+                "关闭后截图仅保存原始视频帧画面",
+                toggle(
+                    "set-shot-subs",
+                    s.screenshot_subs,
+                    cx.listener(|this, _, _, cx| {
+                        this.settings.screenshot_subs = !this.settings.screenshot_subs;
+                        this.settings.save();
+                        cx.notify();
+                    }),
+                ),
+            ))
     }
 
     fn settings_tracks(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -340,7 +381,7 @@ impl IrisWindow {
             .gap(px(14.))
             .child(setting_row(
                 "字幕优先语言",
-                "多字幕轨视频自动选择的语言顺序",
+                "多字幕轨视频自动选择的语言顺序（自动加载同目录模糊匹配外挂字幕）",
                 segmented(
                     "set-slang",
                     &[
@@ -443,6 +484,32 @@ impl IrisWindow {
                     },
                 ),
             ))
+            .child(setting_row(
+                "看图双击行为",
+                "双击照片时切换原始大小 1:1 或切换全屏",
+                segmented(
+                    "set-photo-dbl",
+                    &[("切换 1:1", true), ("切换全屏", false)],
+                    s.photo_double_click_actual,
+                    cx,
+                    |this, val, cx| {
+                        this.settings.photo_double_click_actual = val;
+                        this.settings.save();
+                        cx.notify();
+                    },
+                ),
+            ))
+            .child(setting_row(
+                "照片底部缩略图条",
+                "浏览多张照片时在画面下方显示内存缩略图快速跳转（快捷键 G）",
+                toggle(
+                    "set-filmstrip",
+                    s.photo_filmstrip,
+                    cx.listener(|this, _, w, cx| {
+                        this.toggle_filmstrip(&ToggleFilmstrip, w, cx);
+                    }),
+                ),
+            ))
     }
 
     fn settings_shortcuts(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -452,7 +519,9 @@ impl IrisWindow {
             "Ctrl+"
         };
         let open_k = format!("{cmd}O");
+        let search_k = format!("{cmd}F");
         let refresh_k = format!("{cmd}R");
+        let shot_k = format!("{cmd}S");
         let set_k = format!("{cmd},");
         let quit_k = format!("{cmd}Q");
 
@@ -461,8 +530,11 @@ impl IrisWindow {
                 "通用",
                 vec![
                     (open_k, "打开文件或文件夹"),
+                    (search_k, "搜索当前目录"),
                     ("Tab".into(), "展开 / 收起目录（全屏为弹出）"),
                     ("F / 双击".into(), "切换全屏"),
+                    ("T".into(), "窗口置顶开关"),
+                    ("I".into(), "媒体详情与统计面板"),
                     ("Esc".into(), "关闭浮层 / 退出全屏"),
                     ("PgUp / PgDn".into(), "上一个 / 下一个媒体"),
                     ("S".into(), "收藏 / 取消收藏"),
@@ -472,9 +544,9 @@ impl IrisWindow {
                 ],
             ),
             (
-                "视频",
+                "视频 / 音频",
                 vec![
-                    ("Space".into(), "播放 / 暂停（播完重播）"),
+                    ("Space / 单击".into(), "播放 / 暂停（播完重播）"),
                     ("← / →".into(), "精确快退 / 快进"),
                     ("Shift+← / →".into(), "大步快退 / 快进"),
                     (", / .".into(), "逐帧后退 / 前进"),
@@ -482,18 +554,24 @@ impl IrisWindow {
                     ("M".into(), "静音 / 取消静音"),
                     ("[ / ] / Backspace".into(), "减速 / 加速 / 恢复 1.0×"),
                     ("V / J".into(), "字幕显隐 / 切换字幕轨"),
+                    ("Z / X / Shift+Z".into(), "字幕偏移 −0.1s / +0.1s / 归零"),
                     ("A".into(), "切换音轨"),
                     ("L".into(), "单曲循环开关"),
+                    ("C".into(), "切换画面比例 / 铺满裁剪"),
+                    ("R / H".into(), "旋转 90° / 镜像翻转"),
+                    (shot_k, "保存当前帧截图"),
+                    ("Shift+[ / ]".into(), "上一章节 / 下一章节"),
                 ],
             ),
             (
                 "照片",
                 vec![
                     ("← / →".into(), "上一张 / 下一张"),
-                    ("滚轮 / = / -".into(), "缩放（以光标为中心）"),
+                    ("滚轮 / 捏合 / = / -".into(), "以光标为中心缩放"),
                     ("拖拽".into(), "放大后平移"),
-                    ("0 / Space".into(), "适应窗口 / 切换 1:1"),
-                    ("R / Shift+R".into(), "顺 / 逆时针临时旋转 90°"),
+                    ("0 / Space / 双击".into(), "适应窗口 / 切换 1:1"),
+                    ("R / Shift+R / H".into(), "顺逆时针旋转 90° / 镜像翻转"),
+                    ("G".into(), "显示 / 隐藏底部缩略图条"),
                 ],
             ),
         ];
@@ -637,6 +715,16 @@ impl IrisWindow {
                         )
                     })
                     .child(setting_row(
+                        "最近打开记录",
+                        "清除空窗口显示的最近打开文件与文件夹列表",
+                        action_button("clear-recent-btn", "清除最近").on_click(cx.listener(
+                            |this, _, _, cx| {
+                                this.store.clear_recent();
+                                this.show_toast("已清除最近打开记录", cx);
+                            },
+                        )),
+                    ))
+                    .child(setting_row(
                         "播放进度历史",
                         "清除所有视频的续播时间点，收藏列表不受影响",
                         action_button("clear-progress", "清除进度").on_click(cx.listener(
@@ -657,7 +745,11 @@ impl IrisWindow {
     }
 }
 
-fn setting_row(title: &'static str, desc: &'static str, control: impl IntoElement) -> impl IntoElement {
+fn setting_row(
+    title: &'static str,
+    desc: &'static str,
+    control: impl IntoElement,
+) -> impl IntoElement {
     div()
         .flex()
         .items_center()

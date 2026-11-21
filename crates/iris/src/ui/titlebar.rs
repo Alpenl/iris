@@ -1,5 +1,5 @@
 //! Windowed title bar: platform-conventional window buttons (left on macOS,
-//! right on Windows), drag area with current path and media info.
+//! right on Windows), drag area with current path, media info, and pin toggle.
 use gpui::{
     Context, FontWeight, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
     ParentElement, StatefulInteractiveElement, Styled, div, prelude::FluentBuilder, px,
@@ -23,6 +23,7 @@ impl IrisWindow {
             .and_then(|f| f.file_name())
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "未打开".into());
+        let pinned = self.settings.always_on_top;
 
         let win_btn = |id: &'static str, glyph: Icon, label: &'static str, accent_hover: bool| {
             let group_name = id;
@@ -48,6 +49,34 @@ impl IrisWindow {
                     icon(glyph, 11., text_dim()).group_hover(group_name, |s| s.text_color(text())),
                 )
         };
+
+        let pin_btn = div()
+            .id(("win-pin", usize::from(pinned)))
+            .group("win-pin")
+            .size(px(22.))
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_center()
+            .border_1()
+            .border_color(if pinned { accent() } else { line() })
+            .when(pinned, |d| d.bg(selected()))
+            .when(!pinned, |d| {
+                d.hover(|s| s.bg(hover()).border_color(line_strong()))
+            })
+            .cursor_pointer()
+            .tooltip(tip(
+                if pinned { "取消窗口置顶" } else { "窗口置顶" },
+                Some("T"),
+            ))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_click(cx.listener(|this, _, w, cx| this.toggle_always_on_top(&ToggleAlwaysOnTop, w, cx)))
+            .child(
+                icon(Icon::Pin, 12., if pinned { accent() } else { text_dim() })
+                    .group_hover("win-pin", |s| {
+                        s.text_color(if pinned { accent() } else { text() })
+                    }),
+            );
 
         let mac_buttons = || {
             div()
@@ -98,7 +127,7 @@ impl IrisWindow {
             .items_center()
             .gap(px(10.))
             .pl(px(if cfg!(target_os = "macos") { 12. } else { 14. }))
-            .pr(px(if cfg!(target_os = "macos") { 14. } else { 12. }))
+            .pr(px(10.))
             .on_mouse_down(MouseButton::Left, |ev: &MouseDownEvent, window, _| {
                 if ev.click_count >= 2 {
                     window.titlebar_double_click();
@@ -143,7 +172,8 @@ impl IrisWindow {
                         .text_color(text_dim())
                         .child(info),
                 )
-            });
+            })
+            .child(pin_btn);
 
         let bar = div()
             .h(px(TITLEBAR_H))
