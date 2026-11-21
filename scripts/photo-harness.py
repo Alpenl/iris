@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Photo edge-case checks for Iris, driven over the IRIS_CONTROL pipe.
+"""Photo edge-case checks for Iris, driven over the IRIS_CONTROL local stream.
 
-Starts its own Iris instance (target/release/iris) with a private FIFO and a
-private settings file, so a window you already have open is never touched.
+Starts its own devtools Iris instance with a private Unix socket (macOS) or
+named pipe (Windows) and settings file; existing user windows are never touched.
 Run scripts/make-photo-test-media.sh first; the media goes to test-media/photo.
 
 usage: python3 scripts/photo-harness.py [--repo DIR] [--bin PATH] OUTDIR TEST...
@@ -19,56 +19,82 @@ OUTDIR/<test>-<file>.png and Iris's stderr in OUTDIR/iris-stderr.log.
 Latency is measured until mpv reports video-params for the new file; texture
 upload and presentation are not included.
 """
-import argparse, json, os, queue, re, subprocess, sys, threading, time
+import argparse, ctypes, json, os, queue, re, runpy, subprocess, sys, tempfile, threading, time
+
+ControlClient = runpy.run_path(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                          "control-client.py"))["ControlClient"]
 
 _ap = argparse.ArgumentParser(description="Photo edge-case checks for Iris.")
 _ap.add_argument("--repo", default=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                  help="repository root (default: the parent of scripts/)")
-_ap.add_argument("--bin", help="Iris binary (default: REPO/target/release/iris)")
+_ap.add_argument("--bin", help="Iris debug/devtools binary (default: REPO/target/release/iris[.exe])")
 _ap.add_argument("outdir")
 _ap.add_argument("tests", nargs="+", choices=["probe", "exif", "heic", "icc", "huge", "flip"])
 _args = _ap.parse_args()
 
 REPO, OUT = _args.repo, os.path.abspath(_args.outdir)
 TESTS = _args.tests
-BIN = _args.bin or os.path.join(REPO, "target/release/iris")
-MEDIA = os.path.join(REPO, "test-media/photo")
+BIN = os.path.abspath(_args.bin or os.path.join(REPO, "target", "release",
+                                              "iris.exe" if os.name == "nt" else "iris"))
+MEDIA = os.path.abspath(os.path.join(REPO, "test-media/photo"))
 if not os.path.isfile(BIN):
-    sys.exit(f"no Iris binary at {BIN}; run `cargo build --release` first")
+    sys.exit(f"no Iris binary at {BIN}; run `cargo build --release --features devtools` first")
 if not os.path.isdir(MEDIA):
     sys.exit(f"no test media at {MEDIA}; run scripts/make-photo-test-media.sh first")
 os.makedirs(OUT, exist_ok=True)
 
 
+def normalized_media_path(path):
+    path = os.path.normcase(os.path.normpath(path))
+    if os.name == "nt":
+        if path.startswith("\\\\?\\unc\\"):
+            path = "\\\\" + path[8:]
+        elif path.startswith("\\\\?\\"):
+            path = path[4:]
+    return path
+
+
 class Iris:
     def __init__(self):
-        self.fifo = os.path.join(OUT, "ctl.fifo")
-        if os.path.exists(self.fifo):
-            os.remove(self.fifo)
-        os.mkfifo(self.fifo)
-        env = dict(os.environ, IRIS_CONTROL=self.fifo,
-                   IRIS_SETTINGS=os.path.join(OUT, "settings.conf"))
-        env.pop("GPUI_DISABLE_DIRECT_COMPOSITION", None)
-        self.proc = subprocess.Popen([BIN],
-                                     env=env, stderr=subprocess.PIPE, text=True, bufsize=1)
+        self.private = tempfile.TemporaryDirectory(prefix="iris-photo-",
+                                                   dir="/tmp" if sys.platform == "darwin" else None)
+        self.endpoint = (r"\\.\pipe\iris-" + os.path.basename(self.private.name)
+                         if os.name == "nt" else os.path.join(self.private.name, "control.sock"))
+        self.control = None
+        self.proc = None
+        self.reader = None
         self.lines = queue.Queue()
-        self.log = open(os.path.join(OUT, "iris-stderr.log"), "a")
         self.mpv_msgs = []
-        threading.Thread(target=self._read, daemon=True).start()
-        self.w = open(self.fifo, "w")  # blocks until Iris opens the reader
+        self.log = None
+        try:
+            self.log = open(os.path.join(OUT, "iris-stderr.log"), "a", encoding="utf-8")
+            env = dict(os.environ, IRIS_CONTROL=self.endpoint,
+                       IRIS_SETTINGS=os.path.join(self.private.name, "settings.conf"))
+            env.pop("GPUI_DISABLE_DIRECT_COMPOSITION", None)
+            self.proc = subprocess.Popen([BIN], env=env, stderr=subprocess.PIPE,
+                                         text=True, encoding="utf-8", errors="replace", bufsize=1)
+            self.reader = threading.Thread(target=self._read, daemon=True)
+            self.reader.start()
+            self.control = ControlClient(self.endpoint, timeout=15, process=self.proc)
+        except BaseException:
+            self.quit()
+            raise
 
     def _read(self):
-        for line in self.proc.stderr:
-            t = time.perf_counter()
-            self.log.write(f"{t:.4f} {line}")
-            self.log.flush()
-            if line.startswith("[mpv/"):
-                self.mpv_msgs.append(line.strip())
-            self.lines.put((t, line.rstrip("\n")))
+        try:
+            for line in self.proc.stderr:
+                t = time.perf_counter()
+                self.log.write(f"{t:.4f} {line}")
+                self.log.flush()
+                if line.startswith("[mpv/") or re.search(r"\b(?:WARN|ERROR)\s+iris::mpv(?:\s|\])", line):
+                    self.mpv_msgs.append(line.strip())
+                self.lines.put((t, line.rstrip("\n")))
+        finally:
+            self.proc.stderr.close()
+            self.log.close()
 
     def send(self, cmd):
-        self.w.write(cmd + "\n")
-        self.w.flush()
+        self.control.send(cmd)
 
     def wait_for(self, prefix, timeout=20):
         end = time.perf_counter() + timeout
@@ -106,7 +132,7 @@ class Iris:
         end = t0 + timeout
         while time.perf_counter() < end:
             p, _ = self.get("path")
-            if p == path:
+            if p is not None and normalized_media_path(p) == normalized_media_path(path):
                 w, t = self.get("video-params/w")
                 if w is not None:
                     return t - t0
@@ -114,16 +140,65 @@ class Iris:
         return None
 
     def rss_mb(self):
+        if os.name == "nt":
+            from ctypes import wintypes
+
+            class MemoryCounters(ctypes.Structure):
+                _fields_ = [("cb", wintypes.DWORD), ("PageFaultCount", wintypes.DWORD),
+                            ("PeakWorkingSetSize", ctypes.c_size_t), ("WorkingSetSize", ctypes.c_size_t),
+                            ("QuotaPeakPagedPoolUsage", ctypes.c_size_t), ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                            ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t), ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                            ("PagefileUsage", ctypes.c_size_t), ("PeakPagefileUsage", ctypes.c_size_t)]
+
+            kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+            psapi = ctypes.WinDLL("psapi", use_last_error=True)
+            kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+            kernel.OpenProcess.restype = wintypes.HANDLE
+            kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+            kernel.CloseHandle.restype = wintypes.BOOL
+            psapi.GetProcessMemoryInfo.argtypes = [wintypes.HANDLE, ctypes.POINTER(MemoryCounters), wintypes.DWORD]
+            psapi.GetProcessMemoryInfo.restype = wintypes.BOOL
+            handle = kernel.OpenProcess(0x0400 | 0x0010, False, self.proc.pid)
+            if not handle:
+                raise ctypes.WinError(ctypes.get_last_error())
+            try:
+                counters = MemoryCounters()
+                counters.cb = ctypes.sizeof(counters)
+                if not psapi.GetProcessMemoryInfo(handle, ctypes.byref(counters), counters.cb):
+                    raise ctypes.WinError(ctypes.get_last_error())
+                return counters.WorkingSetSize / (1024 * 1024)
+            finally:
+                kernel.CloseHandle(handle)
         out = subprocess.run(["ps", "-o", "rss=", "-p", str(self.proc.pid)],
-                             capture_output=True, text=True).stdout.strip()
+                             capture_output=True, text=True, check=True).stdout.strip()
         return int(out) / 1024 if out else None
 
     def quit(self):
         try:
-            self.send("quit")
-            self.proc.wait(timeout=5)
-        except Exception:
-            self.proc.kill()
+            if self.proc is not None and self.proc.poll() is None:
+                try:
+                    if self.control is not None:
+                        self.send("quit")
+                        self.proc.wait(timeout=5)
+                    else:
+                        self.proc.kill()
+                        self.proc.wait(timeout=5)
+                except (OSError, subprocess.TimeoutExpired):
+                    self.proc.kill()
+                    self.proc.wait(timeout=5)
+        finally:
+            if self.control is not None:
+                self.control.close()
+            if self.reader is not None:
+                self.reader.join(timeout=5)
+            elif self.log is not None:
+                self.log.close()
+            if self.endpoint and os.name != "nt":
+                try:
+                    os.unlink(self.endpoint)
+                except FileNotFoundError:
+                    pass
+            self.private.cleanup()
 
 
 def video_rect(state_line):
@@ -140,11 +215,12 @@ def props(iris, names):
 
 results = {}
 iris = Iris()
-time.sleep(1.0)
-iris.send("resize 1440 900")
-time.sleep(0.5)
 
 try:
+    time.sleep(1.0)
+    iris.send("resize 1440 900")
+    time.sleep(0.5)
+
     if "probe" in TESTS:
         print(iris.state())
         f = os.path.join(MEDIA, "exif/exif-o1.jpg")

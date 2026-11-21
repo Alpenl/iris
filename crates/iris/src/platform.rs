@@ -78,20 +78,89 @@ mod imp {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "windows")]
 mod imp {
-    pub fn hide_traffic_lights(_window: &gpui::Window) {}
-    pub fn synth_mouse(
-        _window: &gpui::Window,
-        _click: bool,
-        _x: f64,
-        _y: f64,
-    ) -> Option<Box<dyn FnOnce()>> {
-        eprintln!("[iris/control] synthetic mouse input is macOS-only");
-        None
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    use windows::Win32::{
+        Foundation::{HWND, LPARAM, WPARAM, RECT},
+        Graphics::Gdi::*,
+        UI::{Input::KeyboardAndMouse::ReleaseCapture, WindowsAndMessaging::*},
+    };
+
+    fn hwnd(window: &gpui::Window) -> Option<HWND> {
+        match HasWindowHandle::window_handle(window).ok()?.as_raw() {
+            RawWindowHandle::Win32(h) => Some(HWND(h.hwnd.get() as *mut _)),
+            _ => None,
+        }
     }
+
+    pub fn hide_traffic_lights(_window: &gpui::Window) {}
+
+    pub fn synth_mouse(window: &gpui::Window, click: bool, x: f64, y: f64) -> Option<Box<dyn FnOnce()>> {
+        let handle = hwnd(window)?.0 as isize;
+        let scale = window.scale_factor() as f64;
+        let pos = LPARAM((((y * scale) as i32 & 0xffff) << 16 | ((x * scale) as i32 & 0xffff)) as isize);
+        Some(Box::new(move || unsafe {
+            let hwnd = HWND(handle as *mut _);
+            let _ = PostMessageW(hwnd, WM_MOUSEMOVE, WPARAM(0), pos);
+            if click {
+                let _ = PostMessageW(hwnd, WM_LBUTTONDOWN, WPARAM(1), pos);
+                let _ = PostMessageW(hwnd, WM_LBUTTONUP, WPARAM(0), pos);
+            }
+        }))
+    }
+
     pub fn begin_window_drag(window: &gpui::Window) {
-        window.start_window_move();
+        if let Some(hwnd) = hwnd(window) {
+            unsafe {
+                let _ = ReleaseCapture();
+                let _ = PostMessageW(hwnd, WM_NCLBUTTONDOWN, WPARAM(HTCAPTION as usize), LPARAM(0));
+            }
+        }
+    }
+
+    /// Captures the visible desktop rectangle of this window, including both
+    /// DComp targets. The window must be unobscured and on-screen; unlike GDI
+    /// window capture this also sees NOREDIRECTIONBITMAP composition surfaces.
+    pub fn snapshot_window(window: &gpui::Window, path: &std::path::Path) -> anyhow::Result<()> {
+        let hwnd = hwnd(window).ok_or_else(|| anyhow::anyhow!("missing HWND"))?;
+        unsafe {
+            let mut rect = RECT::default();
+            GetWindowRect(hwnd, &mut rect)?;
+            let (w, h) = (rect.right - rect.left, rect.bottom - rect.top);
+            anyhow::ensure!(w > 0 && h > 0, "window is not visible");
+            let screen = GetDC(None);
+            anyhow::ensure!(!screen.0.is_null(), "GetDC failed");
+            let memory = CreateCompatibleDC(screen);
+            let bitmap = CreateCompatibleBitmap(screen, w, h);
+            if memory.0.is_null() || bitmap.0.is_null() {
+                if !bitmap.0.is_null() { let _ = DeleteObject(bitmap); }
+                if !memory.0.is_null() { let _ = DeleteDC(memory); }
+                ReleaseDC(None, screen);
+                anyhow::bail!("creating screenshot bitmap failed");
+            }
+            let old = SelectObject(memory, bitmap);
+            let copied = BitBlt(memory, 0, 0, w, h, screen, rect.left, rect.top, SRCCOPY | CAPTUREBLT);
+            SelectObject(memory, old);
+            let mut pixels = vec![0u8; w as usize * h as usize * 4];
+            let mut info = BITMAPINFO::default();
+            info.bmiHeader = BITMAPINFOHEADER {
+                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: w, biHeight: -h, biPlanes: 1, biBitCount: 32,
+                biCompression: BI_RGB.0, ..Default::default()
+            };
+            let rows = if copied.is_ok() {
+                GetDIBits(screen, bitmap, 0, h as u32, Some(pixels.as_mut_ptr().cast()), &mut info, DIB_RGB_COLORS)
+            } else { 0 };
+            let _ = DeleteObject(bitmap);
+            let _ = DeleteDC(memory);
+            ReleaseDC(None, screen);
+            copied?;
+            anyhow::ensure!(rows == h, "GetDIBits failed");
+            for p in pixels.chunks_exact_mut(4) { p.swap(0, 2); p[3] = 255; }
+            image::save_buffer(path, &pixels, w as u32, h as u32, image::ColorType::Rgba8)?;
+        }
+        Ok(())
     }
 }
 
@@ -197,7 +266,5 @@ pub fn snapshot_window(window: &gpui::Window, path: &std::path::Path) -> anyhow:
     Ok(())
 }
 
-#[cfg(not(target_os = "macos"))]
-pub fn snapshot_window(_window: &gpui::Window, _path: &std::path::Path) -> anyhow::Result<()> {
-    anyhow::bail!("snapshot not implemented on this platform")
-}
+#[cfg(target_os = "windows")]
+pub use imp::snapshot_window;

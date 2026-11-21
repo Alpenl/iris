@@ -1,6 +1,6 @@
 # Iris 架构
 
-本文记录当前代码的实际结构（macOS 技术验证）、Windows 的计划方案和风险，以及色彩管线。决策和进度见 [DECISIONS.md](DECISIONS.md)，测试方法和实测数据见 [TESTING.md](TESTING.md)。
+本文记录 macOS / Windows 原生合成、视口会话和色彩管线。决策和进度见 [DECISIONS.md](DECISIONS.md)，测试方法和实测数据见 [TESTING.md](TESTING.md)。Windows 已有实机证据；本轮 macOS 变更仍缺运行环境复验。
 
 ## 1. 分层
 
@@ -12,8 +12,8 @@ crates/
 
 - `crates/iris-mpv/src/sys.rs`：手写的 C 声明。render API 同时声明了 OpenGL 和 D3D11 两套常量（`MPV_RENDER_API_TYPE_D3D11`、`MPV_RENDER_PARAM_D3D11_INIT_PARAMS = 21`、`MPV_RENDER_PARAM_D3D11_FBO = 22`）。
 - `crates/iris-mpv/build.rs`：macOS 默认链接 `/opt/homebrew/lib` 的 libmpv（Homebrew 的 pkg-config 因 libarchive 是 keg-only 而失败）；其他平台必须用 `MPV_LIB_DIR` 指定。始终动态链接。
-- `crates/iris/src/player.rs`：mpv 选项和事件泵。`vo=libmpv`、`hwdec=auto-safe`、`keep-open`、`image-display-duration=inf`；mpv 自带的 Lua 脚本、OSC、默认按键、配置文件全部关闭，界面完全由 Iris 自己画。
-- `crates/iris/src/ui.rs`：主窗口。目前按键直接绑定到动作，部分动作在 UI 里直接调用 mpv（约 13 处），方向键按 `Kind::Photo` 分支。这是已知的技术债，见 DECISIONS.md 的“输入上下文”和“收拢 mpv 调用”。
+- `crates/iris/src/player.rs`：不依赖 GPUI 的 `Session`；持有播放状态、目录、当前绝对路径，统一处理语义命令、照片加载选项和 mpv 事件翻译。UI 不直接调用 mpv 属性或命令。
+- `crates/iris/src/ui.rs`：窗口持有 `Vec<Viewport>`（当前长度 1）；视口拥有会话、原生画面层、布局矩形和照片变换。键盘上下文由 render 状态推导；`input.rs` 解析指针策略，`geometry.rs` 管理窗口逻辑坐标、媒体像素和缩放／平移。
 - `crates/iris/src/library.rs`：扫描所在文件夹，按自然顺序排序（`ep2` 在 `ep10` 前）。
 - `crates/iris/src/platform.rs`：原生窗口辅助。窗口拖动是自己实现的，因为 GPUI 0.2.2 的 `start_window_move()` 在 macOS 和 Windows 上是空函数（`gpui-0.2.2/src/platform.rs:536`，只有 Linux 后端重写了）。
 - `crates/iris/src/debug.rs`：调试控制管道（`IRIS_CONTROL`），见第 6 节。
@@ -58,9 +58,9 @@ NSWindow contentView
 
 照片走 mpv 时，内嵌 ICC、HEIC 方向和超大图都由 `photo.rs` 读文件头后用单文件选项补上：HEIF 的 `irot` / `imir` 写进 `format=rotate=…`（GPU 旋转；`video-rotate` 对分块 HEIC 无效）和 `hflip` / `vflip`；长边超过 8192 的图先经 `vf=scale` 在 CPU 上缩小。修补不了的是翻页慢和无法预解码下一张（见 TESTING.md）。长期方案是单独的原生照片层：macOS 上用 ImageIO 解码，把 `CGImage` 设为一个 `CALayer` 的内容，系统自动做色彩管理；看图时隐藏 mpv 视频层。**不要**用 GPUI 的图片元素显示照片：它是 8 位 sRGB、没有色彩管理，会丢掉 P3 色域。Windows 上对应 WIC + 原生层，尚未调研。
 
-## 4. Windows 方案（计划，未验证）
+## 4. Windows 原生视频层
 
-Windows 视频层还没写，`crates/iris/src/video/mod.rs` 目前只有 macOS 实现，Windows 不能编译。手上也还没有 Windows 测试机。以下是只读源码得出的方案。
+`crates/iris/src/video/windows.rs` 已实现 D3D11 + DirectComposition。独立渲染线程拥有 D3D immediate context 和 mpv render context；UI 只更新合并后的布局并唤醒线程，视频帧不经 CPU 或 GPUI。实机已验证 `d3d11va`、透明控件叠加、窗口／最大化／全屏、鼠标实时缩放及正常退出；不能由此保证所有 GPU 和系统版本。
 
 ### GPUI 0.2.2 在 Windows 上的事实（`gpui-0.2.2/src/platform/windows/`）
 
@@ -76,26 +76,23 @@ Windows 视频层还没写，`crates/iris/src/video/mod.rs` 目前只有 macOS �
 - mpv 用设备的 immediate context 渲染，**不恢复**设备上下文状态。
 - 用 `D3D11_CREATE_DEVICE_SINGLETHREADED` 创建的设备不支持 d3d11va 直接硬解（只能 copy-back）。
 
-### 方案：同一个 HWND 上的两个 DirectComposition 目标
+### 实现：同一个 HWND 上的两个 DirectComposition 目标
 
 - 每个 HWND 有两个合成目标槽位：topmost = true 和 topmost = false，false 永远在 true 下面。GPUI 占了 true。
 - Iris 用**自己的** D3D11 设备（不带 SINGLETHREADED）和自己的 DComp 设备，在同一个 HWND 上建 `CreateTargetForHwnd(hwnd, false)`，放 mpv 渲染的交换链。不碰 GPUI 私有的视觉树。
 - DComp 视觉树不截获鼠标和键盘，输入仍全部落在 GPUI 窗口上，和 macOS 一致。
-- 实际证据：Ebitengine #3732 是对称的案例（游戏画面占 false 目标，另一个 DComp 设备在同一 HWND 的 true 目标上放 WebView2 界面），作者确认可用并测过拖动缩放。
-- 绑定用微软的 `windows` crate（COM 对象自动 AddRef/Release），按需开 feature。
+- 绑定使用微软 `windows` crate，COM 引用自动管理；关闭时先停止并 join 视频线程、释放 render context，再退出 mpv。
+- `crates/iris/app.manifest` 启用 Common Controls v6 与 PerMonitorV2。缺少 v6 时 GPUI 导入的 `TaskDialogIndirect` 会令进程在 `main` 前失败，首次 Windows 上机已发现并修复。
 
-### 风险
+### 已验证边界与剩余风险
 
-1. **缩放不同步（最大风险）**：两个独立的 DComp 设备各自 Commit，互不同步。拖动缩放或最大化时，视频和界面可能差几帧。Ebitengine 那个案例里，单层画面最大化时都有 1~2 帧旧画面。只看源码证明不了，必须上机测。
-2. **#65402 染色**：Iris 现在用 `WindowBackgroundAppearance::Opaque`（`crates/iris/src/main.rs`）。猜测 Opaque 不会调用染色的 API、但每帧仍清成透明，也许能直接避开 #65402，**未验证**。备选：在 false 目标的根部垫一层铺满客户区的不透明石墨色视觉，把底兜住。
-3. **`GPUI_DISABLE_DIRECT_COMPOSITION`**：`main.rs` 在 Windows 上启动第一步清掉这个变量（已写，未在 Windows 上编译验证）。
-4. **截图（`snap`）**：窗口带 NOREDIRECTIONBITMAP，GDI `BitBlt` 抓出来是黑的。可试 `Windows.Graphics.Capture`（默认有黄色边框，去掉需要较新的系统）或 `PrintWindow` + `PW_RENDERFULLCONTENT`。都没验证。
-5. **调试管道**：`mkfifo` 在 Windows 上不存在，要换成命名管道（macOS 可同时改成 Unix socket），让一套测试脚本两边通用。
+1. **独立提交仍存在理论帧差**：窗口边框实拖过程中截图未见明显错位，最大化、全屏前后也正常；未用高速摄影证明每帧严格同步，不承诺零帧差。
+2. **透明背景**：当前 `Opaque` 下 GPUI 仍清透明，视频透出；本机没有观察到系统强调色染色。保留平台行为说明，不增加猜测性的底层补丁。
+3. **环境变量**：`main` 在创建线程前清掉 `GPUI_DISABLE_DIRECT_COMPOSITION`，避免环境把 GPUI 切换成不透明普通交换链。
+4. **截图**：Windows 调试 `snap` 捕获窗口所在桌面矩形，可看见两个 DComp 目标；要求窗口可见、未被遮挡，不是离屏／后台窗口截图。macOS 仍为只截本窗口。
+5. **调试流**：Windows 当前用户 SID 的保护 DACL、拒绝远程命名管道；macOS Unix socket 权限 0600 并检查 peer uid。单行 16 KiB、待处理队列最多 256 条。普通 release 不创建监听。
+6. **SDR 色彩**：D3D 目标为 BGRA8；读取所在显示器的系统 ICC 交给 mpv / Little CMS，移动到另一显示器后更新。无配置文件时使用 SDR sRGB。HDR/EDR、任意 ICC 与 Windows ACM 全组合未验证，不宣称 HDR 支持。
 
-### 没有 Windows 机器时能做的
-
-- 用 `cargo xwin check --target x86_64-pc-windows-msvc` 在 Mac 上做类型检查（`build.rs` 在 Windows 目标上不设默认路径，check 不链接，应能通过；未试）。
-- 播放状态、列表、输入路由等与平台无关的工作不受影响。
 
 ## 5. 依赖
 
@@ -111,13 +108,13 @@ Windows 视频层还没写，`crates/iris/src/video/mod.rs` 目前只有 macOS �
 
 ## 6. 调试控制管道
 
-`crates/iris/src/debug.rs`：设置 `IRIS_CONTROL` 指向一个 FIFO 后，Iris 逐行读取命令（`key`、`move`、`click`、`snap`、`resize`、`open`、`state`、`get`、`mpv`、`quit`），命令在 `ui.rs` 里执行。用法见 README 和 TESTING.md。
+`crates/iris/src/debug.rs`：debug 或显式 `--features devtools` 构建中，`IRIS_CONTROL` 指向本地流端点（macOS Unix socket、Windows `\\.\pipe\iris-...`）。逐行读取 `key`、`move`、`click`、`snap`、`resize`、`open`、`state`、`get`、`mpv`、`quit`。客户端为 `scripts/control-client.py`；回复保留在 stderr，运行日志另外走 `log`。
 
-- 合成鼠标事件：`Window::dispatch_event` 返回 crate 私有类型，外部调不了；GPUI 在自身 update 期间收到的平台输入会被丢弃。所以 `move`/`click` 在 `cx.update` 返回之后才把 NSEvent 发给 GPUI 的视图。
-- `snap` 用 `CGWindowListCreateImage` 只截本窗口，不需要录屏权限（`platform.rs`）。
+- 合成鼠标事件必须在 GPUI update 之外发出：macOS 发送 NSEvent，Windows 发送原生窗口消息，均经 GPUI 正常命中测试。
+- `snap`：macOS 用 `CGWindowListCreateImage`；Windows 捕获窗口占据的可见桌面区域，不能用于被遮挡窗口的自动像素对比。
 
 ## 7. 安全边界
 
 - **外部传进来的内容永远不能变成 mpv 选项或命令**（文件关联、URL scheme、拖入的路径都一样）。教训是 IINA 的 CVE-2026-47114（GHSA-w5xh-98j7-jp5q）：`iina://` 地址里的 mpv 参数没过滤，导致命令注入。
-- 调试管道里的 `mpv <命令…>` 能执行任意 mpv 命令，必须只在调试时可用。目前只要设置了 `IRIS_CONTROL` 就会启用，发布前要收紧（见 DECISIONS.md）。
-- Iris 对用户的媒体文件和目录只读，不写缓存或隐藏文件；个人数据放在系统的应用数据目录（目前只有 `settings.conf`）。
+- 任意 mpv 控制仅用于 debug／显式 `devtools` 构建，同用户访问，普通 release 不监听；不得把性能测试二进制当发行包。
+- 媒体和所在目录只读；设置、日志及未来个人记录保存在系统应用数据目录，不往媒体目录写隐藏文件或缓存。

@@ -118,6 +118,17 @@ pub struct mpv_opengl_fbo {
     pub internal_format: c_int,
 }
 
+// render_d3d11.h: borrowed COM pointers, retained by mpv where documented.
+#[repr(C)]
+pub struct mpv_d3d11_init_params {
+    pub device: *mut c_void,
+}
+
+#[repr(C)]
+pub struct mpv_d3d11_fbo {
+    pub tex: *mut c_void,
+}
+
 unsafe extern "C" {
     pub fn mpv_client_api_version() -> std::ffi::c_ulong;
     pub fn mpv_error_string(error: c_int) -> *const c_char;

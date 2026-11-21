@@ -4,7 +4,6 @@
 use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures::StreamExt;
@@ -15,12 +14,12 @@ use gpui::{
     StatefulInteractiveElement, Styled, Subscription, Task, Window, actions, canvas, div,
     prelude::FluentBuilder, px, relative,
 };
-use iris_mpv::{Event, Mpv, Value};
 
-use crate::library::{self, Entry, Kind};
-use crate::photo;
+use crate::geometry::ImageView;
+use crate::input::{self, InputContext, PointerInput, PointerCommand};
+use crate::library::Kind;
 use crate::platform;
-use crate::player::{self, prop};
+use crate::player::{Command, Session, SessionEvent};
 use crate::settings::{Settings, Side};
 use crate::theme::*;
 use crate::video::VideoSurface;
@@ -33,8 +32,8 @@ actions!(
     iris,
     [
         TogglePause,
-        SeekBack,
-        SeekForward,
+        SeekBackwardExact,
+        SeekForwardExact,
         VolumeUp,
         VolumeDown,
         SpeedDown,
@@ -44,8 +43,13 @@ actions!(
         ExitFullscreen,
         ToggleSubs,
         CycleSub,
-        NextItem,
-        PrevItem,
+        CycleAudio,
+        ToggleImageSize,
+        FitImage,
+        ZoomIn,
+        ZoomOut,
+        OpenNextMedia,
+        OpenPreviousMedia,
         OpenFile,
         Quit
     ]
@@ -53,49 +57,58 @@ actions!(
 
 pub fn bind_keys(cx: &mut App) {
     cx.bind_keys([
-        KeyBinding::new("space", TogglePause, None),
-        KeyBinding::new("left", SeekBack, None),
-        KeyBinding::new("right", SeekForward, None),
-        KeyBinding::new("up", VolumeUp, None),
-        KeyBinding::new("down", VolumeDown, None),
-        KeyBinding::new("[", SpeedDown, None),
-        KeyBinding::new("]", SpeedUp, None),
-        KeyBinding::new("tab", ToggleDirectory, None),
-        KeyBinding::new("f", ToggleFullscreen, None),
-        KeyBinding::new("escape", ExitFullscreen, None),
-        KeyBinding::new("v", ToggleSubs, None),
-        KeyBinding::new("j", CycleSub, None),
-        KeyBinding::new("pagedown", NextItem, None),
-        KeyBinding::new("pageup", PrevItem, None),
-        // `secondary` is ⌘ on macOS and Ctrl on Windows.
-        KeyBinding::new("secondary-o", OpenFile, None),
-        KeyBinding::new("secondary-q", Quit, None),
+        KeyBinding::new("space", TogglePause, Some("Viewport && media == video")),
+        KeyBinding::new("left", SeekBackwardExact, Some("Viewport && media == video")),
+        KeyBinding::new("right", SeekForwardExact, Some("Viewport && media == video")),
+        KeyBinding::new("up", VolumeUp, Some("Viewport && media == video")),
+        KeyBinding::new("down", VolumeDown, Some("Viewport && media == video")),
+        KeyBinding::new("[", SpeedDown, Some("Viewport && media == video")),
+        KeyBinding::new("]", SpeedUp, Some("Viewport && media == video")),
+        KeyBinding::new("v", ToggleSubs, Some("Viewport && media == video")),
+        KeyBinding::new("j", CycleSub, Some("Viewport && media == video")),
+        KeyBinding::new("a", CycleAudio, Some("Viewport && media == video")),
+        KeyBinding::new("space", ToggleImageSize, Some("Viewport && media == image")),
+        KeyBinding::new("0", FitImage, Some("Viewport && media == image")),
+        KeyBinding::new("=", ZoomIn, Some("Viewport && media == image")),
+        KeyBinding::new("-", ZoomOut, Some("Viewport && media == image")),
+        KeyBinding::new("left", OpenPreviousMedia, Some("Viewport && media == image")),
+        KeyBinding::new("right", OpenNextMedia, Some("Viewport && media == image")),
+        KeyBinding::new("tab", ToggleDirectory, Some("Workspace")),
+        KeyBinding::new("f", ToggleFullscreen, Some("Workspace")),
+        KeyBinding::new("escape", ExitFullscreen, Some("Workspace")),
+        KeyBinding::new("pagedown", OpenNextMedia, Some("Viewport")),
+        KeyBinding::new("pageup", OpenPreviousMedia, Some("Viewport")),
+        KeyBinding::new("secondary-o", OpenFile, Some("Workspace")),
+        KeyBinding::new("secondary-q", Quit, Some("Workspace")),
     ]);
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 struct VideoRect([f64; 4]);
 
+struct Viewport {
+    session: Session,
+    video: Rc<RefCell<Option<VideoSurface>>>,
+    rect: Rc<Cell<Option<VideoRect>>>,
+    image: ImageView,
+    drag_origin: Option<Point<Pixels>>,
+}
+
+impl Drop for Viewport {
+    fn drop(&mut self) {
+        drop(self.video.borrow_mut().take());
+        self.session.shutdown();
+    }
+}
+
 pub struct IrisWindow {
     focus: FocusHandle,
-    mpv: Arc<Mpv>,
-    video: Rc<RefCell<Option<VideoSurface>>>,
-    folder: Option<PathBuf>,
-    entries: Vec<Entry>,
-    current: Option<usize>,
+    // A window owns viewports; each viewport owns one independent session/surface.
+    viewports: Vec<Viewport>,
     show_directory: bool,
-    time_pos: f64,
-    duration: f64,
-    paused: bool,
-    volume: f64,
-    speed: f64,
-    video_size: (i64, i64),
-    hwdec: String,
-    subs_visible: bool,
     tick: i64,
     toast: Option<SharedString>,
     toast_seq: u64,
-    video_rect: Rc<Cell<Option<VideoRect>>>,
     progress_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
     settings: Settings,
     /// Mirrors `window.is_fullscreen()`, updated at the start of each render.
@@ -115,15 +128,16 @@ pub struct IrisWindow {
 
 impl IrisWindow {
     pub fn new(
-        mpv: Arc<Mpv>,
+        session: Session,
         initial: Option<PathBuf>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let video = match VideoSurface::attach(window, mpv.clone()) {
+        let video = match VideoSurface::attach(window, session.render_handle()) {
             Ok(v) => Some(v),
             Err(e) => {
-                eprintln!("[iris] video surface failed: {e:#}");
+                log::error!("video surface failed: {e:#}");
+                cx.quit();
                 None
             }
         };
@@ -131,7 +145,7 @@ impl IrisWindow {
         let focus = cx.focus_handle();
         focus.focus(window);
 
-        let mut rx = player::spawn_event_pump(mpv.clone());
+        let mut rx = session.events();
         let events = cx.spawn(async move |this, cx| {
             while let Some(ev) = rx.next().await {
                 if this.update(cx, |this, cx| this.on_event(ev, cx)).is_err() {
@@ -184,24 +198,17 @@ impl IrisWindow {
 
         let mut this = Self {
             focus,
-            mpv,
-            video: Rc::new(RefCell::new(video)),
-            folder: None,
-            entries: Vec::new(),
-            current: None,
+            viewports: vec![Viewport {
+                session,
+                video: Rc::new(RefCell::new(video)),
+                rect: Rc::new(Cell::new(None)),
+                image: ImageView::default(),
+                drag_origin: None,
+            }],
             show_directory: true,
-            time_pos: 0.,
-            duration: 0.,
-            paused: false,
-            volume: 100.,
-            speed: 1.,
-            video_size: (0, 0),
-            hwdec: String::new(),
-            subs_visible: true,
             tick: -1,
             toast: None,
             toast_seq: 0,
-            video_rect: Rc::new(Cell::new(None)),
             progress_bounds: Rc::new(Cell::new(None)),
             settings: Settings::load(),
             fullscreen: false,
@@ -241,19 +248,19 @@ impl IrisWindow {
             "open" => self.open_path(Path::new(arg), cx),
             "state" => eprintln!(
                 "[iris/control] state pos={:.2} dur={:.2} paused={} vol={} speed={:.2} video={:?} hwdec={} dir={} side={:?} popup={} chrome={} fullscreen={} video_rect={:?} dock={:?}",
-                self.time_pos,
-                self.duration,
-                self.paused,
-                self.volume,
-                self.speed,
-                self.video_size,
-                self.hwdec,
+                self.viewports[0].session.state.time_pos,
+                self.viewports[0].session.state.duration,
+                self.viewports[0].session.state.paused,
+                self.viewports[0].session.state.volume,
+                self.viewports[0].session.state.speed,
+                self.viewports[0].session.state.video_size,
+                self.viewports[0].session.state.hwdec,
                 self.show_directory,
                 self.settings.directory_side,
                 self.dir_popup,
                 self.chrome_visible,
                 window.is_fullscreen(),
-                self.video_rect.get().map(|r| r.0),
+                self.viewports[0].rect.get().map(|r| r.0),
                 self.dock_bounds.get().map(|b| (
                     b.origin.x,
                     b.origin.y,
@@ -261,13 +268,15 @@ impl IrisWindow {
                     b.size.height
                 )),
             ),
-            "get" => match self.mpv.get_property_string(arg) {
+            #[cfg(any(debug_assertions, feature = "devtools"))]
+            "get" => match self.viewports[0].session.debug_property(arg) {
                 Ok(v) => eprintln!("[iris/control] get {arg} = {v}"),
                 Err(e) => eprintln!("[iris/control] get {arg} failed: {e}"),
             },
+            #[cfg(any(debug_assertions, feature = "devtools"))]
             "mpv" => {
                 let args: Vec<&str> = arg.split_whitespace().collect();
-                match self.mpv.command(&args) {
+                match self.viewports[0].session.debug_command(&args) {
                     Ok(()) => eprintln!("[iris/control] mpv {arg} ok"),
                     Err(e) => eprintln!("[iris/control] mpv {arg} failed: {e}"),
                 }
@@ -279,80 +288,38 @@ impl IrisWindow {
 
     fn shutdown(&mut self) {
         // Free the render context before mpv goes away, then stop mpv.
-        drop(self.video.borrow_mut().take());
-        let _ = self.mpv.command(&["quit"]);
+        drop(self.viewports[0].video.borrow_mut().take());
+        self.viewports[0].session.shutdown();
     }
 
     fn open_path(&mut self, path: &Path, cx: &mut Context<Self>) {
-        let (folder, target) = if path.is_dir() {
-            (path.to_path_buf(), None)
-        } else {
-            (
-                path.parent().map(Path::to_path_buf).unwrap_or_default(),
-                Some(path.to_path_buf()),
-            )
-        };
-        self.entries = library::scan(&folder);
-        self.folder = Some(folder);
-        let index = match &target {
-            Some(t) => self.entries.iter().position(|e| &e.path == t),
-            None => (!self.entries.is_empty()).then_some(0),
-        };
-        if let Some(i) = index {
-            self.play(i, cx);
-        } else if let Some(t) = target {
-            // A file we don't list (unknown extension): still try to play it.
-            self.load(&t, None);
+        if let Err(e) = self.viewports[0].session.open(path) {
+            self.show_toast(format!("无法打开 · {e}"), cx);
         }
+        self.viewports[0].image.reset();
         cx.notify();
     }
 
     fn play(&mut self, index: usize, cx: &mut Context<Self>) {
-        let Some(entry) = self.entries.get(index) else {
-            return;
-        };
-        let (path, kind) = (entry.path.clone(), entry.kind);
-        self.load(&path, Some(kind));
-        self.current = Some(index);
+        if let Err(e) = self.viewports[0].session.play(index) {
+            self.show_toast(format!("无法播放 · {e}"), cx);
+        }
+        self.viewports[0].image.reset();
         cx.notify();
     }
 
-    /// Replaces the current file. Photos carry what mpv misses in their
-    /// header (colour profile, HEIF rotation, oversize) as per-file options,
-    /// which mpv drops again when the file ends. Videos load as they are.
-    fn load(&self, path: &Path, kind: Option<Kind>) {
-        let url = path.to_string_lossy();
-        let opts = (kind == Some(Kind::Photo))
-            .then(|| photo::probe(path).mpv_options())
-            .flatten();
-        let result = match opts {
-            Some(opts) => self
-                .mpv
-                .command_async(&["loadfile", &url, "replace", "-1", &opts]),
-            None => self.mpv.command_async(&["loadfile", &url]),
-        };
-        if let Err(e) = result {
-            eprintln!("[iris] loadfile {url} failed: {e}");
-        }
-    }
-
-    fn current_kind(&self) -> Option<Kind> {
-        self.current
-            .and_then(|i| self.entries.get(i))
-            .map(|e| e.kind)
-    }
-
     fn step(&mut self, delta: isize, cx: &mut Context<Self>) {
-        if self.entries.is_empty() {
-            return;
+        if let Err(e) = self.viewports[0].session.step(delta) {
+            self.show_toast(format!("无法切换 · {e}"), cx);
         }
-        let len = self.entries.len() as isize;
-        let next = self
-            .current
-            .map(|c| c as isize + delta)
-            .unwrap_or(0)
-            .rem_euclid(len);
-        self.play(next as usize, cx);
+        self.viewports[0].image.reset();
+        cx.notify();
+    }
+
+    fn command(&mut self, command: Command, cx: &mut Context<Self>) {
+        if let Err(e) = self.viewports[0].session.execute(command) {
+            self.show_toast(format!("操作失败 · {e}"), cx);
+        }
     }
 
     fn show_toast(&mut self, msg: impl Into<SharedString>, cx: &mut Context<Self>) {
@@ -457,110 +424,47 @@ impl IrisWindow {
         );
     }
 
-    fn on_event(&mut self, ev: Event, cx: &mut Context<Self>) {
-        match ev {
-            Event::PropertyChange { id, value, .. } => match (id, value) {
-                (prop::TIME_POS, Value::Double(t)) => {
-                    self.time_pos = t;
-                    // Repaint the UI at most 4x per second for the clock; the
-                    // video itself never needs a GPUI repaint.
-                    // Nothing shows the clock while the fullscreen chrome is
-                    // hidden; showing it again repaints anyway.
-                    let tick = (t * 4.).floor() as i64;
-                    if tick != self.tick {
-                        self.tick = tick;
-                        if self.chrome_shown() {
-                            cx.notify();
-                        }
-                    }
+    fn on_event(&mut self, event: SessionEvent, cx: &mut Context<Self>) {
+        self.viewports[0].session.apply(&event);
+        match event {
+            SessionEvent::Position(t) => {
+                let tick = (t * 4.).floor() as i64;
+                if tick != self.tick {
+                    self.tick = tick;
+                    if self.chrome_shown() { cx.notify(); }
                 }
-                (prop::DURATION, Value::Double(d)) => {
-                    self.duration = d;
-                    cx.notify();
-                }
-                (prop::PAUSE, Value::Flag(p)) => {
-                    self.paused = p;
-                    cx.notify();
-                }
-                (prop::VOLUME, Value::Double(v)) => {
-                    self.volume = v;
-                    cx.notify();
-                }
-                (prop::SPEED, Value::Double(s)) => {
-                    self.speed = s;
-                    cx.notify();
-                }
-                (prop::VIDEO_W, Value::Int(w)) => {
-                    self.video_size.0 = w;
-                    cx.notify();
-                }
-                (prop::VIDEO_H, Value::Int(h)) => {
-                    self.video_size.1 = h;
-                    cx.notify();
-                }
-                (prop::HWDEC, Value::Str(s)) => {
-                    self.hwdec = s;
-                    cx.notify();
-                }
-                (prop::HWDEC, Value::None) => {
-                    self.hwdec.clear();
-                    cx.notify();
-                }
-                (prop::SUB_VISIBLE, Value::Flag(v)) => {
-                    self.subs_visible = v;
-                    cx.notify();
-                }
-                (prop::TIME_POS, Value::None) => {
-                    self.time_pos = 0.;
-                    cx.notify();
-                }
-                _ => {}
-            },
-            Event::FileLoaded | Event::VideoReconfig => cx.notify(),
-            Event::EndFile {
-                reason: iris_mpv::EndReason::Error,
-                error,
-            } => {
-                self.show_toast(format!("无法播放 · mpv 错误 {error}"), cx);
             }
-            _ => {}
+            SessionEvent::Error(code) => self.show_toast(format!("无法播放 · 错误 {code}"), cx),
+            _ => cx.notify(),
         }
     }
 
     // ---- actions ----
 
-    fn toggle_pause(&mut self, _: &TogglePause, _: &mut Window, _: &mut Context<Self>) {
-        let _ = self.mpv.command_async(&["cycle", "pause"]);
+    fn toggle_pause(&mut self, _: &TogglePause, _: &mut Window, cx: &mut Context<Self>) {
+        self.command(Command::TogglePlayback, cx);
     }
-    fn seek_back(&mut self, _: &SeekBack, _: &mut Window, cx: &mut Context<Self>) {
-        if self.current_kind() == Some(Kind::Photo) {
-            self.step(-1, cx);
-        } else {
-            let _ = self.mpv.command_async(&["seek", "-5", "relative"]);
-            self.bump_activity(cx);
-        }
+    fn seek_back(&mut self, _: &SeekBackwardExact, _: &mut Window, cx: &mut Context<Self>) {
+        self.command(Command::SeekRelative(-5.), cx);
+        self.bump_activity(cx);
     }
-    fn seek_forward(&mut self, _: &SeekForward, _: &mut Window, cx: &mut Context<Self>) {
-        if self.current_kind() == Some(Kind::Photo) {
-            self.step(1, cx);
-        } else {
-            let _ = self.mpv.command_async(&["seek", "5", "relative"]);
-            self.bump_activity(cx);
-        }
+    fn seek_forward(&mut self, _: &SeekForwardExact, _: &mut Window, cx: &mut Context<Self>) {
+        self.command(Command::SeekRelative(5.), cx);
+        self.bump_activity(cx);
     }
     fn volume_up(&mut self, _: &VolumeUp, _: &mut Window, cx: &mut Context<Self>) {
-        let _ = self.mpv.command_async(&["add", "volume", "2"]);
+        self.command(Command::VolumeBy(2.), cx);
         self.bump_activity(cx);
     }
     fn volume_down(&mut self, _: &VolumeDown, _: &mut Window, cx: &mut Context<Self>) {
-        let _ = self.mpv.command_async(&["add", "volume", "-2"]);
+        self.command(Command::VolumeBy(-2.), cx);
         self.bump_activity(cx);
     }
-    fn speed_down(&mut self, _: &SpeedDown, _: &mut Window, _: &mut Context<Self>) {
-        let _ = self.mpv.command_async(&["multiply", "speed", "0.9091"]);
+    fn speed_down(&mut self, _: &SpeedDown, _: &mut Window, cx: &mut Context<Self>) {
+        self.command(Command::SpeedBy(1. / 1.1), cx);
     }
-    fn speed_up(&mut self, _: &SpeedUp, _: &mut Window, _: &mut Context<Self>) {
-        let _ = self.mpv.command_async(&["multiply", "speed", "1.1"]);
+    fn speed_up(&mut self, _: &SpeedUp, _: &mut Window, cx: &mut Context<Self>) {
+        self.command(Command::SpeedBy(1.1), cx);
     }
     /// Windowed: show or collapse the docked directory. Fullscreen: open or
     /// close the directory popup over the video.
@@ -594,17 +498,64 @@ impl IrisWindow {
             window.toggle_fullscreen();
         }
     }
-    fn toggle_subs(&mut self, _: &ToggleSubs, _: &mut Window, _: &mut Context<Self>) {
-        let _ = self.mpv.command_async(&["cycle", "sub-visibility"]);
+    fn toggle_subs(&mut self, _: &ToggleSubs, _: &mut Window, cx: &mut Context<Self>) {
+        self.command(Command::ToggleSubtitles, cx);
     }
-    fn cycle_sub(&mut self, _: &CycleSub, _: &mut Window, _: &mut Context<Self>) {
-        let _ = self.mpv.command_async(&["cycle", "sub"]);
+    fn cycle_sub(&mut self, _: &CycleSub, _: &mut Window, cx: &mut Context<Self>) {
+        self.command(Command::NextSubtitle, cx);
     }
-    fn next_item(&mut self, _: &NextItem, _: &mut Window, cx: &mut Context<Self>) {
+
+    fn cycle_audio(&mut self, _: &CycleAudio, _: &mut Window, cx: &mut Context<Self>) {
+        self.command(Command::NextAudio, cx);
+    }
+
+    fn image_geometry(&self) -> ([f64; 2], [f64; 2]) {
+        let rect = self.viewports[0].rect.get().map(|r| r.0).unwrap_or([0.;4]);
+        let state = &self.viewports[0].session.state;
+        let (mut w,mut h) = state.video_size;
+        if state.rotation.rem_euclid(180) == 90 { std::mem::swap(&mut w, &mut h); }
+        ([rect[2],rect[3]], [w.max(1) as f64,h.max(1) as f64])
+    }
+
+    fn apply_image_view(&mut self, cx: &mut Context<Self>) {
+        let view = &self.viewports[0];
+        if let Err(e) = view.session.transform(view.image.zoom, view.image.pan) {
+            self.show_toast(format!("缩放失败 · {e}"), cx);
+        }
+        cx.notify();
+    }
+
+    fn toggle_image_size(&mut self, _: &ToggleImageSize, window: &mut Window, cx: &mut Context<Self>) {
+        let (viewport, media) = self.image_geometry();
+        self.viewports[0].image.toggle_actual_size(viewport, media, window.scale_factor() as f64);
+        self.apply_image_view(cx);
+    }
+
+    fn fit_image(&mut self, _: &FitImage, _: &mut Window, cx: &mut Context<Self>) {
+        self.viewports[0].image.reset();
+        self.apply_image_view(cx);
+    }
+
+    fn zoom_at(&mut self, delta: f64, point: Option<Point<Pixels>>, cx: &mut Context<Self>) {
+        let (viewport, media) = self.image_geometry();
+        let rect = self.viewports[0].rect.get().map(|r|r.0).unwrap_or([0.;4]);
+        let point = point.map(|p| [f32::from(p.x) as f64-rect[0], f32::from(p.y) as f64-rect[1]])
+            .unwrap_or([viewport[0]/2.,viewport[1]/2.]);
+        self.viewports[0].image.zoom_at(delta, point, viewport, media);
+        self.apply_image_view(cx);
+    }
+
+    fn zoom_in(&mut self, _: &ZoomIn, _: &mut Window, cx: &mut Context<Self>) { self.zoom_at(0.25, None, cx); }
+    fn zoom_out(&mut self, _: &ZoomOut, _: &mut Window, cx: &mut Context<Self>) { self.zoom_at(-0.25, None, cx); }
+
+    fn input_context(&self) -> InputContext {
+        InputContext { media: self.viewports[0].session.kind(), zoomed: self.viewports[0].image.zoomed(), overlay: self.dir_popup }
+    }
+    fn next_item(&mut self, _: &OpenNextMedia, _: &mut Window, cx: &mut Context<Self>) {
         self.step(1, cx);
         self.bump_activity(cx);
     }
-    fn prev_item(&mut self, _: &PrevItem, _: &mut Window, cx: &mut Context<Self>) {
+    fn prev_item(&mut self, _: &OpenPreviousMedia, _: &mut Window, cx: &mut Context<Self>) {
         self.step(-1, cx);
         self.bump_activity(cx);
     }
@@ -629,29 +580,22 @@ impl IrisWindow {
         let Some(b) = self.progress_bounds.get() else {
             return;
         };
-        if self.duration <= 0. || b.size.width <= px(0.) {
+        if self.viewports[0].session.state.duration <= 0. || b.size.width <= px(0.) {
             return;
         }
         let ratio = ((x - b.origin.x) / b.size.width).clamp(0., 1.) as f64;
-        let pct = format!("{:.3}", ratio * 100.);
-        let _ = self
-            .mpv
-            .command_async(&["seek", &pct, "absolute-percent+keyframes"]);
+        if let Err(e) = self.viewports[0].session.execute(Command::SeekPercent(ratio * 100.)) {
+            log::error!("seek: {e}");
+        }
     }
 
     // ---- view pieces ----
 
     fn render_titlebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let file = self
-            .current
-            .and_then(|i| self.entries.get(i))
-            .map(|e| e.name.clone())
-            .unwrap_or_default();
-        let folder = self
-            .folder
-            .as_ref()
-            .and_then(|f| f.file_name())
-            .map(|n| n.to_string_lossy().into_owned())
+        let file = self.viewports[0].session.current.as_ref()
+            .and_then(|p| p.file_name()).map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let folder = self.viewports[0].session.folder.as_ref()
+            .and_then(|f| f.file_name()).map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "未打开".into());
         let win_button = |id: &'static str| {
             div()
@@ -738,12 +682,11 @@ impl IrisWindow {
     /// the video; floating it fills the fullscreen popup.
     fn render_directory(&self, floating: bool, cx: &mut Context<Self>) -> impl IntoElement {
         let side = self.settings.directory_side;
-        let videos = self
-            .entries
+        let videos = self.viewports[0].session.entries
             .iter()
             .filter(|e| e.kind == Kind::Video)
             .count();
-        let photos = self.entries.len() - videos;
+        let photos = self.viewports[0].session.entries.len() - videos;
         let tab = |label: String, active: bool| {
             div()
                 .h_full()
@@ -757,8 +700,8 @@ impl IrisWindow {
                 .when(!active, |d| d.text_color(text_dim()))
                 .child(label)
         };
-        let items = self.entries.iter().enumerate().map(|(i, e)| {
-            let is_current = self.current == Some(i);
+        let items = self.viewports[0].session.entries.iter().enumerate().map(|(i, e)| {
+            let is_current = self.viewports[0].session.current.as_ref() == Some(&e.path);
             div()
                 .id(("entry", i))
                 .h(px(48.))
@@ -827,6 +770,8 @@ impl IrisWindow {
             .flex_none()
             .flex()
             .flex_col()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
             // Opaque: a list over moving video is hard to read.
             .when(floating, |d| d.bg(panel()))
             .when(!floating, |d| {
@@ -846,7 +791,6 @@ impl IrisWindow {
                     .border_color(line())
                     .child(tab(format!("视频 {videos}"), true))
                     .child(tab(format!("照片 {photos}"), false))
-                    .child(tab("收藏".into(), false))
                     .child(div().flex_1())
                     .child(side_button("side-left", Side::Left))
                     .child(side_button("side-right", Side::Right))
@@ -919,13 +863,13 @@ impl IrisWindow {
                     .font_family(FONT_MONO)
                     .text_size(px(9.))
                     .text_color(text_dim())
-                    .child(format!("{}", self.entries.len())),
+                    .child(format!("{}", self.viewports[0].session.entries.len())),
             )
     }
 
     fn render_video_area(&self, fullscreen: bool, cx: &mut Context<Self>) -> impl IntoElement {
-        let last_rect = self.video_rect.clone();
-        let video = self.video.clone();
+        let last_rect = self.viewports[0].rect.clone();
+        let video = self.viewports[0].video.clone();
         // Measures where the video area is and moves the native video view
         // there. Between layouts (live resize) AppKit's autoresizing keeps the
         // view's left/top/bottom insets fixed, which matches this layout.
@@ -952,15 +896,15 @@ impl IrisWindow {
         .size_full();
 
         let info = {
-            let (w, h) = self.video_size;
+            let (w, h) = self.viewports[0].session.state.video_size;
             let mut parts = Vec::new();
             if w > 0 {
                 parts.push(format!("{w}×{h}"));
             }
-            parts.push(if self.hwdec.is_empty() || self.hwdec == "no" {
+            parts.push(if self.viewports[0].session.state.hwdec.is_empty() || self.viewports[0].session.state.hwdec == "no" {
                 "软解".into()
             } else {
-                format!("硬解 {}", self.hwdec)
+                format!("硬解 {}", self.viewports[0].session.state.hwdec)
             });
             parts.join(" · ")
         };
@@ -972,17 +916,32 @@ impl IrisWindow {
             .h_full()
             .overflow_hidden()
             .child(probe)
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, ev: &MouseDownEvent, window, cx| {
-                    // A click on the picture closes the directory popup.
-                    if this.dir_popup {
-                        this.close_popup(cx);
-                    } else if ev.click_count == 2 {
-                        window.toggle_fullscreen();
-                    }
-                }),
-            )
+            .key_context({
+                let mut context = gpui::KeyContext::default();
+                context.add("Viewport");
+                context.set("media", match self.viewports[0].session.kind() {
+                    Some(Kind::Photo) => "image", Some(Kind::Video) => "video", None => "none",
+                });
+                if self.viewports[0].image.zoomed() { context.add("zoomed"); }
+                context
+            })
+            .track_focus(&self.focus)
+            .on_scroll_wheel(cx.listener(|this, ev: &gpui::ScrollWheelEvent, _, cx| {
+                let delta = f32::from(ev.delta.pixel_delta(px(20.)).y) as f64 / 240.;
+                if let Some(PointerCommand::Zoom(delta)) = input::resolve_pointer_input(PointerInput::Wheel(delta), this.input_context()) {
+                    this.zoom_at(delta, Some(ev.position), cx);
+                    cx.stop_propagation();
+                }
+            }))
+            .on_mouse_down(MouseButton::Left, cx.listener(|this, ev: &MouseDownEvent, window, cx| {
+                let input = if ev.click_count == 2 { PointerInput::DoubleClick } else { PointerInput::BeginDrag };
+                match input::resolve_pointer_input(input, this.input_context()) {
+                    Some(PointerCommand::CloseOverlay) => this.close_popup(cx),
+                    Some(PointerCommand::ToggleFullscreen) => window.toggle_fullscreen(),
+                    Some(PointerCommand::BeginPan) => this.viewports[0].drag_origin = Some(ev.position),
+                    _ => {}
+                }
+            }))
             // Overlay 1: info chip over the picture, on the edge away from the
             // directory so the popup never covers it.
             .when(self.chrome_shown(), |d| {
@@ -1008,15 +967,10 @@ impl IrisWindow {
             })
             // Overlay 2: toast (bottom-centre, above the floating dock).
             .when_some(self.toast.clone(), |d, msg| {
-                let bottom = match (fullscreen, self.chrome_visible) {
-                    (false, _) => 20.,
-                    (true, true) => DOCK_H + 12.,
-                    (true, false) => 40.,
-                };
                 d.child(
                     div()
                         .absolute()
-                        .bottom(px(bottom))
+                        .top(px(44.))
                         .w_full()
                         .flex()
                         .justify_center()
@@ -1034,7 +988,7 @@ impl IrisWindow {
                         ),
                 )
             })
-            .when(self.current.is_none(), |d| {
+            .when(self.viewports[0].session.current.is_none(), |d| {
                 d.child(
                     div()
                         .absolute()
@@ -1067,6 +1021,7 @@ impl IrisWindow {
                         .border_color(line())
                         // Clicks here are not clicks on the picture.
                         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
                         .child(
                             canvas(move |b, _, _| slot.set(Some(b)), |_, _, _, _| {})
                                 .absolute()
@@ -1085,6 +1040,7 @@ impl IrisWindow {
                     .border_1()
                     .border_color(line())
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
                     .child(self.render_directory(true, cx));
                 d.child(if self.settings.directory_side == Side::Left {
                     popup.left(px(16.))
@@ -1095,8 +1051,8 @@ impl IrisWindow {
     }
 
     fn render_dock_body(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let pct = if self.duration > 0. {
-            (self.time_pos / self.duration).clamp(0., 1.) as f32
+        let pct = if self.viewports[0].session.state.duration > 0. {
+            (self.viewports[0].session.state.time_pos / self.viewports[0].session.state.duration).clamp(0., 1.) as f32
         } else {
             0.
         };
@@ -1120,7 +1076,7 @@ impl IrisWindow {
         } else {
             self.show_directory
         };
-        let vol_segments = (self.volume / 10.).round().clamp(0., 10.) as usize;
+        let vol_segments = (self.viewports[0].session.state.volume / 10.).round().clamp(0., 10.) as usize;
         let field = |label: &'static str, value: String| {
             div()
                 .flex()
@@ -1152,7 +1108,7 @@ impl IrisWindow {
                     .font_family(FONT_MONO)
                     .text_size(px(10.))
                     .text_color(text_dim())
-                    .child(fmt_time(self.time_pos))
+                    .child(fmt_time(self.viewports[0].session.state.time_pos))
                     .child(
                         div()
                             .id("progress")
@@ -1195,7 +1151,7 @@ impl IrisWindow {
                                 }
                             })),
                     )
-                    .child(fmt_time(self.duration)),
+                    .child(fmt_time(self.viewports[0].session.state.duration)),
             )
             .child(
                 div()
@@ -1215,10 +1171,12 @@ impl IrisWindow {
                             )
                             .child(
                                 square("play")
-                                    .child(if self.paused { "▶" } else { "❚❚" })
+                                    .child(if self.viewports[0].session.kind() == Some(Kind::Photo) { "1:1" } else if self.viewports[0].session.state.paused { "▶" } else { "❚❚" })
                                     .border_color(accent())
                                     .on_click(cx.listener(|this, _, w, cx| {
-                                        this.toggle_pause(&TogglePause, w, cx)
+                                        if this.viewports[0].session.kind() == Some(Kind::Photo) {
+                                            this.toggle_image_size(&ToggleImageSize, w, cx);
+                                        } else { this.toggle_pause(&TogglePause, w, cx); }
                                     })),
                             )
                             .child(
@@ -1226,13 +1184,11 @@ impl IrisWindow {
                                     .child("⏭")
                                     .on_click(cx.listener(|this, _, _, cx| this.step(1, cx))),
                             )
-                            .child(
-                                div()
-                                    .pl(px(12.))
-                                    .font_family(FONT_MONO)
-                                    .text_size(px(22.))
-                                    .child(fmt_time(self.time_pos)),
-                            ),
+                            .child(div().pl(px(12.)).font_family(FONT_MONO).text_size(px(22.)).child(
+                                if self.viewports[0].session.kind() == Some(Kind::Photo) {
+                                    format!("{:.0}%", self.viewports[0].image.zoom.exp2() * 100.)
+                                } else { fmt_time(self.viewports[0].session.state.time_pos) }
+                            )),
                     )
                     .child(
                         div()
@@ -1241,13 +1197,20 @@ impl IrisWindow {
                             .gap(px(24.))
                             .child(field(
                                 "字幕",
-                                if self.subs_visible {
+                                if self.viewports[0].session.state.subs_visible {
                                     "开".into()
                                 } else {
                                     "关".into()
                                 },
                             ))
-                            .child(field("速度", format!("{:.2}×", self.speed)))
+                            .child(div().id("audio-track").cursor_pointer()
+                                .on_click(cx.listener(|this, _, _, cx| this.command(Command::NextAudio, cx)))
+                                .child(field("音轨", self.viewports[0].session.state.audio.clone())))
+                            .child(field("速度", format!("{:.2}×", self.viewports[0].session.state.speed)))
+                            .when(self.viewports[0].session.kind() == Some(Kind::Photo), |d| {
+                                d.child(div().id("fit-image").cursor_pointer().child("适应窗口")
+                                    .on_click(cx.listener(|this, _, window, cx| this.fit_image(&FitImage, window, cx))))
+                            })
                             .child(
                                 div()
                                     .flex()
@@ -1258,7 +1221,7 @@ impl IrisWindow {
                                             .font_family(FONT_MONO)
                                             .text_size(px(9.))
                                             .text_color(text_dim())
-                                            .child(format!("音量 {:.0}", self.volume)),
+                                            .child(format!("音量 {:.0}", self.viewports[0].session.state.volume)),
                                     )
                                     .child(div().flex().gap(px(2.)).children((0..10).map(|i| {
                                         div()
@@ -1267,10 +1230,8 @@ impl IrisWindow {
                                             .h(px(12.))
                                             .bg(if i < vol_segments { accent() } else { line() })
                                             .cursor_pointer()
-                                            .on_click(cx.listener(move |this, _, _, _| {
-                                                let v = format!("{}", (i + 1) * 10);
-                                                let _ =
-                                                    this.mpv.command_async(&["set", "volume", &v]);
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.command(Command::SetVolume(((i + 1) * 10) as f64), cx);
                                             }))
                                     }))),
                             )
@@ -1337,19 +1298,26 @@ impl Render for IrisWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_fullscreen(window, cx);
         let fullscreen = self.fullscreen;
-        if let Some(v) = self.video.borrow_mut().as_mut() {
+        if let Some(v) = self.viewports[0].video.borrow_mut().as_mut() {
             v.set_scale(window.scale_factor() as f64);
         }
         if !fullscreen {
             platform::hide_traffic_lights(window);
         }
+        let inset = if fullscreen && self.chrome_visible { DOCK_H as f64 + 12. } else { 0. };
+        // Fullscreen changes layout this frame; the canvas probe still holds
+        // the previous windowed rectangle until prepaint.
+        let height = if fullscreen { f32::from(window.viewport_size().height) as f64 }
+            else { self.viewports[0].rect.get().map(|r| r.0[3]).unwrap_or(0.) };
+        self.viewports[0].session.subtitle_inset(inset, height);
 
         // The root paints nothing: wherever no panel is drawn, mpv's layer
         // underneath shows through.
         div()
             .id("root")
-            .key_context("Iris")
-            .track_focus(&self.focus)
+            .key_context("Workspace")
+            .capture_any_mouse_up(cx.listener(|this, _, window, _| this.focus.focus(window)))
+            .on_any_mouse_down(cx.listener(|this, _, window, _| this.focus.focus(window)))
             .size_full()
             .flex()
             .flex_col()
@@ -1367,6 +1335,11 @@ impl Render for IrisWindow {
             .on_action(cx.listener(Self::exit_fullscreen))
             .on_action(cx.listener(Self::toggle_subs))
             .on_action(cx.listener(Self::cycle_sub))
+            .on_action(cx.listener(Self::cycle_audio))
+            .on_action(cx.listener(Self::toggle_image_size))
+            .on_action(cx.listener(Self::fit_image))
+            .on_action(cx.listener(Self::zoom_in))
+            .on_action(cx.listener(Self::zoom_out))
             .on_action(cx.listener(Self::next_item))
             .on_action(cx.listener(Self::prev_item))
             .on_action(cx.listener(Self::open_file))
@@ -1377,10 +1350,20 @@ impl Render for IrisWindow {
             }))
             .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _, cx| {
                 this.mouse_pos = Some(ev.position);
+                if ev.pressed_button == Some(MouseButton::Left) {
+                    if let Some(origin) = this.viewports[0].drag_origin {
+                        this.viewports[0].drag_origin = Some(ev.position);
+                        let delta = [f32::from(ev.position.x-origin.x) as f64, f32::from(ev.position.y-origin.y) as f64];
+                        let (viewport, media) = this.image_geometry();
+                        this.viewports[0].image.pan_by(delta, viewport, media);
+                        this.apply_image_view(cx);
+                    }
+                } else { this.viewports[0].drag_origin = None; }
                 if this.fullscreen {
                     this.bump_activity(cx);
                 }
             }))
+            .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, _| this.viewports[0].drag_origin = None))
             // Hidden until the mouse moves (macOS) / no cursor (Windows).
             .when(!self.chrome_shown(), |d| d.cursor(CursorStyle::None))
             .when(!fullscreen, |d| d.child(self.render_titlebar(cx)))

@@ -1,7 +1,7 @@
 # cargo-deny: licence gate for the Rust dependency tree.
 #   cargo install cargo-deny && cargo deny check licenses
 #
-# Iris plans a permissive licence (route B, see docs/DECISIONS.md), so every
+# Iris uses MIT OR Apache-2.0 (route B, see docs/DECISIONS.md), so every
 # crate must be usable in permissive or closed-source builds. GPL / AGPL /
 # LGPL-only crates are rejected because they are not listed here.
 # MPL-2.0 is file-level copyleft and fine to link (dwrote, option-ext,
@@ -33,5 +33,5 @@ allow = [
 confidence-threshold = 0.9
 
 [licenses.private]
-# The workspace's own crates are unpublished and still UNLICENSED.
+# Workspace crates are unpublished; their MIT/Apache notices ship with the app.
 ignore = true

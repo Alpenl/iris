@@ -194,7 +194,7 @@ extern "C" fn draw(
     // Never block the main thread waiting for a frame's display time.
     let block = unsafe { pthread_main_np() } == 0;
     if let Err(e) = render.render_gl(fbo, vp[2], vp[3], true, block) {
-        eprintln!("[iris] render failed: {e}");
+        log::error!("render failed: {e}");
     }
     unsafe { glFlush() };
     render.report_swap();

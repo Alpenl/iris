@@ -1,3 +1,5 @@
 /target
 .DS_Store
 /test-media
+__pycache__/
+*.py[cod]

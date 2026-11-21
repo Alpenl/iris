@@ -1,8 +1,12 @@
 //! Iris — mpv-based photo/video player (technical spike).
+#![cfg_attr(all(target_os = "windows", not(debug_assertions)), windows_subsystem = "windows")]
 
 mod debug;
+mod geometry;
 mod icc;
+mod input;
 mod library;
+mod logging;
 mod photo;
 mod platform;
 mod player;
@@ -27,6 +31,7 @@ fn main() {
     unsafe {
         std::env::remove_var("GPUI_DISABLE_DIRECT_COMPOSITION")
     };
+    logging::init();
     let initial = std::env::args_os().nth(1).map(PathBuf::from);
     Application::new().run(move |cx: &mut App| {
         if let Err(e) = cx.text_system().add_fonts(vec![
@@ -40,15 +45,15 @@ fn main() {
                 "../../../Resources/Fonts/IBMPlexMono-Medium.ttf"
             )),
         ]) {
-            eprintln!("[iris] fonts: {e:#}");
+            log::error!("fonts: {e:#}");
         }
         ui::bind_keys(cx);
         cx.on_action(|_: &ui::Quit, cx| cx.quit());
 
-        let mpv = match player::create() {
+        let session = match player::Session::new() {
             Ok(m) => m,
             Err(e) => {
-                eprintln!("[iris] mpv init failed: {e:#}");
+                log::error!("player initialization: {e:#}");
                 cx.quit();
                 return;
             }
@@ -71,9 +76,9 @@ fn main() {
             ..Default::default()
         };
         if let Err(e) = cx.open_window(options, move |window, cx| {
-            cx.new(|cx| ui::IrisWindow::new(mpv, initial, window, cx))
+            cx.new(|cx| ui::IrisWindow::new(session, initial, window, cx))
         }) {
-            eprintln!("[iris] open window failed: {e:#}");
+            log::error!("opening window: {e:#}");
             cx.quit();
             return;
         }

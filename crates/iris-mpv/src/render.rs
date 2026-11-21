@@ -1,8 +1,8 @@
-//! libmpv render API (OpenGL backend for now; D3D11 is in mpv 0.42 too).
+//! libmpv render API (OpenGL and Direct3D 11).
 //!
 //! Rules from render.h that this wrapper relies on:
 //! - The update callback may run on any mpv thread and must only signal.
-//! - All other functions must run with the GL context current, never concurrently.
+//! - Render calls are serialized; OpenGL additionally requires its context current.
 //! - The render context must be freed before the `Mpv` handle is destroyed;
 //!   `RenderContext` keeps an `Arc<Mpv>` so the handle outlives it.
 
@@ -61,6 +61,59 @@ impl RenderContext {
         Ok(Self { ctx, update: None, _mpv: mpv })
     }
 
+    /// Creates a D3D11 render context on the caller's independent device.
+    ///
+    /// # Safety
+    /// `device` must be a live ID3D11Device without SINGLETHREADED. Its immediate
+    /// context must not be used concurrently with this render context.
+    pub unsafe fn new_d3d11(mpv: Arc<Mpv>, device: *mut c_void) -> Result<Self> {
+        let mut init = sys::mpv_d3d11_init_params { device };
+        let mut advanced: c_int = 1;
+        let mut params = [
+            sys::mpv_render_param {
+                type_: sys::MPV_RENDER_PARAM_API_TYPE,
+                data: sys::MPV_RENDER_API_TYPE_D3D11.as_ptr() as *mut c_void,
+            },
+            sys::mpv_render_param {
+                type_: sys::MPV_RENDER_PARAM_D3D11_INIT_PARAMS,
+                data: &mut init as *mut _ as *mut c_void,
+            },
+            sys::mpv_render_param {
+                type_: sys::MPV_RENDER_PARAM_ADVANCED_CONTROL,
+                data: &mut advanced as *mut _ as *mut c_void,
+            },
+            sys::mpv_render_param { type_: 0, data: ptr::null_mut() },
+        ];
+        let mut ctx = ptr::null_mut();
+        check(unsafe { sys::mpv_render_context_create(&mut ctx, mpv.raw(), params.as_mut_ptr()) },
+            || "mpv_render_context_create(d3d11)".into())?;
+        if ctx.is_null() {
+            return Err(Error { code: -1, context: "render context is null".into() });
+        }
+        Ok(Self { ctx, update: None, _mpv: mpv })
+    }
+
+    /// # Safety
+    /// `texture` must be a non-MSAA, single-mip ID3D11Texture2D render target on
+    /// this context's device, and must stay alive until this call returns.
+    pub unsafe fn render_d3d11(&self, texture: *mut c_void) -> Result<()> {
+        let mut fbo = sys::mpv_d3d11_fbo { tex: texture };
+        let mut block: c_int = 0;
+        let mut params = [
+            sys::mpv_render_param {
+                type_: sys::MPV_RENDER_PARAM_D3D11_FBO,
+                data: &mut fbo as *mut _ as *mut c_void,
+            },
+            sys::mpv_render_param {
+                type_: sys::MPV_RENDER_PARAM_BLOCK_FOR_TARGET_TIME,
+                data: &mut block as *mut _ as *mut c_void,
+            },
+            sys::mpv_render_param { type_: 0, data: ptr::null_mut() },
+        ];
+        check(unsafe { sys::mpv_render_context_render(self.ctx, params.as_mut_ptr()) },
+            || "mpv_render_context_render(d3d11)".into())
+    }
+
     /// Sets the callback mpv calls when a new frame (or redraw) is wanted.
     /// It runs on an mpv thread: only signal from it, never call mpv.
     pub fn set_update_callback(&mut self, f: impl Fn() + Send + Sync + 'static) {
@@ -108,7 +161,7 @@ impl RenderContext {
 }
 
 impl Drop for RenderContext {
-    /// The GL context must be current when this runs.
+    /// OpenGL callers must keep their GL context current when this runs.
     fn drop(&mut self) {
         unsafe {
             sys::mpv_render_context_set_update_callback(self.ctx, None, ptr::null_mut());

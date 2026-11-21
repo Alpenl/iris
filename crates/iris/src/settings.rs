@@ -64,7 +64,7 @@ impl Settings {
             .map_or(Ok(()), std::fs::create_dir_all)
             .and_then(|()| std::fs::write(&p, format!("directory_side = {side}\n")));
         if let Err(e) = result {
-            eprintln!("[iris] saving settings to {} failed: {e}", p.display());
+            log::error!("saving settings to {} failed: {e}", p.display());
         }
     }
 }
