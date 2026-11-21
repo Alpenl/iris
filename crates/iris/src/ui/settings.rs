@@ -10,6 +10,7 @@ use super::widgets::{icon, icon_button, tip};
 use super::*;
 use crate::assets::Icon;
 use crate::logging;
+use crate::plugin::{PluginSource, PluginStatus, plugins_dir};
 use crate::settings::{
     DEFAULT_DIRECTORY_WIDTH, Hwdec, MAX_DIRECTORY_WIDTH, MIN_DIRECTORY_WIDTH, OnEof, PhotoDefault,
     Side, SubLang, VideoWheel, path as settings_path,
@@ -30,6 +31,7 @@ impl IrisWindow {
             SettingsTab::Playback => self.settings_playback(cx).into_any_element(),
             SettingsTab::Tracks => self.settings_tracks(cx).into_any_element(),
             SettingsTab::View => self.settings_view(cx).into_any_element(),
+            SettingsTab::Plugins => self.settings_plugins(cx).into_any_element(),
             SettingsTab::Shortcuts => self.settings_shortcuts(cx).into_any_element(),
         };
 
@@ -161,6 +163,7 @@ impl IrisWindow {
                                     .child(nav_item(SettingsTab::Playback, "播放"))
                                     .child(nav_item(SettingsTab::Tracks, "字幕与音频"))
                                     .child(nav_item(SettingsTab::View, "全屏与看图"))
+                                    .child(nav_item(SettingsTab::Plugins, "插件"))
                                     .child(nav_item(SettingsTab::Shortcuts, "快捷键与数据")),
                             )
                             .child(
@@ -512,6 +515,177 @@ impl IrisWindow {
             ))
     }
 
+    fn settings_plugins(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let list = self.plugins.list();
+        let dir = plugins_dir();
+        let dir_text = dir
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "未知".into());
+        let reveal_label = if cfg!(target_os = "macos") {
+            "打开插件目录"
+        } else {
+            "打开插件文件夹"
+        };
+
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(12.))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(8.))
+                    .pb(px(10.))
+                    .border_b_1()
+                    .border_color(line())
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.))
+                            .child(
+                                div()
+                                    .text_size(px(12.))
+                                    .text_color(text())
+                                    .child("控制面与矢量叠层插件"),
+                            )
+                            .child(
+                                div()
+                                    .font_family(FONT_MONO)
+                                    .text_size(px(10.))
+                                    .text_color(text_faint())
+                                    .truncate()
+                                    .child(dir_text),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .gap(px(6.))
+                            .child(action_button("reload-plugins", "重新扫描").on_click(
+                                cx.listener(|this, _, _, cx| {
+                                    this.reload_plugins(cx);
+                                }),
+                            ))
+                            .when_some(dir, |d, p| {
+                                d.child(action_button("open-plugins-dir", reveal_label).on_click(
+                                    cx.listener(move |_, _, _, cx| {
+                                        let _ = std::fs::create_dir_all(&p);
+                                        cx.reveal_path(&p);
+                                    }),
+                                ))
+                            }),
+                    ),
+            )
+            .children(list.into_iter().enumerate().map(|(i, info)| {
+                let pid = info.manifest.id.clone();
+                let enabled = info.enabled;
+                let source_tag = match info.source {
+                    PluginSource::Builtin => "内置",
+                    PluginSource::External(_) => "外部进程",
+                };
+                let (status_text, status_accent) = match &info.status {
+                    PluginStatus::Running => ("运行中".to_string(), false),
+                    PluginStatus::Disabled => ("已禁用".to_string(), false),
+                    PluginStatus::Error(err) => (format!("错误: {err}"), true),
+                };
+                div()
+                    .p(px(10.))
+                    .bg(window_bg())
+                    .border_1()
+                    .border_color(line())
+                    .flex()
+                    .flex_col()
+                    .gap(px(6.))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap(px(10.))
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(6.))
+                                    .child(
+                                        div()
+                                            .text_size(px(12.))
+                                            .text_color(text())
+                                            .child(info.manifest.name),
+                                    )
+                                    .child(
+                                        div()
+                                            .font_family(FONT_MONO)
+                                            .text_size(px(10.))
+                                            .text_color(text_faint())
+                                            .child(format!("v{}", info.manifest.version)),
+                                    )
+                                    .child(
+                                        div()
+                                            .px(px(5.))
+                                            .py(px(1.))
+                                            .bg(panel())
+                                            .border_1()
+                                            .border_color(line())
+                                            .text_size(px(10.))
+                                            .text_color(text_dim())
+                                            .child(source_tag),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(10.))
+                                            .text_color(if status_accent {
+                                                accent()
+                                            } else {
+                                                text_faint()
+                                            })
+                                            .child(status_text),
+                                    ),
+                            )
+                            .child(toggle_indexed(
+                                ("plugin-toggle", i),
+                                enabled,
+                                cx.listener(move |this, _, _, cx| {
+                                    this.toggle_plugin_enabled(&pid, !enabled, cx);
+                                }),
+                            )),
+                    )
+                    .when(!info.manifest.description.is_empty(), |d| {
+                        d.child(
+                            div()
+                                .text_size(px(11.))
+                                .text_color(text_dim())
+                                .child(info.manifest.description),
+                        )
+                    })
+                    .child(
+                        div()
+                            .flex()
+                            .flex_wrap()
+                            .gap(px(4.))
+                            .children(info.manifest.permissions.into_iter().map(|perm| {
+                                div()
+                                    .px(px(5.))
+                                    .py(px(1.))
+                                    .bg(panel())
+                                    .border_1()
+                                    .border_color(line())
+                                    .text_size(px(10.))
+                                    .text_color(text_faint())
+                                    .child(perm.label())
+                            })),
+                    )
+            }))
+    }
+
     fn settings_shortcuts(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let cmd = if cfg!(target_os = "macos") {
             "⌘"
@@ -519,6 +693,7 @@ impl IrisWindow {
             "Ctrl+"
         };
         let open_k = format!("{cmd}O");
+        let pal_k = format!("{cmd}P");
         let search_k = format!("{cmd}F");
         let refresh_k = format!("{cmd}R");
         let shot_k = format!("{cmd}S");
@@ -529,6 +704,7 @@ impl IrisWindow {
             (
                 "通用",
                 vec![
+                    (pal_k, "命令面板（内核与插件命令）"),
                     (open_k, "打开文件或文件夹"),
                     (search_k, "搜索当前目录"),
                     ("Tab".into(), "展开 / 收起目录（全屏为弹出）"),
@@ -773,6 +949,14 @@ fn setting_row(
 
 fn toggle(
     id: &'static str,
+    on: bool,
+    on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App) + 'static,
+) -> impl IntoElement {
+    toggle_indexed(id, on, on_click)
+}
+
+fn toggle_indexed(
+    id: impl Into<gpui::ElementId>,
     on: bool,
     on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App) + 'static,
 ) -> impl IntoElement {

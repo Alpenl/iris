@@ -23,4 +23,6 @@ metadata = json.loads(subprocess.run(
     cwd=ROOT, check=True, capture_output=True, text=True).stdout)
 core = next(p for p in metadata['packages'] if p['name'] == 'iris-core')
 assert not any(d['name'] == 'gpui' for d in core['dependencies']), 'iris-core must stay headless'
-print('Python syntax, UI playback boundary, devtools gate, headless iris-core, Cargo metadata: OK')
+api = next(p for p in metadata['packages'] if p['name'] == 'iris-api')
+assert not any(d['name'] in ('gpui', 'iris-mpv') for d in api['dependencies']), 'iris-api must stay pure control-plane'
+print('Python syntax, UI playback boundary, devtools gate, headless iris-core & iris-api, Cargo metadata: OK')

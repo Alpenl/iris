@@ -2468,6 +2468,7 @@ dependencies = [
  "futures",
  "gpui",
  "image",
+ "iris-api",
  "iris-core",
  "iris-mpv",
  "libc",
@@ -2480,15 +2481,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "iris-api"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "iris-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "env_logger",
  "futures",
+ "iris-api",
  "iris-mpv",
  "log",
  "miniz_oxide 0.8.9",
+ "serde_json",
 ]
 
 [[package]]

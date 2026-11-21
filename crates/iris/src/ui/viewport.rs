@@ -98,7 +98,7 @@ impl IrisWindow {
             .child(probe)
             .key_context({
                 let mut context = gpui::KeyContext::default();
-                if self.settings_open || self.context_menu.is_some() {
+                if self.settings_open || self.context_menu.is_some() || self.palette_open {
                     context.add("Overlay");
                 } else {
                     context.add("Viewport");
@@ -207,6 +207,8 @@ impl IrisWindow {
             .when(kind == Some(Kind::Audio), |d| {
                 d.child(self.render_audio_card())
             })
+            // Plugin vector overlay slot (normalized shapes; non-intercepting).
+            .children(self.render_plugin_overlay())
             // Fullscreen: file name and media info at the top, on the edge
             // away from the directory so the popup never covers it.
             .when(fullscreen && self.chrome_visible, |d| {

@@ -12,6 +12,7 @@ devtools = ["iris-core/devtools"]
 gpui.workspace = true
 anyhow.workspace = true
 iris-mpv = { path = "../iris-mpv" }
+iris-api = { path = "../iris-api" }
 iris-core = { path = "../iris-core" }
 futures = "0.3"
 url = "2"

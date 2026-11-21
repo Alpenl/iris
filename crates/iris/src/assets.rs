@@ -72,6 +72,8 @@ icons! {
     Music => "music",
     FlipH => "flip-h",
     Aspect => "aspect",
+    Puzzle => "puzzle",
+    Command => "command",
 }
 
 pub struct Assets;

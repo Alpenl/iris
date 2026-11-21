@@ -9,5 +9,6 @@ pub mod library;
 pub mod logging;
 pub mod photo;
 pub mod player;
+pub mod plugin;
 pub mod settings;
 pub mod store;

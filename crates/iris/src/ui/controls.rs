@@ -114,9 +114,13 @@ impl IrisWindow {
                 .children(dir.take())
                 .when(start.is_some(), |d| d.child(separator()));
         }
+        let plugin_status = (!tiny)
+            .then(|| self.render_plugin_status_slot(cx))
+            .flatten();
         row = row
             .children(start)
             .child(div().flex_1())
+            .children(plugin_status)
             .children(end)
             .child(self.window_buttons(tiny, cx));
         if let Some(dir) = dir {
@@ -617,10 +621,28 @@ impl IrisWindow {
         } else {
             "Ctrl+,"
         };
+        let pal_key = if cfg!(target_os = "macos") {
+            "⌘P"
+        } else {
+            "Ctrl+P"
+        };
         div()
             .flex()
             .items_center()
             .gap(px(2.))
+            .when(!tiny, |d| {
+                d.child(
+                    icon_button(
+                        ("palette", usize::from(self.palette_open)),
+                        Icon::Command,
+                        self.palette_open,
+                    )
+                    .tooltip(tip("命令面板（内核与插件命令）", Some(pal_key)))
+                    .on_click(cx.listener(|this, _, w, cx| {
+                        this.open_command_palette(&OpenCommandPalette, w, cx)
+                    })),
+                )
+            })
             .when(current.is_some() && !tiny, |d| {
                 d.child(
                     icon_button(

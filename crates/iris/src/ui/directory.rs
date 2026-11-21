@@ -80,6 +80,9 @@ impl IrisWindow {
         let side = self.settings.directory_side;
         let width = self.effective_directory_width(window);
         let compact = width < 320.;
+        let plugin_body = self
+            .sidebar_plugins
+            .then(|| self.render_plugin_sidebar(cx).into_any_element());
         let session = &self.viewports[0].session;
         let videos = session
             .entries
@@ -212,6 +215,24 @@ impl IrisWindow {
                 None,
             ))
             .on_click(cx.listener(move |this, _, _, cx| this.set_directory_side(other, cx)));
+
+        let plugins_btn = icon_button(
+            ("dir-plugins", usize::from(self.sidebar_plugins)),
+            Icon::Puzzle,
+            self.sidebar_plugins,
+        )
+        .tooltip(tip(
+            if self.sidebar_plugins {
+                "返回文件目录"
+            } else {
+                "切换到插件面板"
+            },
+            None,
+        ))
+        .on_click(cx.listener(|this, _, _, cx| {
+            this.sidebar_plugins = !this.sidebar_plugins;
+            cx.notify();
+        }));
 
         let row_count = self.dir_rows.len();
         let note = (row_count == 0).then(|| self.directory_note());
@@ -586,26 +607,42 @@ impl IrisWindow {
                     .px(px(4.))
                     .border_b_1()
                     .border_color(line())
-                    .child(tab("全部", session.entries.len(), DirectoryFilter::All))
-                    .child(tab("视频", videos, DirectoryFilter::Videos))
-                    .child(tab("照片", photos, DirectoryFilter::Photos))
-                    .child(tab("收藏", favorites, DirectoryFilter::Favorites))
+                    .when(!self.sidebar_plugins, |d| {
+                        d.child(tab("全部", session.entries.len(), DirectoryFilter::All))
+                            .child(tab("视频", videos, DirectoryFilter::Videos))
+                            .child(tab("照片", photos, DirectoryFilter::Photos))
+                            .child(tab("收藏", favorites, DirectoryFilter::Favorites))
+                    })
+                    .when(self.sidebar_plugins, |d| {
+                        d.child(
+                            div()
+                                .px(px(8.))
+                                .text_size(px(12.))
+                                .text_color(text())
+                                .child("插件面板"),
+                        )
+                    })
                     .child(div().flex_1())
-                    .child(search_btn)
-                    .child(sort_btn)
-                    .when(!compact, |d| d.child(open_btn).children(refresh_btn))
+                    .when(!self.sidebar_plugins, |d| {
+                        d.child(search_btn)
+                            .child(sort_btn)
+                            .when(!compact, |d| d.child(open_btn).children(refresh_btn))
+                    })
+                    .child(plugins_btn)
                     .child(swap),
             )
-            .children(search_bar)
-            .child(
-                div()
-                    .relative()
-                    .flex_1()
-                    .min_h(px(0.))
-                    .py(px(4.))
-                    .when(row_count > 0, |d| d.child(list).children(scrollbar))
-                    .children(note),
-            )
+            .when(!self.sidebar_plugins, |d| {
+                d.children(search_bar).child(
+                    div()
+                        .relative()
+                        .flex_1()
+                        .min_h(px(0.))
+                        .py(px(4.))
+                        .when(row_count > 0, |d| d.child(list).children(scrollbar))
+                        .children(note),
+                )
+            })
+            .children(plugin_body)
             .children(resize_handle)
     }
 

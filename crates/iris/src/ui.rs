@@ -16,11 +16,14 @@ use gpui::{
     Subscription, Task, UniformListScrollHandle, Window, actions, div, prelude::FluentBuilder, px,
 };
 
+use iris_api::{HostCommand, HostEvent, PlaybackSnapshot};
+
 use crate::geometry::ImageView;
 use crate::input::{self, InputContext, PointerCommand, PointerInput};
 use crate::library::{self, Entry, Kind, ScanResult, SortBy, SortOrder};
 use crate::platform::{self, MediaKey, MediaKeyBridge, PinchMonitor, SleepPreventer};
 use crate::player::{self, Command, Session, SessionEvent, TrackKind};
+use crate::plugin::{self, PluginManager};
 use crate::settings::{
     MAX_DIRECTORY_WIDTH, MIN_DIRECTORY_WIDTH, OnEof, PhotoDefault, Settings, Side, VideoWheel,
 };
@@ -32,6 +35,8 @@ mod context_menu;
 mod controls;
 mod directory;
 mod info;
+mod palette;
+mod plugin_ui;
 mod popover;
 mod settings;
 mod titlebar;
@@ -65,6 +70,7 @@ enum SettingsTab {
     Playback,
     Tracks,
     View,
+    Plugins,
     Shortcuts,
 }
 
@@ -98,6 +104,7 @@ actions!(
         ToggleFullscreen,
         ExitFullscreen,
         OpenSettings,
+        OpenCommandPalette,
         ToggleAlwaysOnTop,
         ToggleInfo,
         TakeScreenshot,
@@ -231,6 +238,8 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("s", ToggleFavorite, Some("Viewport")),
         KeyBinding::new("secondary-o", OpenFile, Some("Workspace")),
         KeyBinding::new("secondary-r", RefreshDirectory, Some("Workspace")),
+        KeyBinding::new("secondary-p", OpenCommandPalette, Some("Workspace")),
+        KeyBinding::new("secondary-shift-p", OpenCommandPalette, Some("Workspace")),
         KeyBinding::new("secondary-,", OpenSettings, Some("Workspace")),
         KeyBinding::new("secondary-q", Quit, Some("Workspace")),
     ]);
@@ -239,9 +248,16 @@ pub fn bind_keys(cx: &mut App) {
 pub struct IrisWindow {
     focus: FocusHandle,
     search_focus: FocusHandle,
+    palette_focus: FocusHandle,
     // A window owns viewports; each viewport owns one independent session/surface.
     viewports: Vec<Viewport>,
     show_directory: bool,
+    sidebar_plugins: bool,
+    plugins: PluginManager,
+    palette_open: bool,
+    palette_query: String,
+    palette_index: usize,
+    last_plugin_tick: Instant,
     tick: i64,
     toast: Option<SharedString>,
     toast_seq: u64,
@@ -328,6 +344,7 @@ pub struct IrisWindow {
     last_now_playing: Instant,
     _quit: Subscription,
     _events: Task<()>,
+    _plugin_poll: Task<()>,
 }
 
 impl IrisWindow {
@@ -352,12 +369,31 @@ impl IrisWindow {
         }
         let focus = cx.focus_handle();
         let search_focus = cx.focus_handle();
+        let palette_focus = cx.focus_handle();
         focus.focus(window);
 
         let mut rx = session.events();
         let events = cx.spawn(async move |this, cx| {
             while let Some(ev) = rx.next().await {
                 if this.update(cx, |this, cx| this.on_event(ev, cx)).is_err() {
+                    break;
+                }
+            }
+        });
+
+        let plugin_poll = cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(250))
+                    .await;
+                let ok = this.update(cx, |this, cx| {
+                    let cmds = this.plugins.poll();
+                    if !cmds.is_empty() {
+                        this.execute_plugin_commands(cmds, cx);
+                        cx.notify();
+                    }
+                });
+                if ok.is_err() {
                     break;
                 }
             }
@@ -455,9 +491,11 @@ impl IrisWindow {
         }
 
         let show_directory = settings.directory_open;
+        let plugins = PluginManager::load(&settings.disabled_plugins);
         let mut this = Self {
             focus,
             search_focus,
+            palette_focus,
             viewports: vec![Viewport {
                 session,
                 video: Rc::new(RefCell::new(video)),
@@ -466,6 +504,12 @@ impl IrisWindow {
                 drag_origin: None,
             }],
             show_directory,
+            sidebar_plugins: false,
+            plugins,
+            palette_open: false,
+            palette_query: String::new(),
+            palette_index: 0,
+            last_plugin_tick: Instant::now(),
             tick: -1,
             toast: None,
             toast_seq: 0,
@@ -522,6 +566,7 @@ impl IrisWindow {
             last_now_playing: Instant::now() - Duration::from_secs(10),
             _quit: quit,
             _events: events,
+            _plugin_poll: plugin_poll,
         };
         this.viewports[0].session.apply_settings(&this.settings);
         if let Some(v) = this.settings.volume {
@@ -739,6 +784,8 @@ impl IrisWindow {
                         this.scroll_directory_to_current();
                         this.ensure_filmstrip_thumbnails(cx);
                         this.sync_now_playing(true);
+                        let snap = this.plugin_snapshot();
+                        this.dispatch_plugin_event(HostEvent::FileOpened { snapshot: snap }, cx);
                     }
                     Err(e) => {
                         this.show_toast(format!("无法打开 · {e}"), cx);
@@ -1084,6 +1131,7 @@ impl IrisWindow {
             && self.chrome_visible
             && !self.dir_popup
             && !self.settings_open
+            && !self.palette_open
             && self.popover.is_none()
             && self.context_menu.is_none()
             && self.resizing_dir.is_none()
@@ -1111,6 +1159,7 @@ impl IrisWindow {
         self.dir_popup
             || self.popover.is_some()
             || self.settings_open
+            || self.palette_open
             || self.context_menu.is_some()
     }
 
@@ -1118,9 +1167,104 @@ impl IrisWindow {
         self.dir_popup = false;
         self.popover = None;
         self.settings_open = false;
+        self.palette_open = false;
         self.context_menu = None;
         self.bump_activity(cx);
         cx.notify();
+    }
+
+    // ---- plugin control-plane helpers ----
+
+    fn plugin_snapshot(&self) -> PlaybackSnapshot {
+        let session = &self.viewports[0].session;
+        let fav = session
+            .current
+            .as_deref()
+            .is_some_and(|p| self.store.favorite(p));
+        plugin::snapshot_from_session(session, fav)
+    }
+
+    fn dispatch_plugin_event(&mut self, event: HostEvent, cx: &mut Context<Self>) {
+        let cmds = self.plugins.dispatch(&event);
+        self.execute_plugin_commands(cmds, cx);
+    }
+
+    fn execute_plugin_commands(&mut self, commands: Vec<HostCommand>, cx: &mut Context<Self>) {
+        for cmd in commands {
+            match cmd {
+                HostCommand::TogglePlayback => self.command(Command::TogglePlayback, cx),
+                HostCommand::SeekRelative { seconds } => {
+                    self.command(Command::SeekRelative(seconds), cx)
+                }
+                HostCommand::SeekAbsolute { seconds } => {
+                    self.command(Command::SeekAbsolute(seconds), cx)
+                }
+                HostCommand::SetSpeed { speed } => self.command(Command::SetSpeed(speed), cx),
+                HostCommand::SetVolume { volume } => self.command(Command::SetVolume(volume), cx),
+                HostCommand::ToggleMute => self.command(Command::ToggleMute, cx),
+                HostCommand::OpenNext => self.step(1, cx),
+                HostCommand::OpenPrevious => self.step(-1, cx),
+                HostCommand::ToggleFavorite => {
+                    if let Some(path) = self.viewports[0].session.current.clone() {
+                        self.store.toggle_favorite(&path);
+                        self.rebuild_directory_rows();
+                    }
+                }
+                HostCommand::ShowToast { message } => self.show_toast(message, cx),
+                HostCommand::SetSidebar { .. }
+                | HostCommand::SetStatus { .. }
+                | HostCommand::SetOverlay { .. }
+                | HostCommand::ClearOverlay => {}
+            }
+        }
+    }
+
+    fn invoke_plugin_command(
+        &mut self,
+        plugin_id: &str,
+        command_id: &str,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let snap = self.plugin_snapshot();
+        let cmds = self.plugins.invoke_command(plugin_id, command_id, snap);
+        self.execute_plugin_commands(cmds, cx);
+        cx.notify();
+    }
+
+    fn invoke_plugin_action(
+        &mut self,
+        plugin_id: &str,
+        action_id: &str,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let snap = self.plugin_snapshot();
+        let cmds = self.plugins.invoke_action(plugin_id, action_id, snap);
+        self.execute_plugin_commands(cmds, cx);
+        cx.notify();
+    }
+
+    fn toggle_plugin_enabled(&mut self, id: &str, enabled: bool, cx: &mut Context<Self>) {
+        if enabled {
+            self.settings.disabled_plugins.retain(|d| d != id);
+        } else if !self.settings.disabled_plugins.iter().any(|d| d == id) {
+            self.settings.disabled_plugins.push(id.to_string());
+        }
+        self.settings.save();
+        self.plugins.set_enabled(id, enabled);
+        if enabled {
+            let snap = self.plugin_snapshot();
+            self.dispatch_plugin_event(HostEvent::StateChanged { snapshot: snap }, cx);
+        }
+        cx.notify();
+    }
+
+    fn reload_plugins(&mut self, cx: &mut Context<Self>) {
+        self.plugins.reload(&self.settings.disabled_plugins);
+        let snap = self.plugin_snapshot();
+        self.dispatch_plugin_event(HostEvent::StateChanged { snapshot: snap }, cx);
+        self.show_toast("插件列表已重新扫描", cx);
     }
 
     fn toggle_popover(&mut self, kind: PopoverKind, cx: &mut Context<Self>) {
@@ -1200,10 +1344,22 @@ impl IrisWindow {
                         cx.notify();
                     }
                 }
+                if self.last_plugin_tick.elapsed() >= Duration::from_millis(200) {
+                    self.last_plugin_tick = Instant::now();
+                    let state = &self.viewports[0].session.state;
+                    let ev = HostEvent::PositionTick {
+                        position: state.time_pos,
+                        duration: state.duration,
+                        paused: state.paused,
+                    };
+                    self.dispatch_plugin_event(ev, cx);
+                }
                 self.sync_now_playing(false);
             }
             SessionEvent::Paused(_) => {
                 self.sync_now_playing(true);
+                let snap = self.plugin_snapshot();
+                self.dispatch_plugin_event(HostEvent::StateChanged { snapshot: snap }, cx);
                 cx.notify();
             }
             SessionEvent::Ended(true) if !was_ended => {
@@ -1465,7 +1621,28 @@ impl IrisWindow {
         if self.settings_open {
             self.popover = None;
             self.context_menu = None;
+            self.palette_open = false;
             self.dir_popup = false;
+        }
+        self.bump_activity(cx);
+        cx.notify();
+    }
+    fn open_command_palette(
+        &mut self,
+        _: &OpenCommandPalette,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.palette_open = !self.palette_open;
+        if self.palette_open {
+            self.palette_query.clear();
+            self.palette_index = 0;
+            self.popover = None;
+            self.context_menu = None;
+            self.settings_open = false;
+            self.palette_focus.focus(window);
+        } else {
+            self.focus.focus(window);
         }
         self.bump_activity(cx);
         cx.notify();
@@ -1481,6 +1658,12 @@ impl IrisWindow {
     fn exit_fullscreen(&mut self, _: &ExitFullscreen, window: &mut Window, cx: &mut Context<Self>) {
         if self.context_menu.is_some() {
             self.context_menu = None;
+            cx.notify();
+        } else if self.palette_open {
+            self.palette_open = false;
+            self.palette_query.clear();
+            self.focus.focus(window);
+            self.bump_activity(cx);
             cx.notify();
         } else if self.settings_open {
             self.settings_open = false;
@@ -1842,13 +2025,13 @@ impl Render for IrisWindow {
             .relative()
             .key_context("Workspace")
             .capture_any_mouse_up(cx.listener(|this, _, window, _| {
-                // Keep keyboard focus in the search box while typing there; everywhere else returns to viewport.
-                if !this.search_focus.is_focused(window) {
+                // Keep keyboard focus in text inputs while typing there; everywhere else returns to viewport.
+                if !this.search_focus.is_focused(window) && !this.palette_focus.is_focused(window) {
                     this.focus.focus(window);
                 }
             }))
             .on_any_mouse_down(cx.listener(|this, _, window, _| {
-                if !this.search_focus.is_focused(window) {
+                if !this.search_focus.is_focused(window) && !this.palette_focus.is_focused(window) {
                     this.focus.focus(window);
                 }
             }))
@@ -1875,6 +2058,7 @@ impl Render for IrisWindow {
             .on_action(cx.listener(Self::toggle_search))
             .on_action(cx.listener(Self::refresh_directory))
             .on_action(cx.listener(Self::open_settings))
+            .on_action(cx.listener(Self::open_command_palette))
             .on_action(cx.listener(Self::toggle_always_on_top))
             .on_action(cx.listener(Self::toggle_info))
             .on_action(cx.listener(Self::take_screenshot))
@@ -2047,6 +2231,9 @@ impl Render for IrisWindow {
             })
             .when(self.settings_open, |d| {
                 d.child(self.render_settings_modal(window, cx))
+            })
+            .when(self.palette_open, |d| {
+                d.child(self.render_command_palette(window, cx))
             })
             .when_some(self.context_menu.clone(), |d, menu| {
                 d.child(self.render_context_menu(&menu, window, cx))

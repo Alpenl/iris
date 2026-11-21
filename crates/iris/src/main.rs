@@ -5,7 +5,7 @@
 )]
 
 // Headless modules live in iris-core; re-exported so `crate::player` etc. resolve.
-use iris_core::{geometry, input, library, logging, player, settings, store};
+use iris_core::{geometry, input, library, logging, player, plugin, settings, store};
 
 mod assets;
 mod debug;
@@ -195,6 +195,8 @@ fn app_menus() -> Vec<Menu> {
         Menu {
             name: "视图".into(),
             items: vec![
+                MenuItem::action("命令面板…", ui::OpenCommandPalette),
+                MenuItem::separator(),
                 MenuItem::action("展开 / 收起目录", ui::ToggleDirectory),
                 MenuItem::action("媒体详情", ui::ToggleInfo),
                 MenuItem::action("窗口置顶", ui::ToggleAlwaysOnTop),

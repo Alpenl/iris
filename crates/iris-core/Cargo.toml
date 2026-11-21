@@ -14,7 +14,9 @@ devtools = []
 [dependencies]
 anyhow.workspace = true
 iris-mpv = { path = "../iris-mpv" }
+iris-api = { path = "../iris-api" }
 futures = "0.3"
 miniz_oxide = "0.8"
 log = "0.4"
 env_logger = "0.11"
+serde_json = "1"
