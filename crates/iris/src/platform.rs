@@ -11,6 +11,7 @@ pub struct PinchEvent {
     pub position: [f64; 2],
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MediaKey {
     Play,
@@ -58,7 +59,7 @@ pub fn decode_thumbnail(path: &Path, max_dim: u32) -> Option<Arc<RenderImage>> {
     let img = image::open(path).ok()?;
     let thumb = img.thumbnail(max_dim, max_dim);
     let mut rgba = thumb.into_rgba8();
-    for px in rgba.chunks_exact_mut(4) {
+    for px in rgba.as_chunks_mut::<4>().0 {
         px.swap(0, 2); // GPUI RenderImage expects BGRA.
     }
     Some(Arc::new(RenderImage::new([image::Frame::new(rgba)])))

@@ -245,12 +245,25 @@ impl IrisWindow {
         let speed_pop = self.popover == Some(PopoverKind::Speed);
         let more_pop = self.popover == Some(PopoverKind::More);
 
+        let shot_key = if cfg!(target_os = "macos") {
+            "⌘S"
+        } else {
+            "Ctrl+S"
+        };
+
         div()
             .flex()
             .items_center()
             .gap(px(2.))
             .when(!narrow, |d| {
                 d.child(
+                    icon_button("screenshot", Icon::Camera, false)
+                        .tooltip(tip("保存当前帧截图", Some(shot_key)))
+                        .on_click(cx.listener(|this, _, w, cx| {
+                            this.take_screenshot(&TakeScreenshot, w, cx)
+                        })),
+                )
+                .child(
                     icon_button(("loop", usize::from(looping)), Icon::Repeat, looping)
                         .tooltip(tip(
                             if looping {

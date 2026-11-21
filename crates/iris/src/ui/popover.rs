@@ -396,11 +396,13 @@ impl IrisWindow {
             AspectMode::FillCrop,
         ];
 
+        type ClickHandler = Box<dyn Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App)>;
+
         let row = |id: &'static str,
                    label: &'static str,
                    key: &'static str,
                    active: bool,
-                   on_click: Box<dyn Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App)>| {
+                   on_click: ClickHandler| {
             div()
                 .id(id)
                 .h(px(26.))
@@ -443,8 +445,12 @@ impl IrisWindow {
                         .gap(px(6.))
                         .child(
                             div()
+                                .flex()
+                                .items_center()
+                                .gap(px(6.))
                                 .text_size(px(10.))
                                 .text_color(text_dim())
+                                .child(icon(Icon::Aspect, 12., text_faint()))
                                 .child("画面比例 (C)"),
                         )
                         .child(

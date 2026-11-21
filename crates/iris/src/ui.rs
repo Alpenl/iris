@@ -538,7 +538,7 @@ impl IrisWindow {
         this
     }
 
-    pub(super) fn popover_anchor(&self, kind: PopoverKind) -> Option<Bounds<Pixels>> {
+    fn popover_anchor(&self, kind: PopoverKind) -> Option<Bounds<Pixels>> {
         match kind {
             PopoverKind::Subtitles => self.anchor_sub.get(),
             PopoverKind::Audio => self.anchor_audio.get(),
