@@ -28,8 +28,8 @@ impl Drop for Viewport {
 }
 
 use gpui::{
-    Context, InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ParentElement, Styled,
-    canvas, div, prelude::FluentBuilder, px,
+    Context, InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ParentElement,
+    StatefulInteractiveElement, Styled, canvas, div, prelude::FluentBuilder, px,
 };
 
 use super::*;
@@ -38,6 +38,7 @@ impl IrisWindow {
     pub(super) fn render_video_area(
         &self,
         fullscreen: bool,
+        window: &Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let last_rect = self.viewports[0].rect.clone();
@@ -67,29 +68,12 @@ impl IrisWindow {
         .absolute()
         .size_full();
 
-        let info = {
-            let (w, h) = self.viewports[0].session.state.video_size;
-            let mut parts = Vec::new();
-            if w > 0 {
-                parts.push(format!("{w}×{h}"));
-            }
-            parts.push(
-                if self.viewports[0].session.state.hwdec.is_empty()
-                    || self.viewports[0].session.state.hwdec == "no"
-                {
-                    "软解".into()
-                } else {
-                    format!("硬解 {}", self.viewports[0].session.state.hwdec)
-                },
-            );
-            parts.join(" · ")
-        };
-
         div()
             .id("video")
             .relative()
             .flex_1()
-            .h_full()
+            .min_h(px(0.))
+            .w_full()
             .overflow_hidden()
             .child(probe)
             .key_context({
@@ -136,83 +120,151 @@ impl IrisWindow {
                     }
                 }),
             )
-            // Overlay 1: info chip over the picture, on the edge away from the
-            // directory so the popup never covers it.
-            .when(self.chrome_shown(), |d| {
-                let chip = div()
-                    .absolute()
-                    .top(px(12.))
-                    .px(px(8.))
-                    .py(px(4.))
-                    .bg(overlay())
-                    .border_1()
-                    .border_color(line())
-                    .font_family(FONT_MONO)
-                    .text_size(px(10.))
-                    .text_color(text_dim())
-                    .child(info);
-                d.child(
-                    if fullscreen && self.settings.directory_side == Side::Left {
-                        chip.right(px(12.))
+            // Fullscreen: file name and media info at the top, on the edge
+            // away from the directory so the popup never covers it.
+            .when(fullscreen && self.chrome_visible, |d| {
+                let name = self.viewports[0]
+                    .session
+                    .current
+                    .as_ref()
+                    .and_then(|p| p.file_name())
+                    .map(|n| n.to_string_lossy().into_owned());
+                d.when_some(name, |d, name| {
+                    let chip = div()
+                        .absolute()
+                        .top(px(FLOAT_GAP))
+                        .max_w(px(480.))
+                        .h(px(28.))
+                        .px(px(10.))
+                        .flex()
+                        .items_center()
+                        .gap(px(10.))
+                        .bg(overlay())
+                        .border_1()
+                        .border_color(line())
+                        .child(
+                            div()
+                                .min_w(px(0.))
+                                .truncate()
+                                .text_size(px(12.))
+                                .child(name),
+                        )
+                        .when_some(self.media_info(), |d, info| {
+                            d.child(
+                                div()
+                                    .flex_none()
+                                    .font_family(FONT_MONO)
+                                    .text_size(px(11.))
+                                    .text_color(text_dim())
+                                    .child(info),
+                            )
+                        });
+                    d.child(if self.settings.directory_side == Side::Left {
+                        chip.right(px(FLOAT_GAP))
                     } else {
-                        chip.left(px(12.))
-                    },
-                )
+                        chip.left(px(FLOAT_GAP))
+                    })
+                })
             })
-            // Overlay 2: toast (bottom-centre, above the floating dock).
+            // Toast: top centre, a small accent square before the message.
             .when_some(self.toast.clone(), |d, msg| {
                 d.child(
                     div()
                         .absolute()
-                        .top(px(44.))
-                        .w_full()
+                        .top(px(if fullscreen { FLOAT_GAP } else { 12. }))
+                        .left_0()
+                        .right_0()
                         .flex()
                         .justify_center()
                         .child(
                             div()
-                                .px(px(14.))
-                                .py(px(8.))
+                                .h(px(28.))
+                                .px(px(10.))
+                                .flex()
+                                .items_center()
+                                .gap(px(8.))
                                 .bg(overlay())
                                 .border_1()
                                 .border_color(line())
-                                .border_l_2()
-                                .border_color(accent())
-                                .text_size(px(12.))
-                                .child(msg),
+                                .child(div().flex_none().size(px(6.)).bg(accent()))
+                                .child(div().text_size(px(12.)).child(msg)),
                         ),
                 )
             })
-            .when(self.viewports[0].session.current.is_none(), |d| {
-                d.child(
-                    div()
-                        .absolute()
-                        .size_full()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .text_color(text_dim())
-                        .text_size(px(13.))
-                        .child(if cfg!(target_os = "macos") {
-                            "拖入文件或文件夹，或按 ⌘O 打开"
-                        } else {
-                            "拖入文件或文件夹，或按 Ctrl+O 打开"
-                        }),
-                )
-            })
-            // Overlay 3: in fullscreen the dock floats over the video and
-            // hides with the rest of the chrome.
+            .when(
+                self.viewports[0].session.current.is_none() && self.pending_path.is_none(),
+                |d| {
+                    d.child(
+                        div()
+                            .absolute()
+                            .size_full()
+                            .flex()
+                            .flex_col()
+                            .items_center()
+                            .justify_center()
+                            .gap(px(16.))
+                            .child(
+                                div()
+                                    .text_size(px(13.))
+                                    .text_color(text_dim())
+                                    .child("拖入文件或文件夹"),
+                            )
+                            .child(
+                                div()
+                                    .id("open-file")
+                                    .h(px(BUTTON))
+                                    .px(px(12.))
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(10.))
+                                    .border_1()
+                                    .border_color(line_strong())
+                                    .text_size(px(12.))
+                                    .cursor_pointer()
+                                    .hover(|s| s.bg(hover()))
+                                    .active(|s| s.bg(selected()))
+                                    .child("打开…")
+                                    .child(
+                                        div()
+                                            .font_family(FONT_MONO)
+                                            .text_size(px(11.))
+                                            .text_color(text_dim())
+                                            .child(if cfg!(target_os = "macos") {
+                                                "⌘O"
+                                            } else {
+                                                "Ctrl+O"
+                                            }),
+                                    )
+                                    // Not a click on the picture.
+                                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                        cx.stop_propagation()
+                                    })
+                                    .on_click(cx.listener(|this, _, w, cx| {
+                                        this.open_file(&OpenFile, w, cx)
+                                    })),
+                            ),
+                    )
+                },
+            )
+            // In fullscreen the control bar floats over the video and hides
+            // with the rest of the chrome. A video's timeline replaces the
+            // frame's top edge.
             .when(fullscreen && self.chrome_visible, |d| {
                 let slot = self.dock_bounds.clone();
+                let seam = self.viewports[0].session.kind() == Some(Kind::Video);
                 d.child(
                     div()
                         .absolute()
-                        .bottom(px(16.))
-                        .left(px(16.))
-                        .right(px(16.))
-                        .h(px(DOCK_H - 16.))
+                        .bottom(px(FLOAT_GAP))
+                        .left(px(FLOAT_GAP))
+                        .right(px(FLOAT_GAP))
+                        .h(px(DOCK_H))
                         .bg(overlay())
-                        .border_1()
                         .border_color(line())
+                        .border_l_1()
+                        .border_r_1()
+                        .border_b_1()
+                        .when(!seam, |d| d.border_t_1())
                         // Clicks here are not clicks on the picture.
                         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                         .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
@@ -221,25 +273,25 @@ impl IrisWindow {
                                 .absolute()
                                 .size_full(),
                         )
-                        .child(self.render_dock_body(cx)),
+                        .child(self.render_dock(true, window, cx)),
                 )
             })
-            // Overlay 4: the directory popup, on the chosen edge, between the
-            // top of the screen and the floating dock.
+            // The directory popup, on the chosen edge, between the top of the
+            // screen and the floating bar.
             .when(fullscreen && self.dir_popup, |d| {
                 let popup = div()
                     .absolute()
-                    .top(px(16.))
-                    .bottom(px(DOCK_H + 8.))
+                    .top(px(FLOAT_GAP))
+                    .bottom(px(DOCK_H + FLOAT_GAP + 8.))
                     .border_1()
                     .border_color(line())
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
                     .child(self.render_directory(true, cx));
                 d.child(if self.settings.directory_side == Side::Left {
-                    popup.left(px(16.))
+                    popup.left(px(FLOAT_GAP))
                 } else {
-                    popup.right(px(16.))
+                    popup.right(px(FLOAT_GAP))
                 })
             })
     }

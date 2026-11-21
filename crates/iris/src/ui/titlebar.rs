@@ -1,22 +1,21 @@
-//! Windowed title bar: window buttons, drag area and the current path.
+//! Windowed title bar: window buttons, then a drag area with the current
+//! path on the left and the picture's size and decoder on the right.
 use gpui::{
     Context, FontWeight, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
-    ParentElement, StatefulInteractiveElement, Styled, div, px,
+    ParentElement, StatefulInteractiveElement, Styled, div, prelude::FluentBuilder, px,
 };
 
 use super::*;
 
 impl IrisWindow {
     pub(super) fn render_titlebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let file = self.viewports[0]
-            .session
+        let session = &self.viewports[0].session;
+        let file = session
             .current
             .as_ref()
             .and_then(|p| p.file_name())
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        let folder = self.viewports[0]
-            .session
+            .map(|n| n.to_string_lossy().into_owned());
+        let folder = session
             .folder
             .as_ref()
             .and_then(|f| f.file_name())
@@ -38,7 +37,7 @@ impl IrisWindow {
             .flex()
             .items_center()
             .gap(px(8.))
-            .px(px(14.))
+            .pl(px(14.))
             .bg(window_bg())
             .border_b_1()
             .border_color(line())
@@ -56,11 +55,13 @@ impl IrisWindow {
                 div()
                     .id("drag")
                     .flex_1()
+                    .min_w(px(0.))
                     .h_full()
                     .flex()
                     .items_center()
                     .gap(px(10.))
                     .pl(px(12.))
+                    .pr(px(14.))
                     .on_mouse_down(MouseButton::Left, |ev: &MouseDownEvent, window, _| {
                         if ev.click_count >= 2 {
                             window.titlebar_double_click();
@@ -70,32 +71,42 @@ impl IrisWindow {
                     })
                     .child(
                         div()
+                            .flex_none()
                             .font_weight(FontWeight::BOLD)
                             .text_size(px(13.))
                             .child("IRIS"),
                     )
-                    .child(div().w(px(1.)).h(px(14.)).bg(line()))
+                    .child(div().flex_none().w(px(1.)).h(px(14.)).bg(line()))
                     .child(
                         div()
+                            .flex_1()
+                            .min_w(px(0.))
                             .flex()
                             .gap(px(6.))
                             .font_family(FONT_MONO)
                             .text_size(px(11.))
-                            .child(div().text_color(text_dim()).child(folder))
-                            .child(div().text_color(text_dim()).child("/"))
-                            .child(div().text_color(text()).child(file)),
-                    ),
-            )
-            .child(
-                div()
-                    .font_family(FONT_MONO)
-                    .text_size(px(10.))
-                    .text_color(text_dim())
-                    .px(px(6.))
-                    .py(px(2.))
-                    .border_1()
-                    .border_color(line())
-                    .child("SPIKE · GPUI 0.2.2 + libmpv"),
+                            .child(div().flex_none().text_color(text_dim()).child(folder))
+                            .when_some(file, |d, file| {
+                                d.child(div().flex_none().text_color(text_faint()).child("/"))
+                                    .child(
+                                        div()
+                                            .min_w(px(0.))
+                                            .truncate()
+                                            .text_color(text())
+                                            .child(file),
+                                    )
+                            }),
+                    )
+                    .when_some(self.media_info(), |d, info| {
+                        d.child(
+                            div()
+                                .flex_none()
+                                .font_family(FONT_MONO)
+                                .text_size(px(11.))
+                                .text_color(text_dim())
+                                .child(info),
+                        )
+                    }),
             )
             .on_mouse_down(
                 MouseButton::Left,

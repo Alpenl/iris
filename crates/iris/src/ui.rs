@@ -1,4 +1,4 @@
-//! The spike's main window: title bar, docked directory, video area, dock,
+//! The main window: title bar, docked directory, video area, control bar,
 //! and overlays drawn by GPUI on top of mpv's video.
 
 use std::cell::{Cell, RefCell};
@@ -8,10 +8,10 @@ use std::time::{Duration, Instant};
 
 use futures::StreamExt;
 use gpui::{
-    AnyElement, App, Bounds, Context, CursorStyle, ExternalPaths, FocusHandle, InteractiveElement,
-    IntoElement, KeyBinding, MouseButton, MouseMoveEvent, ParentElement, PathPromptOptions, Pixels,
-    Point, Render, SharedString, Styled, Subscription, Task, Window, actions, div,
-    prelude::FluentBuilder, px,
+    App, Bounds, Context, CursorStyle, ExternalPaths, FocusHandle, InteractiveElement, IntoElement,
+    KeyBinding, MouseButton, MouseMoveEvent, ParentElement, PathPromptOptions, Pixels, Point,
+    Render, SharedString, Styled, Subscription, Task, Window, actions, div, prelude::FluentBuilder,
+    px,
 };
 
 use crate::geometry::ImageView;
@@ -28,6 +28,7 @@ mod controls;
 mod directory;
 mod titlebar;
 mod viewport;
+mod widgets;
 
 use viewport::Viewport;
 
@@ -43,8 +44,8 @@ enum DirectoryFilter {
 /// While a video plays, its position is written to the records this often.
 const SAVE_EVERY: Duration = Duration::from_secs(5);
 
-/// In fullscreen, the dock, info chip and cursor hide after this long without
-/// mouse movement.
+/// In fullscreen, the control bar, info chip and cursor hide after this long
+/// without mouse movement.
 const HIDE_AFTER: Duration = Duration::from_millis(2000);
 
 actions!(
@@ -139,13 +140,19 @@ pub struct IrisWindow {
     fullscreen: bool,
     /// Fullscreen only: the directory floating over the video.
     dir_popup: bool,
-    /// Fullscreen only: whether the dock, info chip and cursor are shown.
+    /// Fullscreen only: whether the control bar, info chip and cursor are shown.
     chrome_visible: bool,
     last_activity: Instant,
     /// A hide timer is running.
     hide_armed: bool,
     mouse_pos: Option<Point<Pixels>>,
+    /// The fullscreen control bar's frame, for keeping the chrome up while
+    /// the pointer rests on it.
     dock_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
+    /// The pointer is over the timeline.
+    timeline_hover: bool,
+    /// A seek drag started on the timeline and the button is still down.
+    seeking: bool,
     _quit: Subscription,
     _events: Task<()>,
 }
@@ -248,6 +255,8 @@ impl IrisWindow {
             hide_armed: false,
             mouse_pos: None,
             dock_bounds: Rc::new(Cell::new(None)),
+            timeline_hover: false,
+            seeking: false,
             _quit: quit,
             _events: events,
         };
@@ -515,7 +524,7 @@ impl IrisWindow {
         }
     }
 
-    /// Mouse movement (or a key that changes what the dock shows): show the
+    /// Mouse movement (or a key that changes what the bar shows): show the
     /// fullscreen chrome and restart the hide countdown.
     fn bump_activity(&mut self, cx: &mut Context<Self>) {
         self.last_activity = Instant::now();
@@ -535,7 +544,8 @@ impl IrisWindow {
     }
 
     /// Hides the chrome once the mouse has been idle for `HIDE_AFTER`, unless
-    /// it rests on the dock or the directory popup is open. Returns how long
+    /// it rests on the control bar, a seek drag is running or the directory
+    /// popup is open. Returns how long
     /// to wait before checking again, or `None` when the timer should stop
     /// (the next `bump_activity` starts a new one).
     fn hide_check(&mut self, cx: &mut Context<Self>) -> Option<Duration> {
@@ -543,7 +553,8 @@ impl IrisWindow {
             (Some(p), Some(b)) => b.contains(&p),
             _ => false,
         };
-        if self.fullscreen && self.chrome_visible && !self.dir_popup && !over_dock {
+        if self.fullscreen && self.chrome_visible && !self.dir_popup && !self.seeking && !over_dock
+        {
             let idle = self.last_activity.elapsed();
             if idle < HIDE_AFTER {
                 return Some(HIDE_AFTER - idle);
@@ -639,7 +650,7 @@ impl IrisWindow {
         }
         self.show_directory = !self.show_directory;
         if self.show_directory {
-            self.show_toast("目录已展开", cx);
+            cx.notify();
         } else {
             self.show_toast("目录已收起 · Tab 展开", cx);
         }
@@ -763,6 +774,26 @@ impl IrisWindow {
         .detach();
     }
 
+    /// Picture size, plus the decoder for videos: `1920×1080 · 硬解 videotoolbox`.
+    fn media_info(&self) -> Option<String> {
+        let session = &self.viewports[0].session;
+        let kind = session.kind()?;
+        let state = &session.state;
+        let (w, h) = state.video_size;
+        let mut parts = Vec::new();
+        if w > 0 && h > 0 {
+            parts.push(format!("{w}×{h}"));
+        }
+        if kind == Kind::Video {
+            parts.push(if state.hwdec.is_empty() || state.hwdec == "no" {
+                "软解".into()
+            } else {
+                format!("硬解 {}", state.hwdec)
+            });
+        }
+        (!parts.is_empty()).then(|| parts.join(" · "))
+    }
+
     fn seek_to_x(&self, x: Pixels) {
         let Some(b) = self.progress_bounds.get() else {
             return;
@@ -799,8 +830,9 @@ impl Render for IrisWindow {
         if !fullscreen {
             platform::hide_traffic_lights(window);
         }
+        // Keeps subtitles above the floating bar while it is shown.
         let inset = if fullscreen && self.chrome_visible {
-            DOCK_H as f64 + 12.
+            (DOCK_H + FLOAT_GAP + 8.) as f64
         } else {
             0.
         };
@@ -853,6 +885,17 @@ impl Render for IrisWindow {
             }))
             .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _, cx| {
                 this.mouse_pos = Some(ev.position);
+                if this.seeking {
+                    if ev.pressed_button == Some(MouseButton::Left) {
+                        this.seek_to_x(ev.position.x);
+                    } else {
+                        this.seeking = false;
+                    }
+                    cx.notify();
+                } else if this.timeline_hover {
+                    // The hover time label follows the pointer.
+                    cx.notify();
+                }
                 if ev.pressed_button == Some(MouseButton::Left) {
                     if let Some(origin) = this.viewports[0].drag_origin {
                         this.viewports[0].drag_origin = Some(ev.position);
@@ -873,38 +916,39 @@ impl Render for IrisWindow {
             }))
             .on_mouse_up(
                 MouseButton::Left,
-                cx.listener(|this, _, _, _| this.viewports[0].drag_origin = None),
+                cx.listener(|this, _, _, cx| {
+                    this.viewports[0].drag_origin = None;
+                    if this.seeking {
+                        this.seeking = false;
+                        cx.notify();
+                    }
+                }),
             )
             // Hidden until the mouse moves (macOS) / no cursor (Windows).
             .when(!self.chrome_shown(), |d| d.cursor(CursorStyle::None))
             .when(!fullscreen, |d| d.child(self.render_titlebar(cx)))
+            // Two modules side by side: the directory, full height, and the
+            // player (picture over its control bar).
             .child({
-                let side_panel: Option<AnyElement> = (!fullscreen).then(|| {
-                    if self.show_directory {
-                        self.render_directory(false, cx).into_any_element()
-                    } else {
-                        self.render_rail(cx).into_any_element()
-                    }
-                });
-                let video = self.render_video_area(fullscreen, cx).into_any_element();
+                let directory = (!fullscreen && self.show_directory)
+                    .then(|| self.render_directory(false, cx).into_any_element());
+                let player = div()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .h_full()
+                    .flex()
+                    .flex_col()
+                    .child(self.render_video_area(fullscreen, window, cx))
+                    .when(!fullscreen, |d| {
+                        d.child(self.render_dock(false, window, cx))
+                    })
+                    .into_any_element();
                 let row = div().flex_1().min_h(px(0.)).flex();
                 if self.settings.directory_side == Side::Left {
-                    row.children(side_panel).child(video)
+                    row.children(directory).child(player)
                 } else {
-                    row.child(video).children(side_panel)
+                    row.child(player).children(directory)
                 }
-            })
-            .when(!fullscreen, |d| {
-                d.child(
-                    div()
-                        .h(px(DOCK_H))
-                        .flex_none()
-                        .w_full()
-                        .bg(panel())
-                        .border_t_1()
-                        .border_color(line())
-                        .child(self.render_dock_body(cx)),
-                )
             })
     }
 }

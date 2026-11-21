@@ -4,6 +4,7 @@
 // Headless modules live in iris-core; re-exported so `crate::player` etc. resolve.
 use iris_core::{geometry, input, library, logging, player, settings, store};
 
+mod assets;
 mod debug;
 mod instance;
 mod platform;
@@ -48,7 +49,7 @@ fn main() {
         instance::Claim::Primary(guard) => guard,
         instance::Claim::Forwarded => return,
     };
-    let app = Application::new();
+    let app = Application::new().with_assets(assets::Assets);
     app.on_open_urls(move |urls| {
         for value in urls {
             // Local file URLs only. A query, another scheme or any other

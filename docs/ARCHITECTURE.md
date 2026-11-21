@@ -19,7 +19,7 @@ crates/
 - `crates/iris-core/src/store.rs`：收藏和播放进度，按绝对路径做主键，存在设置文件旁的 `records.tsv`（路径十六进制编码，写临时文件再改名）。只记录已加载完成的视频进度（`Session::progress`），续播点取 5 秒以后、片尾 5 秒以前。
 - `crates/iris-core/src/{photo,icc}.rs`：照片文件头和内嵌配置文件，见第 3 节；`input.rs` 解析指针策略，`geometry.rs` 管理窗口逻辑坐标、媒体像素和缩放／平移；`settings.rs`、`logging.rs` 是设置和运行日志。
 - `crates/iris-core/src/library.rs`：扫描所在文件夹，按自然顺序排序（`ep2` 在 `ep10` 前）。
-- `crates/iris/src/ui.rs` + `ui/`：窗口持有 `Vec<Viewport>`（当前长度 1）；视口拥有会话、原生画面层、布局矩形和照片变换。键盘上下文由 render 状态推导。`ui.rs` 是窗口状态和动作；`ui/titlebar.rs`、`ui/directory.rs`（目录和全部／视频／照片／收藏过滤）、`ui/viewport.rs`（画面区）、`ui/controls.rs`（工具栏）只负责渲染。
+- `crates/iris/src/ui.rs` + `ui/`：窗口持有 `Vec<Viewport>`（当前长度 1）；视口拥有会话、原生画面层、布局矩形和照片变换。键盘上下文由 render 状态推导。`ui.rs` 是窗口状态和动作；`ui/titlebar.rs`、`ui/directory.rs`（目录和全部／视频／照片／收藏过滤）、`ui/viewport.rs`（画面区、提示文字、空状态）、`ui/controls.rs`（工具栏和时间轴）只负责渲染；`ui/widgets.rs` 是它们共用的图标、无框按钮、分隔线和悬停提示。图标是 `Resources/Icons/` 下的 SVG，由 `assets.rs` 用 `include_bytes!` 编译进程序，经 GPUI 的 `AssetSource` 交给 `svg()`；GPUI 只用 SVG 的透明度，颜色取元素的文字色。GPUI 0.2.2 的悬停提示在指针移动时就按当时的文字和位置排好、存在元素状态里，按下鼠标并不取消；所以点击后提示文字或位置会变的元素（播放 / 暂停、字幕、收藏、全屏、目录开关、换边按钮和工具栏那一行）把状态写进 id，状态一变旧提示就随旧元素丢掉。
 - `crates/iris/src/instance.rs`：Windows 单实例，见第 7 节。macOS 由系统把打开请求发给已运行的进程，经 GPUI 的 `on_open_urls` 进来，只接受 `file://`。
 - `crates/iris/src/platform.rs`：原生窗口辅助。窗口拖动是自己实现的，因为 GPUI 0.2.2 的 `start_window_move()` 在 macOS 和 Windows 上是空函数（`gpui-0.2.2/src/platform.rs:536`，只有 Linux 后端重写了）。
 - `crates/iris/src/debug.rs`：调试控制管道（`IRIS_CONTROL`），见第 6 节。
@@ -137,7 +137,7 @@ NSWindow contentView
 | `command.rs` / `state.rs` / `event.rs` 分文件 | 都在 `player.rs`（`Command`、`PlaybackState`、`SessionEvent`） | 文件还小，拆开没有收益 |
 | `viewport.rs`、`playlist.rs`、`config.rs` | `geometry.rs`、`library.rs`、`settings.rs` | 只是名字不同 |
 | `platform/` 下按 OS 分目录，加 `VideoUnderlay` trait | `video/{mac,windows}.rs` + `platform.rs`，按 `cfg` 隔离 | 两个平台的生命周期差别大，暂不定公共 trait |
-| `ui/` 拆成 workspace / titlebar / toolbar / sidebar / osd | `ui.rs` + `ui/{titlebar,directory,viewport,controls}.rs` | 提示和空状态还在 `ui.rs` 里，量小 |
+| `ui/` 拆成 workspace / titlebar / toolbar / sidebar / osd | `ui.rs` + `ui/{titlebar,directory,viewport,controls,widgets}.rs` | workspace 就是 `ui.rs`；提示文字和空状态量小，画在 `viewport.rs` 里；共用控件放 `widgets.rs` |
 | `control.rs`（原 `debug.rs`） | 仍叫 `debug.rs` | 只在 debug / `devtools` 构建启用 |
 | `iris-api` crate、插件 | 没有 | 插件是中长期目标，现在不写插件代码 |
 

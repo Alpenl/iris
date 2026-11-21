@@ -12,9 +12,13 @@ impl ImageView {
     pub fn zoomed(&self) -> bool { self.zoom.abs() > 0.0001 || self.pan != [0., 0.] }
 
     pub fn displayed(&self, viewport: [f64; 2], media: [f64; 2]) -> [f64; 2] {
-        let fit = (viewport[0] / media[0].max(1.)).min(viewport[1] / media[1].max(1.));
-        let scale = fit * self.zoom.exp2();
+        let scale = fit(viewport, media) * self.zoom.exp2();
         [media[0] * scale, media[1] * scale]
+    }
+
+    /// Physical screen pixels per image pixel; 1.0 is actual size.
+    pub fn pixel_scale(&self, viewport: [f64; 2], media: [f64; 2], backing_scale: f64) -> f64 {
+        fit(viewport, media) * self.zoom.exp2() * backing_scale
     }
 
     /// Keeps the media point beneath the pointer fixed while changing scale.
@@ -40,7 +44,7 @@ impl ImageView {
 
     pub fn toggle_actual_size(&mut self, viewport: [f64; 2], media: [f64; 2], backing_scale: f64) {
         if self.zoomed() { self.reset(); return; }
-        let fit = (viewport[0] / media[0].max(1.)).min(viewport[1] / media[1].max(1.));
+        let fit = fit(viewport, media);
         self.zoom = (1. / (fit * backing_scale).max(0.00001)).log2().clamp(-4., 6.);
         self.pan = [0., 0.];
     }
@@ -54,9 +58,23 @@ impl ImageView {
     }
 }
 
+/// The scale at which mpv shows the whole image in the viewport.
+fn fit(viewport: [f64; 2], media: [f64; 2]) -> f64 {
+    (viewport[0] / media[0].max(1.)).min(viewport[1] / media[1].max(1.))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pixel_scale_reads_one_at_actual_size() {
+        let mut view = ImageView::default();
+        let (viewport, media) = ([800., 600.], [3200., 2400.]);
+        assert!((view.pixel_scale(viewport, media, 2.) - 0.5).abs() < 1e-9);
+        view.toggle_actual_size(viewport, media, 2.);
+        assert!((view.pixel_scale(viewport, media, 2.) - 1.).abs() < 1e-9);
+    }
 
     #[test]
     fn zoom_preserves_pointer_media_coordinate() {
