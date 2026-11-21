@@ -7,14 +7,20 @@
 ```
 crates/
   iris-mpv/   libmpv 的手写 FFI（不用 bindgen）：client API + render API
-  iris/       GPUI 应用：窗口、界面、平台视频层、调试管道
+  iris-core/  无头内核：会话、照片探测、目录扫描、设置、记录；Cargo.toml 不许依赖 GPUI 或原生窗口 API
+  iris/       GPUI 应用：窗口、界面、平台视频层、单实例、调试管道
 ```
+
+依赖方向只能是 `iris` → `iris-core` → `iris-mpv`。`iris/src/main.rs` 把 core 的模块原样再导出（`use iris_core::{player, …}`），界面代码仍写 `crate::player`。`scripts/check-project.py` 检查 `iris-core` 没有 GPUI 依赖、界面文件里没有 mpv 调用。
 
 - `crates/iris-mpv/src/sys.rs`：手写的 C 声明。render API 同时声明了 OpenGL 和 D3D11 两套常量（`MPV_RENDER_API_TYPE_D3D11`、`MPV_RENDER_PARAM_D3D11_INIT_PARAMS = 21`、`MPV_RENDER_PARAM_D3D11_FBO = 22`）。
 - `crates/iris-mpv/build.rs`：macOS 默认链接 `/opt/homebrew/lib` 的 libmpv（Homebrew 的 pkg-config 因 libarchive 是 keg-only 而失败）；其他平台必须用 `MPV_LIB_DIR` 指定。始终动态链接。
-- `crates/iris/src/player.rs`：不依赖 GPUI 的 `Session`；持有播放状态、目录、当前绝对路径，统一处理语义命令、照片加载选项和 mpv 事件翻译。UI 不直接调用 mpv 属性或命令。
-- `crates/iris/src/ui.rs`：窗口持有 `Vec<Viewport>`（当前长度 1）；视口拥有会话、原生画面层、布局矩形和照片变换。键盘上下文由 render 状态推导；`input.rs` 解析指针策略，`geometry.rs` 管理窗口逻辑坐标、媒体像素和缩放／平移。
-- `crates/iris/src/library.rs`：扫描所在文件夹，按自然顺序排序（`ep2` 在 `ep10` 前）。
+- `crates/iris-core/src/player.rs`：`Session` 持有播放状态、目录、当前绝对路径，统一处理语义命令、照片加载选项和 mpv 事件翻译。UI 不直接调用 mpv 属性或命令。打开分两步：`player::prepare` 做目录扫描和照片文件头读取，只有阻塞文件 I/O，界面放到后台线程跑；`Session::open` 在 UI 线程发 `loadfile`。连续快速打开时界面用代数（generation）丢弃过期结果。
+- `crates/iris-core/src/store.rs`：收藏和播放进度，按绝对路径做主键，存在设置文件旁的 `records.tsv`（路径十六进制编码，写临时文件再改名）。只记录已加载完成的视频进度（`Session::progress`），续播点取 5 秒以后、片尾 5 秒以前。
+- `crates/iris-core/src/{photo,icc}.rs`：照片文件头和内嵌配置文件，见第 3 节；`input.rs` 解析指针策略，`geometry.rs` 管理窗口逻辑坐标、媒体像素和缩放／平移；`settings.rs`、`logging.rs` 是设置和运行日志。
+- `crates/iris-core/src/library.rs`：扫描所在文件夹，按自然顺序排序（`ep2` 在 `ep10` 前）。
+- `crates/iris/src/ui.rs` + `ui/`：窗口持有 `Vec<Viewport>`（当前长度 1）；视口拥有会话、原生画面层、布局矩形和照片变换。键盘上下文由 render 状态推导。`ui.rs` 是窗口状态和动作；`ui/titlebar.rs`、`ui/directory.rs`（目录和全部／视频／照片／收藏过滤）、`ui/viewport.rs`（画面区）、`ui/controls.rs`（工具栏）只负责渲染。
+- `crates/iris/src/instance.rs`：Windows 单实例，见第 7 节。macOS 由系统把打开请求发给已运行的进程，经 GPUI 的 `on_open_urls` 进来，只接受 `file://`。
 - `crates/iris/src/platform.rs`：原生窗口辅助。窗口拖动是自己实现的，因为 GPUI 0.2.2 的 `start_window_move()` 在 macOS 和 Windows 上是空函数（`gpui-0.2.2/src/platform.rs:536`，只有 Linux 后端重写了）。
 - `crates/iris/src/debug.rs`：调试控制管道（`IRIS_CONTROL`），见第 6 节。
 
@@ -50,7 +56,7 @@ NSWindow contentView
 |---|---|---|
 | 视频层色彩空间 | 已完成 | `CAOpenGLLayer` 标注为 Display P3；mpv 设 `target-prim=display-p3`、`target-trc=srgb`。Core Animation 再转换到实际屏幕，和 GPUI 图层走同一条路（`video/mac.rs`，`setColorspace:` 和 `target-prim`/`target-trc` 两处）。|
 | sRGB / BT.709 内容 | 已验证 | 与系统色彩转换的预期值相差不超过 3 个色阶；CPU 无变化。修复前图层未标注，系统把 mpv 输出当成屏幕原始值，sRGB 内容在 P3 屏上过饱和。|
-| 照片内嵌 ICC | 已完成 | mpv 的 libmpv OpenGL 路径忽略内嵌 ICC。`crates/iris/src/photo.rs` 只读文件头，从 JPEG / PNG / WebP / HEIC / AVIF / TIFF 取出配置文件（HEIC 也认 nclx），由 `icc.rs` 按 D50 原色坐标和曲线匹配 sRGB、Display P3、Adobe RGB、BT.2020、ProPhoto；`ui.rs` 的 `load` 把结果作为 `loadfile` 单文件选项（`vf` 里 mpv 自带的 `format` 滤镜带上 `primaries` / `gamma`，外加 `gamut-mapping-mode=clip`）传给 mpv，换文件时自动撤销。照片超出 P3 的颜色直接裁剪，和 ColorSync 一致（mpv 默认的压缩会让 Adobe RGB 纯绿偏青）；视频保留 mpv 默认的映射。识别不了的配置文件仍按 sRGB。|
+| 照片内嵌 ICC | 已完成 | mpv 的 libmpv OpenGL 路径忽略内嵌 ICC。`crates/iris-core/src/photo.rs` 只读文件头，从 JPEG / PNG / WebP / HEIC / AVIF / TIFF 取出配置文件（HEIC 也认 nclx），由 `icc.rs` 按 D50 原色坐标和曲线匹配 sRGB、Display P3、Adobe RGB、BT.2020、ProPhoto；`player.rs` 的 `prepare` / `load` 把结果作为 `loadfile` 单文件选项（`vf` 里 mpv 自带的 `format` 滤镜带上 `primaries` / `gamma`，外加 `gamut-mapping-mode=clip`）传给 mpv，换文件时自动撤销。照片超出 P3 的颜色直接裁剪，和 ColorSync 一致（mpv 默认的压缩会让 Adobe RGB 纯绿偏青）；视频保留 mpv 默认的映射。识别不了的配置文件仍按 sRGB。|
 | 换屏 | 无需额外处理（当前方案） | 显示器转换由 Core Animation 按窗口所在屏幕完成。如果以后改成把显示器 ICC 交给 mpv（`MPV_RENDER_PARAM_ICC_PROFILE = 6`，`sys.rs` 里尚未声明），就必须在窗口换屏时重新读取。|
 | HDR / EDR | 未开始 | 需要换到支持 EDR 的图层（如 `CAMetalLayer`）和 mpv 的对应输出，属于后续版本。|
 
@@ -108,7 +114,7 @@ NSWindow contentView
 
 ## 6. 调试控制管道
 
-`crates/iris/src/debug.rs`：debug 或显式 `--features devtools` 构建中，`IRIS_CONTROL` 指向本地流端点（macOS Unix socket、Windows `\\.\pipe\iris-...`）。逐行读取 `key`、`move`、`click`、`snap`、`resize`、`open`、`state`、`get`、`mpv`、`quit`。客户端为 `scripts/control-client.py`；回复保留在 stderr，运行日志另外走 `log`。
+`crates/iris/src/debug.rs`：debug 或显式 `--features devtools` 构建中，`IRIS_CONTROL` 指向本地流端点（macOS Unix socket、Windows `\\.\pipe\iris-...`）。逐行读取 `key`、`move`、`click`、`snap`、`resize`、`open`、`filter`、`state`、`get`、`mpv`、`quit`。客户端为 `scripts/control-client.py`；回复保留在 stderr，运行日志另外走 `log`。
 
 - 合成鼠标事件必须在 GPUI update 之外发出：macOS 发送 NSEvent，Windows 发送原生窗口消息，均经 GPUI 正常命中测试。
 - `snap`：macOS 用 `CGWindowListCreateImage`；Windows 捕获窗口占据的可见桌面区域，不能用于被遮挡窗口的自动像素对比。
@@ -117,4 +123,21 @@ NSWindow contentView
 
 - **外部传进来的内容永远不能变成 mpv 选项或命令**（文件关联、URL scheme、拖入的路径都一样）。教训是 IINA 的 CVE-2026-47114（GHSA-w5xh-98j7-jp5q）：`iina://` 地址里的 mpv 参数没过滤，导致命令注入。
 - 任意 mpv 控制仅用于 debug／显式 `devtools` 构建，同用户访问，普通 release 不监听；不得把性能测试二进制当发行包。
-- 媒体和所在目录只读；设置、日志及未来个人记录保存在系统应用数据目录，不往媒体目录写隐藏文件或缓存。
+- 媒体和所在目录只读；设置、日志和个人记录（`records.tsv`）保存在系统应用数据目录，不往媒体目录写隐藏文件或缓存。
+- Windows 单实例：`Local\Iris.Player` 互斥量判断是否已有实例；后来的进程把绝对路径（UTF-16，长度前缀，上限 32767 个单位）写进 `\\.\pipe\iris-open-<会话号>-<用户 SID>` 后退出。管道和调试管道共用 `platform::pipe::create_inbound`：只建第一个实例、拒绝远程客户端、DACL 只给当前用户。客户端先用 `GetNamedPipeServerSessionId` 确认服务端在同一登录会话。管道里只有路径，进到界面后和拖入的路径走同一条 `open_path`。设置了 `IRIS_SETTINGS` 的测试实例不参加单实例。
+
+## 8. 规划目录树与实际代码
+
+2026-11-20 规划讨论稿里有一棵三层目录树（`iris-mpv` / `iris-core` / `iris`）。三层结构已经采纳；其余部分按“内核克制、不过早抽象”调整如下：
+
+| 规划稿 | 实际 | 原因 |
+|---|---|---|
+| `iris-core` 不依赖 GPUI | 已拆分（Windows 原生合成验证之后） | 和规划一致；`cargo test -p iris-core` 不起窗口 |
+| `engine/` 下的 `MediaBackend` trait | 没有；`player::Session` 直接用 `iris-mpv` | 只有 mpv 一套实现，等真有第二套再提炼（DECISIONS 4.5） |
+| `command.rs` / `state.rs` / `event.rs` 分文件 | 都在 `player.rs`（`Command`、`PlaybackState`、`SessionEvent`） | 文件还小，拆开没有收益 |
+| `viewport.rs`、`playlist.rs`、`config.rs` | `geometry.rs`、`library.rs`、`settings.rs` | 只是名字不同 |
+| `platform/` 下按 OS 分目录，加 `VideoUnderlay` trait | `video/{mac,windows}.rs` + `platform.rs`，按 `cfg` 隔离 | 两个平台的生命周期差别大，暂不定公共 trait |
+| `ui/` 拆成 workspace / titlebar / toolbar / sidebar / osd | `ui.rs` + `ui/{titlebar,directory,viewport,controls}.rs` | 提示和空状态还在 `ui.rs` 里，量小 |
+| `control.rs`（原 `debug.rs`） | 仍叫 `debug.rs` | 只在 debug / `devtools` 构建启用 |
+| `iris-api` crate、插件 | 没有 | 插件是中长期目标，现在不写插件代码 |
+

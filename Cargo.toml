@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/iris-mpv", "crates/iris"]
+members = ["crates/iris-mpv", "crates/iris-core", "crates/iris"]
 default-members = ["crates/iris"]
 
 [workspace.package]

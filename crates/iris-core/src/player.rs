@@ -96,9 +96,8 @@ fn spawn_event_pump(mpv: Arc<Mpv>) -> UnboundedReceiver<SessionEvent> {
                         log::warn!(target: "iris::mpv", "{prefix}/{level}: {}", text.trim_end());
                     }
                     Some(ev) => {
-                        if let Some(event) = SessionEvent::from_backend(ev) {
-                            if tx.unbounded_send(event).is_err() { break; }
-                        }
+                        if let Some(event) = SessionEvent::from_backend(ev)
+                            && tx.unbounded_send(event).is_err() { break; }
                     }
                     None => {}
                 }
@@ -155,11 +154,48 @@ pub struct PlaybackState {
     pub ended: bool,
     pub audio: String,
     pub rotation: i64,
+    /// The current path has finished loading; positions now belong to it.
+    pub loaded: bool,
 }
 
 pub enum Command {
     TogglePlayback, SeekRelative(f64), SeekPercent(f64), VolumeBy(f64), SetVolume(f64),
-    SpeedBy(f64), ToggleSubtitles, NextSubtitle, NextAudio,
+    SpeedBy(f64), SetSpeed(f64), ToggleSubtitles, NextSubtitle, NextAudio,
+}
+
+/// A folder scan and photo probe done off the UI thread, ready to load.
+pub struct Prepared {
+    folder: PathBuf,
+    entries: Vec<Entry>,
+    target: Option<PathBuf>,
+    kind: Option<Kind>,
+    options: Option<String>,
+}
+
+impl Prepared {
+    /// The file that will load, if any; records are keyed by this path.
+    pub fn target(&self) -> Option<&Path> { self.target.as_deref() }
+}
+
+/// Resolves `path` to its folder listing and load options. Blocking file I/O
+/// only (directory scan, photo headers); safe to run on a background thread.
+/// `cached` reuses an existing listing of the same folder instead of rescanning.
+pub fn prepare(path: &Path, cached: Option<(PathBuf, Vec<Entry>)>) -> Result<Prepared> {
+    let path = path.canonicalize()?;
+    let (folder, file) = if path.is_dir() { (path, None) } else {
+        (path.parent().unwrap_or(Path::new(".")).to_path_buf(), Some(path))
+    };
+    let entries = match cached {
+        Some((dir, entries)) if dir == folder => entries,
+        _ => library::scan(&folder),
+    };
+    let (target, kind) = match file {
+        Some(file) => { let kind = library::kind_of(&file); (Some(file), kind) }
+        None => entries.first().map_or((None, None), |e| (Some(e.path.clone()), Some(e.kind))),
+    };
+    let options = (kind == Some(Kind::Photo))
+        .then(|| target.as_deref().and_then(|p| photo::probe(p).mpv_options())).flatten();
+    Ok(Prepared { folder, entries, target, kind, options })
 }
 
 pub struct Session {
@@ -179,7 +215,7 @@ impl Session {
             mpv: create()?,
             state: PlaybackState { time_pos: 0., duration: 0., paused: false, volume: 100.,
                 speed: 1., video_size: (0, 0), hwdec: String::new(), subs_visible: true,
-                ended: false, audio: String::new(), rotation: 0 },
+                ended: false, audio: String::new(), rotation: 0, loaded: false },
             folder: None, entries: Vec::new(), current: None, kind: None, subtitle_inset: 0.,
         })
     }
@@ -191,57 +227,52 @@ impl Session {
         self.current.as_ref().and_then(|path| self.entries.iter().position(|e| &e.path == path))
     }
 
-    pub fn open(&mut self, path: &Path) -> Result<()> {
-        let path = path.canonicalize()?;
-        let folder = if path.is_dir() { path.clone() } else {
-            path.parent().unwrap_or(Path::new(".")).to_path_buf()
-        };
-        self.entries = library::scan(&folder);
+    /// Loads a prepared folder and file. `resume` (seconds) applies to video only.
+    pub fn open(&mut self, prepared: Prepared, resume: f64) -> Result<()> {
+        let Prepared { folder, entries, target, kind, options } = prepared;
+        self.entries = entries;
         self.folder = Some(folder);
-        if path.is_file() { self.load(&path, library::kind_of(&path))?; }
-        else if let Some(first) = self.entries.first() {
-            let (path, kind) = (first.path.clone(), first.kind);
-            self.load(&path, Some(kind))?;
-        } else {
-            self.mpv.command_async(&["stop"])?;
-            self.current = None;
-            self.kind = None;
+        match target {
+            Some(path) => self.load(&path, kind, options, resume)?,
+            None => {
+                self.mpv.command_async(&["stop"])?;
+                self.current = None;
+                self.kind = None;
+                self.state.loaded = false;
+            }
         }
         Ok(())
     }
 
-    pub fn play(&mut self, index: usize) -> Result<()> {
-        if let Some(entry) = self.entries.get(index) {
-            let (path, kind) = (entry.path.clone(), entry.kind);
-            self.load(&path, Some(kind))?;
-        }
-        Ok(())
-    }
-
-    pub fn step(&mut self, delta: isize) -> Result<()> {
-        if !self.entries.is_empty() {
-            let index = self.index().map(|i| i as isize + delta).unwrap_or(0)
-                .rem_euclid(self.entries.len() as isize) as usize;
-            self.play(index)?;
-        }
-        Ok(())
-    }
-
-    fn load(&mut self, path: &Path, kind: Option<Kind>) -> Result<()> {
+    fn load(&mut self, path: &Path, kind: Option<Kind>, photo_options: Option<String>, resume: f64) -> Result<()> {
         // Async loadfile copies argv; a path never becomes an option or command.
         let url = path.to_string_lossy();
-        let opts = (kind == Some(Kind::Photo)).then(|| photo::probe(path).mpv_options()).flatten();
+        let kind = kind.or(Some(Kind::Video));
+        let opts = match photo_options {
+            Some(opts) => Some(opts),
+            None if kind == Some(Kind::Video) && resume.is_finite() && resume > 0. => Some(format!("start={resume:.3}")),
+            None => None,
+        };
         self.reset_transform()?;
         match opts {
             Some(opts) => self.mpv.command_async(&["loadfile", &url, "replace", "-1", &opts])?,
             None => self.mpv.command_async(&["loadfile", &url])?,
         }
         self.current = Some(path.to_path_buf());
-        self.kind = kind.or(Some(Kind::Video));
+        self.kind = kind;
         self.state.ended = false;
+        self.state.loaded = false;
         self.state.time_pos = 0.;
         self.state.duration = 0.;
         Ok(())
+    }
+
+    /// Playback progress of the loaded video, for path-keyed records:
+    /// `(path, position, duration, ended)`. None while loading or for photos.
+    pub fn progress(&self) -> Option<(&Path, f64, f64, bool)> {
+        let path = self.current.as_deref()?;
+        (self.kind == Some(Kind::Video) && self.state.loaded)
+            .then_some((path, self.state.time_pos, self.state.duration, self.state.ended))
     }
 
     pub fn execute(&self, command: Command) -> Result<()> {
@@ -257,6 +288,7 @@ impl Session {
             Command::VolumeBy(delta) => self.mpv.command_async(&["add", "volume", &delta.to_string()])?,
             Command::SetVolume(volume) => self.mpv.set_property_f64_async("volume", volume.clamp(0.,100.))?,
             Command::SpeedBy(factor) => self.mpv.command_async(&["multiply", "speed", &factor.to_string()])?,
+            Command::SetSpeed(speed) => self.mpv.set_property_f64_async("speed", speed.clamp(0.1, 8.))?,
             Command::ToggleSubtitles => self.mpv.command_async(&["cycle", "sub-visibility"])? ,
             Command::NextSubtitle => self.mpv.command_async(&["cycle", "sub"])? ,
             Command::NextAudio => self.mpv.command_async(&["cycle", "audio"])? ,
@@ -278,6 +310,11 @@ impl Session {
             SessionEvent::Ended(v) => self.state.ended = *v,
             SessionEvent::Audio(v) => self.state.audio.clone_from(v),
             SessionEvent::Rotation(v) => self.state.rotation = *v,
+            // A late event from the previous file must not mark this one loaded.
+            SessionEvent::Loaded => {
+                let current = self.current.as_deref().map(|p| p.to_string_lossy().into_owned());
+                self.state.loaded = self.mpv.get_property_string("path").ok() == current;
+            }
             _ => {}
         }
     }
@@ -311,15 +348,42 @@ mod tests {
     use super::*;
 
     #[test]
+    fn prepare_targets_file_or_first_entry_and_reuses_listing() {
+        let dir = std::env::temp_dir().join(format!("iris-prepare-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in ["ep10.mp4", "ep2.mp4", "notes.txt"] {
+            std::fs::write(dir.join(name), b"").unwrap();
+        }
+        let folder = dir.canonicalize().unwrap();
+
+        let opened = prepare(&dir, None).unwrap();
+        assert_eq!(opened.folder, folder);
+        assert_eq!(opened.entries.len(), 2);
+        assert_eq!(opened.target(), Some(folder.join("ep2.mp4").as_path()));
+        assert_eq!((opened.kind, opened.options.as_deref()), (Some(Kind::Video), None));
+
+        // A cached listing of the same folder is reused as-is, even if stale.
+        let cached = vec![opened.entries[1].clone()];
+        let file = prepare(&dir.join("ep10.mp4"), Some((folder.clone(), cached))).unwrap();
+        assert_eq!(file.target(), Some(folder.join("ep10.mp4").as_path()));
+        assert_eq!(file.entries.len(), 1);
+        // A listing of another folder is not.
+        let other = prepare(&dir.join("ep10.mp4"), Some((PathBuf::from("/elsewhere"), Vec::new()))).unwrap();
+        assert_eq!(other.entries.len(), 2);
+
+        assert!(prepare(&dir.join("missing.mp4"), None).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn subtitle_safe_area_changes_backend_margin_and_restores_it() {
         let mut session = Session::new().unwrap();
         session.mpv.observe_property(100, "sub-margin-y-offset", Format::Int).unwrap();
         let wait_for = |mpv: &Mpv, value| {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
             while std::time::Instant::now() < deadline {
-                if let Some(Event::PropertyChange { id: 100, value: Value::Int(actual), .. }) = mpv.wait_event(0.05) {
-                    if actual == value { return; }
-                }
+                if let Some(Event::PropertyChange { id: 100, value: Value::Int(actual), .. }) = mpv.wait_event(0.05)
+                    && actual == value { return; }
             }
             panic!("subtitle safe margin never became {value}");
         };

@@ -303,7 +303,7 @@ impl VideoSurface {
 
             // The layer and its hosting view.
             let layer: id = msg_send![layer_class(), new];
-            (*(layer as *mut Object)).set_ivar("irisState", Arc::as_ptr(&state) as *mut c_void);
+            (*layer).set_ivar("irisState", Arc::as_ptr(&state) as *mut c_void);
             let _: () = msg_send![layer, setAsynchronous: NO];
             let _: () = msg_send![layer, setOpaque: YES];
             let _: () = msg_send![layer, setNeedsDisplayOnBoundsChange: YES];
@@ -437,7 +437,7 @@ impl Drop for VideoSurface {
                 self.view = nil;
             }
             // The layer keeps a raw pointer to `state`; detach it before `state` drops.
-            (*(self.layer as *mut Object)).set_ivar("irisState", ptr::null_mut::<c_void>());
+            (*self.layer).set_ivar("irisState", ptr::null_mut::<c_void>());
             let _: () = msg_send![self.layer, release];
             CGLReleaseContext(self.state.gl);
             CGLReleasePixelFormat(self.state.pixel_format);

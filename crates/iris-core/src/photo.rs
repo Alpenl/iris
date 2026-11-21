@@ -531,6 +531,9 @@ mod tests {
             ("icc/red-p3.png", Some("display-p3")),
             ("icc/red-adobergb.png", Some("adobe")),
             ("icc/red-p3-jpeg.jpg", Some("display-p3")),
+            ("icc/red-srgb-webp.webp", Some("bt.709")),
+            ("icc/red-p3-webp.webp", Some("display-p3")),
+            ("icc/red-adobergb-webp.webp", Some("adobe")),
         ];
         for (file, want) in cases {
             let Some(p) = media(file) else { continue };

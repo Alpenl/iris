@@ -166,10 +166,10 @@ mod enabled {
 
         impl Drop for Listener {
             fn drop(&mut self) {
-                if let Ok(metadata) = std::fs::symlink_metadata(&self.path) {
-                    if metadata.ino() == self.inode && metadata.dev() == self.device {
-                        let _ = std::fs::remove_file(&self.path);
-                    }
+                if let Ok(metadata) = std::fs::symlink_metadata(&self.path)
+                    && metadata.ino() == self.inode && metadata.dev() == self.device
+                {
+                    let _ = std::fs::remove_file(&self.path);
                 }
             }
         }
@@ -178,33 +178,12 @@ mod enabled {
     #[cfg(target_os = "windows")]
     mod platform {
         use super::*;
-        use std::ffi::{OsStr, c_void};
+        use std::ffi::OsStr;
         use std::fs::File;
         use std::os::windows::ffi::OsStrExt;
-        use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
-        use windows_sys::Win32::Foundation::{ERROR_PIPE_CONNECTED, INVALID_HANDLE_VALUE, LocalFree};
-        use windows_sys::Win32::Security::Authorization::{
-            ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
-            SDDL_REVISION_1,
-        };
-        use windows_sys::Win32::Security::{
-            GetTokenInformation, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER, TokenUser,
-        };
-        use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_FIRST_PIPE_INSTANCE, PIPE_ACCESS_INBOUND};
-        use windows_sys::Win32::System::Pipes::{
-            ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_READMODE_BYTE,
-            PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT,
-        };
-        use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
-
-        // Conversion APIs allocate with LocalAlloc, not Rust's allocator.
-        struct LocalAllocation(*mut c_void);
-
-        impl Drop for LocalAllocation {
-            fn drop(&mut self) {
-                unsafe { LocalFree(self.0); }
-            }
-        }
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Foundation::ERROR_PIPE_CONNECTED;
+        use windows_sys::Win32::System::Pipes::{ConnectNamedPipe, DisconnectNamedPipe};
 
         pub(super) struct Listener(File);
 
@@ -219,58 +198,7 @@ mod enabled {
                         r"IRIS_CONTROL must be \\.\pipe\iris-<unique-name>"));
                 }
                 let name: Vec<u16> = name.into_iter().chain(Some(0)).collect();
-                // SAFETY: all Win32 buffers are owned, aligned, and remain live through
-                // their calls; successful OS handles/allocations immediately gain owners.
-                unsafe {
-                    let mut token = std::ptr::null_mut();
-                    if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
-                        return Err(io::Error::last_os_error());
-                    }
-                    let token = OwnedHandle::from_raw_handle(token);
-                    let mut needed = 0;
-                    GetTokenInformation(token.as_raw_handle(), TokenUser, std::ptr::null_mut(), 0, &mut needed);
-                    if needed == 0 {
-                        return Err(io::Error::last_os_error());
-                    }
-                    let mut info = vec![0usize; (needed as usize).div_ceil(std::mem::size_of::<usize>())];
-                    if GetTokenInformation(token.as_raw_handle(), TokenUser, info.as_mut_ptr().cast(),
-                        needed, &mut needed) == 0
-                    {
-                        return Err(io::Error::last_os_error());
-                    }
-                    let user = &*info.as_ptr().cast::<TOKEN_USER>();
-                    let mut sid = std::ptr::null_mut();
-                    if ConvertSidToStringSidW(user.User.Sid, &mut sid) == 0 {
-                        return Err(io::Error::last_os_error());
-                    }
-                    let _sid_owner = LocalAllocation(sid.cast());
-                    let mut length = 0;
-                    while *sid.add(length) != 0 { length += 1; }
-                    let sid = String::from_utf16(std::slice::from_raw_parts(sid, length))
-                        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-                    // Protected DACL: no inherited grants, only the current token's user.
-                    let sddl: Vec<u16> = format!("D:P(A;;GA;;;{sid})").encode_utf16().chain(Some(0)).collect();
-                    let mut descriptor = std::ptr::null_mut();
-                    if ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl.as_ptr(),
-                        SDDL_REVISION_1, &mut descriptor, std::ptr::null_mut()) == 0
-                    {
-                        return Err(io::Error::last_os_error());
-                    }
-                    let _descriptor_owner = LocalAllocation(descriptor);
-                    let security = SECURITY_ATTRIBUTES {
-                        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
-                        lpSecurityDescriptor: descriptor,
-                        bInheritHandle: 0,
-                    };
-                    let pipe = CreateNamedPipeW(name.as_ptr(),
-                        PIPE_ACCESS_INBOUND | FILE_FLAG_FIRST_PIPE_INSTANCE,
-                        PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
-                        1, 0, MAX_LINE as u32, 0, &security);
-                    if pipe == INVALID_HANDLE_VALUE {
-                        return Err(io::Error::last_os_error());
-                    }
-                    Ok(Self(File::from_raw_handle(pipe)))
-                }
+                crate::platform::pipe::create_inbound(&name, MAX_LINE as u32).map(Self)
             }
 
             pub(super) fn run(mut self, tx: UnboundedSender<String>) {

@@ -15,9 +15,11 @@ pub enum Side {
 pub struct Settings {
     /// Which edge the directory sits on, docked and in the fullscreen popup.
     pub directory_side: Side,
+    pub volume: Option<f64>,
+    pub speed: Option<f64>,
 }
 
-fn path() -> Option<PathBuf> {
+pub fn path() -> Option<PathBuf> {
     if let Some(p) = std::env::var_os("IRIS_SETTINGS") {
         return Some(PathBuf::from(p));
     }
@@ -47,6 +49,18 @@ impl Settings {
             match (k.trim(), v.trim()) {
                 ("directory_side", "left") => s.directory_side = Side::Left,
                 ("directory_side", "right") => s.directory_side = Side::Right,
+                ("volume", v) => {
+                    s.volume = v
+                        .parse::<f64>()
+                        .ok()
+                        .filter(|v| v.is_finite() && (0. ..=100.).contains(v))
+                }
+                ("speed", v) => {
+                    s.speed = v
+                        .parse::<f64>()
+                        .ok()
+                        .filter(|v| v.is_finite() && (0.1..=8.).contains(v))
+                }
                 _ => {}
             }
         }
@@ -62,7 +76,16 @@ impl Settings {
         let result = p
             .parent()
             .map_or(Ok(()), std::fs::create_dir_all)
-            .and_then(|()| std::fs::write(&p, format!("directory_side = {side}\n")));
+            .and_then(|()| {
+                let mut text = format!("directory_side = {side}\n");
+                if let Some(v) = self.volume {
+                    text.push_str(&format!("volume = {v}\n"));
+                }
+                if let Some(v) = self.speed {
+                    text.push_str(&format!("speed = {v}\n"));
+                }
+                std::fs::write(&p, text)
+            });
         if let Err(e) = result {
             log::error!("saving settings to {} failed: {e}", p.display());
         }

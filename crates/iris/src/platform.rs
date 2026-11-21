@@ -143,11 +143,13 @@ mod imp {
             let copied = BitBlt(memory, 0, 0, w, h, screen, rect.left, rect.top, SRCCOPY | CAPTUREBLT);
             SelectObject(memory, old);
             let mut pixels = vec![0u8; w as usize * h as usize * 4];
-            let mut info = BITMAPINFO::default();
-            info.bmiHeader = BITMAPINFOHEADER {
-                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-                biWidth: w, biHeight: -h, biPlanes: 1, biBitCount: 32,
-                biCompression: BI_RGB.0, ..Default::default()
+            let mut info = BITMAPINFO {
+                bmiHeader: BITMAPINFOHEADER {
+                    biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                    biWidth: w, biHeight: -h, biPlanes: 1, biBitCount: 32,
+                    biCompression: BI_RGB.0, ..Default::default()
+                },
+                ..Default::default()
             };
             let rows = if copied.is_ok() {
                 GetDIBits(screen, bitmap, 0, h as u32, Some(pixels.as_mut_ptr().cast()), &mut info, DIB_RGB_COLORS)
@@ -157,7 +159,7 @@ mod imp {
             ReleaseDC(None, screen);
             copied?;
             anyhow::ensure!(rows == h, "GetDIBits failed");
-            for p in pixels.chunks_exact_mut(4) { p.swap(0, 2); p[3] = 255; }
+            for p in pixels.as_chunks_mut::<4>().0 { p.swap(0, 2); p[3] = 255; }
             image::save_buffer(path, &pixels, w as u32, h as u32, image::ColorType::Rgba8)?;
         }
         Ok(())
@@ -268,3 +270,102 @@ pub fn snapshot_window(window: &gpui::Window, path: &std::path::Path) -> anyhow:
 
 #[cfg(target_os = "windows")]
 pub use imp::snapshot_window;
+
+/// Same-user named pipes for the debug control channel and the
+/// single-instance file handoff.
+#[cfg(target_os = "windows")]
+pub mod pipe {
+    use std::ffi::c_void;
+    use std::fs::File;
+    use std::io;
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use windows_sys::Win32::Foundation::{INVALID_HANDLE_VALUE, LocalFree};
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
+        SDDL_REVISION_1,
+    };
+    use windows_sys::Win32::Security::{
+        GetTokenInformation, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER, TokenUser,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_FIRST_PIPE_INSTANCE, PIPE_ACCESS_INBOUND};
+    use windows_sys::Win32::System::Pipes::{
+        CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT,
+    };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    // Conversion APIs allocate with LocalAlloc, not Rust's allocator.
+    struct LocalAllocation(*mut c_void);
+
+    impl Drop for LocalAllocation {
+        fn drop(&mut self) {
+            unsafe { LocalFree(self.0); }
+        }
+    }
+
+    /// The current process token's user SID in string form (`S-1-5-...`).
+    pub fn current_user_sid() -> io::Result<String> {
+        // SAFETY: all Win32 buffers are owned, aligned, and remain live through
+        // their calls; successful OS handles/allocations immediately gain owners.
+        unsafe {
+            let mut token = std::ptr::null_mut();
+            if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let token = OwnedHandle::from_raw_handle(token);
+            let mut needed = 0;
+            GetTokenInformation(token.as_raw_handle(), TokenUser, std::ptr::null_mut(), 0, &mut needed);
+            if needed == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let mut info = vec![0usize; (needed as usize).div_ceil(std::mem::size_of::<usize>())];
+            if GetTokenInformation(token.as_raw_handle(), TokenUser, info.as_mut_ptr().cast(),
+                needed, &mut needed) == 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            let user = &*info.as_ptr().cast::<TOKEN_USER>();
+            let mut sid = std::ptr::null_mut();
+            if ConvertSidToStringSidW(user.User.Sid, &mut sid) == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let _sid_owner = LocalAllocation(sid.cast());
+            let mut length = 0;
+            while *sid.add(length) != 0 { length += 1; }
+            String::from_utf16(std::slice::from_raw_parts(sid, length))
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+        }
+    }
+
+    /// Creates the first and only instance of an inbound, local-only byte pipe
+    /// whose protected DACL grants access to the current token's user alone.
+    /// `name` is NUL-terminated UTF-16.
+    pub fn create_inbound(name: &[u16], in_buffer: u32) -> io::Result<File> {
+        debug_assert_eq!(name.last(), Some(&0));
+        let sid = current_user_sid()?;
+        // Protected DACL: no inherited grants, only the current token's user.
+        let sddl: Vec<u16> = format!("D:P(A;;GA;;;{sid})").encode_utf16().chain(Some(0)).collect();
+        // SAFETY: as above; the descriptor outlives CreateNamedPipeW.
+        unsafe {
+            let mut descriptor = std::ptr::null_mut();
+            if ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl.as_ptr(),
+                SDDL_REVISION_1, &mut descriptor, std::ptr::null_mut()) == 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            let _descriptor_owner = LocalAllocation(descriptor);
+            let security = SECURITY_ATTRIBUTES {
+                nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+                lpSecurityDescriptor: descriptor,
+                bInheritHandle: 0,
+            };
+            let pipe = CreateNamedPipeW(name.as_ptr(),
+                PIPE_ACCESS_INBOUND | FILE_FLAG_FIRST_PIPE_INSTANCE,
+                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
+                1, 0, in_buffer, 0, &security);
+            if pipe == INVALID_HANDLE_VALUE {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(File::from_raw_handle(pipe))
+        }
+    }
+}

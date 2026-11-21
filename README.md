@@ -150,6 +150,7 @@ python3 scripts/icc-report.py out/
 | A | 切换音轨 |
 | 0，`=` / `-` | 照片适应窗口；放大 / 缩小 |
 | PageUp / PageDown | 上一个 / 下一个 |
+| S | 收藏 / 取消收藏当前文件 |
 | ⌘O（Windows：Ctrl+O） | 打开 |
 | ⌘Q（Windows：Ctrl+Q） | 退出 |
 
@@ -160,13 +161,17 @@ python3 scripts/icc-report.py out/
 - macOS：`~/Library/Application Support/Iris/settings.conf`
 - Windows：`%APPDATA%\Iris\settings.conf`
 
-目前只有一项：
-
 ```
 directory_side = left   # 或 right
+volume = 100            # 0–100，退出时保存
+speed = 1               # 0.1–8，退出时保存
 ```
 
-环境变量 `IRIS_SETTINGS` 可以改用别的文件，测试时不会动到真实设置。
+收藏和视频播放进度存在同一目录的 `records.tsv`，按文件绝对路径记录；再次打开同一视频从上次位置继续（前 5 秒和最后 5 秒不续播）。目录顶部的“全部 / 视频 / 照片 / 收藏”切换显示范围，收藏视图跨文件夹列出全部收藏，←/→ 和 PageUp/PageDown 按当前过滤后的列表翻页。
+
+环境变量 `IRIS_SETTINGS` 可以改用别的文件，记录文件随之放到它旁边，测试时不会动到真实数据。
+
+Windows 上再次双击文件不会开第二个窗口：新进程把路径交给已运行的 Iris 后退出（设置了 `IRIS_SETTINGS` 的测试实例除外）。`iris --version` / `iris --help` 打印版本和用法。
 
 运行日志每次启动覆盖，最多 4 MiB：Windows `%LOCALAPPDATA%\Iris\iris.log`，macOS `~/Library/Logs/Iris/iris.log`。`IRIS_LOG` 可覆盖路径；控制协议的逐命令回复仍在 stderr。
 
@@ -189,6 +194,7 @@ Windows 例：设置 `$env:IRIS_CONTROL = '\\.\pipe\iris-test'` 后启动独立�
 | `snap <file.png>` | macOS 只截本窗口；Windows 截取窗口所在可见桌面区域，要求窗口未被遮挡 |
 | `resize <w> <h>` | 调整窗口大小 |
 | `open <路径>` | 打开文件或文件夹 |
+| `filter <all\|video\|photo\|favorites>` | 切换目录过滤 |
 | `state` | 把播放和界面状态打印到 stderr |
 | `get <属性>` / `mpv <命令…>` | 读取 mpv 属性 / 执行 mpv 命令 |
 | `quit` | 退出 |
@@ -198,21 +204,26 @@ Windows 例：设置 `$env:IRIS_CONTROL = '\\.\pipe\iris-test'` 后启动独立�
 ```
 crates/
   iris-mpv/          libmpv 的 Rust 绑定（client API + render API）
-  iris/
-    src/main.rs      启动、字体、窗口
-    src/ui.rs        主窗口：标题栏、目录、视频区、工具栏、全屏浮层
-    src/player.rs    视口会话、语义命令、播放状态、mpv 事件翻译
+  iris-core/         无头内核，不依赖 GPUI
+    src/player.rs    视口会话、后台打开准备、语义命令、播放状态、mpv 事件翻译
+    src/store.rs     收藏与播放进度（路径主键）
+    src/photo.rs     照片文件头：方向、尺寸、内嵌配置文件
+    src/icc.rs       配置文件匹配
     src/input.rs     上下文指针策略
     src/geometry.rs  照片坐标与缩放／平移
-    src/video/       macOS CAOpenGLLayer / Windows D3D11 原生层
-    src/logging.rs   有界运行日志（IRIS_LOG 可覆盖）
     src/library.rs   文件夹扫描
     src/settings.rs  用户设置
+    src/logging.rs   有界运行日志（IRIS_LOG 可覆盖）
+  iris/              GPUI 应用
+    src/main.rs      启动、命令行、字体、窗口、系统打开请求
+    src/ui.rs        主窗口状态与动作；ui/ 下是标题栏、目录、画面区、工具栏的渲染
+    src/video/       macOS CAOpenGLLayer / Windows D3D11 原生层
+    src/instance.rs  Windows 单实例（把路径转给已运行的进程）
     src/theme.rs     颜色、字体、尺寸
-    src/platform.rs  原生窗口辅助（拖动、截图、模拟输入）
+    src/platform.rs  原生窗口辅助（拖动、截图、模拟输入、同用户命名管道）
     src/debug.rs     调试控制管道
 Resources/Fonts/     Space Grotesk、IBM Plex Mono（SIL OFL 1.1）
-scripts/             测试素材生成、照片实测脚本
+scripts/             测试素材生成、照片实测、仓库约束检查（check-project.py）
 docs/                架构、决策与路线图、测试记录
 deny.toml            依赖许可证检查（cargo-deny）
 ```
@@ -226,7 +237,8 @@ deny.toml            依赖许可证检查（cargo-deny）
 - [ ] macOS 本轮新变更的实机复验；Apple Silicon / Intel 安装包验证
 - [ ] 正式分发 Developer ID / 公证、Authenticode 签名（本轮没有凭据）
 - [ ] macOS 全屏动画中第一次 Esc 的历史问题仍待实机验证
-- [ ] 目录照片过滤尚未实现；收藏不属于本轮范围，不再显示虚假收藏入口
+- [x] 目录过滤（全部 / 视频 / 照片 / 收藏）、收藏（S 键或工具栏）、视频续播
+- [ ] Windows 单实例转发尚未实机验证
 - [x] HEIC 的方向标记被忽略，竖拍照片横着显示：已从文件头读出方向交给 mpv
 - [x] 超过 16384 像素的图片显示为蓝屏：长边超过 8192 的图先缩小再显示（4000×40000 解码时内存约 1 GB）
 - [x] 照片内嵌的 ICC 配置文件被忽略（P3 / Adobe RGB 照片偏淡）：已按配置文件逐张覆盖原色，常见配置文件以外的仍按 sRGB

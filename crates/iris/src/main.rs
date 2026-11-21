@@ -1,20 +1,17 @@
 //! Iris — mpv-based photo/video player (technical spike).
 #![cfg_attr(all(target_os = "windows", not(debug_assertions)), windows_subsystem = "windows")]
 
+// Headless modules live in iris-core; re-exported so `crate::player` etc. resolve.
+use iris_core::{geometry, input, library, logging, player, settings, store};
+
 mod debug;
-mod geometry;
-mod icc;
-mod input;
-mod library;
-mod logging;
-mod photo;
+mod instance;
 mod platform;
-mod player;
-mod settings;
 mod theme;
 mod ui;
 mod video;
 
+use futures::StreamExt;
 use std::borrow::Cow;
 use std::path::PathBuf;
 
@@ -24,6 +21,17 @@ use gpui::{
 };
 
 fn main() {
+    match std::env::args_os().nth(1).as_deref().and_then(|arg| arg.to_str()) {
+        Some("--version") => {
+            println!("Iris {}", env!("CARGO_PKG_VERSION"));
+            return;
+        }
+        Some("--help") => {
+            println!("Iris 照片 / 视频播放器\n用法：iris [本地文件或文件夹]\n  --version  显示版本\n  --help     显示本说明");
+            return;
+        }
+        _ => {}
+    }
     // This variable makes GPUI draw into an opaque swap chain, which hides
     // the video layer underneath (docs/ARCHITECTURE.md).
     #[cfg(target_os = "windows")]
@@ -33,7 +41,27 @@ fn main() {
     };
     logging::init();
     let initial = std::env::args_os().nth(1).map(PathBuf::from);
-    Application::new().run(move |cx: &mut App| {
+    // Paths from the OS (file associations, Finder, a second Windows process).
+    let (open_tx, mut open_rx) = futures::channel::mpsc::unbounded::<PathBuf>();
+    #[cfg(target_os = "windows")]
+    let _instance = match instance::claim(initial.as_deref(), open_tx.clone()) {
+        instance::Claim::Primary(guard) => guard,
+        instance::Claim::Forwarded => return,
+    };
+    let app = Application::new();
+    app.on_open_urls(move |urls| {
+        for value in urls {
+            // Local file URLs only. A query, another scheme or any other
+            // external string never becomes a backend option or command.
+            if let Ok(url) = url::Url::parse(&value)
+                && url.scheme() == "file"
+                && let Ok(path) = url.to_file_path()
+            {
+                let _ = open_tx.unbounded_send(path);
+            }
+        }
+    });
+    app.run(move |cx: &mut App| {
         if let Err(e) = cx.text_system().add_fonts(vec![
             Cow::Borrowed(include_bytes!(
                 "../../../Resources/Fonts/SpaceGrotesk-VariableFont_wght.ttf"
@@ -75,13 +103,30 @@ fn main() {
             app_id: Some("app.iris.player".into()),
             ..Default::default()
         };
-        if let Err(e) = cx.open_window(options, move |window, cx| {
+        let window = match cx.open_window(options, move |window, cx| {
             cx.new(|cx| ui::IrisWindow::new(session, initial, window, cx))
         }) {
-            log::error!("opening window: {e:#}");
-            cx.quit();
-            return;
-        }
+            Ok(window) => window,
+            Err(e) => {
+                log::error!("opening window: {e:#}");
+                cx.quit();
+                return;
+            }
+        };
+        cx.spawn(async move |cx| {
+            while let Some(path) = open_rx.next().await {
+                let opened = window.update(cx, |this, window, cx| {
+                    window.activate_window();
+                    if !path.as_os_str().is_empty() {
+                        this.open_path(&path, cx);
+                    }
+                });
+                if opened.is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
         cx.on_window_closed(|cx| {
             if cx.windows().is_empty() {
                 cx.quit();

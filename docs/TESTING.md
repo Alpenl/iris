@@ -5,7 +5,8 @@
 ```bash
 brew install mpv                 # 开发用的 libmpv（GPL 构建，不能拿去分发）
 cargo build --release --features devtools  # 性能/控制测试专用，不能作为发行包
-cargo test -p iris                        # 自然排序、照片解析、ICC、几何与字幕安全区
+cargo test --workspace                    # 自然排序、照片解析、ICC、几何、字幕安全区、记录、打开准备
+python3 scripts/check-project.py          # 仓库约束：UI 不碰 mpv、iris-core 不依赖 GPUI、devtools 门
 cargo deny check licenses        # 依赖许可证检查，需要先 cargo install cargo-deny
 ```
 
@@ -13,12 +14,13 @@ libmpv 不在 `/opt/homebrew/lib` 时用 `MPV_LIB_DIR` 指定。
 
 ## 测试素材
 
-两个脚本都把素材写到 `test-media/`（已忽略，不进仓库）。
+脚本都把素材写到 `test-media/`（已忽略，不进仓库）。
 
 | 脚本 | 内容 | 依赖 |
 |---|---|---|
 | `scripts/make-test-media.sh` | 1080p60 H.264、4K30 HEVC 10bit、带中文字幕的 2.39:1 MKV、几张大照片 | ffmpeg |
 | `scripts/make-photo-test-media.sh` | `test-media/photo/` 下的照片边界素材：EXIF 方向 1/3/6/8 的 JPEG 和方向 6 的 HEIC；48 MP 分块 HEIC；无标签 / sRGB / P3 / Adobe RGB 的纯色块；20000×3000、4000×40000、12000×12000 的巨图；JPEG 和 HEIC 各 20 张约 48 MP 的翻页图（每张宽度不同，用来识别是哪一张）| ffmpeg、exiftool、sips、swift（Command Line Tools）|
+| `scripts/make-webp-test-media.py` | `test-media/photo/icc/` 下 sRGB / P3 / Adobe RGB 的无损 WebP 色块（本机 FFmpeg 没有 WebP 编码器，改用 Pillow）| Pillow（带 WebP）、macOS ColorSync 配置文件 |
 
 ## 照片实测脚本
 
@@ -66,7 +68,8 @@ python3 scripts/icc-report.py out/
 - **修复后**（视频层标 Display P3，mpv 输出 `target-prim=display-p3`、`target-trc=srgb`）：sRGB 和无标签内容与预期值相差不超过 3 个色阶，例如红色测得 (231,50,35)，预期 (234,51,35)。1080p 测试画面改动前后并排比较，色条不再过饱和。
 - **视频层修复后的遗留**：带 P3 / Adobe RGB 配置文件的照片被当成 sRGB，显示偏淡（P3 红测得 (231,50,35)，应为 (255,0,0)）。修复前这类照片在 P3 屏上碰巧是对的，因为两个错误互相抵消。
 - **逐张覆盖原色后**（`crates/iris/src/photo.rs` + `icc.rs`）：21 个色块（PNG / JPEG 测试素材，另加 sips 生成的 P3 / Adobe RGB HEIC、P3 TIFF 和带 nclx 的 HEIC）与 ColorSync 预期值相差都不超过 3 个色阶，例如 P3 红 (252,0,0) 对 (255,0,0)。Adobe RGB 纯绿超出 P3：mpv 默认映射测得 (0,241,105)，改为 `gamut-mapping-mode=clip` 后 (0,249,45)，预期 (0,250,45)。EXIF 方向和翻页延迟（JPEG 中位数 89 ms、HEIC 296 ms）不变；照片之后打开视频，`vf` 已清空。
-- **未实测**：WebP（本机 FFmpeg 没有 WebP 编码器，做不出样图）；放在网络盘上的照片（配置文件在界面线程读取）。
+- WebP：`make-webp-test-media.py` 生成的色块已进单元测试（`photo::tests::reads_colour_from_test_media`，sRGB / P3 / Adobe RGB 都识别正确）。
+- **未实测**：放在网络盘上的照片。文件头读取已移到后台线程（`player::prepare`），不再卡界面，但慢盘上的打开延迟没有测过。
 
 ### 视频 CPU（色彩修复前后，同一脚本、同一窗口尺寸）
 
@@ -133,4 +136,12 @@ Windows 媒体库已在 WSL 中从固定源码实际编译：mpv `d11ffba253def0
 
 安装程序为 459494264 字节，SHA-256 `e8cd34e2373a83c621edc621ac70ebde3f111b77b3676a2ae79183c7fd7c389b`。`Get-AuthenticodeSignature` 实际结果 `NotSigned`，与 `unsigned-local` 清单一致，不使用自签冒充发行签名。
 
+### 合并 Windows 验证分支后（2026-11-21，macOS）
+
+远端 4176e96（Windows 实机验证版）为底，移入本地的收藏、续播、目录过滤、后台打开准备、单实例和 `iris-core` 拆分。
+
+- `cargo test --workspace` 17 项通过；`cargo clippy --workspace --all-targets -D warnings` 在 macOS（默认、`devtools`、release）和 Windows 目标上都无警告；`scripts/check-project.py` 通过。
+- Windows 目标在 Mac 上交叉检查：`x86_64-pc-windows-msvc` 的 debug `cargo clippy` 通过（`ring` 的 C 构建脚本用占位编译器跳过，不链接）。release 检查要编译 GPUI 的 HLSL 着色器，只能在 Windows 上跑，由 `.github/workflows/check.yml` 承担。
+- 独立实例端到端（debug 构建，私有 socket 和 `IRIS_SETTINGS`）：视频跳到 8 秒按 S 收藏、`filter favorites`、`filter photo` 下按 → 只翻到照片；退出时在 12 秒，重启后同一视频从 12.0 秒继续，收藏仍在，音量 94 恢复。顺带发现并修复：音量经 ↑ 超过 100 时，保存的值会被下次读取整个丢弃，现在保存时限制在 0–100。
+- **未验证**：Windows 单实例转发（只过了类型检查）；macOS 从 Finder 打开文件（`on_open_urls`）；这一轮界面在 Windows 上的实机表现。
 
