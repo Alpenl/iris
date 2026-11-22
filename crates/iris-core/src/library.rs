@@ -172,11 +172,6 @@ pub fn scan_dir(dir: &Path) -> ScanResult {
     }
 }
 
-/// Lists playable files in `dir`, in natural name order (see [`natural_cmp`]).
-pub fn scan(dir: &Path) -> Vec<Entry> {
-    scan_dir(dir).entries
-}
-
 pub fn sort_entries(entries: &mut [Entry], by: SortBy, order: SortOrder) {
     entries.sort_by(|a, b| {
         let ord = match by {

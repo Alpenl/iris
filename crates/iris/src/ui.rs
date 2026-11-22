@@ -70,7 +70,6 @@ pub struct IrisWindow {
     palette_focus: FocusHandle,
     // A window owns viewports; each viewport owns one independent session/surface.
     viewports: Vec<Viewport>,
-    show_directory: bool,
     sidebar_plugins: bool,
     plugins: PluginManager,
     overlays: OverlayState,
@@ -304,7 +303,6 @@ impl IrisWindow {
             .detach();
         }
 
-        let show_directory = settings.directory_open;
         let initial_scale = window.scale_factor() as f64;
         let now = Instant::now();
         let mut this = Self {
@@ -318,7 +316,6 @@ impl IrisWindow {
                 image: ImageView::default(),
                 drag_origin: None,
             }],
-            show_directory,
             sidebar_plugins: false,
             plugins,
             overlays: OverlayState::default(),
@@ -427,7 +424,6 @@ impl IrisWindow {
         if self.settings.remember_speed {
             self.settings.speed = Some(speed);
         }
-        self.settings.directory_open = self.show_directory;
         if self.settings.remember_window_size
             && let Some((w, h)) = self.last_window_size
         {
@@ -1733,7 +1729,7 @@ impl Render for IrisWindow {
             .when(!self.chrome_shown(), |d| d.cursor(CursorStyle::None))
             .when(!fullscreen, |d| d.child(self.render_titlebar(cx)))
             .child({
-                let directory = (!fullscreen && self.show_directory)
+                let directory = (!fullscreen && self.settings.directory_open)
                     .then(|| self.render_directory(false, window, cx).into_any_element());
                 let player = div()
                     .flex_1()

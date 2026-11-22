@@ -208,22 +208,6 @@ impl Mpv {
         })
     }
 
-    pub fn set_property_f64(&self, name: &str, mut value: f64) -> Result<()> {
-        with_cstr(name, |n| {
-            check(
-                unsafe {
-                    sys::mpv_set_property(
-                        self.handle,
-                        n,
-                        sys::MPV_FORMAT_DOUBLE,
-                        &mut value as *mut f64 as *mut c_void,
-                    )
-                },
-                || format!("set_property {name}={value}"),
-            )
-        })
-    }
-
     /// Sets a double property asynchronously (no round trip to the core).
     pub fn set_property_f64_async(&self, name: &str, mut value: f64) -> Result<()> {
         with_cstr(name, |n| {
@@ -238,23 +222,6 @@ impl Mpv {
                     )
                 },
                 || format!("set_property_async {name}={value}"),
-            )
-        })
-    }
-
-    pub fn set_property_flag(&self, name: &str, value: bool) -> Result<()> {
-        let mut v: c_int = value as c_int;
-        with_cstr(name, |n| {
-            check(
-                unsafe {
-                    sys::mpv_set_property(
-                        self.handle,
-                        n,
-                        sys::MPV_FORMAT_FLAG,
-                        &mut v as *mut c_int as *mut c_void,
-                    )
-                },
-                || format!("set_property {name}={value}"),
             )
         })
     }
@@ -298,11 +265,6 @@ impl Mpv {
             unsafe { sys::mpv_observe_property(self.handle, id, n.as_ptr(), format.raw()) },
             || format!("observe_property {name}"),
         )
-    }
-
-    /// Wakes up a thread blocked in [`Mpv::wait_event`].
-    pub fn wakeup(&self) {
-        unsafe { sys::mpv_wakeup(self.handle) }
     }
 
     /// Waits for the next event. `timeout < 0` waits forever. Returns `None` on timeout.

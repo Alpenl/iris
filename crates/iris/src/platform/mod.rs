@@ -94,7 +94,6 @@ fn decode_thumbnail_fallback(path: &Path, max_dim: u32) -> Option<Arc<RenderImag
     Some(Arc::new(RenderImage::new([image::Frame::new(rgba)])))
 }
 
-#[cfg_attr(target_os = "macos", allow(dead_code))]
 pub(crate) fn apply_exif_orientation(
     img: image::DynamicImage,
     orientation: u16,

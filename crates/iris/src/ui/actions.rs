@@ -4,7 +4,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use gpui::{App, Context, KeyBinding, PathPromptOptions, Pixels, Point, Window, actions};
 
-use super::controls;
 use super::*;
 use crate::library::{self, Kind};
 use crate::platform;
@@ -238,7 +237,7 @@ impl IrisWindow {
         let step = self.settings.seek_step;
         let target = (self.active().session.state.time_pos - step).max(0.);
         self.command(Command::SeekRelative(-step), cx);
-        self.show_osd(format!("-{step:.0}s · {}", controls::fmt_time(target)), cx);
+        self.show_osd(format!("-{step:.0}s · {}", player::format_time(target)), cx);
     }
 
     pub(super) fn seek_forward(
@@ -251,7 +250,7 @@ impl IrisWindow {
         let state = &self.active().session.state;
         let target = (state.time_pos + step).min(state.duration.max(0.));
         self.command(Command::SeekRelative(step), cx);
-        self.show_osd(format!("+{step:.0}s · {}", controls::fmt_time(target)), cx);
+        self.show_osd(format!("+{step:.0}s · {}", player::format_time(target)), cx);
     }
 
     pub(super) fn seek_back_large(
@@ -263,7 +262,7 @@ impl IrisWindow {
         let step = (self.settings.seek_step * 6.).clamp(15., 120.);
         let target = (self.active().session.state.time_pos - step).max(0.);
         self.command(Command::SeekRelative(-step), cx);
-        self.show_osd(format!("-{step:.0}s · {}", controls::fmt_time(target)), cx);
+        self.show_osd(format!("-{step:.0}s · {}", player::format_time(target)), cx);
     }
 
     pub(super) fn seek_forward_large(
@@ -276,7 +275,7 @@ impl IrisWindow {
         let state = &self.active().session.state;
         let target = (state.time_pos + step).min(state.duration.max(0.));
         self.command(Command::SeekRelative(step), cx);
-        self.show_osd(format!("+{step:.0}s · {}", controls::fmt_time(target)), cx);
+        self.show_osd(format!("+{step:.0}s · {}", player::format_time(target)), cx);
     }
 
     pub(super) fn frame_back(&mut self, _: &FrameBack, _: &mut Window, cx: &mut Context<Self>) {
@@ -425,10 +424,9 @@ impl IrisWindow {
             cx.notify();
             return;
         }
-        self.show_directory = !self.show_directory;
-        self.settings.directory_open = self.show_directory;
+        self.settings.directory_open = !self.settings.directory_open;
         self.settings.save();
-        if self.show_directory {
+        if self.settings.directory_open {
             self.scroll_directory_to_current();
             cx.notify();
         } else {
@@ -445,8 +443,8 @@ impl IrisWindow {
         if self.fullscreen {
             self.overlays.dir_popup = true;
             self.bump_activity(cx);
-        } else if !self.show_directory {
-            self.show_directory = true;
+        } else if !self.settings.directory_open {
+            self.settings.directory_open = true;
         }
         self.sidebar_plugins = false;
         self.search_open = !self.search_open;

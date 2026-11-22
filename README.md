@@ -179,7 +179,7 @@ crates/
   iris-api/            无头插件协议（清单、权限、事件、语义命令、四类宿主容器、JSON stdio v1）
   iris-core/           无头内核，不依赖 GPUI
     src/player.rs      视口会话、后台打开准备、语义命令、轨道/章节/统计、mpv 事件翻译
-    src/plugin.rs      插件管理器、外部 stdio 进程运行时、权限门控与官方内置插件
+    src/plugin/        插件管理器、外部 stdio 进程运行时、权限门控与官方内置插件（mod / builtins）
     src/store.rs       收藏、播放进度与最近打开记录（路径主键，原子写）
     src/photo.rs       照片文件头：方向、尺寸、内嵌 ICC/nclx 与轻量 EXIF 摘要
     src/icc.rs         色彩配置文件匹配与显示名称
@@ -190,12 +190,12 @@ crates/
     src/logging.rs     有界运行日志
   iris/                GPUI 应用
     src/main.rs        启动、命令行、窗口几何恢复、原生菜单栏、系统打开请求
-    src/ui.rs          主窗口状态、快捷键、动作与事件路由
-    src/ui/            titlebar / directory / viewport / controls / popover /
-                       settings / context_menu / info / palette / plugin_ui / widgets
+    src/ui.rs          主窗口编排、事件循环与 IME 输入路由
+    src/ui/            state / actions / debug_cmd / titlebar / directory / viewport / controls /
+                       popover / settings / context_menu / info / palette / plugin_ui / widgets
     src/video/         macOS CAOpenGLLayer / Windows D3D11 原生合成层
     src/instance.rs    Windows 单实例路径转发
-    src/platform.rs    窗口拖动/置顶、防休眠、macOS 捏合手势/媒体键/ImageIO 缩略图、截图
+    src/platform/      按 OS 隔离的窗口拖动/置顶、防休眠、捏合手势/媒体键、原生缩略图、截图（mod / macos / windows）
     src/theme.rs       方向 C 配色与尺寸
     src/assets.rs      编译进程序的 16px SVG 图标
     src/debug.rs       调试控制管道（仅 debug / devtools）

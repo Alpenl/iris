@@ -6,11 +6,10 @@ use gpui::{
     StatefulInteractiveElement, Styled, div, prelude::FluentBuilder, px,
 };
 
-use super::controls::fmt_time;
 use super::widgets::icon;
 use super::*;
 use crate::assets::Icon;
-use crate::player::{AspectMode, SPEED_STEPS, TrackKind};
+use crate::player::{AspectMode, SPEED_STEPS, TrackKind, format_time};
 
 impl IrisWindow {
     pub(super) fn render_popover(
@@ -596,7 +595,7 @@ impl IrisWindow {
                                                 .font_family(FONT_MONO)
                                                 .text_size(px(10.))
                                                 .text_color(text_faint())
-                                                .child(fmt_time(ch.time)),
+                                                .child(format_time(ch.time)),
                                         )
                                         .on_click(cx.listener(move |this, _, _, cx| {
                                             this.command(Command::SelectChapter(i), cx);

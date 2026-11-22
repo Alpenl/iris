@@ -10,7 +10,7 @@ use gpui::{
 use super::widgets::{ghost, icon, icon_button, icon_on_ghost, separator, text_button, tip};
 use super::*;
 use crate::assets::Icon;
-use crate::player::TrackKind;
+use crate::player::{TrackKind, format_time};
 
 /// Height of the timeline's hit area, which straddles the bar's top edge.
 const SEAM_HIT: f32 = 14.;
@@ -36,7 +36,7 @@ impl IrisWindow {
         let total = f32::from(window.viewport_size().width);
         if floating {
             (total - FLOAT_GAP * 2.).max(0.)
-        } else if self.show_directory {
+        } else if self.settings.directory_open {
             (total - self.effective_directory_width(window)).max(0.)
         } else {
             total
@@ -59,7 +59,7 @@ impl IrisWindow {
         let dir_open = if self.fullscreen {
             self.overlays.dir_popup
         } else {
-            self.show_directory
+            self.settings.directory_open
         };
         let mut dir = Some(
             icon_button(
@@ -98,7 +98,7 @@ impl IrisWindow {
         };
         let layout = kind.map_or(0, |k| k as usize + 1) * 4
             + usize::from(left) * 2
-            + usize::from(self.show_directory && !floating);
+            + usize::from(self.settings.directory_open && !floating);
         let mut row = div()
             .id(("dock-row", layout))
             .size_full()
@@ -167,9 +167,9 @@ impl IrisWindow {
             .map_or(state.time_pos, |r| r as f64 * state.duration);
         let second_time = if state.duration > 0. {
             if self.show_remaining {
-                format!("-{}", fmt_time((state.duration - shown_pos).max(0.)))
+                format!("-{}", format_time((state.duration - shown_pos).max(0.)))
             } else {
-                fmt_time(state.duration)
+                format_time(state.duration)
             }
         } else {
             "--:--".into()
@@ -214,7 +214,7 @@ impl IrisWindow {
                         this.show_remaining = !this.show_remaining;
                         cx.notify();
                     }))
-                    .child(div().text_color(text()).child(fmt_time(shown_pos)))
+                    .child(div().text_color(text()).child(format_time(shown_pos)))
                     .when(!tiny, |d| {
                         d.child(div().text_color(text_faint()).child("/"))
                             .child(div().text_color(text_dim()).child(second_time))
@@ -770,7 +770,7 @@ impl IrisWindow {
                                 .font_family(FONT_MONO)
                                 .text_size(px(11.))
                                 .text_color(text())
-                                .child(fmt_time(hover_t))
+                                .child(format_time(hover_t))
                                 .when_some(chapter_title, |d, ch| {
                                     d.child(
                                         div()
@@ -844,15 +844,5 @@ impl IrisWindow {
                     .bg(accent()),
             )
             .children(label)
-    }
-}
-
-pub(super) fn fmt_time(t: f64) -> String {
-    let s = t.max(0.) as u64;
-    let (h, m, s) = (s / 3600, s / 60 % 60, s % 60);
-    if h > 0 {
-        format!("{h}:{m:02}:{s:02}")
-    } else {
-        format!("{m:02}:{s:02}")
     }
 }

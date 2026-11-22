@@ -13,7 +13,7 @@
 | 1.3 | 插件只在控制面和矢量叠加面工作，**不经手实时像素数据**；像素管线由内核独占。 | 已落实 |
 | 1.4 | 界面的视觉语法和布局由内核掌握，插件只能往宿主规定的 4 个容器（侧栏插件面板、底栏状态徽章、视口归一化矢量叠层、命令面板）填结构化数据。 | 已落实 |
 | 1.5 | 不做多轨合成的非线性剪辑；mpv 是单管线前向播放，做不了。 | 方向已定 |
-| 1.6 | UI 发语义化命令 → 会话改状态 → 语义事件 → UI 重绘；UI 不直接使用 mpv 属性；坐标换算显式建模；机制和策略分开。 | 已收口到 `Session` / `geometry.rs` / `input.rs` / `plugin.rs` |
+| 1.6 | UI 发语义化命令 → 会话改状态 → 语义事件 → UI 重绘；UI 不直接使用 mpv 属性；坐标换算显式建模；机制和策略分开。 | 已收口到 `Session` / `geometry.rs` / `input.rs` / `plugin/` |
 | 1.7 | 当前不做：Wasm/Lua 进程内脚本引擎、SQLite 媒体库、Linux 移植。外部插件采用语言无关的 JSON-lines stdio 子进程协议，零额外脚本运行时依赖。 | 已定 |
 | 1.8 | 界面保留方向 C 的配色和整体风格，细节参照 Zed 和 Sooty：工具栏一行 44px，视频时间轴并进工具栏上沿并支持 60fps 跟手拖拽与章节刻度；按钮平时无框，悬停和选中各深一级灰；图标用 16px SVG；目录可拖拽调宽、采用 `uniform_list` 虚拟滚动、支持搜索/排序/子目录与插件面板切换；浮层锚定按钮正上方；独立轻量 OSD 不拉起全屏工具栏；橙色只标“现在在哪”。照片的缩放比例按原始像素算，1:1 即 100%。 | 已完成（2026-11-22）；CI 双端通过，新界面实机人工走查待补 |
 
@@ -39,7 +39,7 @@
 | # | 结论 | 状态 |
 |---|---|---|
 | 3.1 | **会话挂在视口上，不挂在窗口上**：窗口持有 `Vec<Viewport>`，当前长度 1；每个视口持有独立会话、画面层、矩形和照片变换。 | 已完成；不提前实现同屏对比 |
-| 3.2 | **上下文驱动的输入**：键盘按 `Workspace` / `Viewport` / `SearchInput` / `CommandPalette` 与 `media` 匹配；指针与捏合手势经同样的状态策略解析。 | 已完成（`input.rs` + `platform.rs`） |
+| 3.2 | **上下文驱动的输入**：键盘按 `Workspace` / `Viewport` / `SearchInput` / `CommandPalette` 与 `media` 匹配；指针与捏合手势经同样的状态策略解析。 | 已完成（`input.rs` + `platform/`） |
 | 3.3 | **许可走路线 B**：主程序 `MIT OR Apache-2.0`，保留商业 / 闭源扩展可能；媒体动态库独立遵守 LGPL。 | 已落实，见第 5 节 |
 | 3.4 | **媒体只读 + 路径做主键**：内核对媒体文件和目录永远只读，个人数据（设置、收藏、进度、最近打开、插件）全放应用数据目录，照片缩略图仅驻留内存。内容指纹重新匹配尚未做。 | 只读已遵守；收藏、进度与最近打开已实现（`store.rs`） |
 | 3.5 | **色彩准确是内核的硬指标**：视频层与照片内嵌 ICC 色彩管理归内核独占，插件与缩略图条不干扰主视口色彩管线。 | 进行中（SDR 完成，HDR 待后续版本） |
@@ -52,8 +52,8 @@
 - 侧栏、浮层、设置弹窗、右键菜单、命令面板和缩略图条均阻断滚轮与点击冒泡，避免误触发画布缩放或单击暂停。
 - 动作按意图命名，不按按键命名；跨平台快捷键用 GPUI 的 `secondary-*` 修饰符（macOS 是 ⌘，Windows 是 Ctrl）。
 - 复核补充的约束与落实：
-  - GPUI 0.2.2 没有原生双指捏合（magnify）事件，已在 `crates/iris/src/platform.rs` 通过 macOS `NSMagnificationGestureRecognizer`（`PinchMonitor`）原生接入。
-  - `start_window_move()` 在 macOS / Windows 上是空函数，窗口拖动继续用 `platform.rs` 自己的实现。
+  - GPUI 0.2.2 没有原生双指捏合（magnify）事件，已在 `crates/iris/src/platform/macos.rs` 通过 macOS `NSMagnificationGestureRecognizer`（`PinchMonitor`）原生接入。
+  - `start_window_move()` 在 macOS / Windows 上是空函数，窗口拖动继续用 `platform/` 自己的实现。
   - **焦点纪律**：工具栏、标题栏、浮层按钮点击后不保留键盘焦点，焦点回到视口；仅目录搜索栏（`search_focus`）和命令面板（`palette_focus`）在激活时持有文本输入焦点。
   - 单击视频暂停采用 200ms 延迟触发并在双击全屏到达时自动取消，消除单击/双击冲突。
 
@@ -113,7 +113,7 @@
 |---|---|---|
 | 8.1 | D3D11 渲染要设 `MPV_RENDER_PARAM_BACKEND = "gpu-next"`，且 libplacebo ≥ 7.387 | `render.h` 没有 BACKEND 参数，是编的。真正要注意的是不恢复设备状态、不能用 SINGLETHREADED。|
 | 8.2 | 用 GPUI 的 `window.start_window_move()` 拖窗口 | 0.2.2 在 macOS / Windows 上是空函数。|
-| 8.3 | GPUI 视口层自带双指捏合缩放 | GPUI 0.2.2 没有 magnify 事件；已在 `platform.rs` 通过原生 `NSMagnificationGestureRecognizer` 自行桥接。|
+| 8.3 | GPUI 视口层自带双指捏合缩放 | GPUI 0.2.2 没有 magnify 事件；已在 `platform/macos.rs` 通过原生 `NSMagnificationGestureRecognizer` 自行桥接。|
 | 8.4 | 立刻从 cocoa / objc 迁到 objc2 | GPUI 0.2.2 自己用旧库，迁移后类型不互通；不是当前的事。|
 | 8.5 | `deny.toml` 只放行 MIT / Apache / BSD / ISC / Zlib / Unicode | 现有依赖树会直接报红，必须加 MPL-2.0 等。|
 | 8.6 | 用 `target-colorspace-hint` 透传 HDR 和色彩空间 | render API 下管不到 Iris 的图层。|
@@ -136,7 +136,7 @@
 ## 10. 待决问题
 
 - **版权安排**：许可证已定为 `MIT OR Apache-2.0`；是否需要 CLA 或版权归属安排仍待决（5.9）。
-- **macOS 与 Windows 新功能实机走查**：2026-11-22 两轮大型改动已通过 GitHub Actions 双端编译、Clippy、29 项单元测试与许可证门禁，但尚未在实体机上逐项人工点验新 UI（如触控板捏合、媒体键、外部插件 GUI 交互、Windows 新界面与单实例转发）。
+- **macOS 与 Windows 新功能实机走查**：2026-11-22 两轮大型改动与后续工程化打磨已通过编译、Clippy、44 项单元测试与许可证门禁（macOS 亦已完成独立实例空转/播放/IME/色彩回归实测），但仍有部分新 UI 交互（如触控板捏合、媒体键、外部插件 GUI 交互与 Windows 实体机全量界面/WIC/单实例转发）待实体机逐项人工点验。
 - **最低系统版本**：打包脚本当前以 macOS 11 为构建目标；实际支持下限仍需对应系统验证。
 - **商业模式**：是否走 Open-Core，仍未决定。
 - **正式分发签名**：当前仅支持未签名本地包与 CI 构建；正式分发需要 Developer ID / 公证与 Windows Authenticode 凭据。

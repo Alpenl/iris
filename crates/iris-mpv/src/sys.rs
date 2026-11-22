@@ -130,7 +130,6 @@ pub struct mpv_d3d11_fbo {
 }
 
 unsafe extern "C" {
-    pub fn mpv_client_api_version() -> std::ffi::c_ulong;
     pub fn mpv_error_string(error: c_int) -> *const c_char;
     pub fn mpv_free(data: *mut c_void);
     pub fn mpv_create() -> *mut mpv_handle;
@@ -146,12 +145,6 @@ unsafe extern "C" {
         ctx: *mut mpv_handle,
         reply_userdata: u64,
         args: *mut *const c_char,
-    ) -> c_int;
-    pub fn mpv_set_property(
-        ctx: *mut mpv_handle,
-        name: *const c_char,
-        format: mpv_format,
-        data: *mut c_void,
     ) -> c_int;
     pub fn mpv_set_property_string(
         ctx: *mut mpv_handle,
@@ -180,7 +173,6 @@ unsafe extern "C" {
     ) -> c_int;
     pub fn mpv_request_log_messages(ctx: *mut mpv_handle, min_level: *const c_char) -> c_int;
     pub fn mpv_wait_event(ctx: *mut mpv_handle, timeout: f64) -> *mut mpv_event;
-    pub fn mpv_wakeup(ctx: *mut mpv_handle);
 
     pub fn mpv_render_context_create(
         res: *mut *mut mpv_render_context,

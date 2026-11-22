@@ -32,6 +32,16 @@ pub fn step_speed(current: f64, dir: isize) -> f64 {
     }
 }
 
+pub fn format_time(t: f64) -> String {
+    let total = t.max(0.) as u64;
+    let (h, m, s) = (total / 3600, total / 60 % 60, total % 60);
+    if h > 0 {
+        format!("{h}:{m:02}:{s:02}")
+    } else {
+        format!("{m:02}:{s:02}")
+    }
+}
+
 pub fn friendly_error(code: i32) -> &'static str {
     match code {
         -13 => "无法打开或读取文件",
@@ -350,7 +360,6 @@ pub struct PlaybackState {
     pub video_size: (i64, i64),
     pub hwdec: String,
     pub subs_visible: bool,
-    pub sub_id: String,
     pub sub_delay: f64,
     pub ended: bool,
     pub audio: String,
@@ -379,7 +388,6 @@ pub enum Command {
     ToggleMute,
     VolumeBy(f64),
     SetVolume(f64),
-    SpeedStep(isize),
     SetSpeed(f64),
     ToggleSubtitles,
     NextSubtitle,
@@ -389,7 +397,6 @@ pub enum Command {
     LoadSubtitle(PathBuf),
     NextAudio,
     SelectAudio(Option<i64>),
-    ToggleLoop,
     SetLoop(bool),
     SetAspect(AspectMode),
     RotateMedia(i64),
@@ -539,7 +546,6 @@ impl Session {
                 video_size: (0, 0),
                 hwdec: String::new(),
                 subs_visible: true,
-                sub_id: String::new(),
                 sub_delay: 0.,
                 ended: false,
                 audio: String::new(),
@@ -582,11 +588,6 @@ impl Session {
             && self.state.loaded
             && !self.state.paused
             && !self.state.ended
-    }
-    pub fn index(&self) -> Option<usize> {
-        self.current
-            .as_ref()
-            .and_then(|path| self.entries.iter().position(|e| &e.path == path))
     }
 
     pub fn tracks_of(&self, kind: TrackKind) -> Vec<&Track> {
@@ -909,10 +910,6 @@ impl Session {
                 }
                 self.mpv.set_property_f64_async("volume", clamped)?;
             }
-            Command::SpeedStep(dir) => {
-                let next = step_speed(self.state.speed, dir);
-                self.mpv.set_property_f64_async("speed", next)?;
-            }
             Command::SetSpeed(speed) => self
                 .mpv
                 .set_property_f64_async("speed", speed.clamp(0.25, 4.))?,
@@ -952,10 +949,6 @@ impl Session {
                 Some(id) => self.mpv.command_async(&["set", "aid", &id.to_string()])?,
                 None => self.mpv.command_async(&["set", "aid", "no"])?,
             },
-            Command::ToggleLoop => {
-                let next = if self.state.loop_file { "no" } else { "inf" };
-                self.mpv.command_async(&["set", "loop-file", next])?;
-            }
             Command::SetLoop(enable) => {
                 self.mpv
                     .command_async(&["set", "loop-file", if enable { "inf" } else { "no" }])?;
@@ -1055,7 +1048,6 @@ impl Session {
             SessionEvent::Hardware(v) => self.state.hwdec.clone_from(v),
             SessionEvent::Subtitles(v) => self.state.subs_visible = *v,
             SessionEvent::SubtitleTrack(v) => {
-                self.state.sub_id.clone_from(v);
                 if self.state.tracks.is_empty() {
                     self.tracks_dirty = true;
                 } else {

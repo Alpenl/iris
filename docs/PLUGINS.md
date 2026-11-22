@@ -6,7 +6,7 @@ Iris 的插件系统严格遵循**“控制面 + 矢量叠加面”**边界：
 - **宿主掌控视觉语法**：插件不能绘制任意自定义 UI，而是向宿主规定的 4 个结构化容器填入数据，由 Iris 按方向 C 样式统一渲染。
 - **最小权限与进程隔离**：外部插件以独立子进程运行，经 JSON-lines stdio 与宿主通信；所有动作都是强类型语义命令，受清单权限严格过滤，无法注入任何 mpv 原始选项或命令行。
 
-协议定义位于独立的无头 crate [`crates/iris-api`](../crates/iris-api/src/lib.rs)，宿主运行时与内置插件位于 [`crates/iris-core/src/plugin.rs`](../crates/iris-core/src/plugin.rs)。
+协议定义位于独立的无头 crate [`crates/iris-api`](../crates/iris-api/src/lib.rs)，宿主运行时与内置插件位于 [`crates/iris-core/src/plugin/`](../crates/iris-core/src/plugin/mod.rs)。
 
 ---
 

@@ -195,7 +195,7 @@ impl IrisWindow {
             PaletteTarget::Host("toggle_sidebar_mode") => {
                 self.sidebar_plugins = !self.sidebar_plugins;
                 if !self.fullscreen {
-                    self.show_directory = true;
+                    self.settings.directory_open = true;
                 } else {
                     self.overlays.dir_popup = true;
                 }

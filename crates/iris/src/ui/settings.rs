@@ -227,14 +227,17 @@ impl IrisWindow {
                 ),
             ))
             .child(setting_row(
-                "启动时展开目录",
-                "下次打开 Iris 时默认显示停靠目录",
+                "显示停靠目录",
+                "在窗口内停靠显示文件目录与插件侧栏，状态自动记住",
                 toggle(
                     "set-dir-open",
                     s.directory_open,
                     cx.listener(|this, _, _, cx| {
                         this.settings.directory_open = !this.settings.directory_open;
                         this.settings.save();
+                        if this.settings.directory_open {
+                            this.scroll_directory_to_current();
+                        }
                         cx.notify();
                     }),
                 ),
@@ -736,7 +739,10 @@ impl IrisWindow {
                     ("A".into(), "切换音轨"),
                     ("L".into(), "单曲循环开关"),
                     ("C".into(), "切换画面比例 / 铺满裁剪"),
-                    ("R / H".into(), "旋转 90° / 镜像翻转"),
+                    (
+                        "R / Shift+R / H / Shift+H".into(),
+                        "顺逆时针旋转 90° / 水平垂直翻转",
+                    ),
                     (shot_k, "保存当前帧截图"),
                     ("Shift+[ / ]".into(), "上一章节 / 下一章节"),
                 ],
@@ -748,7 +754,10 @@ impl IrisWindow {
                     ("滚轮 / 捏合 / = / -".into(), "以光标为中心缩放"),
                     ("拖拽".into(), "放大后平移"),
                     ("0 / Space / 双击".into(), "适应窗口 / 切换 1:1"),
-                    ("R / Shift+R / H".into(), "顺逆时针旋转 90° / 镜像翻转"),
+                    (
+                        "R / Shift+R / H / Shift+H".into(),
+                        "顺逆时针旋转 90° / 水平垂直翻转",
+                    ),
                     ("G".into(), "显示 / 隐藏底部缩略图条"),
                 ],
             ),

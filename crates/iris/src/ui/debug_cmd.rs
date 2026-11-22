@@ -69,7 +69,7 @@ impl IrisWindow {
                     state.sub_delay,
                     state.video_size,
                     state.hwdec,
-                    self.show_directory,
+                    self.settings.directory_open,
                     self.settings.directory_width,
                     self.settings.directory_side,
                     self.overlays.dir_popup,

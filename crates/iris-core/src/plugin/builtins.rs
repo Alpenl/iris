@@ -11,6 +11,8 @@ use iris_api::{
     SidebarPanel, SidebarSection, StatusItem,
 };
 
+use crate::player::format_time;
+
 // ============================================================================
 // Built-in Official Plugin 1: Composition & Safe-Area Vector Guides
 // ============================================================================
@@ -336,29 +338,19 @@ pub(super) struct AbLoopPlugin {
 }
 
 impl AbLoopPlugin {
-    pub(super) fn fmt_sec(t: f64) -> String {
-        let total = t.max(0.) as u64;
-        let (h, m, s) = (total / 3600, total / 60 % 60, total % 60);
-        if h > 0 {
-            format!("{h}:{m:02}:{s:02}")
-        } else {
-            format!("{m:02}:{s:02}")
-        }
-    }
-
     fn sync_ui(&self) -> Vec<HostCommand> {
         let mut cmds = Vec::new();
         let status = match (self.point_a, self.point_b) {
             (Some(a), Some(b)) => Some(StatusItem {
                 id: "ab-status".into(),
-                text: format!("A-B {}–{}", Self::fmt_sec(a), Self::fmt_sec(b)),
+                text: format!("A-B {}–{}", format_time(a), format_time(b)),
                 tooltip: Some("A-B 区间循环中 · 点击清除".into()),
                 accent: true,
                 action_id: Some("clear".into()),
             }),
             (Some(a), None) => Some(StatusItem {
                 id: "ab-status".into(),
-                text: format!("A {}–?", Self::fmt_sec(a)),
+                text: format!("A {}–?", format_time(a)),
                 tooltip: Some("已设置起点 A · 点击清除".into()),
                 accent: false,
                 action_id: Some("clear".into()),
@@ -372,12 +364,12 @@ impl AbLoopPlugin {
             items: vec![
                 SidebarItem::KeyValue {
                     key: "起点 A".into(),
-                    value: self.point_a.map_or("未设置".into(), Self::fmt_sec),
+                    value: self.point_a.map_or("未设置".into(), format_time),
                     accent: self.point_a.is_some(),
                 },
                 SidebarItem::KeyValue {
                     key: "终点 B".into(),
-                    value: self.point_b.map_or("未设置".into(), Self::fmt_sec),
+                    value: self.point_b.map_or("未设置".into(), format_time),
                     accent: self.point_b.is_some(),
                 },
                 SidebarItem::ButtonRow {
@@ -412,7 +404,7 @@ impl AbLoopPlugin {
         {
             for (i, &t) in list.iter().enumerate() {
                 marker_items.push(SidebarItem::Button {
-                    label: format!("#{}  {}", i + 1, Self::fmt_sec(t)),
+                    label: format!("#{}  {}", i + 1, format_time(t)),
                     action_id: format!("jump:{t:.3}"),
                     accent: false,
                 });
@@ -443,7 +435,7 @@ impl AbLoopPlugin {
         {
             cmds.push(HostCommand::SeekAbsolute { seconds: sec });
             cmds.push(HostCommand::ShowToast {
-                message: format!("跳转标记 · {}", Self::fmt_sec(sec)),
+                message: format!("跳转标记 · {}", format_time(sec)),
             });
             return cmds;
         }
@@ -464,7 +456,7 @@ impl AbLoopPlugin {
                 }
                 cmds.extend(self.sync_ui());
                 cmds.push(HostCommand::ShowToast {
-                    message: format!("A-B 起点 A · {}", Self::fmt_sec(snapshot.position)),
+                    message: format!("A-B 起点 A · {}", format_time(snapshot.position)),
                 });
             }
             "set_b" => {
@@ -475,11 +467,7 @@ impl AbLoopPlugin {
                         self.last_loop_seek = None;
                         cmds.extend(self.sync_ui());
                         cmds.push(HostCommand::ShowToast {
-                            message: format!(
-                                "A-B 循环 · {}–{}",
-                                Self::fmt_sec(a),
-                                Self::fmt_sec(pos)
-                            ),
+                            message: format!("A-B 循环 · {}–{}", format_time(a), format_time(pos)),
                         });
                     }
                     _ => {
@@ -506,7 +494,7 @@ impl AbLoopPlugin {
                     list.sort_by(f64::total_cmp);
                     cmds.extend(self.sync_ui());
                     cmds.push(HostCommand::ShowToast {
-                        message: format!("已添加时间标记 · {}", Self::fmt_sec(t)),
+                        message: format!("已添加时间标记 · {}", format_time(t)),
                     });
                 }
             }

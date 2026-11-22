@@ -11,12 +11,11 @@ use gpui::{
 };
 
 use super::context_menu::{ContextMenu, ContextTarget};
-use super::controls::fmt_time;
 use super::widgets::icon;
 use super::*;
 use crate::assets::Icon;
 use crate::geometry::ImageView;
-use crate::player::Session;
+use crate::player::{Session, format_time};
 use crate::video::VideoSurface;
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -401,9 +400,9 @@ impl IrisWindow {
                             .text_color(text_dim())
                             .child(format!(
                                 "{} / {} · {}",
-                                fmt_time(state.time_pos),
+                                format_time(state.time_pos),
                                 if state.duration > 0. {
-                                    fmt_time(state.duration)
+                                    format_time(state.duration)
                                 } else {
                                     "--:--".into()
                                 },

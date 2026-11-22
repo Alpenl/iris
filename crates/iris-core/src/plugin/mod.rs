@@ -467,16 +467,6 @@ pub struct PluginManager {
 }
 
 impl PluginManager {
-    pub fn load(disabled: &[String]) -> Self {
-        let mut mgr = Self {
-            plugins: BTreeMap::new(),
-            host_version: env!("CARGO_PKG_VERSION").to_string(),
-            wake: None,
-        };
-        mgr.reload(disabled);
-        mgr
-    }
-
     /// Loads plugins and returns an event-driven wake channel that fires only
     /// when an external plugin emits a message or exits (zero idle polling).
     pub fn load_with_wake(disabled: &[String]) -> (Self, UnboundedReceiver<()>) {
@@ -971,8 +961,8 @@ mod tests {
 
     #[test]
     fn ab_loop_plugin_loops_dedups_and_formats_hours() {
-        assert_eq!(AbLoopPlugin::fmt_sec(90.), "01:30");
-        assert_eq!(AbLoopPlugin::fmt_sec(3665.), "1:01:05");
+        assert_eq!(crate::player::format_time(90.), "01:30");
+        assert_eq!(crate::player::format_time(3665.), "1:01:05");
 
         let mut mgr = PluginManager {
             plugins: BTreeMap::new(),
