@@ -11,7 +11,7 @@ use crate::assets::Icon;
 
 impl IrisWindow {
     pub(super) fn render_titlebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let session = &self.viewports[0].session;
+        let session = &self.active().session;
         let file = session
             .current
             .as_ref()
@@ -66,11 +66,17 @@ impl IrisWindow {
             })
             .cursor_pointer()
             .tooltip(tip(
-                if pinned { "取消窗口置顶" } else { "窗口置顶" },
+                if pinned {
+                    "取消窗口置顶"
+                } else {
+                    "窗口置顶"
+                },
                 Some("T"),
             ))
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .on_click(cx.listener(|this, _, w, cx| this.toggle_always_on_top(&ToggleAlwaysOnTop, w, cx)))
+            .on_click(
+                cx.listener(|this, _, w, cx| this.toggle_always_on_top(&ToggleAlwaysOnTop, w, cx)),
+            )
             .child(
                 icon(Icon::Pin, 12., if pinned { accent() } else { text_dim() })
                     .group_hover("win-pin", |s| {

@@ -26,7 +26,7 @@ impl IrisWindow {
         let modal_w = (f32::from(vp.width) - 24.).clamp(420., 660.);
         let modal_h = (f32::from(vp.height) - 24.).clamp(260., 496.);
 
-        let body: AnyElement = match self.settings_tab {
+        let body: AnyElement = match self.overlays.settings_tab {
             SettingsTab::Appearance => self.settings_appearance(cx).into_any_element(),
             SettingsTab::Playback => self.settings_playback(cx).into_any_element(),
             SettingsTab::Tracks => self.settings_tracks(cx).into_any_element(),
@@ -36,7 +36,7 @@ impl IrisWindow {
         };
 
         let nav_item = |tab: SettingsTab, label: &'static str| {
-            let active = self.settings_tab == tab;
+            let active = self.overlays.settings_tab == tab;
             div()
                 .id(("settings-tab", tab as usize))
                 .relative()
@@ -64,7 +64,7 @@ impl IrisWindow {
                 })
                 .child(label)
                 .on_click(cx.listener(move |this, _, _, cx| {
-                    this.settings_tab = tab;
+                    this.overlays.settings_tab = tab;
                     cx.notify();
                 }))
         };
@@ -80,7 +80,7 @@ impl IrisWindow {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
-                    this.settings_open = false;
+                    this.overlays.settings_open = false;
                     this.bump_activity(cx);
                     cx.stop_propagation();
                     cx.notify();
@@ -136,7 +136,7 @@ impl IrisWindow {
                                 icon_button("settings-close", Icon::Close, false)
                                     .tooltip(tip("关闭设置", Some("Esc")))
                                     .on_click(cx.listener(|this, _, _, cx| {
-                                        this.settings_open = false;
+                                        this.overlays.settings_open = false;
                                         this.bump_activity(cx);
                                         cx.notify();
                                     })),
@@ -286,7 +286,7 @@ impl IrisWindow {
                     |this, val, cx| {
                         this.settings.on_eof = val;
                         this.settings.save();
-                        this.viewports[0].session.apply_settings(&this.settings);
+                        this.active().session.set_on_eof_loop(val);
                         cx.notify();
                     },
                 ),
@@ -330,7 +330,7 @@ impl IrisWindow {
                     |this, val, cx| {
                         this.settings.hwdec = val;
                         this.settings.save();
-                        this.viewports[0].session.apply_settings(&this.settings);
+                        this.active().session.set_hwdec(val);
                         cx.notify();
                     },
                 ),
@@ -398,7 +398,7 @@ impl IrisWindow {
                     |this, val, cx| {
                         this.settings.sub_lang = val;
                         this.settings.save();
-                        this.viewports[0].session.apply_settings(&this.settings);
+                        this.active().session.set_sub_lang(val);
                         cx.notify();
                     },
                 ),
@@ -415,7 +415,7 @@ impl IrisWindow {
                             ((this.settings.sub_scale - 0.1) * 100.).round() / 100.;
                         this.settings.sub_scale = this.settings.sub_scale.clamp(0.5, 2.5);
                         this.settings.save();
-                        this.viewports[0].session.apply_settings(&this.settings);
+                        this.active().session.set_sub_scale(this.settings.sub_scale);
                         cx.notify();
                     }),
                     cx.listener(|this, _, _, cx| {
@@ -423,13 +423,13 @@ impl IrisWindow {
                             ((this.settings.sub_scale + 0.1) * 100.).round() / 100.;
                         this.settings.sub_scale = this.settings.sub_scale.clamp(0.5, 2.5);
                         this.settings.save();
-                        this.viewports[0].session.apply_settings(&this.settings);
+                        this.active().session.set_sub_scale(this.settings.sub_scale);
                         cx.notify();
                     }),
                     cx.listener(|this, _, _, cx| {
                         this.settings.sub_scale = 1.0;
                         this.settings.save();
-                        this.viewports[0].session.apply_settings(&this.settings);
+                        this.active().session.set_sub_scale(this.settings.sub_scale);
                         cx.notify();
                     }),
                 ),
@@ -439,7 +439,10 @@ impl IrisWindow {
                 "指针在视频画面上方滚动滚轮时的响应",
                 segmented(
                     "set-wheel",
-                    &[("调节音量", VideoWheel::Volume), ("无操作", VideoWheel::None)],
+                    &[
+                        ("调节音量", VideoWheel::Volume),
+                        ("无操作", VideoWheel::None),
+                    ],
                     s.video_wheel,
                     cx,
                     |this, val, cx| {
@@ -477,7 +480,10 @@ impl IrisWindow {
                 "打开新照片时的初始缩放模式",
                 segmented(
                     "set-photo-default",
-                    &[("适应窗口", PhotoDefault::Fit), ("原始 1:1", PhotoDefault::Actual)],
+                    &[
+                        ("适应窗口", PhotoDefault::Fit),
+                        ("原始 1:1", PhotoDefault::Actual),
+                    ],
                     s.photo_default,
                     cx,
                     |this, val, cx| {
@@ -666,23 +672,19 @@ impl IrisWindow {
                                 .child(info.manifest.description),
                         )
                     })
-                    .child(
-                        div()
-                            .flex()
-                            .flex_wrap()
-                            .gap(px(4.))
-                            .children(info.manifest.permissions.into_iter().map(|perm| {
-                                div()
-                                    .px(px(5.))
-                                    .py(px(1.))
-                                    .bg(panel())
-                                    .border_1()
-                                    .border_color(line())
-                                    .text_size(px(10.))
-                                    .text_color(text_faint())
-                                    .child(perm.label())
-                            })),
-                    )
+                    .child(div().flex().flex_wrap().gap(px(4.)).children(
+                        info.manifest.permissions.into_iter().map(|perm| {
+                            div()
+                                .px(px(5.))
+                                .py(px(1.))
+                                .bg(panel())
+                                .border_1()
+                                .border_color(line())
+                                .text_size(px(10.))
+                                .text_color(text_faint())
+                                .child(perm.label())
+                        }),
+                    ))
             }))
     }
 
@@ -942,7 +944,12 @@ fn setting_row(
                 .flex_col()
                 .gap(px(2.))
                 .child(div().text_size(px(12.)).text_color(text()).child(title))
-                .child(div().text_size(px(11.)).text_color(text_faint()).child(desc)),
+                .child(
+                    div()
+                        .text_size(px(11.))
+                        .text_color(text_faint())
+                        .child(desc),
+                ),
         )
         .child(div().flex_none().child(control))
 }
@@ -969,16 +976,14 @@ fn toggle_indexed(
         .items_center()
         .when(on, |d| d.justify_end().bg(accent()).border_color(accent()))
         .when(!on, |d| {
-            d.justify_start().bg(window_bg()).border_color(line_strong())
+            d.justify_start()
+                .bg(window_bg())
+                .border_color(line_strong())
         })
         .border_1()
         .cursor_pointer()
         .on_click(on_click)
-        .child(
-            div()
-                .size(px(14.))
-                .bg(if on { text() } else { text_dim() }),
-        )
+        .child(div().size(px(14.)).bg(if on { text() } else { text_dim() }))
 }
 
 fn segmented<T: Copy + PartialEq + 'static>(

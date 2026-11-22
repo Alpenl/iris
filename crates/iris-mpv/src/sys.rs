@@ -136,11 +136,28 @@ unsafe extern "C" {
     pub fn mpv_create() -> *mut mpv_handle;
     pub fn mpv_initialize(ctx: *mut mpv_handle) -> c_int;
     pub fn mpv_terminate_destroy(ctx: *mut mpv_handle);
-    pub fn mpv_set_option_string(ctx: *mut mpv_handle, name: *const c_char, data: *const c_char) -> c_int;
+    pub fn mpv_set_option_string(
+        ctx: *mut mpv_handle,
+        name: *const c_char,
+        data: *const c_char,
+    ) -> c_int;
     pub fn mpv_command(ctx: *mut mpv_handle, args: *mut *const c_char) -> c_int;
-    pub fn mpv_command_async(ctx: *mut mpv_handle, reply_userdata: u64, args: *mut *const c_char) -> c_int;
-    pub fn mpv_set_property(ctx: *mut mpv_handle, name: *const c_char, format: mpv_format, data: *mut c_void) -> c_int;
-    pub fn mpv_set_property_string(ctx: *mut mpv_handle, name: *const c_char, data: *const c_char) -> c_int;
+    pub fn mpv_command_async(
+        ctx: *mut mpv_handle,
+        reply_userdata: u64,
+        args: *mut *const c_char,
+    ) -> c_int;
+    pub fn mpv_set_property(
+        ctx: *mut mpv_handle,
+        name: *const c_char,
+        format: mpv_format,
+        data: *mut c_void,
+    ) -> c_int;
+    pub fn mpv_set_property_string(
+        ctx: *mut mpv_handle,
+        name: *const c_char,
+        data: *const c_char,
+    ) -> c_int;
     pub fn mpv_set_property_async(
         ctx: *mut mpv_handle,
         reply_userdata: u64,
@@ -148,9 +165,19 @@ unsafe extern "C" {
         format: mpv_format,
         data: *mut c_void,
     ) -> c_int;
-    pub fn mpv_get_property(ctx: *mut mpv_handle, name: *const c_char, format: mpv_format, data: *mut c_void) -> c_int;
+    pub fn mpv_get_property(
+        ctx: *mut mpv_handle,
+        name: *const c_char,
+        format: mpv_format,
+        data: *mut c_void,
+    ) -> c_int;
     pub fn mpv_get_property_string(ctx: *mut mpv_handle, name: *const c_char) -> *mut c_char;
-    pub fn mpv_observe_property(ctx: *mut mpv_handle, reply_userdata: u64, name: *const c_char, format: mpv_format) -> c_int;
+    pub fn mpv_observe_property(
+        ctx: *mut mpv_handle,
+        reply_userdata: u64,
+        name: *const c_char,
+        format: mpv_format,
+    ) -> c_int;
     pub fn mpv_request_log_messages(ctx: *mut mpv_handle, min_level: *const c_char) -> c_int;
     pub fn mpv_wait_event(ctx: *mut mpv_handle, timeout: f64) -> *mut mpv_event;
     pub fn mpv_wakeup(ctx: *mut mpv_handle);
@@ -166,7 +193,10 @@ unsafe extern "C" {
         callback_ctx: *mut c_void,
     );
     pub fn mpv_render_context_update(ctx: *mut mpv_render_context) -> u64;
-    pub fn mpv_render_context_render(ctx: *mut mpv_render_context, params: *mut mpv_render_param) -> c_int;
+    pub fn mpv_render_context_render(
+        ctx: *mut mpv_render_context,
+        params: *mut mpv_render_param,
+    ) -> c_int;
     pub fn mpv_render_context_report_swap(ctx: *mut mpv_render_context);
     pub fn mpv_render_context_free(ctx: *mut mpv_render_context);
 }

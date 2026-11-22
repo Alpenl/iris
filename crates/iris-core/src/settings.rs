@@ -3,8 +3,47 @@
 //! Windows `%APPDATA%\Iris\settings.conf`. `IRIS_SETTINGS` overrides the path.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::library::{SortBy, SortOrder};
+
+static ATOMIC_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Atomically writes `content` to `path` via a unique sibling `.tmp` file,
+/// cleaning up the temp file on failure and retrying briefly on Windows
+/// transient sharing locks.
+pub fn atomic_write(path: &Path, content: &str) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let seq = ATOMIC_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = path.with_extension(format!("{}.{}.tmp", std::process::id(), seq));
+    if let Err(e) = std::fs::write(&tmp, content) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    let mut last_err = None;
+    let attempts = if cfg!(windows) { 5 } else { 1 };
+    for attempt in 0..attempts {
+        match std::fs::rename(&tmp, path) {
+            Ok(()) => return Ok(()),
+            Err(e)
+                if cfg!(windows)
+                    && attempt + 1 < attempts
+                    && e.kind() == std::io::ErrorKind::PermissionDenied =>
+            {
+                last_err = Some(e);
+                std::thread::sleep(std::time::Duration::from_millis(10 * (attempt + 1) as u64));
+            }
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(e);
+            }
+        }
+    }
+    let _ = std::fs::remove_file(&tmp);
+    Err(last_err.unwrap_or_else(|| std::io::Error::other("atomic rename failed")))
+}
 
 pub const DEFAULT_DIRECTORY_WIDTH: f32 = 288.;
 pub const MIN_DIRECTORY_WIDTH: f32 = 220.;
@@ -439,12 +478,7 @@ impl Settings {
             ));
         }
 
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
-        std::fs::write(&tmp, text)?;
-        std::fs::rename(tmp, path)
+        atomic_write(path, &text)
     }
 }
 

@@ -3,7 +3,10 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::path::PathBuf;
 
-struct LogOutput { file: File, remaining: u64 }
+struct LogOutput {
+    file: File,
+    remaining: u64,
+}
 impl Write for LogOutput {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         let _ = io::stderr().write_all(bytes);
@@ -15,7 +18,9 @@ impl Write for LogOutput {
         }
         Ok(bytes.len())
     }
-    fn flush(&mut self) -> io::Result<()> { self.file.flush() }
+    fn flush(&mut self) -> io::Result<()> {
+        self.file.flush()
+    }
 }
 
 pub fn log_path() -> Option<PathBuf> {
@@ -35,14 +40,31 @@ pub fn log_path() -> Option<PathBuf> {
 }
 
 pub fn init() {
-    let mut builder = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("iris=info"));
+    let mut builder = env_logger::Builder::from_env(
+        env_logger::Env::default().default_filter_or("iris=info,iris_core=info,iris_mpv=info"),
+    );
     builder.format_timestamp_millis();
     if let Some(path) = log_path() {
-        let opened = path.parent().map_or(Ok(()), std::fs::create_dir_all)
-            .and_then(|_| OpenOptions::new().create(true).truncate(true).write(true).open(&path));
+        let opened = path
+            .parent()
+            .map_or(Ok(()), std::fs::create_dir_all)
+            .and_then(|_| {
+                OpenOptions::new()
+                    .create(true)
+                    .truncate(true)
+                    .write(true)
+                    .open(&path)
+            });
         match opened {
-            Ok(file) => { builder.target(env_logger::Target::Pipe(Box::new(LogOutput { file, remaining: 4 * 1024 * 1024 }))); }
-            Err(e) => { eprintln!("Iris: cannot open log {}: {e}", path.display()); }
+            Ok(file) => {
+                builder.target(env_logger::Target::Pipe(Box::new(LogOutput {
+                    file,
+                    remaining: 4 * 1024 * 1024,
+                })));
+            }
+            Err(e) => {
+                eprintln!("Iris: cannot open log {}: {e}", path.display());
+            }
         }
     }
     builder.init();

@@ -5,7 +5,7 @@
 ```bash
 brew install mpv                 # 开发用的 libmpv（GPL 构建，不能拿去分发）
 cargo build --release --features devtools  # 性能/控制测试专用，不能作为发行包
-cargo test --locked --workspace            # 29 项单元/集成测试：协议、插件权限与外部 stdio 握手、排序、照片/ICC、几何、字幕安全区、设置、记录
+cargo test --locked --workspace            # 44 项单元/集成测试：协议、插件权限/崩溃与外部 stdio 握手、排序、照片/ICC 畸形头防御、几何、输入策略、字幕安全区、设置、记录、IME 与缩略图 LRU 缓存
 python3 scripts/check-project.py           # 仓库约束：UI 不碰 mpv、iris-core 与 iris-api 无头隔离、devtools 门、锁定元数据
 cargo deny check licenses        # 依赖许可证检查，需要先 cargo install cargo-deny
 ```
@@ -182,5 +182,26 @@ Windows 媒体库已在 WSL 中从固定源码实际编译：mpv `d11ffba253def0
   - `windows`（`windows-2025`，4m22s）：`scripts/check-project.py` 与 debug / `--release` 两轮 `cargo clippy -- -D warnings` 零告警通过。
 - GitHub Actions `Release recipe policy` run `44953868554`（`f732354`）：`cargo deny check licenses` 与发行策略检查通过。
 - **未实机人工验证**：上述 2026-11-22 两轮新增交互（触控板双指捏合、macOS 媒体键与 Now Playing、底部缩略图条、右键菜单、命令面板、外部插件 GUI 交互、窗口置顶以及 Windows 实机界面与单实例转发）仅完成 CI 编译、Clippy、权限与 stdio 单元测试，尚未在实体 macOS / Windows 机器上逐项人工点验。
+
+### 工程化、稳定性与性能优化打磨（2026-11-22，macOS 本机实测 + Windows 交叉检查）
+
+范围：不增新功能，全面修复底层 FFI / 原生视频层 / 插件隔离隐患，优化热路径与重绘频率，补齐中文 IME / 剪贴板 / 键盘滚动等 UX 细节，拆分超大文件并收敛工具链/CI/打包脚本。
+
+- **静态检查与格式**：
+  - `python3 scripts/check-project.py`（扩展校验 `examples/**/*.py` 语法）通过；`scripts/release/*.py` 策略校验通过。
+  - `cargo fmt --all -- --check` 通过（已在 `.github/workflows/check.yml` 与 `rust-toolchain.toml` 纳入校验）。
+  - `cargo clippy --locked --workspace --all-targets -- -D warnings` 四套目标全部零告警通过：macOS debug 默认、macOS debug `--features iris/devtools`、macOS `--release`（Thin LTO）、Windows `x86_64-pc-windows-msvc` debug（验证 `platform/windows.rs` 原生 WIC 缩略图解码与 `video/windows.rs` 后台 ICC / `FLIP_DISCARD` / D3D11 设备重置恢复）。
+- **单元与集成测试**：`cargo test --locked --workspace` **44 项全部通过**（`iris` 2 项 IME UTF-16 与缩略图 LRU 并发测试 + `iris-api` 2 项 + `iris-core` 40 项，新增 `input.rs` 策略全覆盖、畸形 PNG/JPEG/HEIF/ICC 防护、5000 项自然排序基准、脏标记与完成条目清理、真实 libmpv `track-list` JSON 解析、A-B 循环小时格式与防抖、有界读行器与外部插件崩溃/满载写队列非阻塞集成测试）。
+- **macOS 独立隔离实例实测**（`target/release/iris`，带 `devtools` 与 Thin LTO，私有 Unix socket、`IRIS_SETTINGS` 与 `IRIS_PLUGINS`，挂载 `examples/plugins/watch-stats`）：
+  - 空状态空闲 2.0s：`renders=3 -> 3`（**0.00 Hz**，彻底消除空转重绘）。
+  - 30 秒 1080p60 视频播放（`videotoolbox` 硬解 + `watch-stats` 外部插件每秒更新状态）：3.01s 内 `delta=15`（**4.99 Hz**，含 4 Hz 短视频时间轴上限 + 1 Hz 外部插件状态刷新）。
+  - 打开多轨字幕 MKV 并切换 `I` 详情面板、打开照片切换底部缩略图条 `G` / 1:1 `Space` / 适应 `0` / 翻页 `→` 均正常。
+  - 搜索栏（`⌘F`）与命令面板（`⌘P`）中输入 `f` / `t` 保持 `fullscreen=false`（`Workspace && !TextInput` 作用域与 `EntityInputHandler` 生效），方向键滚动正常。
+  - `quit` 退出码 0，外部 `watch-stats` Python 子进程零残留，`stderr` 无 panic、无 ERROR、无 mpv 废弃选项告警（已将 `video-aspect-override=-1` 修正为 `no`）。
+- **照片边界与 ColorSync ICC 回归**（`scripts/photo-harness.py --bin target/release/iris ... probe exif heic icc` + `scripts/icc-report.py`）：
+  - EXIF 1/3/6/8、HEIC 方向 6 与 48 MP 分块 HEIC 全部通过。
+  - 17 个 PNG/JPEG 色块与 macOS ColorSync 预期值最大误差均在 **1–3 个色阶**内（`green-adobergb.png` 误差 1、`red-p3-jpeg.jpg` 误差 1、`red-srgb.png` 误差 3），色彩管线零回归。
+- **未在 Windows 实体机复验**：Windows WIC 缩略图、D3D11 设备重置恢复与后台显示器 ICC 切换已通过 `x86_64-pc-windows-msvc` 交叉 Clippy 零告警验证，尚未在实体 Windows 机器上实测。
+
 
 

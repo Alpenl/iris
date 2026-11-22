@@ -9,7 +9,7 @@ use iris_mpv::{Event, Format, Mpv, Value};
 
 use crate::library::{self, Entry, FolderEntry, Kind, ScanResult};
 use crate::photo::{self, ExifSummary, Photo};
-use crate::settings::{OnEof, Settings};
+use crate::settings::{Hwdec, OnEof, Settings, SubLang};
 
 pub const SPEED_STEPS: &[f64] = &[0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0];
 
@@ -463,6 +463,52 @@ pub fn prepare(path: &Path, cached: Option<(PathBuf, ScanResult)>) -> Result<Pre
     })
 }
 
+/// A multi-file drop queue prepared off the UI thread, ready to load.
+pub struct PreparedQueue {
+    folder: PathBuf,
+    entries: Vec<Entry>,
+    photo: Option<Photo>,
+    options: Option<String>,
+}
+
+impl PreparedQueue {
+    pub fn target(&self) -> Option<&Path> {
+        self.entries.first().map(|e| e.path.as_path())
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+/// Resolves a multi-file drop queue off the UI thread (canonicalization,
+/// metadata stat, and photo header probing).
+pub fn prepare_queue(paths: Vec<PathBuf>) -> Option<PreparedQueue> {
+    let entries: Vec<Entry> = paths
+        .into_iter()
+        .filter_map(|p| p.canonicalize().ok())
+        .filter_map(library::entry_from_path)
+        .collect();
+    let first = entries.first()?;
+    let folder = first
+        .path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let photo = (first.kind == Kind::Photo).then(|| photo::probe(&first.path));
+    let options = photo.as_ref().and_then(Photo::mpv_options);
+    Some(PreparedQueue {
+        folder,
+        entries,
+        photo,
+        options,
+    })
+}
+
 pub struct Session {
     mpv: Arc<Mpv>,
     pub state: PlaybackState,
@@ -475,6 +521,8 @@ pub struct Session {
     photo_meta: Option<Photo>,
     extra_rotate: u16,
     subtitle_inset: f64,
+    tracks_dirty: bool,
+    chapters_dirty: bool,
 }
 
 impl Session {
@@ -515,6 +563,8 @@ impl Session {
             photo_meta: None,
             extra_rotate: 0,
             subtitle_inset: 0.,
+            tracks_dirty: false,
+            chapters_dirty: false,
         })
     }
 
@@ -528,7 +578,10 @@ impl Session {
         self.kind
     }
     pub fn is_actively_playing_video(&self) -> bool {
-        self.kind == Some(Kind::Video) && self.state.loaded && !self.state.paused && !self.state.ended
+        self.kind == Some(Kind::Video)
+            && self.state.loaded
+            && !self.state.paused
+            && !self.state.ended
     }
     pub fn index(&self) -> Option<usize> {
         self.current
@@ -552,10 +605,7 @@ impl Session {
     }
 
     pub fn chapter_at(&self, time: f64) -> Option<&Chapter> {
-        self.state
-            .chapters
-            .iter()
-            .rfind(|c| c.time <= time + 0.05)
+        self.state.chapters.iter().rfind(|c| c.time <= time + 0.05)
     }
 
     /// Queries detailed media / decoder stats on demand (only when Info panel is open).
@@ -569,7 +619,12 @@ impl Session {
             .and_then(|p| std::fs::metadata(p).ok())
             .map_or(0, |m| m.len());
         let prop_str = |name: &str| self.mpv.get_property_string(name).unwrap_or_default();
-        let prop_f64 = |name: &str| self.mpv.get_property_f64(name).ok().filter(|v| v.is_finite());
+        let prop_f64 = |name: &str| {
+            self.mpv
+                .get_property_f64(name)
+                .ok()
+                .filter(|v| v.is_finite())
+        };
         let prop_i64 = |name: &str| {
             self.mpv
                 .get_property_string(name)
@@ -597,23 +652,65 @@ impl Session {
         }
     }
 
-    /// Applies user preferences that map to live backend properties.
-    pub fn apply_settings(&self, settings: &Settings) {
-        let _ = self
-            .mpv
-            .command_async(&["set", "hwdec", settings.hwdec.mpv_value()]);
-        let _ = self
-            .mpv
-            .command_async(&["set", "slang", settings.sub_lang.mpv_slang()]);
-        let _ = self
-            .mpv
-            .set_property_f64_async("sub-scale", settings.sub_scale.clamp(0.5, 2.5));
-        let loop_val = if settings.on_eof == OnEof::Loop {
-            "inf"
-        } else {
-            "no"
+    /// Refreshes only the live-changing playback metrics on an existing `MediaStats`
+    /// snapshot (called at ~1 Hz while the Info overlay is visible).
+    pub fn refresh_dynamic_stats(&self, stats: &mut MediaStats) {
+        let prop_f64 = |name: &str| {
+            self.mpv
+                .get_property_f64(name)
+                .ok()
+                .filter(|v| v.is_finite())
         };
+        let prop_i64 = |name: &str| {
+            self.mpv
+                .get_property_string(name)
+                .ok()
+                .and_then(|s| s.parse::<i64>().ok())
+        };
+        let (w, h) = self.state.video_size;
+        stats.resolution = (w > 0 && h > 0).then_some((w, h));
+        stats.hwdec.clone_from(&self.state.hwdec);
+        match self.kind {
+            Some(Kind::Video) => {
+                stats.video_fps =
+                    prop_f64("estimated-vf-fps").or_else(|| prop_f64("container-fps"));
+                stats.video_bitrate = prop_f64("video-bitrate");
+                stats.dropped_frames = prop_i64("frame-drop-count");
+            }
+            Some(Kind::Audio) => {
+                stats.audio_bitrate = prop_f64("audio-bitrate");
+            }
+            _ => {}
+        }
+    }
+
+    pub fn set_hwdec(&self, hwdec: Hwdec) {
+        let _ = self.mpv.command_async(&["set", "hwdec", hwdec.mpv_value()]);
+    }
+
+    pub fn set_sub_lang(&self, sub_lang: SubLang) {
+        let _ = self
+            .mpv
+            .command_async(&["set", "slang", sub_lang.mpv_slang()]);
+    }
+
+    pub fn set_sub_scale(&self, scale: f64) {
+        let _ = self
+            .mpv
+            .set_property_f64_async("sub-scale", scale.clamp(0.5, 2.5));
+    }
+
+    pub fn set_on_eof_loop(&self, on_eof: OnEof) {
+        let loop_val = if on_eof == OnEof::Loop { "inf" } else { "no" };
         let _ = self.mpv.command_async(&["set", "loop-file", loop_val]);
+    }
+
+    /// Applies user preferences that map to live backend properties (used on startup).
+    pub fn apply_settings(&self, settings: &Settings) {
+        self.set_hwdec(settings.hwdec);
+        self.set_sub_lang(settings.sub_lang);
+        self.set_sub_scale(settings.sub_scale);
+        self.set_on_eof_loop(settings.on_eof);
     }
 
     /// Loads a prepared folder and file. `resume` (seconds) applies to video only.
@@ -643,27 +740,30 @@ impl Session {
                 self.state.tracks.clear();
                 self.state.chapters.clear();
                 self.state.loaded = false;
+                self.tracks_dirty = false;
+                self.chapters_dirty = false;
             }
         }
         Ok(())
     }
 
-    /// Opens an explicit multi-file drop queue as the active playlist.
-    pub fn open_queue(&mut self, entries: Vec<Entry>, resume: f64) -> Result<()> {
-        let Some(first) = entries.first().cloned() else {
+    /// Opens an explicit multi-file drop queue prepared off the UI thread.
+    pub fn open_prepared_queue(&mut self, prepared: PreparedQueue, resume: f64) -> Result<()> {
+        let PreparedQueue {
+            folder,
+            entries,
+            photo,
+            options,
+        } = prepared;
+        let Some(first) = entries.first() else {
             return Ok(());
         };
-        let folder = first
-            .path
-            .parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| PathBuf::from("."));
-        let photo = (first.kind == Kind::Photo).then(|| photo::probe(&first.path));
-        let options = photo.as_ref().and_then(Photo::mpv_options);
+        let first_path = first.path.clone();
+        let first_kind = first.kind;
         self.folder = Some(folder);
         self.entries = entries;
         self.subfolders.clear();
-        self.load(&first.path, Some(first.kind), photo, options, resume)
+        self.load(&first_path, Some(first_kind), photo, options, resume)
     }
 
     fn load(
@@ -689,7 +789,9 @@ impl Session {
         };
         self.reset_transform()?;
         let _ = self.mpv.command_async(&["set", "video-rotate", "0"]);
-        let _ = self.mpv.command_async(&["set", "video-aspect-override", "-1"]);
+        let _ = self
+            .mpv
+            .command_async(&["set", "video-aspect-override", "no"]);
         let _ = self.mpv.set_property_f64_async("panscan", 0.);
         let _ = self.mpv.set_property_f64_async("sub-delay", 0.);
         let _ = self.mpv.command_async(&["set", "vf", ""]);
@@ -719,6 +821,8 @@ impl Session {
         self.state.tracks.clear();
         self.state.chapters.clear();
         self.state.current_chapter = -1;
+        self.tracks_dirty = false;
+        self.chapters_dirty = false;
         Ok(())
     }
 
@@ -774,11 +878,10 @@ impl Session {
                 self.mpv
                     .command_async(&["seek", &seconds.to_string(), "relative+exact"])?
             }
-            Command::SeekAbsolute(seconds) => self.mpv.command_async(&[
-                "seek",
-                &seconds.max(0.).to_string(),
-                "absolute+exact",
-            ])?,
+            Command::SeekAbsolute(seconds) => {
+                self.mpv
+                    .command_async(&["seek", &seconds.max(0.).to_string(), "absolute+exact"])?
+            }
             Command::SeekPercent(percent) => self.mpv.command_async(&[
                 "seek",
                 &percent.clamp(0., 100.).to_string(),
@@ -862,7 +965,7 @@ impl Session {
                 match mode {
                     AspectMode::Original => {
                         self.mpv
-                            .command_async(&["set", "video-aspect-override", "-1"])?;
+                            .command_async(&["set", "video-aspect-override", "no"])?;
                         self.mpv.set_property_f64_async("panscan", 0.)?;
                     }
                     AspectMode::Ratio16x9 => {
@@ -882,7 +985,7 @@ impl Session {
                     }
                     AspectMode::FillCrop => {
                         self.mpv
-                            .command_async(&["set", "video-aspect-override", "-1"])?;
+                            .command_async(&["set", "video-aspect-override", "no"])?;
                         self.mpv.set_property_f64_async("panscan", 1.)?;
                     }
                 }
@@ -891,8 +994,7 @@ impl Session {
                 if !matches!(self.kind, Some(Kind::Photo | Kind::Video)) {
                     return Ok(());
                 }
-                self.extra_rotate =
-                    ((self.extra_rotate as i64 + delta_deg).rem_euclid(360)) as u16;
+                self.extra_rotate = ((self.extra_rotate as i64 + delta_deg).rem_euclid(360)) as u16;
                 let is_heif = self.kind == Some(Kind::Photo)
                     && self
                         .current
@@ -954,19 +1056,37 @@ impl Session {
             SessionEvent::Subtitles(v) => self.state.subs_visible = *v,
             SessionEvent::SubtitleTrack(v) => {
                 self.state.sub_id.clone_from(v);
-                self.refresh_tracks();
+                if self.state.tracks.is_empty() {
+                    self.tracks_dirty = true;
+                } else {
+                    let selected_id = v.parse::<i64>().ok();
+                    for t in &mut self.state.tracks {
+                        if t.kind == TrackKind::Sub {
+                            t.selected = selected_id == Some(t.id);
+                        }
+                    }
+                }
             }
             SessionEvent::SubDelay(v) => self.state.sub_delay = *v,
             SessionEvent::Ended(v) => self.state.ended = *v,
             SessionEvent::Audio(v) => {
                 self.state.audio.clone_from(v);
-                self.refresh_tracks();
+                if self.state.tracks.is_empty() {
+                    self.tracks_dirty = true;
+                } else {
+                    let selected_id = v.parse::<i64>().ok();
+                    for t in &mut self.state.tracks {
+                        if t.kind == TrackKind::Audio {
+                            t.selected = selected_id == Some(t.id);
+                        }
+                    }
+                }
             }
             SessionEvent::Rotation(v) => self.state.rotation = *v,
             SessionEvent::LoopFile(v) => self.state.loop_file = *v,
             SessionEvent::Chapter(v) => self.state.current_chapter = *v,
-            SessionEvent::ChaptersChanged => self.refresh_chapters(),
-            SessionEvent::TracksChanged => self.refresh_tracks(),
+            SessionEvent::ChaptersChanged => self.chapters_dirty = true,
+            SessionEvent::TracksChanged => self.tracks_dirty = true,
             // A late event from the previous file must not mark this one loaded.
             SessionEvent::Loaded => {
                 let current = self
@@ -975,94 +1095,41 @@ impl Session {
                     .map(|p| p.to_string_lossy().into_owned());
                 self.state.loaded = self.mpv.get_property_string("path").ok() == current;
                 if self.state.loaded {
-                    self.refresh_tracks();
-                    self.refresh_chapters();
+                    self.tracks_dirty = true;
+                    self.chapters_dirty = true;
                 }
             }
             _ => {}
         }
     }
 
-    fn refresh_chapters(&mut self) {
-        let count = self
-            .mpv
-            .get_property_string("chapter-list/count")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(0)
-            .min(128);
-        let mut chapters = Vec::with_capacity(count);
-        for i in 0..count {
-            let time = self
-                .mpv
-                .get_property_f64(&format!("chapter-list/{i}/time"))
-                .unwrap_or(0.);
-            let title = self
-                .mpv
-                .get_property_string(&format!("chapter-list/{i}/title"))
-                .ok()
-                .filter(|s| !s.trim().is_empty())
-                .unwrap_or_else(|| format!("第 {} 章", i + 1));
-            chapters.push(Chapter { title, time });
+    /// Flushes deferred track/chapter queries once per event batch, avoiding
+    /// redundant mpv round-trips during file load bursts.
+    pub fn flush_deferred(&mut self) {
+        if self.tracks_dirty {
+            self.tracks_dirty = false;
+            self.refresh_tracks();
         }
-        self.state.chapters = chapters;
+        if self.chapters_dirty {
+            self.chapters_dirty = false;
+            self.refresh_chapters();
+        }
+    }
+
+    fn refresh_chapters(&mut self) {
+        let Ok(raw) = self.mpv.get_property_string("chapter-list") else {
+            self.state.chapters.clear();
+            return;
+        };
+        self.state.chapters = parse_chapter_list_json(&raw);
     }
 
     fn refresh_tracks(&mut self) {
-        let count = self
-            .mpv
-            .get_property_string("track-list/count")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(0)
-            .min(64);
-        let mut tracks = Vec::new();
-        for i in 0..count {
-            let Ok(ty) = self.mpv.get_property_string(&format!("track-list/{i}/type")) else {
-                continue;
-            };
-            let kind = match ty.as_str() {
-                "audio" => TrackKind::Audio,
-                "sub" => TrackKind::Sub,
-                _ => continue,
-            };
-            let id = self
-                .mpv
-                .get_property_string(&format!("track-list/{i}/id"))
-                .ok()
-                .and_then(|s| s.parse::<i64>().ok())
-                .unwrap_or(i as i64 + 1);
-            let title = self
-                .mpv
-                .get_property_string(&format!("track-list/{i}/title"))
-                .unwrap_or_default();
-            let lang = self
-                .mpv
-                .get_property_string(&format!("track-list/{i}/lang"))
-                .unwrap_or_default();
-            let codec = self
-                .mpv
-                .get_property_string(&format!("track-list/{i}/codec"))
-                .unwrap_or_default();
-            let selected = self
-                .mpv
-                .get_property_string(&format!("track-list/{i}/selected"))
-                .is_ok_and(|s| s == "yes");
-            let external = self
-                .mpv
-                .get_property_string(&format!("track-list/{i}/external"))
-                .is_ok_and(|s| s == "yes");
-            tracks.push(Track {
-                id,
-                kind,
-                title,
-                lang,
-                codec,
-                selected,
-                external,
-            });
-        }
-        self.state.tracks = tracks;
+        let Ok(raw) = self.mpv.get_property_string("track-list") else {
+            self.state.tracks.clear();
+            return;
+        };
+        self.state.tracks = parse_track_list_json(&raw);
     }
 
     pub fn transform(&self, zoom: f64, pan: [f64; 2]) -> Result<()> {
@@ -1104,6 +1171,69 @@ impl Session {
     pub fn shutdown(&self) {
         let _ = self.mpv.command(&["quit"]);
     }
+}
+
+fn parse_track_list_json(raw: &str) -> Vec<Track> {
+    let Ok(serde_json::Value::Array(items)) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return Vec::new();
+    };
+    let mut tracks = Vec::with_capacity(items.len().min(64));
+    for (i, item) in items.iter().take(64).enumerate() {
+        let Some(obj) = item.as_object() else {
+            continue;
+        };
+        let kind = match obj.get("type").and_then(|v| v.as_str()) {
+            Some("audio") => TrackKind::Audio,
+            Some("sub") => TrackKind::Sub,
+            _ => continue,
+        };
+        let id = obj
+            .get("id")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(i as i64 + 1);
+        let str_field = |k: &str| {
+            obj.get(k)
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string()
+        };
+        let bool_field = |k: &str| obj.get(k).and_then(|v| v.as_bool()).unwrap_or(false);
+        tracks.push(Track {
+            id,
+            kind,
+            title: str_field("title"),
+            lang: str_field("lang"),
+            codec: str_field("codec"),
+            selected: bool_field("selected"),
+            external: bool_field("external"),
+        });
+    }
+    tracks
+}
+
+fn parse_chapter_list_json(raw: &str) -> Vec<Chapter> {
+    let Ok(serde_json::Value::Array(items)) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return Vec::new();
+    };
+    let mut chapters = Vec::with_capacity(items.len().min(128));
+    for (i, item) in items.iter().take(128).enumerate() {
+        let Some(obj) = item.as_object() else {
+            continue;
+        };
+        let time = obj
+            .get("time")
+            .and_then(|v| v.as_f64())
+            .filter(|t| t.is_finite())
+            .unwrap_or(0.);
+        let title = obj
+            .get("title")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty())
+            .map(String::from)
+            .unwrap_or_else(|| format!("第 {} 章", i + 1));
+        chapters.push(Chapter { title, time });
+    }
+    chapters
 }
 
 #[cfg(test)]
@@ -1184,6 +1314,95 @@ mod tests {
         wait_for(&session.mpv, 106);
         session.subtitle_inset(0., 900.);
         wait_for(&session.mpv, 0);
+        session.shutdown();
+    }
+
+    #[test]
+    fn parses_mpv_track_and_chapter_json() {
+        let tracks = parse_track_list_json(
+            r#"[
+                {"id":1,"type":"video","codec":"h264","selected":true},
+                {"id":1,"type":"audio","lang":"jpn","codec":"aac","selected":true,"external":false},
+                {"id":2,"type":"sub","title":"简体中文","lang":"zh","codec":"ass","selected":false,"external":true}
+            ]"#,
+        );
+        assert_eq!(tracks.len(), 2);
+        assert_eq!(tracks[0].kind, TrackKind::Audio);
+        assert!(tracks[0].selected);
+        assert_eq!(tracks[0].lang, "jpn");
+        assert_eq!(tracks[1].kind, TrackKind::Sub);
+        assert!(tracks[1].external);
+        assert_eq!(tracks[1].title, "简体中文");
+
+        let chapters =
+            parse_chapter_list_json(r#"[{"title":"Intro","time":0.0},{"title":"","time":42.5}]"#);
+        assert_eq!(chapters.len(), 2);
+        assert_eq!(chapters[0].title, "Intro");
+        assert_eq!(chapters[1].title, "第 2 章");
+        assert!((chapters[1].time - 42.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn session_apply_updates_state_and_track_selection_in_memory() {
+        let mut session = Session::new().unwrap();
+        session.state.tracks = vec![
+            Track {
+                id: 1,
+                kind: TrackKind::Audio,
+                title: String::new(),
+                lang: "en".into(),
+                codec: "aac".into(),
+                selected: true,
+                external: false,
+            },
+            Track {
+                id: 2,
+                kind: TrackKind::Audio,
+                title: String::new(),
+                lang: "zh".into(),
+                codec: "flac".into(),
+                selected: false,
+                external: false,
+            },
+        ];
+        session.apply(&SessionEvent::Position(12.5));
+        session.apply(&SessionEvent::Duration(90.0));
+        session.apply(&SessionEvent::Paused(true));
+        session.apply(&SessionEvent::Audio("2".into()));
+        assert!((session.state.time_pos - 12.5).abs() < 1e-9);
+        assert!((session.state.duration - 90.0).abs() < 1e-9);
+        assert!(session.state.paused);
+        assert!(!session.state.tracks[0].selected);
+        assert!(session.state.tracks[1].selected);
+        assert!(!session.tracks_dirty);
+        session.shutdown();
+    }
+
+    #[test]
+    fn loads_real_track_list_json_from_libmpv() {
+        let mkv =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../test-media/03-bars-scope-subs.mkv");
+        if !mkv.is_file() {
+            return;
+        }
+        let mut session = Session::new().unwrap();
+        let prepared = prepare(&mkv, None).unwrap();
+        session.open(prepared, 0.).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while std::time::Instant::now() < deadline && !session.state.loaded {
+            if let Some(ev) = session.mpv.wait_event(0.05)
+                && let Some(se) = SessionEvent::from_backend(ev)
+            {
+                session.apply(&se);
+            }
+        }
+        session.flush_deferred();
+        assert!(session.state.loaded, "test MKV should finish loading");
+        assert!(
+            !session.tracks_of(TrackKind::Sub).is_empty(),
+            "expected subtitle tracks from single-call track-list JSON, got {:?}",
+            session.state.tracks
+        );
         session.shutdown();
     }
 }

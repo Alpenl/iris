@@ -88,7 +88,7 @@ pub fn classify_icc(icc: &[u8]) -> Option<Colour> {
     if icc.len() < 132 || &icc[36..40] != b"acsp" || &icc[16..20] != b"RGB " {
         return None;
     }
-    let count = be32(&icc[128..]) as usize;
+    let count = (be32(&icc[128..]) as usize).min(1024);
     let tag = |sig: &[u8; 4]| -> Option<&[u8]> {
         (0..count).find_map(|i| {
             let e = icc.get(132 + 12 * i..144 + 12 * i)?;
@@ -104,9 +104,11 @@ pub fn classify_icc(icc: &[u8]) -> Option<Colour> {
         if t.len() < 20 || &t[..4] != b"XYZ " {
             return None;
         }
-        let v: Vec<f64> = (0..3)
-            .map(|i| be32(&t[8 + 4 * i..]) as i32 as f64 / 65536.0)
-            .collect();
+        let v = [
+            be32(&t[8..]) as i32 as f64 / 65536.0,
+            be32(&t[12..]) as i32 as f64 / 65536.0,
+            be32(&t[16..]) as i32 as f64 / 65536.0,
+        ];
         let sum = v[0] + v[1] + v[2];
         (sum > 0.0).then(|| [v[0] / sum, v[1] / sum])
     };
@@ -141,7 +143,8 @@ fn classify_trc(t: &[u8]) -> Option<&'static str> {
                 1 => pure_gamma(be16(t.get(12..14)?) as f64 / 256.0),
                 _ => {
                     // A sampled curve: compare with the sRGB curve.
-                    let table = t.get(12..12 + 2 * n)?;
+                    let end = n.checked_mul(2)?.checked_add(12)?;
+                    let table = t.get(12..end)?;
                     let fits = (0..n).step_by((n / 32).max(1)).all(|i| {
                         let x = i as f64 / (n - 1) as f64;
                         let y = be16(&table[2 * i..]) as f64 / 65535.0;
@@ -272,5 +275,22 @@ mod tests {
             p3.mpv_format().as_deref(),
             Some("primaries=display-p3:gamma=srgb")
         );
+    }
+
+    #[test]
+    fn malformed_icc_never_panics() {
+        assert_eq!(classify_icc(&[]), None);
+        assert_eq!(classify_icc(&[0u8; 200]), None);
+        // Header with huge tag count and out-of-bounds offsets.
+        let mut fake = vec![0u8; 160];
+        fake[16..20].copy_from_slice(b"RGB ");
+        fake[36..40].copy_from_slice(b"acsp");
+        fake[128..132].copy_from_slice(&u32::MAX.to_be_bytes());
+        assert_eq!(classify_icc(&fake), None);
+        // Sampled curve with overflowing entry count.
+        let mut curv = vec![0u8; 16];
+        curv[..4].copy_from_slice(b"curv");
+        curv[8..12].copy_from_slice(&u32::MAX.to_be_bytes());
+        assert_eq!(classify_trc(&curv), None);
     }
 }

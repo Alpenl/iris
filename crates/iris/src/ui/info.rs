@@ -15,8 +15,9 @@ impl IrisWindow {
         fullscreen: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let stats = self.viewports[0].session.media_stats();
-        let kind = self.viewports[0].session.kind();
+        // Use cached stats refreshed on load/open and at 1 Hz (never sync-poll mpv in render()).
+        let stats = self.cached_stats.clone().unwrap_or_default();
+        let kind = self.active().session.kind();
         let mut rows: Vec<(&'static str, String)> = Vec::new();
 
         if !stats.file_name.is_empty() {
@@ -72,7 +73,7 @@ impl IrisWindow {
                     }
                     rows.push(("音频", audio));
                 }
-                let chapters = self.viewports[0].session.state.chapters.len();
+                let chapters = self.active().session.state.chapters.len();
                 if chapters > 0 {
                     rows.push(("章节", format!("{chapters} 个")));
                 }
@@ -96,7 +97,10 @@ impl IrisWindow {
                 }
             }
             Some(Kind::Photo) => {
-                rows.push(("色彩空间", stats.photo_colour.unwrap_or("sRGB (默认)").into()));
+                rows.push((
+                    "色彩空间",
+                    stats.photo_colour.unwrap_or("sRGB (默认)").into(),
+                ));
                 if let Some(exif) = stats.photo_exif {
                     if let Some(cam) = exif.camera {
                         rows.push(("相机", cam));
@@ -129,52 +133,48 @@ impl IrisWindow {
         }
 
         let top = if fullscreen { FLOAT_GAP + 36. } else { 12. };
-        let panel_box = div()
-            .id("media-info")
-            .absolute()
-            .top(px(top))
-            .w(px(330.))
-            .max_w(px(330.))
-            .flex()
-            .flex_col()
-            .bg(overlay())
-            .border_1()
-            .border_color(line_strong())
-            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
-            .child(
-                div()
-                    .h(px(32.))
-                    .px(px(10.))
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .border_b_1()
-                    .border_color(line())
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(8.))
-                            .child(div().size(px(6.)).bg(accent()))
-                            .child(div().text_size(px(12.)).child("媒体详情")),
-                    )
-                    .child(
-                        icon_button("info-close", Icon::Close, false)
-                            .tooltip(tip("关闭详情", Some("I / Esc")))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.info_open = false;
-                                cx.notify();
-                            })),
-                    ),
-            )
-            .child(
-                div()
-                    .p(px(10.))
-                    .flex()
-                    .flex_col()
-                    .gap(px(6.))
-                    .children(rows.into_iter().map(|(k, v)| {
+        let panel_box =
+            div()
+                .id("media-info")
+                .absolute()
+                .top(px(top))
+                .w(px(330.))
+                .max_w(px(330.))
+                .flex()
+                .flex_col()
+                .bg(overlay())
+                .border_1()
+                .border_color(line_strong())
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+                .child(
+                    div()
+                        .h(px(32.))
+                        .px(px(10.))
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .border_b_1()
+                        .border_color(line())
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(8.))
+                                .child(div().size(px(6.)).bg(accent()))
+                                .child(div().text_size(px(12.)).child("媒体详情")),
+                        )
+                        .child(
+                            icon_button("info-close", Icon::Close, false)
+                                .tooltip(tip("关闭详情", Some("I / Esc")))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.overlays.info_open = false;
+                                    cx.notify();
+                                })),
+                        ),
+                )
+                .child(div().p(px(10.)).flex().flex_col().gap(px(6.)).children(
+                    rows.into_iter().map(|(k, v)| {
                         div()
                             .flex()
                             .items_baseline()
@@ -190,13 +190,19 @@ impl IrisWindow {
                                     .text_color(text())
                                     .child(v),
                             )
-                    })),
-            );
+                    }),
+                ));
 
-        if self.settings.directory_side == Side::Left {
-            panel_box.left(px(12.))
+        // In fullscreen, anchor opposite the directory popup so the two never overlap.
+        let place_left = if fullscreen {
+            self.settings.directory_side == Side::Right
         } else {
-            panel_box.right(px(12.))
+            self.settings.directory_side == Side::Left
+        };
+        if place_left {
+            panel_box.left(px(if fullscreen { FLOAT_GAP } else { 12. }))
+        } else {
+            panel_box.right(px(if fullscreen { FLOAT_GAP } else { 12. }))
         }
     }
 }

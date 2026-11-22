@@ -52,7 +52,15 @@ impl IrisWindow {
                             .w(relative(w.clamp(0., 1.)))
                             .h(relative(h.clamp(0., 1.)))
                             .child(div().absolute().top_0().left_0().right_0().h(px(t)).bg(c))
-                            .child(div().absolute().bottom_0().left_0().right_0().h(px(t)).bg(c))
+                            .child(
+                                div()
+                                    .absolute()
+                                    .bottom_0()
+                                    .left_0()
+                                    .right_0()
+                                    .h(px(t))
+                                    .bg(c),
+                            )
                             .child(div().absolute().top_0().bottom_0().left_0().w(px(t)).bg(c))
                             .child(div().absolute().top_0().bottom_0().right_0().w(px(t)).bg(c))
                             .into_any_element(),
@@ -169,7 +177,12 @@ impl IrisWindow {
                             .into_any_element(),
                     );
                 }
-                OverlayShape::Label { x, y, text: label, color } => {
+                OverlayShape::Label {
+                    x,
+                    y,
+                    text: label,
+                    color,
+                } => {
                     let c = overlay_rgba(*color, 0.9);
                     nodes.push(
                         div()
@@ -194,7 +207,10 @@ impl IrisWindow {
     }
 
     /// Compact plugin badges placed inside the control bar status slot.
-    pub(super) fn render_plugin_status_slot(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+    pub(super) fn render_plugin_status_slot(
+        &self,
+        cx: &mut Context<Self>,
+    ) -> Option<impl IntoElement> {
         let items: Vec<(String, iris_api::StatusItem)> = self
             .plugins
             .status_items()
@@ -204,47 +220,40 @@ impl IrisWindow {
         if items.is_empty() {
             return None;
         }
-        Some(
-            div()
-                .flex()
-                .items_center()
-                .gap(px(4.))
-                .pr(px(4.))
-                .children(items.into_iter().enumerate().map(|(i, (pid, item))| {
-                    let action = item.action_id.clone();
-                    let label = item.text.clone();
-                    let tip_str = item
-                        .tooltip
-                        .clone()
-                        .unwrap_or_else(|| format!("插件状态 · {pid}"));
-                    div()
-                        .id(("plugin-status", i))
-                        .h(px(22.))
-                        .px(px(7.))
-                        .flex()
-                        .items_center()
-                        .gap(px(5.))
-                        .bg(panel())
-                        .border_1()
-                        .border_color(if item.accent { accent() } else { line_strong() })
-                        .font_family(FONT_MONO)
-                        .text_size(px(10.))
-                        .text_color(if item.accent { text() } else { text_muted() })
-                        .when(action.is_some(), |d| {
-                            d.cursor_pointer().hover(|s| s.bg(hover()))
-                        })
-                        .tooltip(tip(tip_str, None))
-                        .when_some(action, |d, act| {
-                            d.on_click(cx.listener(move |this, _, w, cx| {
-                                this.invoke_plugin_action(&pid, &act, w, cx);
-                            }))
-                        })
-                        .when(item.accent, |d| {
-                            d.child(div().size(px(5.)).bg(accent()))
-                        })
-                        .child(label)
-                })),
-        )
+        Some(div().flex().items_center().gap(px(4.)).pr(px(4.)).children(
+            items.into_iter().enumerate().map(|(i, (pid, item))| {
+                let action = item.action_id.clone();
+                let label = item.text.clone();
+                let tip_str = item
+                    .tooltip
+                    .clone()
+                    .unwrap_or_else(|| format!("插件状态 · {pid}"));
+                div()
+                    .id(("plugin-status", i))
+                    .h(px(22.))
+                    .px(px(7.))
+                    .flex()
+                    .items_center()
+                    .gap(px(5.))
+                    .bg(panel())
+                    .border_1()
+                    .border_color(if item.accent { accent() } else { line_strong() })
+                    .font_family(FONT_MONO)
+                    .text_size(px(10.))
+                    .text_color(if item.accent { text() } else { text_muted() })
+                    .when(action.is_some(), |d| {
+                        d.cursor_pointer().hover(|s| s.bg(hover()))
+                    })
+                    .tooltip(tip(tip_str, None))
+                    .when_some(action, |d, act| {
+                        d.on_click(cx.listener(move |this, _, w, cx| {
+                            this.invoke_plugin_action(&pid, &act, w, cx);
+                        }))
+                    })
+                    .when(item.accent, |d| d.child(div().size(px(5.)).bg(accent())))
+                    .child(label)
+            }),
+        ))
     }
 
     /// Structured plugin panels rendered inside the sidebar when switched to plugin view.
@@ -288,128 +297,158 @@ impl IrisWindow {
                         ),
                 )
             })
-            .children(panels.into_iter().enumerate().map(|(pi, (pid, panel_data))| {
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(px(8.))
-                    .p(px(10.))
-                    .bg(window_bg())
-                    .border_1()
-                    .border_color(line())
-                    .child(
+            .children(
+                panels
+                    .into_iter()
+                    .enumerate()
+                    .map(|(pi, (pid, panel_data))| {
                         div()
                             .flex()
-                            .items_center()
-                            .gap(px(6.))
-                            .pb(px(6.))
-                            .border_b_1()
+                            .flex_col()
+                            .gap(px(8.))
+                            .p(px(10.))
+                            .bg(window_bg())
+                            .border_1()
                             .border_color(line())
-                            .child(div().size(px(6.)).bg(accent()))
                             .child(
                                 div()
-                                    .text_size(px(12.))
-                                    .text_color(text())
-                                    .child(panel_data.title),
-                            ),
-                    )
-                    .children(panel_data.sections.into_iter().enumerate().map(
-                        |(si, section)| {
-                            let pid_sec = pid.clone();
-                            div()
-                                .flex()
-                                .flex_col()
-                                .gap(px(6.))
-                                .child(
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(6.))
+                                    .pb(px(6.))
+                                    .border_b_1()
+                                    .border_color(line())
+                                    .child(div().size(px(6.)).bg(accent()))
+                                    .child(
+                                        div()
+                                            .text_size(px(12.))
+                                            .text_color(text())
+                                            .child(panel_data.title),
+                                    ),
+                            )
+                            .children(panel_data.sections.into_iter().enumerate().map(
+                                |(si, section)| {
+                                    let pid_sec = pid.clone();
                                     div()
-                                        .text_size(px(10.))
-                                        .text_color(text_faint())
-                                        .child(section.heading),
-                                )
-                                .children(section.items.into_iter().enumerate().map(|(ii, item)| {
-                                    let pid_item = pid_sec.clone();
-                                    let base_id = pi * 1000 + si * 100 + ii;
-                                    match item {
-                                        SidebarItem::Text { text: txt, muted } => div()
-                                            .text_size(px(11.))
-                                            .text_color(if muted { text_dim() } else { text() })
-                                            .child(txt)
-                                            .into_any_element(),
-                                        SidebarItem::KeyValue { key, value, accent: hi } => div()
-                                            .flex()
-                                            .items_center()
-                                            .justify_between()
-                                            .text_size(px(11.))
-                                            .child(div().text_color(text_dim()).child(key))
-                                            .child(
-                                                div()
-                                                    .font_family(FONT_MONO)
-                                                    .text_color(if hi { accent() } else { text() })
-                                                    .child(value),
-                                            )
-                                            .into_any_element(),
-                                        SidebarItem::Progress { label, ratio } => div()
-                                            .flex()
-                                            .flex_col()
-                                            .gap(px(4.))
-                                            .child(
-                                                div()
-                                                    .text_size(px(10.))
-                                                    .text_color(text_dim())
-                                                    .child(label),
-                                            )
-                                            .child(
-                                                div()
-                                                    .h(px(4.))
-                                                    .w_full()
-                                                    .bg(line())
-                                                    .child(
-                                                        div()
-                                                            .h_full()
-                                                            .w(relative(ratio.clamp(0., 1.)))
-                                                            .bg(accent()),
-                                                    ),
-                                            )
-                                            .into_any_element(),
-                                        SidebarItem::Button {
-                                            label,
-                                            action_id,
-                                            accent: hi,
-                                        } => div()
-                                            .id(("pl-btn", base_id))
-                                            .h(px(26.))
-                                            .px(px(8.))
-                                            .flex()
-                                            .items_center()
-                                            .cursor_pointer()
-                                            .border_1()
-                                            .border_color(if hi { accent() } else { line_strong() })
-                                            .bg(if hi { selected() } else { panel() })
-                                            .text_size(px(11.))
-                                            .text_color(if hi { text() } else { text_muted() })
-                                            .hover(|s| s.bg(hover()).text_color(text()))
-                                            .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                                                cx.stop_propagation()
-                                            })
-                                            .on_click(cx.listener(move |this, _, w, cx| {
-                                                this.invoke_plugin_action(
-                                                    &pid_item,
-                                                    &action_id,
-                                                    w,
-                                                    cx,
-                                                );
-                                            }))
-                                            .child(label)
-                                            .into_any_element(),
-                                        SidebarItem::ButtonRow { buttons } => div()
-                                            .flex()
-                                            .flex_wrap()
-                                            .gap(px(4.))
-                                            .children(buttons.into_iter().enumerate().map(
-                                                |(bi, btn)| {
-                                                    let pid_b = pid_item.clone();
-                                                    let act = btn.action_id;
-                                                    div()
+                                        .flex()
+                                        .flex_col()
+                                        .gap(px(6.))
+                                        .child(
+                                            div()
+                                                .text_size(px(10.))
+                                                .text_color(text_faint())
+                                                .child(section.heading),
+                                        )
+                                        .children(section.items.into_iter().enumerate().map(
+                                            |(ii, item)| {
+                                                let pid_item = pid_sec.clone();
+                                                let base_id = pi * 1000 + si * 100 + ii;
+                                                match item {
+                                                    SidebarItem::Text { text: txt, muted } => div()
+                                                        .text_size(px(11.))
+                                                        .text_color(if muted {
+                                                            text_dim()
+                                                        } else {
+                                                            text()
+                                                        })
+                                                        .child(txt)
+                                                        .into_any_element(),
+                                                    SidebarItem::KeyValue {
+                                                        key,
+                                                        value,
+                                                        accent: hi,
+                                                    } => div()
+                                                        .flex()
+                                                        .items_center()
+                                                        .justify_between()
+                                                        .text_size(px(11.))
+                                                        .child(
+                                                            div().text_color(text_dim()).child(key),
+                                                        )
+                                                        .child(
+                                                            div()
+                                                                .font_family(FONT_MONO)
+                                                                .text_color(if hi {
+                                                                    accent()
+                                                                } else {
+                                                                    text()
+                                                                })
+                                                                .child(value),
+                                                        )
+                                                        .into_any_element(),
+                                                    SidebarItem::Progress { label, ratio } => div()
+                                                        .flex()
+                                                        .flex_col()
+                                                        .gap(px(4.))
+                                                        .child(
+                                                            div()
+                                                                .text_size(px(10.))
+                                                                .text_color(text_dim())
+                                                                .child(label),
+                                                        )
+                                                        .child(
+                                                            div()
+                                                                .h(px(4.))
+                                                                .w_full()
+                                                                .bg(line())
+                                                                .child(
+                                                                    div()
+                                                                        .h_full()
+                                                                        .w(relative(
+                                                                            ratio.clamp(0., 1.),
+                                                                        ))
+                                                                        .bg(accent()),
+                                                                ),
+                                                        )
+                                                        .into_any_element(),
+                                                    SidebarItem::Button {
+                                                        label,
+                                                        action_id,
+                                                        accent: hi,
+                                                    } => div()
+                                                        .id(("pl-btn", base_id))
+                                                        .h(px(26.))
+                                                        .px(px(8.))
+                                                        .flex()
+                                                        .items_center()
+                                                        .cursor_pointer()
+                                                        .border_1()
+                                                        .border_color(if hi {
+                                                            accent()
+                                                        } else {
+                                                            line_strong()
+                                                        })
+                                                        .bg(if hi { selected() } else { panel() })
+                                                        .text_size(px(11.))
+                                                        .text_color(if hi {
+                                                            text()
+                                                        } else {
+                                                            text_muted()
+                                                        })
+                                                        .hover(|s| s.bg(hover()).text_color(text()))
+                                                        .on_mouse_down(
+                                                            MouseButton::Left,
+                                                            |_, _, cx| cx.stop_propagation(),
+                                                        )
+                                                        .on_click(cx.listener(
+                                                            move |this, _, w, cx| {
+                                                                this.invoke_plugin_action(
+                                                                    &pid_item, &action_id, w, cx,
+                                                                );
+                                                            },
+                                                        ))
+                                                        .child(label)
+                                                        .into_any_element(),
+                                                    SidebarItem::ButtonRow { buttons } => div()
+                                                        .flex()
+                                                        .flex_wrap()
+                                                        .gap(px(4.))
+                                                        .children(
+                                                            buttons.into_iter().enumerate().map(
+                                                                |(bi, btn)| {
+                                                                    let pid_b = pid_item.clone();
+                                                                    let act = btn.action_id;
+                                                                    div()
                                                         .id(("pl-rbtn", base_id * 16 + bi))
                                                         .h(px(24.))
                                                         .px(px(8.))
@@ -448,13 +487,16 @@ impl IrisWindow {
                                                             },
                                                         ))
                                                         .child(btn.label)
-                                                },
-                                            ))
-                                            .into_any_element(),
-                                    }
-                                }))
-                        },
-                    ))
-            }))
+                                                                },
+                                                            ),
+                                                        )
+                                                        .into_any_element(),
+                                                }
+                                            },
+                                        ))
+                                },
+                            ))
+                    }),
+            )
     }
 }

@@ -18,6 +18,12 @@ use crate::icc::{self, Colour, be16, be32};
 
 /// Profiles bigger than this are not photo profiles we can match anyway.
 const MAX_ICC: usize = 4 << 20;
+/// Defensive bounds against corrupt/malicious image headers.
+const MAX_CHUNKS: usize = 4096;
+const MAX_IHDR: usize = 64;
+const MAX_VP8X: usize = 1024;
+const MAX_TOP_BOXES: usize = 256;
+const MAX_IFD_ENTRIES: usize = 4096;
 
 /// Longest side handed to mpv's GPU renderer. The texture limit is 16384,
 /// but 12000×12000 already logs texture/framebuffer failures and uses
@@ -127,6 +133,136 @@ impl Photo {
     }
 }
 
+/// Reads EXIF orientation (1..=8) from a JPEG or TIFF file header, for
+/// thumbnail decoders that ignore EXIF transforms. Returns 1 (upright) on
+/// unknown/absent orientation.
+pub fn exif_orientation(path: &Path) -> u16 {
+    let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
+        return 1;
+    };
+    let Ok(file) = File::open(path) else {
+        return 1;
+    };
+    let mut r = BufReader::new(file);
+    if ext.eq_ignore_ascii_case("jpg") || ext.eq_ignore_ascii_case("jpeg") {
+        jpeg_orientation(&mut r).unwrap_or(1)
+    } else if ext.eq_ignore_ascii_case("tif") || ext.eq_ignore_ascii_case("tiff") {
+        tiff_orientation(&mut r).unwrap_or(1)
+    } else {
+        1
+    }
+}
+
+fn jpeg_orientation<R: Read + Seek>(r: &mut R) -> Option<u16> {
+    if read_n(r, 2)? != [0xFF, 0xD8] {
+        return None;
+    }
+    for _ in 0..MAX_CHUNKS {
+        let mut m = [0u8; 2];
+        if r.read_exact(&mut m).is_err() || m[0] != 0xFF {
+            break;
+        }
+        match m[1] {
+            0xFF => {
+                r.seek(SeekFrom::Current(-1)).ok()?;
+                continue;
+            }
+            0xD8 | 0x01 | 0xD0..=0xD7 => continue,
+            0xDA | 0xD9 => break,
+            marker => {
+                let len = be16(&read_n(r, 2)?) as usize;
+                if len < 2 {
+                    break;
+                }
+                let body = len - 2;
+                if marker == 0xE1 && body > 14 && body <= 256 * 1024 {
+                    let seg = read_n(r, body)?;
+                    if &seg[..6] == b"Exif\0\0" {
+                        return exif_orientation_from_tiff(&seg[6..]);
+                    }
+                } else {
+                    r.seek(SeekFrom::Current(body as i64)).ok()?;
+                }
+            }
+        }
+    }
+    None
+}
+
+fn tiff_orientation<R: Read + Seek>(r: &mut R) -> Option<u16> {
+    let head = read_n(r, 8)?;
+    let le = match &head[..4] {
+        b"II*\0" => true,
+        b"MM\0*" => false,
+        _ => return None,
+    };
+    let u16_ = |b: &[u8]| {
+        if le {
+            u16::from_le_bytes([b[0], b[1]])
+        } else {
+            be16(b)
+        }
+    };
+    let u32_ = |b: &[u8]| {
+        if le {
+            u32::from_le_bytes([b[0], b[1], b[2], b[3]])
+        } else {
+            be32(b)
+        }
+    };
+    r.seek(SeekFrom::Start(u32_(&head[4..]) as u64)).ok()?;
+    let n = (u16_(&read_n(r, 2)?) as usize).min(MAX_IFD_ENTRIES);
+    let entries = read_n(r, n * 12)?;
+    for e in entries.as_chunks::<12>().0 {
+        if u16_(e) == 0x0112 {
+            let val = u16_(&e[8..]);
+            if (1..=8).contains(&val) {
+                return Some(val);
+            }
+        }
+    }
+    None
+}
+
+fn exif_orientation_from_tiff(buf: &[u8]) -> Option<u16> {
+    if buf.len() < 8 {
+        return None;
+    }
+    let le = match &buf[..4] {
+        b"II*\0" => true,
+        b"MM\0*" => false,
+        _ => return None,
+    };
+    let u16_ = |off: usize| -> Option<u16> {
+        let s = buf.get(off..off + 2)?;
+        Some(if le {
+            u16::from_le_bytes([s[0], s[1]])
+        } else {
+            be16(s)
+        })
+    };
+    let u32_ = |off: usize| -> Option<u32> {
+        let s = buf.get(off..off + 4)?;
+        Some(if le {
+            u32::from_le_bytes([s[0], s[1], s[2], s[3]])
+        } else {
+            be32(s)
+        })
+    };
+    let ifd0 = u32_(4)? as usize;
+    let count0 = u16_(ifd0)?.min(128) as usize;
+    for i in 0..count0 {
+        let off = ifd0.checked_add(2)?.checked_add(i * 12)?;
+        if u16_(off)? == 0x0112 {
+            let val = u16_(off + 8)?;
+            if (1..=8).contains(&val) {
+                return Some(val);
+            }
+        }
+    }
+    None
+}
+
 /// Reads a photo's header. Unknown formats and unreadable files give the
 /// default (no overrides).
 pub fn probe(path: &Path) -> Photo {
@@ -197,7 +333,7 @@ fn jpeg<R: Read + Seek>(r: &mut R, h: &mut Header) -> Option<()> {
     }
     let mut chunks: Vec<(u8, Vec<u8>)> = Vec::new();
     let mut total = 0;
-    loop {
+    for _ in 0..MAX_CHUNKS {
         let mut m = [0u8; 2];
         if r.read_exact(&mut m).is_err() || m[0] != 0xFF {
             break;
@@ -256,11 +392,12 @@ fn png<R: Read + Seek>(r: &mut R, h: &mut Header) -> Option<()> {
     if read_n(r, 8)? != b"\x89PNG\r\n\x1a\n" {
         return None;
     }
-    loop {
+    for _ in 0..MAX_CHUNKS {
         let head = read_n(r, 8)?;
-        let len = be32(&head) as usize;
+        let len_u32 = be32(&head);
+        let len = len_u32 as usize;
         match &head[4..8] {
-            b"IHDR" if len >= 8 => {
+            b"IHDR" if (8..=MAX_IHDR).contains(&len) => {
                 let d = read_n(r, len)?;
                 h.size = Some((be32(&d), be32(&d[4..])));
                 r.seek(SeekFrom::Current(4)).ok()?;
@@ -276,10 +413,12 @@ fn png<R: Read + Seek>(r: &mut R, h: &mut Header) -> Option<()> {
             }
             b"IDAT" | b"IEND" => return Some(()),
             _ => {
-                r.seek(SeekFrom::Current(len as i64 + 4)).ok()?;
+                let skip = i64::from(len_u32) + 4;
+                r.seek(SeekFrom::Current(skip)).ok()?;
             }
         }
     }
+    Some(())
 }
 
 /// WebP: `VP8X` (canvas size), `ICCP`, then the bitstream chunk.
@@ -289,11 +428,12 @@ fn webp<R: Read + Seek>(r: &mut R, h: &mut Header) -> Option<()> {
         return None;
     }
     let le24 = |b: &[u8]| u32::from_le_bytes([b[0], b[1], b[2], 0]);
-    loop {
+    for _ in 0..MAX_CHUNKS {
         let c = read_n(r, 8)?;
-        let len = u32::from_le_bytes([c[4], c[5], c[6], c[7]]) as usize;
+        let len_u32 = u32::from_le_bytes([c[4], c[5], c[6], c[7]]);
+        let len = len_u32 as usize;
         match &c[..4] {
-            b"VP8X" if len >= 10 => {
+            b"VP8X" if (10..=MAX_VP8X).contains(&len) => {
                 let d = read_n(r, len + (len & 1))?;
                 h.size = Some((le24(&d[4..]) + 1, le24(&d[7..]) + 1));
             }
@@ -315,10 +455,12 @@ fn webp<R: Read + Seek>(r: &mut R, h: &mut Header) -> Option<()> {
             }
             b"VP8 " | b"VP8L" | b"ANIM" => return Some(()),
             _ => {
-                r.seek(SeekFrom::Current((len + (len & 1)) as i64)).ok()?;
+                let skip = i64::from(len_u32) + i64::from(len_u32 & 1);
+                r.seek(SeekFrom::Current(skip)).ok()?;
             }
         }
     }
+    Some(())
 }
 
 /// HEIF/AVIF: the primary item's properties in `meta`: `colr`, `ispe`,
@@ -329,21 +471,24 @@ fn heif<R: Read + Seek>(r: &mut R, h: &mut Header) -> Option<()> {
     let end = r.seek(SeekFrom::End(0)).ok()?;
     r.seek(SeekFrom::Start(0)).ok()?;
     let mut pos = 0u64;
-    let meta = loop {
+    let mut found = None;
+    for _ in 0..MAX_TOP_BOXES {
         if pos + 8 > end {
             return None;
         }
         let (kind, header, size) = box_header(r, end - pos)?;
         if &kind == b"meta" {
-            let body = size.checked_sub(header)? as usize;
+            let body = usize::try_from(size.checked_sub(header)?).ok()?;
             if body > 16 << 20 {
                 return None;
             }
-            break read_n(r, body)?;
+            found = Some(read_n(r, body)?);
+            break;
         }
-        pos += size;
+        pos = pos.checked_add(size)?;
         r.seek(SeekFrom::Start(pos)).ok()?;
-    };
+    }
+    let meta = found?;
     // `meta` is a full box: skip version and flags.
     let meta = meta.get(4..)?;
     let iprp = find_box(meta, b"iprp")?;
@@ -428,7 +573,7 @@ fn ipma_for(ipma: &[u8], item: u32) -> Option<Vec<usize>> {
         p += n;
         Some(s)
     };
-    let count = be32(take(4)?);
+    let count = be32(take(4)?).min(4096);
     for _ in 0..count {
         let id = if version < 1 {
             be16(take(2)?) as u32
@@ -478,7 +623,10 @@ fn boxes(mut buf: &[u8]) -> impl Iterator<Item = ([u8; 4], &[u8])> {
         let kind = [buf[4], buf[5], buf[6], buf[7]];
         let (header, size) = match be32(buf) {
             0 => (8, buf.len()),
-            1 if buf.len() >= 16 => (16, u64::from_be_bytes(buf[8..16].try_into().ok()?) as usize),
+            1 if buf.len() >= 16 => (
+                16,
+                usize::try_from(u64::from_be_bytes(buf[8..16].try_into().ok()?)).ok()?,
+            ),
             1 => return None,
             s => (8, s as usize),
         };
@@ -519,7 +667,7 @@ fn tiff<R: Read + Seek>(r: &mut R, h: &mut Header) -> Option<()> {
         }
     };
     r.seek(SeekFrom::Start(u32_(&head[4..]) as u64)).ok()?;
-    let n = u16_(&read_n(r, 2)?) as usize;
+    let n = (u16_(&read_n(r, 2)?) as usize).min(MAX_IFD_ENTRIES);
     let entries = read_n(r, n * 12)?;
     let (mut w, mut ht, mut icc_at) = (None, None, None);
     for e in entries.as_chunks::<12>().0 {
@@ -618,7 +766,10 @@ fn parse_exif_tiff(buf: &[u8]) -> Option<ExifSummary> {
 
     summary.camera = match (make, model) {
         (Some(mk), Some(md)) => {
-            if md.to_ascii_lowercase().starts_with(&mk.to_ascii_lowercase()) {
+            if md
+                .to_ascii_lowercase()
+                .starts_with(&mk.to_ascii_lowercase())
+            {
                 Some(md)
             } else {
                 Some(format!("{mk} {md}"))
@@ -774,5 +925,47 @@ mod tests {
         assert_eq!((h.mirror, h.rotate_cw), (Some(Mirror::Horizontal), 270));
         add_mirror(&mut h, Mirror::Vertical);
         assert_eq!((h.mirror, h.rotate_cw), (None, 270));
+    }
+
+    #[test]
+    fn malformed_headers_never_oom_or_loop() {
+        use std::io::Cursor;
+
+        // PNG with huge IHDR and 0xFFFF_FFFF unknown chunk length.
+        let mut bad_png = b"\x89PNG\r\n\x1a\n".to_vec();
+        bad_png.extend_from_slice(&u32::MAX.to_be_bytes());
+        bad_png.extend_from_slice(b"IHDR");
+        bad_png.extend_from_slice(&0x8000_0000u32.to_be_bytes());
+        bad_png.extend_from_slice(b"tEXt");
+        let mut h = Header::default();
+        let _ = png(&mut Cursor::new(&bad_png), &mut h);
+        assert_eq!(h.size, None);
+
+        // WebP with oversized VP8X length.
+        let mut bad_webp = b"RIFF\x20\x00\x00\x00WEBP".to_vec();
+        bad_webp.extend_from_slice(b"VP8X");
+        bad_webp.extend_from_slice(&u32::MAX.to_le_bytes());
+        let mut h = Header::default();
+        let _ = webp(&mut Cursor::new(&bad_webp), &mut h);
+        assert_eq!(h.size, None);
+
+        // HEIF with extended-size overflow box.
+        let mut bad_heif = vec![0, 0, 0, 1];
+        bad_heif.extend_from_slice(b"free");
+        bad_heif.extend_from_slice(&u64::MAX.to_be_bytes());
+        let mut h = Header::default();
+        assert_eq!(heif(&mut Cursor::new(&bad_heif), &mut h), None);
+
+        // JPEG truncated after SOI and huge marker.
+        let mut h = Header::default();
+        let _ = jpeg(&mut Cursor::new(b"\xFF\xD8\xFF\xE1\xFF\xFF"), &mut h);
+        assert_eq!(h.size, None);
+
+        // TIFF pointing past EOF.
+        let mut h = Header::default();
+        assert_eq!(
+            tiff(&mut Cursor::new(b"II*\0\xFF\xFF\xFF\x7F"), &mut h),
+            None
+        );
     }
 }

@@ -6,8 +6,11 @@ import subprocess
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-for script in (ROOT / 'scripts').rglob('*.py'):
-    ast.parse(script.read_text(encoding='utf-8'), filename=str(script))
+for directory in ('scripts', 'examples'):
+    base = ROOT / directory
+    if base.is_dir():
+        for script in base.rglob('*.py'):
+            ast.parse(script.read_text(encoding='utf-8'), filename=str(script))
 
 # The UI talks to playback through player::Session commands only.
 ui_files = [ROOT / 'crates/iris/src/ui.rs', *sorted((ROOT / 'crates/iris/src/ui').glob('*.rs'))]

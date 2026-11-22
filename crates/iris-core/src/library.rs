@@ -61,17 +61,16 @@ const SUBTITLE_EXT: &[&str] = &["srt", "ass", "ssa", "vtt", "sub", "sup", "idx",
 pub fn is_subtitle(path: &Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
-        .map(|e| SUBTITLE_EXT.contains(&e.to_ascii_lowercase().as_str()))
-        .unwrap_or(false)
+        .is_some_and(|e| SUBTITLE_EXT.iter().any(|k| e.eq_ignore_ascii_case(k)))
 }
 
 pub fn kind_of(path: &Path) -> Option<Kind> {
-    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
-    if VIDEO_EXT.contains(&ext.as_str()) {
+    let ext = path.extension()?.to_str()?;
+    if VIDEO_EXT.iter().any(|k| ext.eq_ignore_ascii_case(k)) {
         Some(Kind::Video)
-    } else if PHOTO_EXT.contains(&ext.as_str()) {
+    } else if PHOTO_EXT.iter().any(|k| ext.eq_ignore_ascii_case(k)) {
         Some(Kind::Photo)
-    } else if AUDIO_EXT.contains(&ext.as_str()) {
+    } else if AUDIO_EXT.iter().any(|k| ext.eq_ignore_ascii_case(k)) {
         Some(Kind::Audio)
     } else {
         None
@@ -105,27 +104,32 @@ pub fn scan_dir(dir: &Path) -> ScanResult {
     let mut entries = Vec::new();
     let mut subfolders = Vec::new();
     for item in read.flatten() {
-        let path = item.path();
-        let Some(name) = path.file_name().map(|n| n.to_string_lossy().into_owned()) else {
-            continue;
-        };
+        let name = item.file_name().to_string_lossy().into_owned();
         if name.starts_with('.') {
             continue;
         }
-        let Ok(meta) = item.metadata() else {
+        let path = item.path();
+        // Fast path: `file_type()` uses d_type from readdir without an extra stat
+        // syscall on non-media files. Symlinks fall through to `metadata()`.
+        let Ok(ft) = item.file_type() else {
             continue;
         };
-        if meta.is_dir() {
+        if ft.is_dir() {
             subfolders.push(FolderEntry { path, name });
-        } else if meta.is_file()
-            && let Some(kind) = kind_of(&path)
-        {
-            let size = meta.len();
-            let modified_secs = meta
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                .map_or(0, |d| d.as_secs());
+            continue;
+        }
+        if ft.is_file() {
+            let Some(kind) = kind_of(&path) else {
+                continue;
+            };
+            let (size, modified_secs) = item.metadata().ok().map_or((0, 0), |m| {
+                let secs = m
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                    .map_or(0, |d| d.as_secs());
+                (m.len(), secs)
+            });
             entries.push(Entry {
                 path,
                 name,
@@ -133,6 +137,31 @@ pub fn scan_dir(dir: &Path) -> ScanResult {
                 size,
                 modified_secs,
             });
+            continue;
+        }
+        if ft.is_symlink() {
+            let Ok(meta) = item.metadata() else {
+                continue;
+            };
+            if meta.is_dir() {
+                subfolders.push(FolderEntry { path, name });
+            } else if meta.is_file()
+                && let Some(kind) = kind_of(&path)
+            {
+                let size = meta.len();
+                let modified_secs = meta
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                    .map_or(0, |d| d.as_secs());
+                entries.push(Entry {
+                    path,
+                    name,
+                    kind,
+                    size,
+                    modified_secs,
+                });
+            }
         }
     }
     entries.sort_by(|a, b| natural_cmp(&a.name, &b.name));
@@ -188,16 +217,19 @@ pub fn format_size(bytes: u64) -> String {
 /// compare by value (`ep2` before `ep10`), other characters compare
 /// case-insensitively. Names that only differ in case or leading zeros
 /// fall back to a plain comparison, so the order is total and stable.
+/// Allocation-free: slices directly into `a` and `b`.
 pub fn natural_cmp(a: &str, b: &str) -> Ordering {
-    let (mut x, mut y) = (a.chars().peekable(), b.chars().peekable());
+    let (mut ra, mut rb) = (a, b);
     loop {
-        match (x.peek().copied(), y.peek().copied()) {
+        match (ra.chars().next(), rb.chars().next()) {
             (None, None) => return a.cmp(b),
             (None, Some(_)) => return Ordering::Less,
             (Some(_), None) => return Ordering::Greater,
             (Some(c), Some(d)) if c.is_ascii_digit() && d.is_ascii_digit() => {
-                let m = digit_run(&mut x);
-                let n = digit_run(&mut y);
+                let (m, rest_a) = take_digits(ra);
+                let (n, rest_b) = take_digits(rb);
+                ra = rest_a;
+                rb = rest_b;
                 let (m, n) = (m.trim_start_matches('0'), n.trim_start_matches('0'));
                 // Without leading zeros, a longer run is a bigger number.
                 let ord = m.len().cmp(&n.len()).then_with(|| m.cmp(n));
@@ -210,19 +242,19 @@ pub fn natural_cmp(a: &str, b: &str) -> Ordering {
                 if ord != Ordering::Equal {
                     return ord;
                 }
-                x.next();
-                y.next();
+                ra = &ra[c.len_utf8()..];
+                rb = &rb[d.len_utf8()..];
             }
         }
     }
 }
 
-fn digit_run(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> String {
-    let mut run = String::new();
-    while let Some(c) = chars.next_if(char::is_ascii_digit) {
-        run.push(c);
-    }
-    run
+fn take_digits(s: &str) -> (&str, &str) {
+    let end = s
+        .bytes()
+        .position(|b| !b.is_ascii_digit())
+        .unwrap_or(s.len());
+    (&s[..end], &s[end..])
 }
 
 #[cfg(test)]
@@ -301,5 +333,22 @@ mod tests {
         assert_eq!(items[0].name, "a.mp4");
         sort_entries(&mut items, SortBy::Modified, SortOrder::Desc);
         assert_eq!(items[0].name, "b.mp4");
+    }
+
+    #[test]
+    fn natural_sort_handles_large_folder_quickly() {
+        let mut names: Vec<String> = (0..5000)
+            .rev()
+            .map(|i| format!("IMG_{:04}_shot_{}.HEIC", i % 500, i))
+            .collect();
+        let start = std::time::Instant::now();
+        names.sort_by(|a, b| natural_cmp(a, b));
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "5000-entry natural sort took {:?}",
+            start.elapsed()
+        );
+        assert_eq!(names[0], "IMG_0000_shot_0.HEIC");
+        assert_eq!(names[1], "IMG_0000_shot_500.HEIC");
     }
 }

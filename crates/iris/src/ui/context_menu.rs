@@ -52,7 +52,7 @@ impl IrisWindow {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
-                    this.context_menu = None;
+                    this.overlays.context_menu = None;
                     cx.stop_propagation();
                     cx.notify();
                 }),
@@ -60,7 +60,7 @@ impl IrisWindow {
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(|this, _, _, cx| {
-                    this.context_menu = None;
+                    this.overlays.context_menu = None;
                     cx.stop_propagation();
                     cx.notify();
                 }),
@@ -86,7 +86,7 @@ impl IrisWindow {
     }
 
     fn viewport_context_items(&self, cx: &mut Context<Self>) -> Vec<gpui::AnyElement> {
-        let session = &self.viewports[0].session;
+        let session = &self.active().session;
         let kind = session.kind();
         let paused = session.state.paused;
         let current = session.current.clone();
@@ -106,7 +106,7 @@ impl IrisWindow {
                     if paused { "播放" } else { "暂停" },
                     Some("Space"),
                     cx.listener(|this, _, w, cx| {
-                        this.context_menu = None;
+                        this.overlays.context_menu = None;
                         this.toggle_pause(&TogglePause, w, cx);
                     }),
                 )
@@ -124,7 +124,7 @@ impl IrisWindow {
                         "Ctrl+S"
                     }),
                     cx.listener(|this, _, w, cx| {
-                        this.context_menu = None;
+                        this.overlays.context_menu = None;
                         this.take_screenshot(&TakeScreenshot, w, cx);
                     }),
                 )
@@ -136,7 +136,7 @@ impl IrisWindow {
                     aspect_label,
                     Some("C"),
                     cx.listener(|this, _, w, cx| {
-                        this.context_menu = None;
+                        this.overlays.context_menu = None;
                         this.cycle_aspect(&CycleAspect, w, cx);
                     }),
                 )
@@ -150,7 +150,7 @@ impl IrisWindow {
                     "顺时针旋转 90°",
                     Some("R"),
                     cx.listener(|this, _, w, cx| {
-                        this.context_menu = None;
+                        this.overlays.context_menu = None;
                         this.rotate_cw(&RotateCw, w, cx);
                     }),
                 )
@@ -162,7 +162,7 @@ impl IrisWindow {
                     "水平镜像翻转",
                     Some("H"),
                     cx.listener(|this, _, w, cx| {
-                        this.context_menu = None;
+                        this.overlays.context_menu = None;
                         this.toggle_hflip(&ToggleHFlip, w, cx);
                     }),
                 )
@@ -175,10 +175,14 @@ impl IrisWindow {
         out.push(
             menu_row(
                 "ctx-pin",
-                if pinned { "取消窗口置顶" } else { "窗口置顶" },
+                if pinned {
+                    "取消窗口置顶"
+                } else {
+                    "窗口置顶"
+                },
                 Some("T"),
                 cx.listener(|this, _, w, cx| {
-                    this.context_menu = None;
+                    this.overlays.context_menu = None;
                     this.toggle_always_on_top(&ToggleAlwaysOnTop, w, cx);
                 }),
             )
@@ -191,7 +195,7 @@ impl IrisWindow {
                     "媒体详情与统计",
                     Some("I"),
                     cx.listener(|this, _, w, cx| {
-                        this.context_menu = None;
+                        this.overlays.context_menu = None;
                         this.toggle_info(&ToggleInfo, w, cx);
                     }),
                 )
@@ -204,7 +208,7 @@ impl IrisWindow {
                     reveal_label,
                     None,
                     cx.listener(move |this, _, _, cx| {
-                        this.context_menu = None;
+                        this.overlays.context_menu = None;
                         cx.reveal_path(&p_reveal);
                         cx.notify();
                     }),
@@ -218,7 +222,7 @@ impl IrisWindow {
                     "复制文件路径",
                     None,
                     cx.listener(move |this, _, _, cx| {
-                        this.context_menu = None;
+                        this.overlays.context_menu = None;
                         cx.write_to_clipboard(ClipboardItem::new_string(p_copy.clone()));
                         this.show_toast("已复制文件路径", cx);
                     }),
@@ -237,7 +241,7 @@ impl IrisWindow {
                     "Ctrl+,"
                 }),
                 cx.listener(|this, _, w, cx| {
-                    this.context_menu = None;
+                    this.overlays.context_menu = None;
                     this.open_settings(&OpenSettings, w, cx);
                 }),
             )
@@ -273,7 +277,7 @@ impl IrisWindow {
                 "打开播放",
                 None,
                 cx.listener(move |this, _, _, cx| {
-                    this.context_menu = None;
+                    this.overlays.context_menu = None;
                     this.open_path(&p_open, cx);
                 }),
             )
@@ -283,10 +287,17 @@ impl IrisWindow {
                 if fav { "取消收藏" } else { "加入收藏" },
                 None,
                 cx.listener(move |this, _, _, cx| {
-                    this.context_menu = None;
+                    this.overlays.context_menu = None;
                     let added = this.store.toggle_favorite(&p_fav);
                     this.rebuild_directory_rows();
-                    this.show_toast(if added { "已收藏" } else { "已取消收藏" }, cx);
+                    this.show_toast(
+                        if added {
+                            "已收藏"
+                        } else {
+                            "已取消收藏"
+                        },
+                        cx,
+                    );
                 }),
             )
             .into_any_element(),
@@ -298,7 +309,7 @@ impl IrisWindow {
                     "重置播放进度",
                     None,
                     cx.listener(move |this, _, _, cx| {
-                        this.context_menu = None;
+                        this.overlays.context_menu = None;
                         if this.store.reset_progress(&p_reset) {
                             this.show_toast("已重置播放进度", cx);
                         }
@@ -314,7 +325,7 @@ impl IrisWindow {
                 reveal_label,
                 None,
                 cx.listener(move |this, _, _, cx| {
-                    this.context_menu = None;
+                    this.overlays.context_menu = None;
                     cx.reveal_path(&p_reveal);
                     cx.notify();
                 }),
@@ -327,7 +338,7 @@ impl IrisWindow {
                 "复制文件路径",
                 None,
                 cx.listener(move |this, _, _, cx| {
-                    this.context_menu = None;
+                    this.overlays.context_menu = None;
                     cx.write_to_clipboard(ClipboardItem::new_string(p_copy.clone()));
                     this.show_toast("已复制文件路径", cx);
                 }),

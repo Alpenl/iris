@@ -12,7 +12,8 @@ use std::sync::Arc;
 
 use crate::{Error, Mpv, Result, check, sys};
 
-pub type GetProcAddress = unsafe extern "C" fn(ctx: *mut c_void, name: *const c_char) -> *mut c_void;
+pub type GetProcAddress =
+    unsafe extern "C" fn(ctx: *mut c_void, name: *const c_char) -> *mut c_void;
 
 type UpdateFn = Box<dyn Fn() + Send + Sync>;
 
@@ -29,7 +30,11 @@ impl RenderContext {
     ///
     /// # Safety
     /// `get_proc_address` must resolve GL symbols for the current context.
-    pub unsafe fn new_gl(mpv: Arc<Mpv>, get_proc_address: GetProcAddress, proc_ctx: *mut c_void) -> Result<Self> {
+    pub unsafe fn new_gl(
+        mpv: Arc<Mpv>,
+        get_proc_address: GetProcAddress,
+        proc_ctx: *mut c_void,
+    ) -> Result<Self> {
         let mut init = sys::mpv_opengl_init_params {
             get_proc_address: Some(get_proc_address),
             get_proc_address_ctx: proc_ctx,
@@ -48,7 +53,10 @@ impl RenderContext {
                 type_: sys::MPV_RENDER_PARAM_ADVANCED_CONTROL,
                 data: &mut advanced as *mut c_int as *mut c_void,
             },
-            sys::mpv_render_param { type_: sys::MPV_RENDER_PARAM_INVALID, data: ptr::null_mut() },
+            sys::mpv_render_param {
+                type_: sys::MPV_RENDER_PARAM_INVALID,
+                data: ptr::null_mut(),
+            },
         ];
         let mut ctx = ptr::null_mut();
         check(
@@ -56,9 +64,16 @@ impl RenderContext {
             || "mpv_render_context_create(opengl)".into(),
         )?;
         if ctx.is_null() {
-            return Err(Error { code: -1, context: "render context is null".into() });
+            return Err(Error {
+                code: -1,
+                context: "render context is null".into(),
+            });
         }
-        Ok(Self { ctx, update: None, _mpv: mpv })
+        Ok(Self {
+            ctx,
+            update: None,
+            _mpv: mpv,
+        })
     }
 
     /// Creates a D3D11 render context on the caller's independent device.
@@ -82,15 +97,27 @@ impl RenderContext {
                 type_: sys::MPV_RENDER_PARAM_ADVANCED_CONTROL,
                 data: &mut advanced as *mut _ as *mut c_void,
             },
-            sys::mpv_render_param { type_: 0, data: ptr::null_mut() },
+            sys::mpv_render_param {
+                type_: 0,
+                data: ptr::null_mut(),
+            },
         ];
         let mut ctx = ptr::null_mut();
-        check(unsafe { sys::mpv_render_context_create(&mut ctx, mpv.raw(), params.as_mut_ptr()) },
-            || "mpv_render_context_create(d3d11)".into())?;
+        check(
+            unsafe { sys::mpv_render_context_create(&mut ctx, mpv.raw(), params.as_mut_ptr()) },
+            || "mpv_render_context_create(d3d11)".into(),
+        )?;
         if ctx.is_null() {
-            return Err(Error { code: -1, context: "render context is null".into() });
+            return Err(Error {
+                code: -1,
+                context: "render context is null".into(),
+            });
         }
-        Ok(Self { ctx, update: None, _mpv: mpv })
+        Ok(Self {
+            ctx,
+            update: None,
+            _mpv: mpv,
+        })
     }
 
     /// # Safety
@@ -108,10 +135,15 @@ impl RenderContext {
                 type_: sys::MPV_RENDER_PARAM_BLOCK_FOR_TARGET_TIME,
                 data: &mut block as *mut _ as *mut c_void,
             },
-            sys::mpv_render_param { type_: 0, data: ptr::null_mut() },
+            sys::mpv_render_param {
+                type_: 0,
+                data: ptr::null_mut(),
+            },
         ];
-        check(unsafe { sys::mpv_render_context_render(self.ctx, params.as_mut_ptr()) },
-            || "mpv_render_context_render(d3d11)".into())
+        check(
+            unsafe { sys::mpv_render_context_render(self.ctx, params.as_mut_ptr()) },
+            || "mpv_render_context_render(d3d11)".into(),
+        )
     }
 
     /// Sets the callback mpv calls when a new frame (or redraw) is wanted.
@@ -133,8 +165,20 @@ impl RenderContext {
     }
 
     /// Renders the current frame into the given GL framebuffer.
-    pub fn render_gl(&self, fbo: i32, w: i32, h: i32, flip_y: bool, block_for_target: bool) -> Result<()> {
-        let mut target = sys::mpv_opengl_fbo { fbo, w, h, internal_format: 0 };
+    pub fn render_gl(
+        &self,
+        fbo: i32,
+        w: i32,
+        h: i32,
+        flip_y: bool,
+        block_for_target: bool,
+    ) -> Result<()> {
+        let mut target = sys::mpv_opengl_fbo {
+            fbo,
+            w,
+            h,
+            internal_format: 0,
+        };
         let mut flip: c_int = flip_y as c_int;
         let mut block: c_int = block_for_target as c_int;
         let mut params = [
@@ -142,16 +186,23 @@ impl RenderContext {
                 type_: sys::MPV_RENDER_PARAM_OPENGL_FBO,
                 data: &mut target as *mut _ as *mut c_void,
             },
-            sys::mpv_render_param { type_: sys::MPV_RENDER_PARAM_FLIP_Y, data: &mut flip as *mut c_int as *mut c_void },
+            sys::mpv_render_param {
+                type_: sys::MPV_RENDER_PARAM_FLIP_Y,
+                data: &mut flip as *mut c_int as *mut c_void,
+            },
             sys::mpv_render_param {
                 type_: sys::MPV_RENDER_PARAM_BLOCK_FOR_TARGET_TIME,
                 data: &mut block as *mut c_int as *mut c_void,
             },
-            sys::mpv_render_param { type_: sys::MPV_RENDER_PARAM_INVALID, data: ptr::null_mut() },
+            sys::mpv_render_param {
+                type_: sys::MPV_RENDER_PARAM_INVALID,
+                data: ptr::null_mut(),
+            },
         ];
-        check(unsafe { sys::mpv_render_context_render(self.ctx, params.as_mut_ptr()) }, || {
-            "mpv_render_context_render".into()
-        })
+        check(
+            unsafe { sys::mpv_render_context_render(self.ctx, params.as_mut_ptr()) },
+            || "mpv_render_context_render".into(),
+        )
     }
 
     /// Tells mpv a frame was presented (improves frame timing).

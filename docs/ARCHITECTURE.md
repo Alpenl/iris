@@ -21,33 +21,36 @@ crates/
 
 ### 核心模块职责
 
-- `crates/iris-mpv/src/sys.rs`：手写的 C 声明。render API 同时声明了 OpenGL 和 D3D11 两套常量（`MPV_RENDER_API_TYPE_D3D11`、`MPV_RENDER_PARAM_D3D11_INIT_PARAMS = 21`、`MPV_RENDER_PARAM_D3D11_FBO = 22`）。
+- `crates/iris-mpv/src/lib.rs` & `sys.rs`：手写的 C 声明与薄封装。短属性名路径采用栈缓冲（`with_cstr`）避免热路径堆分配，`wait_event` 防御空指针属性载荷。render API 同时声明了 OpenGL 和 D3D11 两套常量（`MPV_RENDER_API_TYPE_D3D11`、`MPV_RENDER_PARAM_D3D11_INIT_PARAMS = 21`、`MPV_RENDER_PARAM_D3D11_FBO = 22`）。
 - `crates/iris-mpv/build.rs`：macOS 默认链接 `/opt/homebrew/lib` 的 libmpv（Homebrew 的 pkg-config 因 libarchive 是 keg-only 而失败）；其他平台必须用 `MPV_LIB_DIR` 指定。始终动态链接。
-- `crates/iris-api/src/lib.rs`：控制面与矢量叠加面协议 v1（`PROTOCOL_VERSION = 1`），定义 `PluginManifest`（含路径穿越与协议版本校验）、`Permission`、`PlaybackSnapshot`、`HostEvent`、`HostCommand`、`SidebarPanel`、`StatusItem`、`OverlayShape`、`HostMessage`/`PluginMessage` 与 `BuiltinPlugin` trait。
-- `crates/iris-core/src/player.rs`：`Session` 持有播放状态、目录、子文件夹列表与当前绝对路径，统一处理语义命令（精确/大步跳转、倍速、音量、静音、循环、音轨、字幕显隐/切轨/偏移、`sub-auto=fuzzy`、章节切换、画面比例、旋转与镜像、截图、多文件临时队列）、照片加载选项和 mpv 事件翻译，并汇总 `MediaStats` 与友好错误信息。打开分两步：`player::prepare` 在后台线程完成目录扫描与照片头解析，`Session::open` 在 UI 线程执行 `loadfile`，界面以代数（generation）丢弃过期结果。
-- `crates/iris-core/src/plugin.rs`：`PluginManager` 管理内置官方插件（`iris.guides` 构图辅助线、`iris.ab-loop` A-B 循环与标记）以及外部 JSON-lines stdio 子进程插件，执行清单权限校验、槽位状态缓存与消息轮询。
-- `crates/iris-core/src/store.rs`：收藏与播放进度（`records.tsv`）以及最近打开历史（`recent.tsv`），均按绝对路径十六进制编码保存，写临时文件再原子改名。只记录已加载完成的视频进度（`Session::progress`），续播点取 5 秒以后、片尾 5 秒以前。
-- `crates/iris-core/src/{photo,icc}.rs`：照片文件头解析（尺寸、HEIF 方向、内嵌 ICC、JPEG APP1 EXIF 摘要）与原色匹配，见第 3 节。
+- `crates/iris-api/src/lib.rs`：控制面与矢量叠加面协议 v1（`PROTOCOL_VERSION = 1`），定义 `PluginManifest`（拒绝绝对路径、Windows 盘符前缀与 `..` 路径穿越，校验协议版本）、`Permission`、`PlaybackSnapshot`、`HostEvent`、`HostCommand`、`SidebarPanel`、`StatusItem`、`OverlayShape`、`HostMessage`/`HostMessageRef`/`PluginMessage` 与 `BuiltinPlugin` trait。
+- `crates/iris-core/src/player.rs`：`Session` 持有播放状态、目录、子文件夹列表与当前绝对路径，统一处理语义命令（精确/大步跳转、倍速、音量、静音、循环、音轨、字幕显隐/切轨/偏移、`sub-auto=fuzzy`、章节切换、画面比例、旋转与镜像、截图、多文件后台准备队列 `PreparedQueue`）、照片加载选项和 mpv 事件翻译，并汇总 `MediaStats`（打开详情面板时按 1 Hz 增量刷新动态解码指标）与友好错误信息。音轨/字幕轨与章节列表采用单次 JSON FFI 读取（`track-list` / `chapter-list`）并在事件批次末尾合并刷新；切轨事件优先原地更新选中状态。设置修改走细粒度 setter，不再全量重写所有 mpv 属性。打开分两步：`player::prepare` / `prepare_queue` 在后台线程完成目录扫描与照片头解析，`Session::open` / `open_prepared_queue` 在 UI 线程执行 `loadfile`，界面以代数（generation）丢弃过期结果。
+- `crates/iris-core/src/plugin/{mod,builtins}.rs`：`PluginManager` 管理内置官方插件（`iris.guides` 构图辅助线、`iris.ab-loop` A-B 循环与标记，带 400ms 循环防抖与小时格式）以及外部 JSON-lines stdio 子进程插件。外部插件采用非阻塞独立写线程（有界队列、满载时丢弃 `PositionTick`）、有界读线程（`fill_buf`/`consume` 单行上限 64 KiB + 事件驱动 `WakeSignal` 唤醒 UI，消除空转轮询）、有界 stderr 日志转发、符号链接逃逸校验与崩溃检测，退出时先发 `Shutdown` 等待宽限期再回收。
+- `crates/iris-core/src/store.rs`：收藏与播放进度（`records.tsv`）以及最近打开历史（`recent.tsv`），采用查表式预分配十六进制路径编码与共用原子写（唯一临时后缀 + Windows 短重试）。记录脏标记 `dirty` 并支持后台线程异步写快照；片尾自动清理非收藏进度行。
+- `crates/iris-core/src/{photo,icc}.rs`：带解析上限与防溢出保护的照片文件头解析（尺寸、EXIF 方向、HEIF 方向、内嵌 ICC、JPEG APP1 EXIF 摘要）与栈上原色匹配，见第 3 节。
 - `crates/iris-core/src/{input,geometry,library,settings,logging}.rs`：
   - `input.rs`：指针与手势策略解析（含视频单击暂停、照片双击 1:1、双指捏合缩放）。
   - `geometry.rs`：窗口逻辑坐标、媒体像素与缩放／平移变换。
-  - `library.rs`：扫描文件夹（支持视频、照片、音频 `Kind::Audio` 与子文件夹 `FolderEntry`），自然排序及按名称 / 修改时间 / 大小升降序。
-  - `settings.rs`：原子落盘的 `key = value` 偏好设置（目录侧边与宽度、排序、单曲循环、播放/跳转/解码/字幕/截图、照片默认视图与缩略图条、窗口置顶、禁用插件列表等）。
-  - `logging.rs`：GUI 发布版运行日志（单次启动上限 4 MiB）。
-- `crates/iris/src/ui.rs` + `ui/`：窗口持有 `Vec<Viewport>`（当前长度 1）；视口拥有会话、原生画面层、布局矩形和照片变换。键盘上下文由 `render()` 状态纯函数推导。
+  - `library.rs`：扫描文件夹（支持视频、照片、音频 `Kind::Audio` 与子文件夹 `FolderEntry`；先检查 `file_type()` 与扩展名再 `stat`），零分配自然排序（`&str` 切片）及按名称 / 修改时间 / 大小升降序。
+  - `settings.rs`：共用原子落盘的 `key = value` 偏好设置（目录侧边与宽度、排序、单曲循环、播放/跳转/解码/字幕/截图、照片默认视图与缩略图条、窗口置顶、禁用插件列表等）。
+  - `logging.rs`：GUI 发布版运行日志（单次启动上限 4 MiB），默认启用 `iris=info,iris_core=info,iris_mpv=info`。
+- `crates/iris/src/ui.rs` + `ui/`：窗口持有 `Vec<Viewport>`（当前长度 1）；视口拥有会话、原生画面层、布局矩形和照片变换。键盘上下文由 `render()` 状态纯函数推导，且单键 `Workspace` 快捷键（`Tab`/`F`/`T`/`Esc`）限定为 `Workspace && !TextInput`，避免拦截文本输入与 IME 组合。事件循环按批消费 mpv 事件，时间轴重绘按秒变或像素变化触发（短视频上限 4 Hz，长视频降至 1 Hz，全屏隐藏工具栏与空状态为 0 Hz）。
+  - `ui/state.rs`：内聚状态结构体——`OverlayState`（互斥浮层状态机）、`ScrubState`、`DirectoryCache`（排序结果、照片切片与标签计数缓存）、`ThumbCache`（LRU 上限 80 项 + 并发上限 3 的优先级解码队列）与 `TextInputState`（光标/选区/剪贴板与 UTF-16 IME 组合状态）。
+  - `ui/actions.rs`：全部 GPUI Action 声明、上下文快捷键绑定与命令处理器。
+  - `ui/debug_cmd.rs`：`IRIS_CONTROL` 调试管道命令解析与状态输出。
   - `ui/titlebar.rs`：按平台习惯排布的窗口控制按钮（macOS 左、Windows 右）、当前文件与媒体元信息、窗口置顶图钉。
-  - `ui/directory.rs`：基于 GPUI `uniform_list` 的虚拟化列表 + 右缘细滚动条、目录搜索栏（`⌘F` / `Ctrl+F`）、排序切换、子文件夹/`..` 导航、目录/插件侧栏视图切换，以及边缘拖拽调宽手柄。
+  - `ui/directory.rs`：基于 GPUI `uniform_list` 的虚拟化列表 + 右缘细滚动条、支持中文 IME 与剪贴板的目录搜索栏（`⌘F` / `Ctrl+F`）、排序切换、子文件夹/`..` 导航、目录/插件侧栏视图切换，以及边缘拖拽调宽手柄。
   - `ui/viewport.rs`：视频/照片区探针、独立轻量 OSD 胶囊（全屏不拉起工具栏）、顶部 Toast、音频播放卡片、空状态最近打开列表、照片内存缩略图底条（`G`）、单击暂停与照片双击 1:1 交互。
   - `ui/controls.rs`：44px 单行工具栏、60fps 跟手拖拽预览时间轴与章节刻度、连续可拖拽 0–100% 音量条、小窗响应式折叠、按钮锚点探针。
   - `ui/popover.rs`：按钮正上方锚定的字幕（含偏移微调）、音轨、倍速与更多操作浮层。
   - `ui/context_menu.rs`：画面与目录行方向 C 右键上下文菜单。
-  - `ui/info.rs`：`I` / `⌘I` 媒体详情、解码统计与照片 EXIF 浮层。
+  - `ui/info.rs`：`I` / `⌘I` 媒体详情、缓存式解码统计与照片 EXIF 浮层（全屏置于目录对侧避免重叠）。
   - `ui/settings.rs`：居中多标签设置弹窗（外观、播放、字幕与音频、看图、插件、快捷键、数据管理）。
-  - `ui/palette.rs`：`⌘P` / `Ctrl+P` 命令面板，统一检索与触发内核和插件命令。
+  - `ui/palette.rs`：`⌘P` / `Ctrl+P` 命令面板，支持中文 IME、剪贴板与 `ScrollHandle` 键盘跟随滚动，统一检索与触发内核和插件命令。
   - `ui/plugin_ui.rs`：宿主渲染的 3 个视觉插件槽位（视口矢量叠层、底栏状态徽章、侧栏插件面板）。
   - `ui/widgets.rs`：共用 SVG 图标、无框按钮、分隔线与悬停提示。图标是 `Resources/Icons/` 下的 16px SVG，经 `assets.rs` 编译进二进制。GPUI 0.2.2 的悬停提示按指针移入时的文本与位置缓存在元素状态中，所以点击后文字或位置会变的按钮把状态写进元素 `id`，确保旧提示随旧元素丢弃。
 - `crates/iris/src/instance.rs`：Windows 单实例，见第 8 节。macOS 由系统把打开请求发给已运行进程，经 GPUI `on_open_urls` 进来，只接受 `file://`。
-- `crates/iris/src/platform.rs`：原生系统桥接——自实现窗口拖动（GPUI 0.2.2 `start_window_move()` 在 macOS/Windows 上为空函数）、窗口置顶（macOS `NSFloatingWindowLevel` / Win32 `SetWindowPos`）、播放期防休眠 `SleepPreventer`（macOS `IOKit` / Win32 `SetThreadExecutionState`）、macOS 触控板双指捏合 `PinchMonitor`（`NSMagnificationGestureRecognizer`）、macOS 媒体键与控制中心桥接 `MediaKeyBridge`（`MediaPlayer.framework`）、默认截图目录与照片内存缩略图解码 `decode_thumbnail`（macOS `ImageIO` 原生缩放 + 跨平台 `image` crate BGRA 回退）。
+- `crates/iris/src/platform/{mod,macos,windows}.rs`：按 OS 拆分的原生系统桥接——自实现窗口拖动（GPUI 0.2.2 `start_window_move()` 在 macOS/Windows 上为空函数）、窗口置顶（macOS `NSFloatingWindowLevel` / Win32 `SetWindowPos`）、播放期防休眠 `SleepPreventer`（macOS `IOKit` / Win32 `SetThreadExecutionState`）、macOS 触控板双指捏合 `PinchMonitor`（持有 `NSView` 强引用避免 UAF）、macOS 媒体键与控制中心桥接 `MediaKeyBridge`（`MediaPlayer.framework`，同步真实倍速与清空状态）、默认截图目录，以及照片内存缩略图解码 `decode_thumbnail`（macOS `ImageIO` 原生 sRGB 缩放并反预乘为直通 BGRA、Windows 原生 WIC 缩放 + EXIF 方向校正，跨平台 `image` crate 带内存/尺寸上限回退）。
 - `crates/iris/src/debug.rs`：调试控制管道（`IRIS_CONTROL`），见第 7 节。
 
 ## 2. macOS 视频合成（已验证）
@@ -62,8 +65,8 @@ NSWindow contentView
 
 - 视频视图用 `addSubview:positioned:NSWindowBelow relativeTo:gpui_view` 插在 GPUI 视图下面。视频帧不经过 GPUI，界面重绘也不影响视频。
 - 视频视图的 frame 等于 GPUI 布局里量出来的视频区矩形（canvas 探针），并设置宽高自动伸缩以跟随实时缩放。字幕和 OSD 因此永远落在画面内。曾试过用 `video-margin-ratio-*` 定位视频，结果字幕跑到目录栏下面，已放弃。
-- mpv 的 render 更新回调只触发图层 `setNeedsDisplay`，绘制在 `drawInCGLContext:` 里完成。
-- 时间显示每秒最多重绘 4 次，暂停时整个应用 CPU 约 0.5%。
+- mpv 的 render 更新回调通过容量 1 的有界通道唤醒 `iris-video` 渲染线程，绘制循环包在 `autoreleasepool` 中避免 60fps 长期播放泄漏 Objective-C 临时对象；关闭时严格按“释放 render context → join 渲染线程 → 清空 ivar 并移除视图”顺序执行，消除关窗数据竞争。
+- 时间显示按秒变或进度条像素步进触发重绘（短视频上限 4 Hz，长视频降至 1 Hz，全屏隐藏工具栏与空状态为 0 Hz）。
 - GPUI 0.2.2 的 `surface()` 只接受 NV12 的 CVPixelBuffer，所以没有走“把帧交给 GPUI 画”的方案。
 
 **尚未人工验证**：拖动窗口边缘实时缩放时，视频层和界面会不会错位几帧。程序模拟不出真实拖动，需要人手动测。这和 Windows 的同步风险是同一类问题。
@@ -144,7 +147,7 @@ NSWindow contentView
 - **绝不接触实时像素**：视频与照片帧始终留在原生视频层；插件只能在视口层提交 `[0..1]` 归一化矢量图元（矩形、直线、网格、十字准星、角标），由 GPUI 透明叠层无阻塞绘制且不拦截鼠标事件。
 - **内置与外部同协议**：内置官方插件（`iris.guides`、`iris.ab-loop`）和外部进程插件共享同一套 `HostEvent` / `HostCommand` / `Permission` 模型，并在 **设置 → 插件** 统一管理启停并持久化到 `settings.conf`。
 - **宿主掌控视觉语法**：插件提交的是结构化数据（`SidebarPanel`、`StatusItem`、`OverlayShape`、`CommandSpec`），由 `crates/iris/src/ui/{plugin_ui,palette}.rs` 严格按方向 C 风格渲染。
-- **异步防卡顿**：外部子进程由独立读线程解码 stdout（单行上限 64 KiB）并送入 `mpsc` 队列；UI 每 250ms 轮询上限 256 条消息，子进程阻塞或崩溃不会冻结主界面或视频渲染。
+- **异步防卡顿**：外部子进程由独立读线程（有界单行 64 KiB）和独立非阻塞写线程（有界队列，满载丢弃 `PositionTick`）通信，通过事件驱动 `WakeSignal` 唤醒 UI，不再空转 250ms 轮询；子进程阻塞、超长输出或崩溃均不会冻结主界面或视频渲染。
 
 ## 6. 依赖
 
@@ -183,10 +186,10 @@ NSWindow contentView
 | 规划稿 | 实际 | 原因 |
 |---|---|---|
 | `iris-core` 不依赖 GPUI | 已拆分并由 `check-project.py` 强制约束 | `cargo test -p iris-core` 无窗口运行 |
-| `iris-api` crate 与控制面插件 | 已落地：`iris-api` + `iris-core/src/plugin.rs` + `ui/{palette,plugin_ui}.rs` | 播放器体验完善后，按用户要求落地控制面与矢量叠加面插件系统，坚持不接触像素数据 |
+| `iris-api` crate 与控制面插件 | 已落地：`iris-api` + `iris-core/src/plugin/{mod,builtins}.rs` + `ui/{palette,plugin_ui}.rs` | 播放器体验完善后，按用户要求落地控制面与矢量叠加面插件系统，坚持不接触像素数据 |
 | `engine/` 下的 `MediaBackend` trait | 仍没有；`player::Session` 直接用 `iris-mpv` | 只有 mpv 一套实现，等真有第二套原生照片/解码后端再提炼（DECISIONS 4.5） |
 | `command.rs` / `state.rs` / `event.rs` 分文件 | 都在 `player.rs`（`Command`、`PlaybackState`、`SessionEvent`） | 模块边界清晰，无需过度拆分 |
 | `viewport.rs`、`playlist.rs`、`config.rs` | `geometry.rs`、`library.rs`、`settings.rs` | 只是名字不同 |
-| `platform/` 下按 OS 分目录，加 `VideoUnderlay` trait | `video/{mac,windows}.rs` + `platform.rs`，按 `cfg` 隔离 | 两个平台的生命周期差别大，暂不定公共 trait |
-| `ui/` 拆成 workspace / titlebar / toolbar / sidebar / osd | `ui.rs` + `ui/{titlebar,directory,viewport,controls,popover,context_menu,info,settings,palette,plugin_ui,widgets}.rs` | 按独立交互表面拆分为清晰子模块，workspace 仍收口在 `ui.rs` |
+| `platform/` 下按 OS 分目录，加 `VideoUnderlay` trait | `video/{mac,windows}.rs` + `platform/{mod,macos,windows}.rs`，按 `cfg` 隔离 | 两个平台的生命周期差别大，暂不定公共 trait |
+| `ui/` 拆成 workspace / titlebar / toolbar / sidebar / osd | `ui.rs` + `ui/{state,actions,debug_cmd,titlebar,directory,viewport,controls,popover,context_menu,info,settings,palette,plugin_ui,widgets}.rs` | 按独立交互表面与内聚状态拆分为清晰子模块，workspace 收口在 `ui.rs` |
 | `control.rs`（原 `debug.rs`） | 仍叫 `debug.rs` | 只在 debug / `devtools` 构建启用 |

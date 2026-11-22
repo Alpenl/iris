@@ -30,7 +30,7 @@ impl IrisWindow {
             PopoverKind::Subtitles | PopoverKind::Audio => 272.,
         };
         // Position directly above the trigger button inside the viewport.
-        let vp_rect = self.viewports[0].rect.get().map(|r| r.0);
+        let vp_rect = self.active().rect.get().map(|r| r.0);
         let anchor = self.popover_anchor(kind);
         let left_px = match (vp_rect, anchor) {
             (Some([vx, _, vw, _]), Some(ab)) if vw > 0. => {
@@ -80,12 +80,7 @@ impl IrisWindow {
             .justify_between()
             .border_b_1()
             .border_color(line())
-            .child(
-                div()
-                    .text_size(px(11.))
-                    .text_color(text_dim())
-                    .child(title),
-            )
+            .child(div().text_size(px(11.)).text_color(text_dim()).child(title))
             .when_some(hint, |d, hint| {
                 d.child(
                     div()
@@ -98,7 +93,7 @@ impl IrisWindow {
     }
 
     fn render_sub_popover(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let session = &self.viewports[0].session;
+        let session = &self.active().session;
         let visible = session.state.subs_visible;
         let delay = session.state.sub_delay;
         let tracks = session.tracks_of(TrackKind::Sub);
@@ -121,14 +116,18 @@ impl IrisWindow {
                     d.text_color(text_muted())
                         .hover(|s| s.bg(hover()).text_color(text()))
                 })
-                .child(div().w(px(14.)).flex_none().flex().justify_center().when(
-                    active,
-                    |d| d.child(icon(Icon::Check, 12., accent())),
-                ))
+                .child(
+                    div()
+                        .w(px(14.))
+                        .flex_none()
+                        .flex()
+                        .justify_center()
+                        .when(active, |d| d.child(icon(Icon::Check, 12., accent()))),
+                )
                 .child(div().flex_1().min_w(px(0.)).truncate().child(label.clone()))
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.command(Command::SelectSubtitle(Some(id)), cx);
-                    this.popover = None;
+                    this.overlays.popover = None;
                     this.show_osd(format!("字幕 · {label}"), cx);
                 }))
         });
@@ -157,14 +156,22 @@ impl IrisWindow {
                         d.text_color(text_muted())
                             .hover(|s| s.bg(hover()).text_color(text()))
                     })
-                    .child(div().w(px(14.)).flex_none().flex().justify_center().when(
-                        !visible,
-                        |d| d.child(icon(Icon::Check, 12., accent())),
-                    ))
-                    .child(if visible { "隐藏字幕" } else { "字幕已关闭" })
+                    .child(
+                        div()
+                            .w(px(14.))
+                            .flex_none()
+                            .flex()
+                            .justify_center()
+                            .when(!visible, |d| d.child(icon(Icon::Check, 12., accent()))),
+                    )
+                    .child(if visible {
+                        "隐藏字幕"
+                    } else {
+                        "字幕已关闭"
+                    })
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.command(Command::ToggleSubtitles, cx);
-                        this.popover = None;
+                        this.overlays.popover = None;
                         cx.notify();
                     })),
             )
@@ -276,7 +283,7 @@ impl IrisWindow {
     }
 
     fn render_audio_popover(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let session = &self.viewports[0].session;
+        let session = &self.active().session;
         let tracks = session.tracks_of(TrackKind::Audio);
         let has_tracks = !tracks.is_empty();
 
@@ -298,14 +305,18 @@ impl IrisWindow {
                     d.text_color(text_muted())
                         .hover(|s| s.bg(hover()).text_color(text()))
                 })
-                .child(div().w(px(14.)).flex_none().flex().justify_center().when(
-                    active,
-                    |d| d.child(icon(Icon::Check, 12., accent())),
-                ))
+                .child(
+                    div()
+                        .w(px(14.))
+                        .flex_none()
+                        .flex()
+                        .justify_center()
+                        .when(active, |d| d.child(icon(Icon::Check, 12., accent()))),
+                )
                 .child(div().flex_1().min_w(px(0.)).truncate().child(label.clone()))
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.command(Command::SelectAudio(Some(id)), cx);
-                    this.popover = None;
+                    this.overlays.popover = None;
                     this.show_osd(format!("音轨 · {label}"), cx);
                 }))
         });
@@ -340,7 +351,7 @@ impl IrisWindow {
     }
 
     fn render_speed_popover(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let current = self.viewports[0].session.state.speed;
+        let current = self.active().session.state.speed;
         let rows = SPEED_STEPS.iter().copied().enumerate().map(|(i, speed)| {
             let active = (current - speed).abs() < 0.02;
             div()
@@ -362,7 +373,7 @@ impl IrisWindow {
                 .when(active, |d| d.child(icon(Icon::Check, 12., accent())))
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.command(Command::SetSpeed(speed), cx);
-                    this.popover = None;
+                    this.overlays.popover = None;
                     this.show_osd(format!("倍速 · {speed:.2}×"), cx);
                 }))
         });
@@ -376,7 +387,7 @@ impl IrisWindow {
     }
 
     fn render_more_popover(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let session = &self.viewports[0].session;
+        let session = &self.active().session;
         let state = &session.state;
         let aspect = state.aspect;
         let chapters = state.chapters.clone();
@@ -453,36 +464,32 @@ impl IrisWindow {
                                 .child(icon(Icon::Aspect, 12., text_faint()))
                                 .child("画面比例 (C)"),
                         )
-                        .child(
-                            div()
-                                .flex()
-                                .flex_wrap()
-                                .gap(px(4.))
-                                .children(aspect_modes.into_iter().enumerate().map(|(i, m)| {
-                                    let on = aspect == m;
-                                    div()
-                                        .id(("aspect-opt", i))
-                                        .h(px(22.))
-                                        .px(px(7.))
-                                        .flex()
-                                        .items_center()
-                                        .cursor_pointer()
-                                        .border_1()
-                                        .border_color(if on { accent() } else { line_strong() })
-                                        .when(on, |d| d.bg(selected()).text_color(text()))
-                                        .when(!on, |d| {
-                                            d.bg(window_bg())
-                                                .text_color(text_dim())
-                                                .hover(|s| s.bg(hover()).text_color(text()))
-                                        })
-                                        .text_size(px(11.))
-                                        .child(m.label())
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            this.command(Command::SetAspect(m), cx);
-                                            this.show_osd(format!("画面比例 · {}", m.label()), cx);
-                                        }))
-                                })),
-                        ),
+                        .child(div().flex().flex_wrap().gap(px(4.)).children(
+                            aspect_modes.into_iter().enumerate().map(|(i, m)| {
+                                let on = aspect == m;
+                                div()
+                                    .id(("aspect-opt", i))
+                                    .h(px(22.))
+                                    .px(px(7.))
+                                    .flex()
+                                    .items_center()
+                                    .cursor_pointer()
+                                    .border_1()
+                                    .border_color(if on { accent() } else { line_strong() })
+                                    .when(on, |d| d.bg(selected()).text_color(text()))
+                                    .when(!on, |d| {
+                                        d.bg(window_bg())
+                                            .text_color(text_dim())
+                                            .hover(|s| s.bg(hover()).text_color(text()))
+                                    })
+                                    .text_size(px(11.))
+                                    .child(m.label())
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.command(Command::SetAspect(m), cx);
+                                        this.show_osd(format!("画面比例 · {}", m.label()), cx);
+                                    }))
+                            }),
+                        )),
                 )
             })
             .child(
@@ -524,7 +531,7 @@ impl IrisWindow {
                             shot_key,
                             false,
                             Box::new(cx.listener(|this, _, w, cx| {
-                                this.popover = None;
+                                this.overlays.popover = None;
                                 this.take_screenshot(&TakeScreenshot, w, cx);
                             })),
                         ))
@@ -533,9 +540,9 @@ impl IrisWindow {
                         "more-info",
                         "媒体详情与统计",
                         "I",
-                        self.info_open,
+                        self.overlays.info_open,
                         Box::new(cx.listener(|this, _, w, cx| {
-                            this.popover = None;
+                            this.overlays.popover = None;
                             this.toggle_info(&ToggleInfo, w, cx);
                         })),
                     )),
@@ -593,7 +600,7 @@ impl IrisWindow {
                                         )
                                         .on_click(cx.listener(move |this, _, _, cx| {
                                             this.command(Command::SelectChapter(i), cx);
-                                            this.popover = None;
+                                            this.overlays.popover = None;
                                             cx.notify();
                                         }))
                                 })),

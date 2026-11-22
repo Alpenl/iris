@@ -1,8 +1,9 @@
 //! Direction C Command Palette (`⌘P` / `Ctrl+P` / `⌘⇧P`): unifies built-in
 //! player commands and all commands contributed by enabled plugins.
 use gpui::{
-    Context, InteractiveElement, IntoElement, KeyDownEvent, MouseButton, ParentElement,
-    StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder, px,
+    ClipboardItem, Context, ElementInputHandler, InteractiveElement, IntoElement, KeyContext,
+    KeyDownEvent, MouseButton, ParentElement, StatefulInteractiveElement, Styled, Window, canvas,
+    div, prelude::FluentBuilder, px,
 };
 
 use super::widgets::icon;
@@ -12,7 +13,10 @@ use crate::assets::Icon;
 #[derive(Clone, Debug)]
 pub(super) enum PaletteTarget {
     Host(&'static str),
-    Plugin { plugin_id: String, command_id: String },
+    Plugin {
+        plugin_id: String,
+        command_id: String,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -152,7 +156,7 @@ impl IrisWindow {
             });
         }
 
-        let q = self.palette_query.trim().to_ascii_lowercase();
+        let q = self.palette_input.text().trim().to_ascii_lowercase();
         if !q.is_empty() {
             entries.retain(|e| {
                 e.title.to_ascii_lowercase().contains(&q)
@@ -171,8 +175,8 @@ impl IrisWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.palette_open = false;
-        self.palette_query.clear();
+        self.overlays.palette_open = false;
+        self.palette_input.clear();
         self.palette_index = 0;
         self.focus.focus(window);
         match target {
@@ -193,19 +197,18 @@ impl IrisWindow {
                 if !self.fullscreen {
                     self.show_directory = true;
                 } else {
-                    self.dir_popup = true;
+                    self.overlays.dir_popup = true;
                 }
                 cx.notify();
             }
             PaletteTarget::Host("search") => self.toggle_search(&ToggleSearch, window, cx),
             PaletteTarget::Host("refresh") => self.refresh_directory(&RefreshDirectory, window, cx),
             PaletteTarget::Host("settings") => {
-                self.settings_open = true;
+                self.overlays.open_settings(None);
                 cx.notify();
             }
             PaletteTarget::Host("plugins") => {
-                self.settings_tab = SettingsTab::Plugins;
-                self.settings_open = true;
+                self.overlays.open_settings(Some(SettingsTab::Plugins));
                 cx.notify();
             }
             PaletteTarget::Host(_) => {}
@@ -232,7 +235,14 @@ impl IrisWindow {
         } else {
             0
         };
-        let q = self.palette_query.clone();
+        let is_empty = self.palette_input.is_empty();
+        let display = if is_empty {
+            "输入命令或插件名称…".to_string()
+        } else {
+            self.palette_input.display_text(true)
+        };
+        let focus_ime = self.palette_focus.clone();
+        let entity_ime = cx.entity().clone();
 
         div()
             .id("palette-backdrop")
@@ -246,8 +256,8 @@ impl IrisWindow {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, window, cx| {
-                    this.palette_open = false;
-                    this.palette_query.clear();
+                    this.overlays.palette_open = false;
+                    this.palette_input.clear();
                     this.focus.focus(window);
                     cx.stop_propagation();
                     cx.notify();
@@ -265,13 +275,73 @@ impl IrisWindow {
                     .border_1()
                     .border_color(line_strong())
                     .track_focus(&self.palette_focus)
-                    .key_context("CommandPalette")
+                    .key_context({
+                        let mut ctx = KeyContext::default();
+                        ctx.add("CommandPalette");
+                        ctx.add("TextInput");
+                        ctx
+                    })
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
+                        if this.palette_input.marked_range.is_some() {
+                            // Active IME composition: let the OS input method handle editing/confirm/cancel keys.
+                            return;
+                        }
+                        let mods = ev.keystroke.modifiers;
+                        if mods.secondary() && !mods.alt {
+                            match ev.keystroke.key.as_str() {
+                                "a" => {
+                                    this.palette_input.select_all();
+                                    cx.stop_propagation();
+                                    cx.notify();
+                                    return;
+                                }
+                                "c" => {
+                                    let sel = this.palette_input.selected_text();
+                                    let to_copy = if sel.is_empty() {
+                                        this.palette_input.text()
+                                    } else {
+                                        sel
+                                    };
+                                    if !to_copy.is_empty() {
+                                        cx.write_to_clipboard(ClipboardItem::new_string(
+                                            to_copy.to_string(),
+                                        ));
+                                    }
+                                    cx.stop_propagation();
+                                    return;
+                                }
+                                "x" => {
+                                    let sel = this.palette_input.selected_text().to_string();
+                                    if !sel.is_empty() {
+                                        cx.write_to_clipboard(ClipboardItem::new_string(sel));
+                                        this.palette_input.backspace();
+                                        this.palette_index = 0;
+                                        this.palette_scroll.scroll_to_item(0);
+                                        cx.notify();
+                                    }
+                                    cx.stop_propagation();
+                                    return;
+                                }
+                                "v" => {
+                                    if let Some(text) =
+                                        cx.read_from_clipboard().and_then(|c| c.text())
+                                    {
+                                        this.palette_input.insert_paste(&text);
+                                        this.palette_index = 0;
+                                        this.palette_scroll.scroll_to_item(0);
+                                        cx.notify();
+                                    }
+                                    cx.stop_propagation();
+                                    return;
+                                }
+                                _ => return,
+                            }
+                        }
                         match ev.keystroke.key.as_str() {
                             "escape" => {
-                                this.palette_open = false;
-                                this.palette_query.clear();
+                                this.overlays.palette_open = false;
+                                this.palette_input.clear();
                                 this.focus.focus(window);
                                 cx.stop_propagation();
                                 cx.notify();
@@ -284,6 +354,7 @@ impl IrisWindow {
                                     } else {
                                         this.palette_index - 1
                                     };
+                                    this.palette_scroll.scroll_to_item(this.palette_index);
                                 }
                                 cx.stop_propagation();
                                 cx.notify();
@@ -292,6 +363,7 @@ impl IrisWindow {
                                 let len = this.palette_entries().len();
                                 if len > 0 {
                                     this.palette_index = (this.palette_index + 1) % len;
+                                    this.palette_scroll.scroll_to_item(this.palette_index);
                                 }
                                 cx.stop_propagation();
                                 cx.notify();
@@ -306,27 +378,48 @@ impl IrisWindow {
                                 cx.stop_propagation();
                             }
                             "backspace" => {
-                                this.palette_query.pop();
+                                this.palette_input.backspace();
                                 this.palette_index = 0;
+                                this.palette_scroll.scroll_to_item(0);
+                                cx.stop_propagation();
+                                cx.notify();
+                            }
+                            "delete" => {
+                                this.palette_input.delete_forward();
+                                this.palette_index = 0;
+                                this.palette_scroll.scroll_to_item(0);
+                                cx.stop_propagation();
+                                cx.notify();
+                            }
+                            "left" => {
+                                this.palette_input.move_left();
+                                cx.stop_propagation();
+                                cx.notify();
+                            }
+                            "right" => {
+                                this.palette_input.move_right();
+                                cx.stop_propagation();
+                                cx.notify();
+                            }
+                            "home" => {
+                                this.palette_input.move_home();
+                                cx.stop_propagation();
+                                cx.notify();
+                            }
+                            "end" => {
+                                this.palette_input.move_end();
                                 cx.stop_propagation();
                                 cx.notify();
                             }
                             _ => {
-                                if !ev.keystroke.modifiers.platform
-                                    && !ev.keystroke.modifiers.control
-                                    && let Some(ch) = &ev.keystroke.key_char
-                                    && !ch.chars().any(char::is_control)
-                                {
-                                    this.palette_query.push_str(ch);
-                                    this.palette_index = 0;
-                                    cx.stop_propagation();
-                                    cx.notify();
-                                }
+                                // Leave printable keys unhandled so GPUI routes ASCII & IME
+                                // composition through `EntityInputHandler`.
                             }
                         }
                     }))
                     .child(
                         div()
+                            .relative()
                             .h(px(38.))
                             .flex_none()
                             .px(px(12.))
@@ -336,6 +429,20 @@ impl IrisWindow {
                             .bg(window_bg())
                             .border_b_1()
                             .border_color(line())
+                            .child(
+                                canvas(
+                                    |_, _, _| {},
+                                    move |bounds, _, window, cx| {
+                                        window.handle_input(
+                                            &focus_ime,
+                                            ElementInputHandler::new(bounds, entity_ime.clone()),
+                                            cx,
+                                        );
+                                    },
+                                )
+                                .absolute()
+                                .inset_0(),
+                            )
                             .child(icon(Icon::Command, 14., accent()))
                             .child(
                                 div()
@@ -343,12 +450,8 @@ impl IrisWindow {
                                     .min_w(px(0.))
                                     .truncate()
                                     .text_size(px(13.))
-                                    .text_color(if q.is_empty() { text_faint() } else { text() })
-                                    .child(if q.is_empty() {
-                                        "输入命令或插件名称…".to_string()
-                                    } else {
-                                        format!("{q}▏")
-                                    }),
+                                    .text_color(if is_empty { text_faint() } else { text() })
+                                    .child(display),
                             )
                             .child(
                                 div()
@@ -365,6 +468,7 @@ impl IrisWindow {
                             .min_h(px(0.))
                             .max_h(px(360.))
                             .overflow_y_scroll()
+                            .track_scroll(&self.palette_scroll)
                             .py(px(4.))
                             .flex()
                             .flex_col()

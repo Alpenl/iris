@@ -1,6 +1,7 @@
 //! Path-keyed personal data, stored beside settings, never beside media.
 use std::{
     collections::BTreeMap,
+    fmt::Write as _,
     path::{Path, PathBuf},
 };
 
@@ -17,6 +18,7 @@ const MAX_RECENT: usize = 20;
 pub struct Store {
     pub records: BTreeMap<PathBuf, Record>,
     pub recent: Vec<PathBuf>,
+    dirty: bool,
 }
 
 impl Store {
@@ -54,18 +56,12 @@ impl Store {
         }
     }
     fn write_recent(&self, path: &Path) -> std::io::Result<()> {
-        let text: String = self
-            .recent
-            .iter()
-            .take(MAX_RECENT)
-            .map(|p| format!("{}\n", encode_path(p)))
-            .collect();
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+        let mut text = String::with_capacity(self.recent.len() * 64);
+        for p in self.recent.iter().take(MAX_RECENT) {
+            encode_path_into(p, &mut text);
+            text.push('\n');
         }
-        let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
-        std::fs::write(&tmp, text)?;
-        std::fs::rename(tmp, path)
+        crate::settings::atomic_write(path, &text)
     }
     pub fn push_recent(&mut self, path: &Path) {
         let p = path.to_path_buf();
@@ -128,37 +124,57 @@ impl Store {
         this
     }
 
-    pub fn save(&self) {
+    pub fn save(&mut self) {
         let Some(path) = crate::settings::path().map(|p| p.with_file_name("records.tsv")) else {
             return;
         };
         if let Err(e) = self.write(&path) {
             log::error!("saving records failed: {e}");
+        } else {
+            self.dirty = false;
         }
     }
+
+    pub fn is_dirty(&self) -> bool {
+        self.dirty
+    }
+
+    /// Captures serialized records for off-UI-thread atomic saving, clearing the
+    /// dirty flag. Returns `None` if nothing changed since the last save.
+    pub fn take_dirty_snapshot(&mut self) -> Option<(PathBuf, String)> {
+        if !self.dirty {
+            return None;
+        }
+        let path = crate::settings::path().map(|p| p.with_file_name("records.tsv"))?;
+        self.dirty = false;
+        Some((path, self.format_records()))
+    }
+
+    /// Writes a previously captured snapshot to disk (safe to run on a worker thread).
+    pub fn write_snapshot(path: &Path, text: &str) {
+        if let Err(e) = crate::settings::atomic_write(path, text) {
+            log::error!("saving records failed: {e}");
+        }
+    }
+
+    fn format_records(&self) -> String {
+        let mut text = String::with_capacity(self.records.len() * 96);
+        for (p, r) in &self.records {
+            encode_path_into(p, &mut text);
+            let _ = writeln!(
+                text,
+                "\t{}\t{:.3}\t{:.3}",
+                u8::from(r.favorite),
+                r.position,
+                r.duration
+            );
+        }
+        text
+    }
+
     fn write(&self, path: &Path) -> std::io::Result<()> {
-        let text: String = self
-            .records
-            .iter()
-            .map(|(p, r)| {
-                format!(
-                    "{}\t{}\t{:.3}\t{:.3}\n",
-                    encode_path(p),
-                    u8::from(r.favorite),
-                    r.position,
-                    r.duration
-                )
-            })
-            .collect();
-        let write = || -> std::io::Result<()> {
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
-            std::fs::write(&tmp, text)?;
-            std::fs::rename(tmp, path)
-        };
-        write()
+        let text = self.format_records();
+        crate::settings::atomic_write(path, &text)
     }
 
     pub fn favorite(&self, path: &Path) -> bool {
@@ -168,6 +184,9 @@ impl Store {
         let r = self.records.entry(path.to_path_buf()).or_default();
         r.favorite = !r.favorite;
         let favorite = r.favorite;
+        if !favorite && r.position <= 0. && r.duration <= 0. {
+            self.records.remove(path);
+        }
         self.save();
         favorite
     }
@@ -213,31 +232,86 @@ impl Store {
             .filter(|r| r.position >= 5. && r.position < r.duration - 5.)
             .map_or(0., |r| r.position)
     }
-    pub fn remember(&mut self, path: &Path, position: f64, duration: f64, eof: bool) {
+    pub fn remember(&mut self, path: &Path, position: f64, duration: f64, eof: bool) -> bool {
         if !position.is_finite() || !duration.is_finite() || duration <= 0. {
-            return;
+            return false;
         }
-        let r = self.records.entry(path.to_path_buf()).or_default();
-        r.position = if eof { 0. } else { position.max(0.) };
-        r.duration = duration;
+        if eof {
+            let changed = match self.records.get_mut(path) {
+                Some(r) if r.favorite => {
+                    let diff = r.position > 0. || (r.duration - duration).abs() > 0.01;
+                    r.position = 0.;
+                    r.duration = duration;
+                    diff
+                }
+                Some(_) => {
+                    self.records.remove(path);
+                    true
+                }
+                None => false,
+            };
+            if changed {
+                self.dirty = true;
+            }
+            return changed;
+        }
+        let next_pos = position.max(0.);
+        if let Some(r) = self.records.get_mut(path) {
+            if (r.position - next_pos).abs() < 0.25 && (r.duration - duration).abs() < 0.01 {
+                return false;
+            }
+            r.position = next_pos;
+            r.duration = duration;
+            self.dirty = true;
+            return true;
+        }
+        // Avoid storing unresumable non-favorite positions near start/end.
+        if next_pos < 5. || next_pos >= duration - 5. {
+            return false;
+        }
+        self.records.insert(
+            path.to_path_buf(),
+            Record {
+                favorite: false,
+                position: next_pos,
+                duration,
+            },
+        );
+        self.dirty = true;
+        true
     }
 }
 
-fn encode_path(path: &Path) -> String {
+const HEX: &[u8; 16] = b"0123456789abcdef";
+
+fn push_hex(bytes: &[u8], out: &mut String) {
+    out.reserve(bytes.len() * 2);
+    for &b in bytes {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0x0F) as usize] as char);
+    }
+}
+
+fn encode_path_into(path: &Path, out: &mut String) {
     #[cfg(unix)]
-    let bytes = {
+    {
         use std::os::unix::ffi::OsStrExt;
-        path.as_os_str().as_bytes().to_vec()
-    };
+        push_hex(path.as_os_str().as_bytes(), out);
+    }
     #[cfg(windows)]
-    let bytes: Vec<u8> = {
+    {
         use std::os::windows::ffi::OsStrExt;
-        path.as_os_str()
-            .encode_wide()
-            .flat_map(u16::to_le_bytes)
-            .collect()
-    };
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+        for unit in path.as_os_str().encode_wide() {
+            push_hex(&unit.to_le_bytes(), out);
+        }
+    }
+}
+
+#[cfg(test)]
+fn encode_path(path: &Path) -> String {
+    let mut out = String::new();
+    encode_path_into(path, &mut out);
+    out
 }
 
 fn decode_path(text: &str) -> Option<PathBuf> {
@@ -356,5 +430,25 @@ mod tests {
         assert!(s.favorite(fav));
         assert_eq!(s.progress_ratio(fav), None);
         assert!(!s.records.contains_key(plain));
+    }
+
+    #[test]
+    fn remember_prunes_completed_non_favorites_and_tracks_dirty() {
+        let p = Path::new("clip.mp4");
+        let mut s = Store::default();
+        assert!(!s.is_dirty());
+        // Within first 5s: not resumable, should not create a dead entry.
+        assert!(!s.remember(p, 2.0, 60.0, false));
+        assert!(!s.records.contains_key(p));
+        assert!(!s.is_dirty());
+        // Resumable position creates entry and marks dirty.
+        assert!(s.remember(p, 15.0, 60.0, false));
+        assert!(s.is_dirty());
+        assert_eq!(s.resume(p), 15.0);
+        // Tiny sub-0.25s drift does not trigger another write.
+        assert!(!s.remember(p, 15.1, 60.0, false));
+        // Reaching EOF removes non-favorite entry cleanly.
+        assert!(s.remember(p, 60.0, 60.0, true));
+        assert!(!s.records.contains_key(p));
     }
 }

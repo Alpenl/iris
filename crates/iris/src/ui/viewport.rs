@@ -44,8 +44,8 @@ impl IrisWindow {
         window: &Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let last_rect = self.viewports[0].rect.clone();
-        let video = self.viewports[0].video.clone();
+        let last_rect = self.active().rect.clone();
+        let video = self.active().video.clone();
         let probe = canvas(
             move |bounds, _, _| {
                 let r = VideoRect([
@@ -68,9 +68,9 @@ impl IrisWindow {
         .absolute()
         .size_full();
 
-        let kind = self.viewports[0].session.kind();
-        let is_photo_zoomed = kind == Some(Kind::Photo) && self.viewports[0].image.zoomed();
-        let panning = self.viewports[0].drag_origin.is_some();
+        let kind = self.active().session.kind();
+        let is_photo_zoomed = kind == Some(Kind::Photo) && self.active().image.zoomed();
+        let panning = self.active().drag_origin.is_some();
         let show_filmstrip = kind == Some(Kind::Photo)
             && self.settings.photo_filmstrip
             && (!fullscreen || self.chrome_visible);
@@ -98,7 +98,11 @@ impl IrisWindow {
             .child(probe)
             .key_context({
                 let mut context = gpui::KeyContext::default();
-                if self.settings_open || self.context_menu.is_some() || self.palette_open {
+                if self.overlays.settings_open
+                    || self.overlays.context_menu.is_some()
+                    || self.overlays.palette_open
+                    || self.search_focus.is_focused(window)
+                {
                     context.add("Overlay");
                 } else {
                     context.add("Viewport");
@@ -111,7 +115,7 @@ impl IrisWindow {
                             None => "none",
                         },
                     );
-                    if self.viewports[0].image.zoomed() {
+                    if self.active().image.zoomed() {
                         context.add("zoomed");
                     }
                 }
@@ -136,8 +140,7 @@ impl IrisWindow {
                         let delta = this.damped_volume_delta(ev);
                         if delta.abs() >= 0.5 {
                             this.command(Command::VolumeBy(delta), cx);
-                            let next =
-                                (this.viewports[0].session.state.volume + delta).clamp(0., 100.);
+                            let next = (this.active().session.state.volume + delta).clamp(0., 100.);
                             this.show_osd(format!("音量 · {next:.0}%"), cx);
                         }
                         cx.stop_propagation();
@@ -148,8 +151,7 @@ impl IrisWindow {
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(|this, ev: &MouseDownEvent, _, cx| {
-                    this.popover = None;
-                    this.context_menu = Some(ContextMenu {
+                    this.overlays.open_context_menu(ContextMenu {
                         pos: ev.position,
                         target: ContextTarget::Viewport,
                     });
@@ -163,7 +165,7 @@ impl IrisWindow {
                     let ctx = this.input_context();
                     if ev.click_count >= 2 {
                         // Cancel any pending single-click pause timer.
-                        this.click_seq += 1;
+                        this.scrub.click_seq += 1;
                         match input::resolve_pointer_input(PointerInput::DoubleClick, ctx) {
                             Some(PointerCommand::CloseOverlay) => this.close_overlays(cx),
                             Some(PointerCommand::ToggleFullscreen) => window.toggle_fullscreen(),
@@ -179,21 +181,22 @@ impl IrisWindow {
                     } else if let Some(PointerCommand::BeginPan) =
                         input::resolve_pointer_input(PointerInput::BeginDrag, ctx)
                     {
-                        this.viewports[0].drag_origin = Some(ev.position);
+                        this.active_mut().drag_origin = Some(ev.position);
                         cx.notify();
                     } else if let Some(PointerCommand::TogglePlayback) =
                         input::resolve_pointer_input(PointerInput::SingleClick, ctx)
                     {
                         // Short delay so double-click fullscreen doesn't pause first.
-                        this.click_seq += 1;
-                        let seq = this.click_seq;
+                        this.scrub.click_seq += 1;
+                        let seq = this.scrub.click_seq;
                         cx.spawn(async move |this, cx| {
                             cx.background_executor()
                                 .timer(Duration::from_millis(200))
                                 .await;
                             let _ = this.update(cx, |this, cx| {
-                                if this.click_seq == seq {
-                                    let next_paused = !this.viewports[0].session.state.paused;
+                                if this.scrub.click_seq == seq {
+                                    let state = &this.active().session.state;
+                                    let next_paused = !state.paused && !state.ended;
                                     this.command(Command::TogglePlayback, cx);
                                     this.show_osd(if next_paused { "暂停" } else { "播放" }, cx);
                                 }
@@ -212,7 +215,8 @@ impl IrisWindow {
             // Fullscreen: file name and media info at the top, on the edge
             // away from the directory so the popup never covers it.
             .when(fullscreen && self.chrome_visible, |d| {
-                let name = self.viewports[0]
+                let name = self
+                    .active()
                     .session
                     .current
                     .as_ref()
@@ -276,22 +280,18 @@ impl IrisWindow {
                                 .border_1()
                                 .border_color(line())
                                 .child(div().flex_none().size(px(6.)).bg(accent()))
-                                .child(
-                                    div()
-                                        .font_family(FONT_MONO)
-                                        .text_size(px(12.))
-                                        .child(msg),
-                                ),
+                                .child(div().font_family(FONT_MONO).text_size(px(12.)).child(msg)),
                         ),
                 )
             })
             // Media info inspector panel (`I` / `⌘I`).
-            .when(self.info_open && self.viewports[0].session.current.is_some(), |d| {
-                d.child(self.render_info_overlay(fullscreen, cx))
-            })
+            .when(
+                self.overlays.info_open && self.active().session.current.is_some(),
+                |d| d.child(self.render_info_overlay(fullscreen, cx)),
+            )
             // Empty state: open CTA + Recent files/folders list.
             .when(
-                self.viewports[0].session.current.is_none() && self.pending_path.is_none(),
+                self.active().session.current.is_none() && self.pending_path.is_none(),
                 |d| d.child(self.render_empty_state(cx)),
             )
             // Photo thumbnail filmstrip along the bottom edge.
@@ -326,11 +326,11 @@ impl IrisWindow {
                 )
             })
             // Button-anchored popover above the control bar.
-            .when_some(self.popover, |d, pop| {
+            .when_some(self.overlays.popover, |d, pop| {
                 d.child(self.render_popover(pop, fullscreen, cx))
             })
             // Fullscreen directory popup.
-            .when(fullscreen && self.dir_popup, |d| {
+            .when(fullscreen && self.overlays.dir_popup, |d| {
                 let popup = div()
                     .absolute()
                     .top(px(FLOAT_GAP))
@@ -349,7 +349,7 @@ impl IrisWindow {
     }
 
     fn render_audio_card(&self) -> impl IntoElement {
-        let session = &self.viewports[0].session;
+        let session = &self.active().session;
         let state = &session.state;
         let name = session
             .current
@@ -407,7 +407,11 @@ impl IrisWindow {
                                 } else {
                                     "--:--".into()
                                 },
-                                if state.paused { "已暂停" } else { "播放中" }
+                                if state.paused {
+                                    "已暂停"
+                                } else {
+                                    "播放中"
+                                }
                             )),
                     ),
             )
@@ -536,15 +540,11 @@ impl IrisWindow {
         fullscreen: bool,
         cx: &mut Context<Self>,
     ) -> Option<impl IntoElement> {
-        let photos: Vec<Entry> = self
-            .display_entries()
-            .into_iter()
-            .filter(|e| e.kind == Kind::Photo)
-            .collect();
+        let photos = &self.dir_cache.photo_entries;
         if photos.len() < 2 {
             return None;
         }
-        let current = self.viewports[0].session.current.as_ref();
+        let current = self.active().session.current.as_ref();
         let cur_ix = current
             .and_then(|p| photos.iter().position(|e| &e.path == p))
             .unwrap_or(0);
@@ -584,7 +584,7 @@ impl IrisWindow {
                         .children(slice.iter().enumerate().map(|(offset, e)| {
                             let is_cur = Some(&e.path) == current;
                             let path = e.path.clone();
-                            let thumb = self.thumb_cache.get(&e.path).cloned();
+                            let thumb = self.thumbs.get(&e.path);
                             div()
                                 .id(("thumb", start + offset))
                                 .w(px(56.))
@@ -595,7 +595,9 @@ impl IrisWindow {
                                 .border_1()
                                 .border_color(if is_cur { accent() } else { line() })
                                 .cursor_pointer()
-                                .hover(|s| s.border_color(if is_cur { accent() } else { text_dim() }))
+                                .hover(|s| {
+                                    s.border_color(if is_cur { accent() } else { text_dim() })
+                                })
                                 .flex()
                                 .items_center()
                                 .justify_center()

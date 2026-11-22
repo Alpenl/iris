@@ -18,3 +18,4 @@ debug = 0
 
 [profile.release]
 debug = "line-tables-only"
+lto = "thin"

@@ -61,6 +61,7 @@ def main() -> None:
     opened_count = 0
     current_file = ""
     last_tick = None
+    last_emitted_sec = -1
 
     for raw in sys.stdin:
         raw = raw.strip()
@@ -76,12 +77,14 @@ def main() -> None:
         kind = ev.get("event")
 
         if kind == "init":
+            last_emitted_sec = int(watched)
             emit(build_ui(watched, opened_count, current_file))
         elif kind == "file_opened":
             snap = ev.get("snapshot") or {}
             opened_count += 1
             current_file = snap.get("file_name") or ""
             last_tick = None
+            last_emitted_sec = int(watched)
             emit(build_ui(watched, opened_count, current_file))
         elif kind == "position_tick":
             now = time.monotonic()
@@ -91,7 +94,10 @@ def main() -> None:
                     if 0.0 < dt < 5.0:
                         watched += dt
                 last_tick = now
-                emit(build_ui(watched, opened_count, current_file))
+                cur_sec = int(watched)
+                if cur_sec != last_emitted_sec:
+                    last_emitted_sec = cur_sec
+                    emit(build_ui(watched, opened_count, current_file))
             else:
                 last_tick = None
         elif kind in ("command_invoked", "action_invoked"):
@@ -99,6 +105,7 @@ def main() -> None:
             if act == "reset":
                 watched = 0.0
                 last_tick = None
+                last_emitted_sec = 0
                 emit(
                     build_ui(watched, opened_count, current_file)
                     + [{"command": "show_toast", "message": "观影计时已重置"}]

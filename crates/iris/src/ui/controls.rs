@@ -23,15 +23,11 @@ fn anchor_wrap(
     slot: Rc<Cell<Option<Bounds<Pixels>>>>,
     child: impl IntoElement,
 ) -> impl IntoElement {
-    div()
-        .relative()
-        .flex_none()
-        .child(child)
-        .child(
-            canvas(move |b, _, _| slot.set(Some(b)), |_, _, _, _| {})
-                .absolute()
-                .size_full(),
-        )
+    div().relative().flex_none().child(child).child(
+        canvas(move |b, _, _| slot.set(Some(b)), |_, _, _, _| {})
+            .absolute()
+            .size_full(),
+    )
 }
 
 impl IrisWindow {
@@ -55,13 +51,13 @@ impl IrisWindow {
         window: &Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let kind = self.viewports[0].session.kind();
+        let kind = self.active().session.kind();
         let left = self.settings.directory_side == Side::Left;
         let avail_w = self.dock_available_width(floating, window);
         let narrow = avail_w < 640.;
         let tiny = avail_w < 500.;
         let dir_open = if self.fullscreen {
-            self.dir_popup
+            self.overlays.dir_popup
         } else {
             self.show_directory
         };
@@ -162,11 +158,12 @@ impl IrisWindow {
     }
 
     fn video_transport(&self, tiny: bool, cx: &mut Context<Self>) -> impl IntoElement {
-        let state = &self.viewports[0].session.state;
+        let state = &self.active().session.state;
         let paused = state.paused;
         let shown_pos = self
+            .scrub
             .seek_preview_ratio
-            .filter(|_| self.seeking && state.duration > 0.)
+            .filter(|_| self.scrub.seeking && state.duration > 0.)
             .map_or(state.time_pos, |r| r as f64 * state.duration);
         let second_time = if state.duration > 0. {
             if self.show_remaining {
@@ -226,7 +223,7 @@ impl IrisWindow {
     }
 
     fn video_fields(&self, narrow: bool, tiny: bool, cx: &mut Context<Self>) -> impl IntoElement {
-        let session = &self.viewports[0].session;
+        let session = &self.active().session;
         let state = &session.state;
         let subs = state.subs_visible;
         let looping = state.loop_file;
@@ -244,10 +241,10 @@ impl IrisWindow {
                 track => track.to_string(),
             });
         let speed = state.speed;
-        let sub_pop = self.popover == Some(PopoverKind::Subtitles);
-        let audio_pop = self.popover == Some(PopoverKind::Audio);
-        let speed_pop = self.popover == Some(PopoverKind::Speed);
-        let more_pop = self.popover == Some(PopoverKind::More);
+        let sub_pop = self.overlays.popover == Some(PopoverKind::Subtitles);
+        let audio_pop = self.overlays.popover == Some(PopoverKind::Audio);
+        let speed_pop = self.overlays.popover == Some(PopoverKind::Speed);
+        let more_pop = self.overlays.popover == Some(PopoverKind::More);
 
         let shot_key = if cfg!(target_os = "macos") {
             "⌘S"
@@ -277,7 +274,9 @@ impl IrisWindow {
                             },
                             Some("L"),
                         ))
-                        .on_click(cx.listener(|this, _, w, cx| this.toggle_loop(&ToggleLoop, w, cx))),
+                        .on_click(
+                            cx.listener(|this, _, w, cx| this.toggle_loop(&ToggleLoop, w, cx)),
+                        ),
                 )
             })
             .child(anchor_wrap(
@@ -323,7 +322,7 @@ impl IrisWindow {
                     .on_mouse_down(
                         MouseButton::Right,
                         cx.listener(|this, _, _, cx| {
-                            this.popover = None;
+                            this.overlays.popover = None;
                             this.command(Command::SetSpeed(1.), cx);
                             this.show_osd("倍速 · 1.00×", cx);
                             cx.stop_propagation();
@@ -333,7 +332,7 @@ impl IrisWindow {
                         let step = this.damped_wheel_steps(ev, 36.);
                         if step != 0 {
                             let next = player::step_speed(
-                                this.viewports[0].session.state.speed,
+                                this.active().session.state.speed,
                                 step.signum(),
                             );
                             this.command(Command::SetSpeed(next), cx);
@@ -356,10 +355,10 @@ impl IrisWindow {
     }
 
     fn audio_fields(&self, narrow: bool, cx: &mut Context<Self>) -> impl IntoElement {
-        let state = &self.viewports[0].session.state;
+        let state = &self.active().session.state;
         let looping = state.loop_file;
         let speed = state.speed;
-        let speed_pop = self.popover == Some(PopoverKind::Speed);
+        let speed_pop = self.overlays.popover == Some(PopoverKind::Speed);
         div()
             .flex()
             .items_center()
@@ -394,7 +393,7 @@ impl IrisWindow {
     /// Clickable speaker (mute toggle), continuously draggable 0–100% volume
     /// bar (plus wheel damping), and numeric readout.
     fn render_volume(&self, narrow: bool, cx: &mut Context<Self>) -> impl IntoElement {
-        let state = &self.viewports[0].session.state;
+        let state = &self.active().session.state;
         let volume = state.volume;
         let muted = state.muted;
         let filled = if muted {
@@ -414,7 +413,7 @@ impl IrisWindow {
                 let delta = this.damped_volume_delta(ev);
                 if delta.abs() >= 0.5 {
                     this.command(Command::VolumeBy(delta), cx);
-                    let next = (this.viewports[0].session.state.volume + delta).clamp(0., 100.);
+                    let next = (this.active().session.state.volume + delta).clamp(0., 100.);
                     this.show_osd(format!("音量 · {next:.0}%"), cx);
                 }
                 cx.stop_propagation();
@@ -445,7 +444,7 @@ impl IrisWindow {
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(|this, ev: &MouseDownEvent, _, cx| {
-                                this.dragging_volume = true;
+                                this.scrub.dragging_volume = true;
                                 this.set_volume_from_x(ev.position.x, cx);
                                 cx.stop_propagation();
                             }),
@@ -457,21 +456,15 @@ impl IrisWindow {
                         )
                         .children((0..10).map(|i| {
                             let on = i < filled;
-                            div()
-                                .w(px(6.))
-                                .h(px(BUTTON))
-                                .flex()
-                                .items_center()
-                                .child(
-                                    div()
-                                        .w(px(4.))
-                                        .h(px(10.))
-                                        .when(on, |d| {
-                                            d.bg(text_dim())
-                                                .group_hover("volume", |s| s.bg(text()))
-                                        })
-                                        .when(!on, |d| d.bg(line_strong())),
-                                )
+                            div().w(px(6.)).h(px(BUTTON)).flex().items_center().child(
+                                div()
+                                    .w(px(4.))
+                                    .h(px(10.))
+                                    .when(on, |d| {
+                                        d.bg(text_dim()).group_hover("volume", |s| s.bg(text()))
+                                    })
+                                    .when(!on, |d| d.bg(line_strong())),
+                            )
                         })),
                 )
                 .child(
@@ -491,8 +484,9 @@ impl IrisWindow {
     }
 
     fn photo_transport(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let entries = self.display_entries();
-        let index = self.viewports[0]
+        let entries = &self.dir_cache.sorted_entries;
+        let index = self
+            .active()
             .session
             .current
             .as_ref()
@@ -531,11 +525,11 @@ impl IrisWindow {
         window: &Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let view = &self.viewports[0].image;
-        let hflip = self.viewports[0].session.state.hflip;
+        let view = &self.active().image;
+        let hflip = self.active().session.state.hflip;
         let strip_on = self.settings.photo_filmstrip;
         let (viewport, media) = self.image_geometry();
-        let known = viewport[0] > 0. && self.viewports[0].session.state.video_size.0 > 0;
+        let known = viewport[0] > 0. && self.active().session.state.video_size.0 > 0;
         let percent =
             known.then(|| view.pixel_scale(viewport, media, window.scale_factor() as f64) * 100.);
         div()
@@ -558,7 +552,9 @@ impl IrisWindow {
                         Some("G"),
                     ))
                     .on_click(
-                        cx.listener(|this, _, w, cx| this.toggle_filmstrip(&ToggleFilmstrip, w, cx)),
+                        cx.listener(|this, _, w, cx| {
+                            this.toggle_filmstrip(&ToggleFilmstrip, w, cx)
+                        }),
                     ),
                 )
                 .child(
@@ -614,7 +610,7 @@ impl IrisWindow {
 
     /// Info, favorite, settings and fullscreen: about the file and the window.
     fn window_buttons(&self, tiny: bool, cx: &mut Context<Self>) -> impl IntoElement {
-        let current = self.viewports[0].session.current.as_deref();
+        let current = self.active().session.current.as_deref();
         let favorite = current.is_some_and(|p| self.store.favorite(p));
         let set_key = if cfg!(target_os = "macos") {
             "⌘,"
@@ -633,9 +629,9 @@ impl IrisWindow {
             .when(!tiny, |d| {
                 d.child(
                     icon_button(
-                        ("palette", usize::from(self.palette_open)),
+                        ("palette", usize::from(self.overlays.palette_open)),
                         Icon::Command,
-                        self.palette_open,
+                        self.overlays.palette_open,
                     )
                     .tooltip(tip("命令面板（内核与插件命令）", Some(pal_key)))
                     .on_click(cx.listener(|this, _, w, cx| {
@@ -646,9 +642,9 @@ impl IrisWindow {
             .when(current.is_some() && !tiny, |d| {
                 d.child(
                     icon_button(
-                        ("info", usize::from(self.info_open)),
+                        ("info", usize::from(self.overlays.info_open)),
                         Icon::Info,
-                        self.info_open,
+                        self.overlays.info_open,
                     )
                     .tooltip(tip("媒体详情", Some("I")))
                     .on_click(cx.listener(|this, _, w, cx| this.toggle_info(&ToggleInfo, w, cx))),
@@ -670,9 +666,9 @@ impl IrisWindow {
             })
             .child(
                 icon_button(
-                    ("settings", usize::from(self.settings_open)),
+                    ("settings", usize::from(self.overlays.settings_open)),
                     Icon::Settings,
-                    self.settings_open,
+                    self.overlays.settings_open,
                 )
                 .tooltip(tip("设置", Some(set_key)))
                 .on_click(cx.listener(|this, _, w, cx| this.open_settings(&OpenSettings, w, cx))),
@@ -701,11 +697,11 @@ impl IrisWindow {
     /// A 2px line on the bar's top edge with chapter ticks and a playhead.
     /// While dragging, the visual bar locks 1:1 to the pointer at display refresh rate.
     fn render_timeline(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let session = &self.viewports[0].session;
+        let session = &self.active().session;
         let state = &session.state;
         let duration = state.duration;
-        let pct = if let Some(r) = self.seek_preview_ratio
-            && self.seeking
+        let pct = if let Some(r) = self.scrub.seek_preview_ratio
+            && self.scrub.seeking
         {
             r.clamp(0., 1.)
         } else if duration > 0. {
@@ -713,7 +709,7 @@ impl IrisWindow {
         } else {
             0.
         };
-        let active = self.timeline_hover || self.seeking;
+        let active = self.scrub.timeline_hover || self.scrub.seeking;
         let track = if active { 4. } else { 2. };
         let slot = self.progress_bounds.clone();
 
@@ -799,14 +795,14 @@ impl IrisWindow {
             .h(px(SEAM_HIT))
             .cursor_pointer()
             .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
-                this.timeline_hover = *hovered;
+                this.scrub.timeline_hover = *hovered;
                 cx.notify();
             }))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, ev: &MouseDownEvent, _, cx| {
-                    this.seeking = true;
-                    this.last_seek_drag = Instant::now();
+                    this.scrub.seeking = true;
+                    this.scrub.last_seek_drag = Instant::now();
                     this.update_seek_preview(ev.position.x);
                     this.seek_to_x(ev.position.x, true);
                     cx.stop_propagation();

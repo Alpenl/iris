@@ -105,13 +105,32 @@ impl PluginManifest {
         if self.protocol != PROTOCOL_VERSION {
             return Err("unsupported protocol version");
         }
-        if let Some(entry) = &self.entry
-            && (entry.is_empty()
-                || entry.contains("..")
+        if let Some(entry) = &self.entry {
+            if entry.is_empty()
+                || entry.contains(':')
                 || entry.starts_with('/')
-                || entry.starts_with('\\'))
-        {
-            return Err("unsafe plugin entry path");
+                || entry.starts_with('\\')
+            {
+                return Err("unsafe plugin entry path");
+            }
+            let mut has_component = false;
+            for part in entry.split(['/', '\\']) {
+                if part.is_empty() || part == "." || part == ".." {
+                    return Err("unsafe plugin entry path");
+                }
+                has_component = true;
+            }
+            if !has_component {
+                return Err("unsafe plugin entry path");
+            }
+            let path = std::path::Path::new(entry);
+            if path.is_absolute()
+                || !path
+                    .components()
+                    .all(|c| matches!(c, std::path::Component::Normal(_)))
+            {
+                return Err("unsafe plugin entry path");
+            }
         }
         Ok(())
     }
@@ -363,6 +382,13 @@ pub enum HostMessage {
     Event { payload: HostEvent },
 }
 
+/// Borrowed wire envelope for zero-clone serialization of [`HostEvent`].
+#[derive(Debug, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum HostMessageRef<'a> {
+    Event { payload: &'a HostEvent },
+}
+
 /// Wire envelope from external plugin to host (newline-delimited JSON on stdout).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -441,10 +467,32 @@ mod tests {
             commands: Vec::new(),
         };
         assert!(m.validate().is_ok());
-        m.entry = Some("../escape.py".into());
-        assert!(m.validate().is_err());
+        for bad in [
+            "",
+            "../escape.py",
+            "sub/../escape.py",
+            "/abs/path.py",
+            r"\abs\path.py",
+            "C:relative.exe",
+            r"C:\abs.exe",
+            "./dot.py",
+            "a//b.py",
+        ] {
+            m.entry = Some(bad.into());
+            assert!(m.validate().is_err(), "expected rejection for {bad:?}");
+        }
+        m.entry = Some("bin/plugin.py".into());
+        assert!(m.validate().is_ok());
         m.entry = Some("main.py".into());
         m.protocol = 99;
         assert!(m.validate().is_err());
+
+        let ev = HostEvent::Shutdown;
+        let owned = serde_json::to_string(&HostMessage::Event {
+            payload: ev.clone(),
+        })
+        .unwrap();
+        let borrowed = serde_json::to_string(&HostMessageRef::Event { payload: &ev }).unwrap();
+        assert_eq!(owned, borrowed);
     }
 }

@@ -37,7 +37,12 @@ def sha(path):
 
 def application_inputs():
     files = [ROOT / name for name in ("Cargo.toml", "Cargo.lock", "deny.toml", "LICENSE-MIT", "LICENSE-APACHE")]
-    files += [p for directory in ("crates", "Resources") for p in (ROOT / directory).rglob("*") if p.is_file()]
+    files += [
+        p
+        for directory in ("crates", "Resources")
+        for p in (ROOT / directory).rglob("*")
+        if p.is_file() and p.name != ".DS_Store"
+    ]
     return {p.relative_to(ROOT).as_posix(): sha(p) for p in sorted(files)}
 
 
@@ -270,6 +275,12 @@ def main():
     parser.add_argument("--adopt-completed-vendor", action="store_true",
                         help="Migrate a pre-checkpoint run known to have completed build/license/vendor; requires --resume")
     parser.add_argument("--reuse-rust", type=Path, help="Reuse verified Rust source/license artifacts from a prior package output")
+    parser.add_argument(
+        "--source-mode",
+        choices=["embedded", "sidecar"],
+        default="embedded",
+        help="embedded (default) bundles corresponding source tarballs inside compliance/; sidecar emits them alongside the package",
+    )
     args = parser.parse_args()
     if not re.fullmatch(r"\d+\.\d+\.\d+", args.version):
         parser.error("version must be numeric major.minor.patch")
@@ -287,6 +298,8 @@ def main():
     checkpoint = output / "package-checkpoint.json"
     identity = {"application": application_inputs(), "sdk_manifest": sha(compliance / "build-manifest.json"),
                 "mode": args.mode, "version": args.version, "target": manifest["target"]}
+    if args.source_mode != "embedded":
+        identity["source_mode"] = args.source_mode
     state = {"identity": identity}
     if checkpoint.exists():
         state = json.loads(checkpoint.read_text())
@@ -374,8 +387,16 @@ def main():
     elif sha(executable) != state["build"]:
         raise RuntimeError("Staged executable changed; refusing resume")
     notices = payload / "compliance" if windows else payload / "Contents/Resources/compliance"
-    shutil.copytree(compliance, notices, dirs_exist_ok=True)
-    shutil.copytree(ROOT / "Resources", payload / "Resources" if windows else payload / "Contents/Resources/assets", dirs_exist_ok=True)
+    shutil.copytree(compliance, notices, dirs_exist_ok=True, ignore=shutil.ignore_patterns(".DS_Store"))
+    if args.source_mode == "sidecar":
+        (notices / "corresponding-source.tar.gz").unlink(missing_ok=True)
+    # Fonts and SVG icons are compiled into the binary via include_bytes!;
+    # ship only their OFL license notices to avoid duplicating embedded assets.
+    font_licenses = notices / "font-licenses"
+    font_licenses.mkdir(exist_ok=True)
+    for ofl in sorted((ROOT / "Resources/Fonts").glob("*-OFL.txt")):
+        shutil.copy2(ofl, font_licenses / ofl.name)
+    archive_dir = notices if args.source_mode == "embedded" else output
     if args.reuse_rust and not state.get("rust_notices"):
         prior = args.reuse_rust.resolve()
         previous = json.loads((prior / "package-checkpoint.json").read_text())
@@ -385,10 +406,13 @@ def main():
                     parser.error("Rust dependency/license inputs changed; cannot reuse Rust artifacts")
         old_notices = prior / ("stage/Iris/compliance" if windows else "stage/Iris.app/Contents/Resources/compliance")
         archive = old_notices / "rust-corresponding-source.tar.gz"
-        if not previous.get("rust_notices") or sha(archive) != previous.get("rust_source"):
+        if not archive.is_file():
+            archive = prior / "rust-corresponding-source.tar.gz"
+        if not previous.get("rust_notices") or not archive.is_file() or sha(archive) != previous.get("rust_source"):
             parser.error("Prior Rust source artifacts lack a valid completion checkpoint")
         verify_vendor_archive(archive)
-        for name in ("rust-corresponding-source.tar.gz", "rust-license-manifest.json", "cargo-vendor-config.toml"):
+        shutil.copy2(archive, archive_dir / "rust-corresponding-source.tar.gz")
+        for name in ("rust-license-manifest.json", "cargo-vendor-config.toml"):
             shutil.copy2(old_notices / name, notices / name)
         shutil.copytree(old_notices / "rust-licenses", notices / "rust-licenses", dirs_exist_ok=True)
         state.update(rust_notices=True, rust_source=sha(archive))
@@ -398,11 +422,12 @@ def main():
         application_source(notices)
     for directory, archive, flag in (("rust-vendor", "rust-corresponding-source.tar.gz", "rust_source"),
                                      ("iris-source", "iris-corresponding-source.tar.gz", "iris_source")):
+        target_archive = archive_dir / archive
         if not state.get(flag):
-            _media.source_archive(notices / directory, notices / archive, manifest["source_date_epoch"])
-            state[flag] = sha(notices / archive)
+            _media.source_archive(notices / directory, target_archive, manifest["source_date_epoch"])
+            state[flag] = sha(target_archive)
             save_checkpoint(checkpoint, state)
-        elif not (notices / archive).is_file() or sha(notices / archive) != state[flag]:
+        elif not target_archive.is_file() or sha(target_archive) != state[flag]:
             raise RuntimeError("Completed corresponding source archive changed: " + archive)
         if (notices / directory).exists():
             shutil.rmtree(notices / directory)
@@ -480,6 +505,9 @@ def main():
         if not binary.is_file():
             raise RuntimeError("Expected distribution missing: " + str(binary))
         shutil.copy2(compliance / "corresponding-source.tar.gz", output / (binary.name + ".corresponding-source.tar.gz"))
+        if args.source_mode == "sidecar":
+            for extra in ("rust-corresponding-source.tar.gz", "iris-corresponding-source.tar.gz"):
+                shutil.copy2(output / extra, output / (binary.name + "." + extra))
         bundle = {**state, "binary_sha256": sha(binary), "media_build": manifest}
         (output / (binary.name + ".build-manifest.json")).write_text(json.dumps(bundle, indent=2) + "\n")
         with tarfile.open(output / (binary.name + ".licenses.tar.gz"), "w:gz") as tar:

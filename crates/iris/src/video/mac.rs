@@ -6,8 +6,9 @@
 use std::ffi::{CString, c_char, c_int, c_void};
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc;
-use std::sync::{Arc, Mutex, Once};
+use std::sync::mpsc::{self, SyncSender};
+use std::sync::{Arc, Mutex, Once, OnceLock};
+use std::thread::JoinHandle;
 
 use anyhow::{Context as _, Result, anyhow};
 use cocoa::base::{NO, YES, id, nil};
@@ -15,6 +16,7 @@ use cocoa::foundation::NSRect;
 use iris_mpv::Mpv;
 use iris_mpv::render::RenderContext;
 use objc::declare::ClassDecl;
+use objc::rc::autoreleasepool;
 use objc::runtime::{BOOL, Class, Object, Sel};
 use objc::{class, msg_send, sel, sel_impl};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -77,22 +79,20 @@ unsafe extern "C" {
 }
 
 unsafe extern "C" fn gl_get_proc_address(_ctx: *mut c_void, name: *const c_char) -> *mut c_void {
-    static mut HANDLE: *mut c_void = ptr::null_mut();
-    static INIT: Once = Once::new();
-    unsafe {
-        INIT.call_once(|| {
-            let path = CString::new("/System/Library/Frameworks/OpenGL.framework/OpenGL").unwrap();
-            HANDLE = dlopen(path.as_ptr(), RTLD_LAZY);
-        });
-        if HANDLE.is_null() {
-            ptr::null_mut()
-        } else {
-            dlsym(HANDLE, name)
-        }
+    static HANDLE: OnceLock<usize> = OnceLock::new();
+    let handle = *HANDLE.get_or_init(|| {
+        let path = CString::new("/System/Library/Frameworks/OpenGL.framework/OpenGL").unwrap();
+        unsafe { dlopen(path.as_ptr(), RTLD_LAZY) as usize }
+    }) as *mut c_void;
+    if handle.is_null() {
+        ptr::null_mut()
+    } else {
+        unsafe { dlsym(handle, name) }
     }
 }
 
 /// Shared between the layer callbacks (CA threads), the redraw thread and the UI.
+/// Owns `gl` and `pixel_format` so they always outlive any active CA callback.
 struct LayerState {
     pixel_format: CGLPixelFormatObj,
     gl: CGLContextObj,
@@ -105,6 +105,29 @@ struct LayerState {
 unsafe impl Send for LayerState {}
 unsafe impl Sync for LayerState {}
 
+impl Drop for LayerState {
+    fn drop(&mut self) {
+        // Ensure render context is freed before releasing the GL context.
+        if let Some(render) = self.render.lock().unwrap().take() {
+            unsafe {
+                CGLLockContext(self.gl);
+                CGLSetCurrentContext(self.gl);
+                drop(render);
+                CGLSetCurrentContext(ptr::null_mut());
+                CGLUnlockContext(self.gl);
+            }
+        }
+        unsafe {
+            if !self.gl.is_null() {
+                CGLReleaseContext(self.gl);
+            }
+            if !self.pixel_format.is_null() {
+                CGLReleasePixelFormat(self.pixel_format);
+            }
+        }
+    }
+}
+
 struct SendId(id);
 unsafe impl Send for SendId {}
 
@@ -112,7 +135,8 @@ pub struct VideoSurface {
     state: Arc<LayerState>,
     view: id,
     layer: id,
-    redraw_tx: mpsc::Sender<()>,
+    redraw_tx: Option<SyncSender<()>>,
+    worker: Option<JoinHandle<()>>,
     scale: f64,
 }
 
@@ -280,19 +304,7 @@ impl VideoSurface {
                 CGLReleasePixelFormat(pf);
                 return Err(anyhow!("CGLCreateContext failed"));
             }
-            // The layer is tagged Display P3 (below), so mpv must output
-            // Display P3 with the sRGB curve. Core Animation then converts to
-            // the screen, as it does for GPUI's layer. Untagged, the layer was
-            // shown as raw screen values: BT.709/sRGB looked oversaturated on
-            // P3 screens.
-            mpv.set_property_string("target-prim", "display-p3")?;
-            mpv.set_property_string("target-trc", "srgb")?;
-
-            CGLSetCurrentContext(gl);
-            let render = RenderContext::new_gl(mpv, gl_get_proc_address, ptr::null_mut())
-                .context("creating mpv render context")?;
-            CGLSetCurrentContext(ptr::null_mut());
-
+            // Wrap GL resources in LayerState immediately so any early `?` frees them.
             let state = Arc::new(LayerState {
                 pixel_format: pf,
                 gl,
@@ -300,6 +312,18 @@ impl VideoSurface {
                 force: AtomicBool::new(true),
                 last_size: Mutex::new((0, 0)),
             });
+
+            // The layer is tagged Display P3 (below), so mpv must output
+            // Display P3 with the sRGB curve. Core Animation then converts to
+            // the screen, as it does for GPUI's layer.
+            mpv.set_property_string("target-prim", "display-p3")?;
+            mpv.set_property_string("target-trc", "srgb")?;
+
+            CGLSetCurrentContext(gl);
+            let render_res = RenderContext::new_gl(mpv, gl_get_proc_address, ptr::null_mut())
+                .context("creating mpv render context");
+            CGLSetCurrentContext(ptr::null_mut());
+            let mut render = render_res?;
 
             // The layer and its hosting view.
             let layer: id = msg_send![layer_class(), new];
@@ -323,30 +347,28 @@ impl VideoSurface {
             let _: () = msg_send![view, setAutoresizingMask: NS_VIEW_WIDTH_SIZABLE | NS_VIEW_HEIGHT_SIZABLE];
             let _: () = msg_send![content, addSubview: view positioned: NS_WINDOW_BELOW relativeTo: gpui_view];
 
-            // mpv's update callback only signals; a dedicated thread asks the
-            // layer to display (CA then calls canDraw/draw on that thread).
-            let (tx, rx) = mpsc::channel::<()>();
-            let mut render = render;
-            let cb_tx = Mutex::new(tx.clone());
+            // Bounded capacity-1 channel coalesces frame signals with zero Mutex contention.
+            let (tx, rx) = mpsc::sync_channel::<()>(1);
+            let cb_tx = tx.clone();
             render.set_update_callback(move || {
-                let _ = cb_tx.lock().unwrap().send(());
+                let _ = cb_tx.try_send(());
             });
             *state.render.lock().unwrap() = Some(render);
 
-            // The thread holds its own reference to the layer and exits once
-            // every sender (ours and the render callback's) is gone.
             let _: id = msg_send![layer, retain];
             let layer_ref = SendId(layer);
             let keep_state = state.clone();
-            std::thread::Builder::new()
+            let worker = std::thread::Builder::new()
                 .name("iris-video".into())
                 .spawn(move || {
                     let layer = layer_ref;
                     let _keep_state = keep_state;
                     while rx.recv().is_ok() {
-                        while rx.try_recv().is_ok() {}
-                        let _: () = msg_send![layer.0, display];
-                        let _: () = msg_send![class!(CATransaction), flush];
+                        // Drain Objective-C autoreleased temporaries every frame.
+                        autoreleasepool(|| {
+                            let _: () = msg_send![layer.0, display];
+                            let _: () = msg_send![class!(CATransaction), flush];
+                        });
                     }
                     let _: () = msg_send![layer.0, release];
                 })?;
@@ -356,7 +378,8 @@ impl VideoSurface {
                 state,
                 view,
                 layer,
-                redraw_tx: tx,
+                redraw_tx: Some(tx),
+                worker: Some(worker),
                 scale,
             })
         }
@@ -365,7 +388,9 @@ impl VideoSurface {
     /// Re-renders the current frame even if mpv has no new one.
     pub fn request_redraw(&self) {
         self.state.force.store(true, Ordering::Release);
-        let _ = self.redraw_tx.send(());
+        if let Some(tx) = &self.redraw_tx {
+            let _ = tx.try_send(());
+        }
     }
 
     /// Places the video view over the video area, given in GPUI window
@@ -408,8 +433,11 @@ impl VideoSurface {
         }
     }
 
-    /// Frees the render context (with its GL context current) before mpv goes away.
+    /// Stops mpv render callbacks, joins the video thread, detaches the layer's
+    /// state pointer, and frees the render context with its GL context current.
     pub fn shutdown(&mut self) {
+        // 1. Free the render context first so mpv's update callback stops firing
+        //    and releases its clone of `redraw_tx`.
         let render = self.state.render.lock().unwrap().take();
         if let Some(render) = render {
             unsafe {
@@ -420,7 +448,18 @@ impl VideoSurface {
                 CGLUnlockContext(self.state.gl);
             }
         }
+        // 2. Drop our sender and wait for the render thread to exit completely
+        //    before mutating `irisState` or detaching the view.
+        self.redraw_tx.take();
+        if let Some(worker) = self.worker.take()
+            && worker.join().is_err()
+        {
+            log::error!("video worker panicked");
+        }
         unsafe {
+            if self.layer != nil {
+                (*self.layer).set_ivar("irisState", ptr::null_mut::<c_void>());
+            }
             if self.view != nil {
                 let _: () = msg_send![self.view, removeFromSuperview];
             }
@@ -436,11 +475,10 @@ impl Drop for VideoSurface {
                 let _: () = msg_send![self.view, release];
                 self.view = nil;
             }
-            // The layer keeps a raw pointer to `state`; detach it before `state` drops.
-            (*self.layer).set_ivar("irisState", ptr::null_mut::<c_void>());
-            let _: () = msg_send![self.layer, release];
-            CGLReleaseContext(self.state.gl);
-            CGLReleasePixelFormat(self.state.pixel_format);
+            if self.layer != nil {
+                let _: () = msg_send![self.layer, release];
+                self.layer = nil;
+            }
         }
     }
 }

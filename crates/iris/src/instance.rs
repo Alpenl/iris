@@ -13,8 +13,12 @@ mod imp {
     use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
     use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant};
-    use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, ERROR_PIPE_CONNECTED, GetLastError};
-    use windows_sys::Win32::System::Pipes::{ConnectNamedPipe, DisconnectNamedPipe, GetNamedPipeServerSessionId};
+    use windows_sys::Win32::Foundation::{
+        ERROR_ALREADY_EXISTS, ERROR_PIPE_CONNECTED, GetLastError,
+    };
+    use windows_sys::Win32::System::Pipes::{
+        ConnectNamedPipe, DisconnectNamedPipe, GetNamedPipeServerSessionId,
+    };
     use windows_sys::Win32::System::RemoteDesktop::ProcessIdToSessionId;
     use windows_sys::Win32::System::Threading::{CreateMutexW, GetCurrentProcessId};
 
@@ -60,7 +64,10 @@ mod imp {
         let (mutex, exists) = unsafe {
             let handle = CreateMutexW(std::ptr::null(), 0, name.as_ptr());
             let exists = GetLastError() == ERROR_ALREADY_EXISTS;
-            ((!handle.is_null()).then(|| OwnedHandle::from_raw_handle(handle)), exists)
+            (
+                (!handle.is_null()).then(|| OwnedHandle::from_raw_handle(handle)),
+                exists,
+            )
         };
         if exists {
             match forward(&endpoint, session, initial) {
@@ -87,9 +94,14 @@ mod imp {
     fn forward(endpoint: &str, session: u32, path: Option<&Path>) -> io::Result<()> {
         // The primary has its own working directory; send an absolute path.
         let path = path.map(std::path::absolute).transpose()?;
-        let units: Vec<u16> = path.map(|p| p.as_os_str().encode_wide().collect()).unwrap_or_default();
+        let units: Vec<u16> = path
+            .map(|p| p.as_os_str().encode_wide().collect())
+            .unwrap_or_default();
         if units.len() > MAX_UNITS {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "file path is too long"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "file path is too long",
+            ));
         }
         // The primary may still be starting its listener; give it a moment.
         let deadline = Instant::now() + Duration::from_secs(3);
@@ -103,12 +115,19 @@ mod imp {
         // Pipe names are global; refuse a server outside this logon session.
         let mut server = u32::MAX;
         // SAFETY: valid pipe handle and out-parameter.
-        if unsafe { GetNamedPipeServerSessionId(pipe.as_raw_handle(), &mut server) } == 0 || server != session {
-            return Err(io::Error::new(io::ErrorKind::PermissionDenied, "pipe server is in another session"));
+        if unsafe { GetNamedPipeServerSessionId(pipe.as_raw_handle(), &mut server) } == 0
+            || server != session
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "pipe server is in another session",
+            ));
         }
         let mut message = Vec::with_capacity(4 + units.len() * 2);
         message.extend_from_slice(&(units.len() as u32).to_le_bytes());
-        units.iter().for_each(|unit| message.extend_from_slice(&unit.to_le_bytes()));
+        units
+            .iter()
+            .for_each(|unit| message.extend_from_slice(&unit.to_le_bytes()));
         pipe.write_all(&message)
     }
 
@@ -124,11 +143,16 @@ mod imp {
             }
             match read_path(&mut pipe) {
                 // An empty path only asks the running window to come forward.
-                Ok(path) => { let _ = opened.unbounded_send(path); }
+                Ok(path) => {
+                    let _ = opened.unbounded_send(path);
+                }
                 Err(e) => log::warn!("file-open message: {e}"),
             }
             if unsafe { DisconnectNamedPipe(pipe.as_raw_handle()) } == 0 {
-                log::error!("disconnecting file-open pipe: {}", io::Error::last_os_error());
+                log::error!(
+                    "disconnecting file-open pipe: {}",
+                    io::Error::last_os_error()
+                );
                 return;
             }
         }
@@ -139,13 +163,24 @@ mod imp {
         reader.read_exact(&mut len)?;
         let len = u32::from_le_bytes(len) as usize;
         if len > MAX_UNITS {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "file path is too long"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "file path is too long",
+            ));
         }
         let mut bytes = vec![0u8; len * 2];
         reader.read_exact(&mut bytes)?;
-        let units: Vec<u16> = bytes.as_chunks::<2>().0.iter().map(|b| u16::from_le_bytes(*b)).collect();
+        let units: Vec<u16> = bytes
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|b| u16::from_le_bytes(*b))
+            .collect();
         if units.contains(&0) {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "NUL in file path"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "NUL in file path",
+            ));
         }
         Ok(PathBuf::from(OsString::from_wide(&units)))
     }

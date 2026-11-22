@@ -79,7 +79,10 @@ mod enabled {
             let end = available.iter().position(|byte| *byte == b'\n');
             let count = end.map_or(available.len(), |index| index + 1);
             if bytes.len() + count > MAX_LINE {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "control line exceeds 16 KiB"));
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "control line exceeds 16 KiB",
+                ));
             }
             bytes.extend_from_slice(&available[..count]);
             reader.consume(count);
@@ -151,7 +154,8 @@ mod enabled {
                     let mut uid = 0;
                     let mut gid = 0;
                     // SAFETY: stream owns a live socket and both output pointers are valid.
-                    let result = unsafe { libc::getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) };
+                    let result =
+                        unsafe { libc::getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) };
                     // Checking the peer also closes the bind-to-chmod permission window.
                     if result != 0 || uid != unsafe { libc::geteuid() } {
                         log::warn!("rejecting control connection from a different or unknown user");
@@ -167,7 +171,8 @@ mod enabled {
         impl Drop for Listener {
             fn drop(&mut self) {
                 if let Ok(metadata) = std::fs::symlink_metadata(&self.path)
-                    && metadata.ino() == self.inode && metadata.dev() == self.device
+                    && metadata.ino() == self.inode
+                    && metadata.dev() == self.device
                 {
                     let _ = std::fs::remove_file(&self.path);
                 }
@@ -191,11 +196,16 @@ mod enabled {
             pub(super) fn bind(path: &OsStr) -> io::Result<Self> {
                 let name: Vec<u16> = path.encode_wide().collect();
                 let prefix: Vec<u16> = OsStr::new(r"\\.\pipe\iris-").encode_wide().collect();
-                if !name.starts_with(&prefix) || name.len() == prefix.len()
-                    || name[prefix.len()..].iter().any(|ch| matches!(*ch, 0 | 47 | 92))
+                if !name.starts_with(&prefix)
+                    || name.len() == prefix.len()
+                    || name[prefix.len()..]
+                        .iter()
+                        .any(|ch| matches!(*ch, 0 | 47 | 92))
                 {
-                    return Err(io::Error::new(io::ErrorKind::InvalidInput,
-                        r"IRIS_CONTROL must be \\.\pipe\iris-<unique-name>"));
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        r"IRIS_CONTROL must be \\.\pipe\iris-<unique-name>",
+                    ));
                 }
                 let name: Vec<u16> = name.into_iter().chain(Some(0)).collect();
                 crate::platform::pipe::create_inbound(&name, MAX_LINE as u32).map(Self)
@@ -204,7 +214,8 @@ mod enabled {
             pub(super) fn run(mut self, tx: UnboundedSender<String>) {
                 while !tx.is_closed() {
                     // Blocking accept/read prevent a disconnected client from hot-spinning.
-                    let connected = unsafe { ConnectNamedPipe(self.0.as_raw_handle(), std::ptr::null_mut()) };
+                    let connected =
+                        unsafe { ConnectNamedPipe(self.0.as_raw_handle(), std::ptr::null_mut()) };
                     if connected == 0 {
                         let error = io::Error::last_os_error();
                         if error.raw_os_error() != Some(ERROR_PIPE_CONNECTED as i32) {

@@ -1,0 +1,112 @@
+//! Small native window, power, gesture, media-key and thumbnail helpers,
+//! isolated by operating system.
+
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(target_os = "windows")]
+mod windows;
+
+#[cfg(target_os = "macos")]
+pub use macos::*;
+#[cfg(target_os = "windows")]
+pub use windows::*;
+
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use gpui::RenderImage;
+
+#[derive(Clone, Copy, Debug)]
+pub struct PinchEvent {
+    pub delta: f64,
+    pub position: [f64; 2],
+}
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MediaKey {
+    Play,
+    Pause,
+    Toggle,
+    Next,
+    Prev,
+}
+
+/// Default folder for saved screenshots (`Desktop` on macOS, `Pictures`/`Desktop` on Windows).
+pub fn default_screenshot_dir() -> PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(h) = std::env::var_os("HOME") {
+            let desktop = PathBuf::from(&h).join("Desktop");
+            if desktop.is_dir() {
+                return desktop;
+            }
+            return PathBuf::from(h);
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(home) = std::env::var_os("USERPROFILE") {
+            let pics = PathBuf::from(&home).join("Pictures");
+            if pics.is_dir() {
+                return pics;
+            }
+            let desktop = PathBuf::from(&home).join("Desktop");
+            if desktop.is_dir() {
+                return desktop;
+            }
+            return PathBuf::from(home);
+        }
+    }
+    std::env::temp_dir()
+}
+
+/// Decodes a compact straight-BGRA `RenderImage` thumbnail entirely in memory.
+pub fn decode_thumbnail(path: &Path, max_dim: u32) -> Option<Arc<RenderImage>> {
+    #[cfg(target_os = "macos")]
+    if let Some(img) = macos::decode_thumbnail_imageio(path, max_dim) {
+        return Some(img);
+    }
+    #[cfg(target_os = "windows")]
+    if let Some(img) = windows::decode_thumbnail_wic(path, max_dim) {
+        return Some(img);
+    }
+    decode_thumbnail_fallback(path, max_dim)
+}
+
+/// Bounded cross-platform thumbnail decoder fallback with EXIF orientation support.
+fn decode_thumbnail_fallback(path: &Path, max_dim: u32) -> Option<Arc<RenderImage>> {
+    let mut reader = image::ImageReader::open(path).ok()?;
+    let mut limits = image::Limits::default();
+    limits.max_alloc = Some(128 * 1024 * 1024);
+    limits.max_image_width = Some(16_384);
+    limits.max_image_height = Some(16_384);
+    reader.limits(limits);
+    let img = reader.decode().ok()?;
+    let thumb = apply_exif_orientation(
+        img.thumbnail(max_dim, max_dim),
+        iris_core::photo::exif_orientation(path),
+    );
+    let mut rgba = thumb.into_rgba8();
+    for px in rgba.as_chunks_mut::<4>().0 {
+        px.swap(0, 2); // GPUI RenderImage expects straight BGRA.
+    }
+    Some(Arc::new(RenderImage::new([image::Frame::new(rgba)])))
+}
+
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+pub(crate) fn apply_exif_orientation(
+    img: image::DynamicImage,
+    orientation: u16,
+) -> image::DynamicImage {
+    match orientation {
+        2 => img.fliph(),
+        3 => img.rotate180(),
+        4 => img.flipv(),
+        5 => img.rotate90().fliph(),
+        6 => img.rotate90(),
+        7 => img.rotate270().fliph(),
+        8 => img.rotate270(),
+        _ => img,
+    }
+}
