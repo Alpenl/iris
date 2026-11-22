@@ -255,7 +255,7 @@ impl PluginManager {
             Box::new(GuidesPlugin::default()),
             Box::new(AbLoopPlugin::default()),
         ];
-        for mut b in builtins {
+        for b in builtins {
             let manifest = b.manifest();
             let id = manifest.id.clone();
             let enabled = !disabled.iter().any(|d| d == &id);
