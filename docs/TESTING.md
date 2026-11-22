@@ -5,8 +5,8 @@
 ```bash
 brew install mpv                 # 开发用的 libmpv（GPL 构建，不能拿去分发）
 cargo build --release --features devtools  # 性能/控制测试专用，不能作为发行包
-cargo test --workspace                    # 自然排序、照片解析、ICC、几何、字幕安全区、记录、打开准备
-python3 scripts/check-project.py          # 仓库约束：UI 不碰 mpv、iris-core 不依赖 GPUI、devtools 门
+cargo test --locked --workspace            # 29 项单元/集成测试：协议、插件权限与外部 stdio 握手、排序、照片/ICC、几何、字幕安全区、设置、记录
+python3 scripts/check-project.py           # 仓库约束：UI 不碰 mpv、iris-core 与 iris-api 无头隔离、devtools 门、锁定元数据
 cargo deny check licenses        # 依赖许可证检查，需要先 cargo install cargo-deny
 ```
 
@@ -162,4 +162,25 @@ Windows 媒体库已在 WSL 中从固定源码实际编译：mpv `d11ffba253def0
   - 照片全屏适应屏幕显示 61%，悬浮工具栏补上边线；Esc 回到窗口，目录停在右侧，照片 48%。
 - 全屏实测时发现并修复了过期的悬停提示：在提示出现之前点按钮，GPUI 过一会儿仍按点击前的文字和位置弹出提示。点“播放”后，暂停图标上方冒出“播放 Space”；在目录里换边后，按钮原来的位置上冒出“目录移到右侧”。原因是 GPUI 0.2.2 在指针移动时就按当时的文字排好提示，按下鼠标只清掉已经显示的提示。现在会变的按钮和工具栏那一行的元素 id 带上状态或布局，变化后旧提示随旧元素丢弃。复测（窗口和全屏各一遍）：点播放后不再出现旧提示，移动指针后显示“暂停 Space”；换边、点目录按钮、Tab 收起目录后都没有残留提示。修复后重跑 `cargo test`、上面四种 clippy 和 `check-project.py`，都通过。
 - **未验证**：按住时间轴拖动（只测了点击）；全屏只在内建屏上测过，没测外接屏和多屏；Windows 实机上的新界面。
+
+### 成熟播放器体验完善（2026-11-22，GitHub Actions）
+
+范围：可调宽虚拟化目录（`uniform_list`）、搜索与多维排序、子目录导航、设置面板、60fps 跟手进度条与章节刻度、连续音量条、音频播放卡片、字幕模糊自动加载与偏移、画面比例/旋转/翻转/截图、防休眠、窗口置顶、独立轻量 OSD、右键上下文菜单、媒体详情与 EXIF、照片内存缩略图底条、macOS 原生捏合手势与媒体键。
+
+- 提交：`8c15a5c`（基础体验与设置面板，CI `Checks` run `44930580831` 双端通过）、`bce0319` + Clippy 告警修复 `871385b`。
+- GitHub Actions `Checks` run `44952797730`（Rust `1.100.0`）：
+  - `macos`（`macos-15`）：`scripts/check-project.py`、`cargo test --locked --workspace`（23 项通过，新增音频/字幕分类、多维排序、倍速档位、设置校验与记录测试）、`cargo clippy --locked --workspace --all-targets -- -D warnings`（默认与 `--features iris/devtools`）全部通过。
+  - `windows`（`windows-2025`）：`scripts/check-project.py` 与 debug / `--release` 两轮 `cargo clippy -- -D warnings` 全部通过。
+
+### 控制面与矢量叠加面插件系统（2026-11-22，GitHub Actions）
+
+范围：新增无头协议 crate `crates/iris-api`、`crates/iris-core/src/plugin.rs`（`PluginManager`、外部 JSON-lines stdio v1 运行时、权限门控、内置 `iris.guides` 与 `iris.ab-loop`）、命令面板（`⌘P` / `Ctrl+P`）、4 类宿主槽位渲染、设置内插件管理与示例插件 `examples/plugins/watch-stats`。
+
+- 提交：`f732354` + 告警修复 `9037a2c`（移除多余 `mut` 并将 `iris-api` 的 `serde_json` 移至 `[dev-dependencies]`）。
+- GitHub Actions `Checks` run `44971302313`（`9037a2c`）：
+  - `macos`（`macos-15`，4m14s）：`scripts/check-project.py`（含 `iris-api` 无 GPUI / 无 `iris-mpv` 依赖约束）通过；`cargo test --locked --workspace` **29 项全部通过**（`iris-api` 2 项协议往返与路径穿越/协议版本校验 + `iris-core` 27 项，包含权限拦截、内置构图线/A-B 循环测试，以及拉起真实 Python 3 进程 `examples/plugins/watch-stats/main.py` 的外部 stdio 握手与命令集成测试）；默认与 `devtools` 两轮 `cargo clippy -- -D warnings` 零告警通过。
+  - `windows`（`windows-2025`，4m22s）：`scripts/check-project.py` 与 debug / `--release` 两轮 `cargo clippy -- -D warnings` 零告警通过。
+- GitHub Actions `Release recipe policy` run `44953868554`（`f732354`）：`cargo deny check licenses` 与发行策略检查通过。
+- **未实机人工验证**：上述 2026-11-22 两轮新增交互（触控板双指捏合、macOS 媒体键与 Now Playing、底部缩略图条、右键菜单、命令面板、外部插件 GUI 交互、窗口置顶以及 Windows 实机界面与单实例转发）仅完成 CI 编译、Clippy、权限与 stdio 单元测试，尚未在实体 macOS / Windows 机器上逐项人工点验。
+
 
