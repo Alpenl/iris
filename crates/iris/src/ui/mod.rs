@@ -104,14 +104,47 @@ impl IrisWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let video = match VideoSurface::attach(window, session.render_handle()) {
-            Ok(v) => Some(v),
+        let (video, video_reset_rx) = match VideoSurface::attach(window, session.render_handle()) {
+            Ok((v, rx)) => (Some(v), Some(rx)),
             Err(e) => {
                 log::error!("video surface failed: {e:#}");
                 cx.quit();
-                None
+                (None, None)
             }
         };
+        if let Some(mut reset_rx) = video_reset_rx {
+            cx.spawn(async move |this, cx| {
+                while reset_rx.next().await.is_some() {
+                    let is_photo = this
+                        .update(cx, |this, _| {
+                            this.active().session.kind() == Some(Kind::Photo)
+                        })
+                        .unwrap_or(false);
+                    if !is_photo {
+                        cx.background_executor()
+                            .timer(Duration::from_millis(120))
+                            .await;
+                    }
+                    if this
+                        .update(cx, |this, cx| {
+                            let (zoom, pan) = {
+                                let vp = this.active();
+                                (vp.image.zoom, vp.image.pan)
+                            };
+                            let settings = this.settings.clone();
+                            this.active_mut()
+                                .session
+                                .recover_unloaded_after_gpu_reset(&settings, zoom, pan);
+                            cx.notify();
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            })
+            .detach();
+        }
         platform::hide_traffic_lights(window);
         if settings.always_on_top {
             platform::set_always_on_top(window, true);
@@ -347,6 +380,12 @@ impl IrisWindow {
         self.persist_user_settings();
         drop(self.active().video.borrow_mut().take());
         self.active().session.shutdown();
+    }
+}
+
+impl Drop for IrisWindow {
+    fn drop(&mut self) {
+        self.shutdown();
     }
 }
 

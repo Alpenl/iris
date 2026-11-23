@@ -343,9 +343,17 @@ fn execute_bounded(
             wire.push_str(&format!("Content-Length: {}\r\n", payload.len()));
         }
         wire.push_str("Connection: close\r\n\r\n");
-        transport.write_all(wire.as_bytes())?;
+        let mut wire_bytes = wire.into_bytes();
         if let Some(payload) = cur_body.filter(|b| !b.is_empty()) {
-            transport.write_all(payload)?;
+            if payload.len() <= 16 * 1024 {
+                wire_bytes.extend_from_slice(payload);
+                transport.write_all(&wire_bytes)?;
+            } else {
+                transport.write_all(&wire_bytes)?;
+                transport.write_all(payload)?;
+            }
+        } else {
+            transport.write_all(&wire_bytes)?;
         }
         transport.flush()?;
 

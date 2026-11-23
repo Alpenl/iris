@@ -94,6 +94,32 @@ impl IrisWindow {
                     self.chrome.render_count,
                 );
             }
+            "ui" => {
+                eprintln!(
+                    "[iris/control] ui preset={} seek_step={:.1} top={} filmstrip={} thumbs={} sb_mode={:?} rows={} queue={} search_open={} search_q={:?} palette={} palette_q={:?} scheme={:?} theme={} hide_tb={} tb_hover={} ctx_menu={} modal={} sources={} osd={:?} toast={:?}",
+                    self.settings.active_preset,
+                    self.settings.seek_step,
+                    self.settings.always_on_top,
+                    self.settings.photo_filmstrip,
+                    self.catalog.thumbs.len(),
+                    self.catalog.sidebar_mode,
+                    self.catalog.rows.len(),
+                    self.queue.len(),
+                    self.text_inputs.search_open,
+                    self.text_inputs.search_input.text(),
+                    self.overlays.palette_open,
+                    self.text_inputs.palette_input.text(),
+                    self.keymap.scheme,
+                    self.settings.theme_id,
+                    self.effective_hide_titlebar(),
+                    self.chrome.titlebar_hover,
+                    self.overlays.context_menu.is_some(),
+                    self.plugins.active_modal().is_some(),
+                    self.plugins.media_sources().len(),
+                    self.chrome.osd,
+                    self.chrome.toast,
+                );
+            }
             "get" => match self.active().session.debug_property(arg) {
                 Ok(v) => eprintln!("[iris/control] get {arg} = {v}"),
                 Err(e) => eprintln!("[iris/control] get {arg} failed: {e}"),
@@ -103,6 +129,12 @@ impl IrisWindow {
                 match self.active().session.debug_command(&args) {
                     Ok(()) => eprintln!("[iris/control] mpv {arg} ok"),
                     Err(e) => eprintln!("[iris/control] mpv {arg} failed: {e}"),
+                }
+            }
+            "sim_device_reset" => {
+                if let Some(v) = self.active().video.borrow().as_ref() {
+                    v.debug_force_device_reset();
+                    eprintln!("[iris/control] sim_device_reset ok");
                 }
             }
             "quit" => cx.quit(),

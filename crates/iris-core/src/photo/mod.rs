@@ -40,6 +40,18 @@ pub struct Photo {
 impl Photo {
     /// Video filter chain with an optional extra clockwise rotation (`0/90/180/270`).
     pub(crate) fn vf_chain(&self, extra_rotate_cw: u16) -> Option<String> {
+        self.vf_chain_with_transforms(extra_rotate_cw, false, false)
+    }
+
+    /// Video filter chain combining optional user `hflip`/`vflip` (in upright image space)
+    /// and extra clockwise rotation while keeping `format=primaries=...:gamma=...:rotate=...`
+    /// at the tail so `lavfi` mirror filters never strip wide-gamut or rotation metadata.
+    pub(crate) fn vf_chain_with_transforms(
+        &self,
+        extra_rotate_cw: u16,
+        extra_hflip: bool,
+        extra_vflip: bool,
+    ) -> Option<String> {
         let mut vf = Vec::new();
         if let Some((w, h)) = self.size
             && w.max(h) > MAX_SIDE
@@ -50,10 +62,18 @@ impl Photo {
                 format!("scale=w=-2:h={MAX_SIDE}")
             });
         }
-        match self.mirror {
-            Some(Mirror::Horizontal) => vf.push("hflip".into()),
-            Some(Mirror::Vertical) => vf.push("vflip".into()),
-            None => {}
+        let (pre_h, pre_v) = if self.rotate_cw.is_multiple_of(180) {
+            (extra_hflip, extra_vflip)
+        } else {
+            (extra_vflip, extra_hflip)
+        };
+        let net_hflip = (self.mirror == Some(Mirror::Horizontal)) ^ pre_h;
+        let net_vflip = (self.mirror == Some(Mirror::Vertical)) ^ pre_v;
+        if net_hflip {
+            vf.push("hflip".into());
+        }
+        if net_vflip {
+            vf.push("vflip".into());
         }
         let colour = self.colour.and_then(|c| c.mpv_format());
         let mut format: Vec<String> = colour.into_iter().collect();
@@ -230,6 +250,24 @@ mod tests {
         assert_eq!((h.mirror, h.rotate_cw), (Some(Mirror::Horizontal), 270));
         containers::add_mirror(&mut h, Mirror::Vertical);
         assert_eq!((h.mirror, h.rotate_cw), (None, 270));
+
+        // User mirror on a wide-gamut portrait HEIF commutes before `rotate=90` and preserves P3 format tail.
+        assert_eq!(
+            portrait.vf_chain_with_transforms(0, true, false).as_deref(),
+            Some("scale=w=-2:h=8192,vflip,format=primaries=display-p3:gamma=srgb:rotate=90")
+        );
+        let p3_png = Photo {
+            colour: Some(Colour {
+                primaries: "display-p3",
+                gamma: Some("srgb"),
+            }),
+            size: Some((1200, 900)),
+            ..Default::default()
+        };
+        assert_eq!(
+            p3_png.vf_chain_with_transforms(0, true, false).as_deref(),
+            Some("hflip,format=primaries=display-p3:gamma=srgb")
+        );
     }
 
     #[test]

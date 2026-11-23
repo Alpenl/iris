@@ -5,7 +5,7 @@
 ```bash
 brew install mpv                 # 开发用的 libmpv（GPL 构建，不能拿去分发）
 cargo build --release --features devtools  # 性能/控制测试专用，不能作为发行包
-cargo test --locked --workspace            # 71 项单元/端到端测试：协议与多源权限、插件隔离/异步校验与外部 stdio 握手、内置 iris.webdav、稀疏预设与基线保护、!TextInput 打字防火墙、照片/ICC 单遍解析、UI 契约与 ThemeTokens 安全兜底
+cargo test --locked --workspace            # 72 项单元/端到端测试：协议与多源权限、插件隔离/异步校验与外部 stdio 握手、内置 iris.webdav、稀疏预设与基线保护、!TextInput 打字防火墙、硬解镜像自动回拷切换、照片/ICC 单遍解析、Windows WIC 缩略图方向/通道、UI 契约与 ThemeTokens 安全兜底
 python3 scripts/check-project.py           # 仓库约束：递归 UI/mpv 隔离、iris-core 与 iris-api 依赖门禁、devtools 默认特性门禁、单文件 650/850 行预算、SVG 图标与插件清单校验
 cargo deny check licenses        # 依赖许可证检查，需要先 cargo install cargo-deny
 ```
@@ -201,7 +201,37 @@ Windows 媒体库已在 WSL 中从固定源码实际编译：mpv `d11ffba253def0
 - **照片边界与 ColorSync ICC 回归**（`scripts/photo-harness.py --bin target/release/iris ... probe exif heic icc` + `scripts/icc-report.py`）：
   - EXIF 1/3/6/8、HEIC 方向 6 与 48 MP 分块 HEIC 全部通过。
   - 17 个 PNG/JPEG 色块与 macOS ColorSync 预期值最大误差均在 **1–3 个色阶**内（`green-adobergb.png` 误差 1、`red-p3-jpeg.jpg` 误差 1、`red-srgb.png` 误差 3），色彩管线零回归。
-- **未在 Windows 实体机复验**：Windows WIC 缩略图、D3D11 设备重置恢复与后台显示器 ICC 切换已通过 `x86_64-pc-windows-msvc` 交叉 Clippy 零告警验证，尚未在实体 Windows 机器上实测。
+- **未在 Windows 实体机复验**：Windows WIC 缩略图、D3D11 设备重置恢复与后台显示器 ICC 切换已通过 `x86_64-pc-windows-msvc` 交叉 Clippy 零告警验证，尚未在实体 Windows 机器上实测（后续已于 2026-11-23 完成实体机双屏核销，见下节）。
+
+### 中期架构收敛后的 Windows 实体机回归与 Issue #1 核销（2026-11-23，Windows 11 双屏实测）
+
+环境：Windows 11 x64，双显示器（主屏 `\\.\DISPLAY2` 2194×1234 @ 175% 缩放 + 副屏 `\\.\DISPLAY1` 1707×1067），Rust `1.100.0`，MSVC Build Tools 2022，自建 LGPL `libmpv` SDK（`target/lgpl-media-sdk`）。
+
+- **实测与深度走查捕获并修复的 11 项问题**：
+  1. **普通 `--release` 构建条件导入（`crates/iris/src/platform/windows.rs`）**：无 `devtools` 特性的 `--release` 构建下，顶层 `Gdi::*` 未随 `snapshot_window` 条件门控触发 `-D unused-imports` 报错，现已收拢至 `snapshot_window` 内部。
+  2. **硬解视频水平/垂直镜像滤镜失效（`crates/iris-core/src/player/{mod,backend}.rs`）**：`hwdec=auto-safe`（零拷贝 `d3d11va` 硬件帧）下直接挂载 FFmpeg `hflip` / `vflip` 会报像素格式无法转换并自动禁用滤镜；现改为视频开启镜像期间自动切换至 `auto-copy`（`d3d11va-copy` 硬解回拷），关闭镜像或切集时立即恢复零拷贝 `auto-safe`（含回归单测）。
+  3. **看图广色域/竖拍 HEIF 镜像滤镜顺序与色域保护（`crates/iris-core/src/photo/mod.rs`、`player/backend.rs`）**：`Photo::vf_chain_with_transforms` 将用户水平/垂直镜像按正立图像坐标换算并置于 `format=primaries=…:gamma=…[:rotate=…]` 之前，确保 Display P3 / Adobe RGB 色彩元数据与 HEIF 旋转标记不被 `lavfi` 镜像滤镜冲掉（含单测与实机验证）。
+  4. **D3D11 设备丢失（TDR / 驱动更新）完整自愈闭环（`crates/iris/src/video/windows.rs`、`crates/iris-mpv/src/render.rs`、`player/backend.rs`、`ui/mod.rs`）**：除检测 DXGI 返回码（含 `REMOVED / RESET / HUNG / DRIVER_INTERNAL_ERROR`）外，新增 `ID3D11Device::GetDeviceRemovedReason()` 检查以捕获 `mpv_render_context_render` 侧先行触发的设备丢失；每次绘制成功后清零连续重试计数；修复表面重建期间 `mpv_render_context_free` 导致视频 `vid` 置 `no`（黑屏仅剩声音）及静帧图片自动卸载的问题——现重建后立即恢复显示器 ICC、重绑视频 `vid` 与 `d3d11va` 硬解，并对静帧照片/无音轨流自动原子重载且保留镜像、旋转与缩放平移状态。
+  5. **点击窗口 `X` 按钮或 `Alt+F4`（`WM_CLOSE`）退出漏落盘（`crates/iris/src/ui/mod.rs`）**：GPUI 在窗口销毁时先释放 `IrisWindow` 实体再触发 `on_app_quit`，导致 `WeakEntity` 回调拿不到实体；现补充 `impl Drop for IrisWindow` 幂等调用 `shutdown()`，保证点击 `win-close` 与 `WM_CLOSE` 均完整保存续播进度、音量、倍速与窗口尺寸。
+  6. **Windows 自绘标题栏最大化无法还原、双击空实现与单击模态卡死（`crates/iris/src/platform/windows.rs`、`ui/titlebar.rs`）**：绕开 GPUI 0.2.2 Windows 后端 `zoom_window()` 写死 `SW_MAXIMIZE` 及 `titlebar_double_click()` 空实现，基于 `IsZoomed(hwnd)` 原生切换 `SW_MAXIMIZE` / `SW_RESTORE`；标题栏拖拽接入 5px 位移阈值与 `GetAsyncKeyState(VK_LBUTTON)` 按下校验后调用 `WM_SYSCOMMAND(SC_DRAGMOVE)`，既支持最大化窗口拖出还原，又杜绝单击/双击误入 Win32 键盘移动模态循环。
+  7. **Winsock 小请求体分包触发 TCP `RST`（`crates/iris-core/src/vfs/http_client.rs`）**：`TCP_NODELAY` 下请求头与小请求体分两次 `write_all` 发送，服务端提早关闭连接时易触发 `WSAECONNRESET`；现对 `<= 16 KiB` 请求体（如 WebDAV `PROPFIND` XML）与请求头合并单次发送。
+  8. **Windows 本地路径冗余 `\\?\` 前缀统一（`crates/iris-core/src/{library,media_uri}.rs`）**：对常规长度本地磁盘路径自动剥离 `canonicalize()` 产生的 `\\?\` 逐字前缀，确保 `MediaUri::Local` 与 `file://` URI 往返判等、侧栏高亮、收藏续播及资源管理器定位一致。
+  9. **快捷键作用域徽标同步（`crates/iris/src/ui/settings/shortcuts.rs`）**：设置 → 快捷键中的作用域标签改为由 `gpui_contexts` 推导（`R / Shift+R / H / Shift+H` 准确显示「视频/看图」）。
+  10. **外部 Python 插件 Windows UTF-8 管道编码兜底（`crates/iris-core/src/plugin/process.rs`）**：外部 `.py` 插件子进程注入 `PYTHONUTF8=1` 与 `PYTHONIOENCODING=utf-8`，防止默认 GBK 代码页损坏非 ASCII JSON。
+  11. **无 Lua 构建单测与照片脚本兼容（`crates/iris-mpv/src/lib.rs`、`scripts/photo-harness.py`）**：自建无 Lua `libmpv` 下兼容 `osc` 编译期不存在（错误码 `-5`）；`photo-harness.py` 跳过原始 `.icc` 配置文件。
+- **静态门禁与全量测试**：
+  - `python scripts/check-project.py`、`cargo fmt --all -- --check`、`cargo deny --locked check licenses` 全部通过。
+  - Windows 原生三套 `cargo clippy --locked --workspace --all-targets -- -D warnings`（默认、`--features iris/devtools`、`--release` 含 HLSL 着色器编译）全部零告警通过。
+  - `cargo test --locked --workspace` **72 项全部通过**（新增 Windows 原生 WIC 缩略图 EXIF 1/3/6/8 旋转宽高与直通 BGRA 像素通道单测、硬解镜像 `auto-copy` 切换回归单测及广色域/竖拍 HEIF 镜像滤镜单测）。
+- **Issue #1、窗口控制、D3D11 重置自愈与新架构 Windows 实体机逐项点验（独立隔离实例，零污染用户 `%APPDATA%\Iris`）**：
+  - **空转与播放渲染门控**：空窗口静置 2.0s `renders=2 -> 2`（**0.00 Hz**）；`01-smoke.mp4` 启用 `current-vo=libmpv`、`hwdec-current=d3d11va` 正常推进播放并可由 `mpv` 导出精确解码帧。
+  - **D3D11 设备丢失连续三次故障注入自愈（视频 + 广色域照片）**：在 `01-smoke.mp4` 硬解播放中连续 3 次注入 `DXGI_ERROR_DEVICE_REMOVED`（`sim_device_reset`），渲染工作线程每次均以 `attempt 1` 完成旧表面销毁、新 `ID3D11Device` / DXGI 交换链 / DirectComposition 视觉树重建、显示器 ICC 重绑及 `vid=1` / `hwdec=d3d11va` 恢复，时间轴持续前进并成功导出 198 KB 真实解码帧；在水平镜像后的 Display P3 PNG 上注入设备重置，同样自动重载并恢复 `current-vo=libmpv` 与 `vf=hflip,format=primaries=display-p3:gamma=srgb`。
+  - **Windows 窗口按钮、标题栏双击与退出落盘**：点击右上角 `win-max` 按钮在正常窗口与最大化（`IsZoomed == true`）间双向切换，双击 `#drag` 标题栏同样双向切换最大化/还原且不卡焦点；分别通过点击右上角 `win-close`（`remove_window`）与投递原生 `WM_CLOSE`（`Alt+F4`）关闭窗口，进程均以退出码 `0` 结束，准确落盘 `volume = 42`、`speed = 1.5`、`window_width = 1080`、`window_height = 680` 与 `records.tsv` 续播进度（`7.5s`）。
+  - **设置「显示停靠侧栏」单真源与混合同步**：在 **设置 → 外观与常规** 点击切换开关，主窗口侧栏立即收起；退出后 `settings.conf` 写入 `directory_open = false`，冷启动重开保持 `dir=false`；混合 `Tab`、侧栏宽度调节、`Ctrl+F` 搜索、命令面板（`Ctrl+P` 切换至「数据源」视图）状态始终一致。
+  - **变换、时间格式、全屏与双屏 ICC**：`R / Shift+R`（`video-rotate` `0° <-> 90°`）、视频 `H / Shift+H`（`d3d11va <-> d3d11va-copy` 无滤镜报错）、广色域 P3 PNG 与 `heic-o6.heic` 镜像滤镜（保留尾部 `format=primaries=display-p3:gamma=srgb` 与 `rotate=90`）、跳转 OSD（`+5s · 00:06`）与超过 1 分钟 WAV 纯音频卡片正常；全屏工具栏显示时 `sub-margin-y-offset > 0`，静置 2.3s 自动隐藏顶底栏且字幕边距归零，`Esc` 退出正常；将主窗口在 `\\.\DISPLAY2` 与 `\\.\DISPLAY1` 之间跨屏移动，后台线程均按 500ms 轮询触发 `display ICC` 更新且播放无中断。
+  - **WIC 缩略图、中文/Emoji 直输与防火墙、右键菜单、置顶与单实例转发**：`photo-harness.py`（`probe / exif / heic / icc / huge`）全量通过，按 `G` 开启照片缩略图底条经 WIC 成功解码缓存；`Ctrl+F` 搜索框直接接收原生 `WM_CHAR` UTF-16 中文与代理对 Emoji（`测试🎬`）、两段式 `Escape`（先清空文本再关搜索框）、剪贴板中文+Emoji 粘贴及 `!TextInput` 快捷键防火墙均正常；右键弹出上下文菜单、`T` 置顶（Win32 `WS_EX_TOPMOST` 实测生效）正常；Windows 单实例转发含空格与中文路径（`中文目录 单实例测试\测试照片 10.jpg`）在 `0.098s` 内以退出码 `0` 准确投递至主实例打开。
+  - **`1B+` 稀疏预设、`iris.webdav` + Windows 凭据管理器与外部插件**：`seek_step = 12` 个人基线下切换 `精听与学习 (3.0) -> 小窗置顶 (自动回退 12.0 + 置顶) -> 默认工作区`，磁盘基线零污染；`iris.webdav` 实连 Windows Credential Manager（`CredWriteW` / `CredReadW` / 测试后 `CredDeleteW` 清理）完成本地 WebDAV `PROPFIND`、带认证视频流与同名 `.srt` 字幕自动挂载、远程 Display P3 PNG `bytes=0-262143` 头探测与色彩滤镜注入；同时挂载 `watch-stats`、`cloud-media-demo`、`cinema-ui` 三个外部 Python 插件，`EnumWindows` 实测 **0 个控制台弹窗**（`CREATE_NO_WINDOW`），`cinema-ui` 无标题栏 `hide_titlebar` 顶缘悬浮唤醒零画面抖动、「恢复默认外观」一键逃生生效，退出后子进程 **0 残留**。
+- **仍待后续环境验证的边界**：本轮中期重构后的 macOS 实体机人工点验（含触控板双指捏合与 macOS 媒体键）待在 Mac 设备上补齐。
 
 
 

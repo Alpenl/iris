@@ -187,8 +187,24 @@ impl SessionEvent {
 }
 
 impl Session {
+    fn effective_hwdec_str(&self) -> &'static str {
+        match self.user_hwdec.get() {
+            Hwdec::Off => "no",
+            Hwdec::AutoSafe => {
+                if self.kind == Some(Kind::Video) && (self.state.hflip || self.state.vflip) {
+                    "auto-copy"
+                } else {
+                    "auto-safe"
+                }
+            }
+        }
+    }
+
     pub fn set_hwdec(&self, hwdec: Hwdec) {
-        let _ = self.mpv.command_async(&["set", "hwdec", hwdec.mpv_value()]);
+        self.user_hwdec.set(hwdec);
+        let _ = self
+            .mpv
+            .command_async(&["set", "hwdec", self.effective_hwdec_str()]);
     }
 
     pub fn set_sub_lang(&self, sub_lang: SubLang) {
@@ -227,6 +243,9 @@ impl Session {
             .command_async(&["set", "video-aspect-override", "no"]);
         let _ = self.mpv.set_property_f64_async("panscan", 0.);
         let _ = self.mpv.set_property_f64_async("sub-delay", 0.);
+        let _ = self
+            .mpv
+            .command_async(&["set", "hwdec", self.user_hwdec.get().mpv_value()]);
         let _ = self.mpv.command_async(&["set", "vf", ""]);
         Ok(())
     }
@@ -277,23 +296,104 @@ impl Session {
     }
 
     fn apply_vf_filters(&self) -> Result<()> {
-        let mut chain = Vec::new();
-        if self.kind == Some(Kind::Photo) {
+        let vf = if self.kind == Some(Kind::Photo) {
             let is_heif = self.is_current_heif();
-            if let Some(meta) = &self.photo_meta
-                && let Some(base) = meta.vf_chain(if is_heif { self.extra_rotate } else { 0 })
-            {
-                chain.push(base);
+            let fallback = crate::photo::Photo::default();
+            let meta = self.photo_meta.as_ref().unwrap_or(&fallback);
+            meta.vf_chain_with_transforms(
+                if is_heif { self.extra_rotate } else { 0 },
+                self.state.hflip,
+                self.state.vflip,
+            )
+            .unwrap_or_default()
+        } else {
+            let mut chain = Vec::new();
+            if self.state.hflip {
+                chain.push("hflip");
+            }
+            if self.state.vflip {
+                chain.push("vflip");
+            }
+            if self.kind == Some(Kind::Video) {
+                let _ = self
+                    .mpv
+                    .command_async(&["set", "hwdec", self.effective_hwdec_str()]);
+            }
+            chain.join(",")
+        };
+        self.mpv.command_async(&["set", "vf", &vf])?;
+        Ok(())
+    }
+
+    pub fn recover_unloaded_after_gpu_reset(
+        &mut self,
+        settings: &Settings,
+        zoom: f64,
+        pan: [f64; 2],
+    ) {
+        if self.kind != Some(Kind::Photo) {
+            let has_path = self
+                .mpv
+                .get_property_string("path")
+                .is_ok_and(|p| !p.is_empty());
+            if has_path {
+                if self.kind == Some(Kind::Video)
+                    && self
+                        .mpv
+                        .get_property_string("current-vo")
+                        .map(|vo| vo.is_empty())
+                        .unwrap_or(true)
+                {
+                    let _ = self.mpv.command_async(&["set", "vid", "1"]);
+                }
+                return;
             }
         }
-        if self.state.hflip {
-            chain.push("hflip".into());
+        let (hflip, vflip, extra_rotate, aspect, sub_delay, paused, pos) = (
+            self.state.hflip,
+            self.state.vflip,
+            self.extra_rotate,
+            self.state.aspect,
+            self.state.sub_delay,
+            self.state.paused,
+            self.state.time_pos,
+        );
+        let reloaded = if let Some(path) = self.current.clone() {
+            let (kind, photo) = (self.kind, self.photo_meta.clone());
+            self.load(&path, kind, photo, pos).is_ok()
+        } else if let Some(req) = self.last_remote.clone() {
+            self.open_remote(req, settings, pos).is_ok()
+        } else {
+            false
+        };
+        if !reloaded {
+            return;
         }
-        if self.state.vflip {
-            chain.push("vflip".into());
+        self.state.hflip = hflip;
+        self.state.vflip = vflip;
+        self.extra_rotate = extra_rotate;
+        if hflip || vflip || (self.is_current_heif() && extra_rotate != 0) {
+            let _ = self.apply_vf_filters();
         }
-        self.mpv.command_async(&["set", "vf", &chain.join(",")])?;
-        Ok(())
+        if !self.is_current_heif() && extra_rotate != 0 {
+            let _ = self
+                .mpv
+                .command_async(&["set", "video-rotate", &extra_rotate.to_string()]);
+        }
+        if aspect != AspectMode::Original {
+            let _ = self.execute(Command::SetAspect(aspect));
+        }
+        if sub_delay.abs() > 0.001 {
+            let _ = self.execute(Command::SetSubDelay(sub_delay));
+        }
+        if matches!(self.kind, Some(Kind::Video | Kind::Audio)) {
+            let _ = self
+                .mpv
+                .command_async(&["set", "pause", if paused { "yes" } else { "no" }]);
+        }
+        if zoom != 0. || pan != [0., 0.] {
+            let _ = self.transform(zoom, pan);
+        }
     }
 
     pub fn execute(&mut self, command: Command) -> Result<()> {

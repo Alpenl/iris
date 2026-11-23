@@ -15,7 +15,7 @@
 | 1.5 | 不做多轨合成的非线性剪辑；mpv 是单管线前向播放，做不了。 | 方向已定 |
 | 1.6 | UI 发语义化命令 → 会话改状态 → 语义事件 → UI 重绘；UI 不直接使用 mpv 属性（渲染层仅持窄能力 `RenderHandle`）；坐标换算显式建模；机制和策略分开。 | 已收口到 `Session` / `RenderHandle` / `geometry.rs` / `input.rs` / `plugin/` |
 | 1.7 | 当前不做：Wasm/Lua 进程内脚本引擎、SQLite 媒体库、Linux 移植。外部插件采用语言无关的 JSON-lines stdio 子进程协议，零额外脚本运行时依赖。 | 已定 |
-| 1.8 | 本体默认界面保持方向 C 的配色和整体风格（细节参照 Zed 和 Sooty：默认直角、36px 标题栏、44px 单行工具栏、60fps 跟手拖拽时间轴、16px SVG、可调宽虚拟滚动侧栏），但**不以此限制插件的定制自由度**；圆角与栏高经 `ThemeTokens` 统一封装进 `ui/kit/` 原语。照片的缩放比例按原始像素算，1:1 即 100%。 | 已完成（2026-11-22）；CI 双端通过，新界面实机人工走查待补 |
+| 1.8 | 本体默认界面保持方向 C 的配色和整体风格（细节参照 Zed 和 Sooty：默认直角、36px 标题栏、44px 单行工具栏、60fps 跟手拖拽时间轴、16px SVG、可调宽虚拟滚动侧栏），但**不以此限制插件的定制自由度**；圆角与栏高经 `ThemeTokens` 统一封装进 `ui/kit/` 原语。照片的缩放比例按原始像素算，1:1 即 100%。 | 已完成（2026-11-23 Windows 11 双屏实机核验通过；macOS 本轮新界面人工走查待补） |
 
 ## 2. 技术栈与依赖
 
@@ -94,7 +94,7 @@
 | 6.1 | render API 下 `target-colorspace-hint` 管不到 Iris 的图层，色彩空间由 Iris 自己设置。 | 已定 |
 | 6.2 | 视频层标注色彩空间，且与 mpv 输出目标一致：macOS 上图层标 Display P3，mpv 输出 `target-prim=display-p3`、`target-trc=srgb`。 | 已完成；sRGB / BT.709 误差 ≤ 3 色阶，CPU 无变化 |
 | 6.3 | 照片内嵌 ICC 逐张覆盖；超出目标色域裁剪。 | 已完成；Windows P3／Adobe RGB 的 PNG／WebP／TIFF 六组截图误差 ≤ 2 色阶 |
-| 6.4 | macOS 换屏由 Core Animation 处理；Windows 读取当前显示器 ICC，跨显示器时更新 mpv 配置。 | 已实现；任意多屏组合待后续实测 |
+| 6.4 | macOS 换屏由 Core Animation 处理；Windows 读取当前显示器 ICC，跨显示器时更新 mpv 配置。 | 已实现并完成 Windows 双屏跨显示器切换实测；广色域/HDR 多屏组合待后续扩展验证 |
 | 6.5 | HDR / EDR。 | 计划（后续版本） |
 | 6.6 | 长期照片主视图管线是原生图层（macOS：ImageIO + `CALayer` 的 `CGImage` 内容），不是 GPUI 纹理；目前 `ImageIO` 已率先用于底部 160px 内存缩略图预览。 | 主视图原生层计划于后续版本 |
 
@@ -137,7 +137,7 @@
 ## 10. 待决问题
 
 - **版权安排**：许可证已定为 `MIT OR Apache-2.0`；是否需要 CLA 或版权归属安排仍待决（5.9）。
-- **macOS 与 Windows 新功能实机走查**：2026-11-22 两轮大型改动与后续工程化打磨已通过编译、Clippy、44 项单元测试与许可证门禁（macOS 亦已完成独立实例空转/播放/IME/色彩回归实测），但仍有部分新 UI 交互（如触控板捏合、媒体键、外部插件 GUI 交互与 Windows 实体机全量界面/WIC/单实例转发）待实体机逐项人工点验。
+- **macOS 新功能实机走查**：Windows 11 双屏实体机已于 2026-11-23 完成全量 72 项测试、三套 Clippy、原生 D3D11（含连续 3 次设备丢失重置自愈并恢复 `d3d11va` 硬解与看图状态）/跨屏 ICC/WIC 缩略图/窗口控制与 `WM_CLOSE` 落盘/单实例转发、`1B+` 稀疏预设、`iris.webdav`（Windows 凭据管理器）及外部插件/无边框护栏实测核销（见 `TESTING.md`）；macOS 侧的触控板双指捏合、系统媒体键以及中期重构后的 GUI 仍待在实体 Mac 上人工点验。
 - **最低系统版本**：打包脚本当前以 macOS 11 为构建目标；实际支持下限仍需对应系统验证。
 - **商业模式**：是否走 Open-Core，仍未决定。
 - **正式分发签名**：当前仅支持未签名本地包与 CI 构建；正式分发需要 Developer ID / 公证与 Windows Authenticode 凭据。

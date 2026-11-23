@@ -10,13 +10,10 @@ use gpui::RenderImage;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use windows::Win32::{
     Foundation::{GENERIC_READ, HWND, LPARAM, WPARAM},
-    Graphics::{
-        Gdi::*,
-        Imaging::{
-            CLSID_WICImagingFactory, GUID_WICPixelFormat32bppBGRA, IWICBitmapSource,
-            IWICImagingFactory, WICBitmapDitherTypeNone, WICBitmapInterpolationModeFant,
-            WICBitmapPaletteTypeCustom, WICDecodeMetadataCacheOnDemand,
-        },
+    Graphics::Imaging::{
+        CLSID_WICImagingFactory, GUID_WICPixelFormat32bppBGRA, IWICBitmapSource,
+        IWICImagingFactory, WICBitmapDitherTypeNone, WICBitmapInterpolationModeFant,
+        WICBitmapPaletteTypeCustom, WICDecodeMetadataCacheOnDemand,
     },
     System::{
         Com::{
@@ -25,7 +22,10 @@ use windows::Win32::{
         },
         Power::{ES_CONTINUOUS, ES_DISPLAY_REQUIRED, ES_SYSTEM_REQUIRED, SetThreadExecutionState},
     },
-    UI::{Input::KeyboardAndMouse::ReleaseCapture, WindowsAndMessaging::*},
+    UI::{
+        Input::KeyboardAndMouse::{GetAsyncKeyState, ReleaseCapture, VK_LBUTTON},
+        WindowsAndMessaging::*,
+    },
 };
 use windows::core::{Interface, PCWSTR};
 
@@ -210,15 +210,32 @@ pub(crate) fn synth_mouse(
 pub(crate) fn begin_window_drag(window: &gpui::Window) {
     if let Some(hwnd) = hwnd(window) {
         unsafe {
+            // Only invoke `SC_DRAGMOVE` (`0xF012`) while the physical left mouse button is
+            // held down; otherwise `DefWindowProcW` enters modal keyboard-move mode.
+            if (GetAsyncKeyState(i32::from(VK_LBUTTON.0)) as u16 & 0x8000) == 0 {
+                return;
+            }
             let _ = ReleaseCapture();
-            let _ = PostMessageW(
-                hwnd,
-                WM_NCLBUTTONDOWN,
-                WPARAM(HTCAPTION as usize),
-                LPARAM(0),
-            );
+            let _ = PostMessageW(hwnd, WM_SYSCOMMAND, WPARAM(0xF012), LPARAM(0));
         }
     }
+}
+
+pub(crate) fn toggle_maximize(window: &gpui::Window) {
+    if let Some(hwnd) = hwnd(window) {
+        unsafe {
+            let cmd = if IsZoomed(hwnd).as_bool() || window.is_maximized() {
+                SW_RESTORE
+            } else {
+                SW_MAXIMIZE
+            };
+            let _ = ShowWindowAsync(hwnd, cmd);
+        }
+    }
+}
+
+pub(crate) fn titlebar_double_click(window: &gpui::Window) {
+    toggle_maximize(window);
 }
 
 /// Captures the visible desktop rectangle of this window, including both
@@ -227,6 +244,7 @@ pub(crate) fn begin_window_drag(window: &gpui::Window) {
 #[cfg(any(debug_assertions, feature = "devtools"))]
 pub(crate) fn snapshot_window(window: &gpui::Window, path: &Path) -> anyhow::Result<()> {
     use windows::Win32::Foundation::RECT;
+    use windows::Win32::Graphics::Gdi::*;
     let hwnd = hwnd(window).ok_or_else(|| anyhow::anyhow!("missing HWND"))?;
     unsafe {
         let mut rect = RECT::default();
@@ -420,6 +438,67 @@ pub(crate) mod pipe {
                 return Err(io::Error::last_os_error());
             }
             Ok(File::from_raw_handle(pipe))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::decode_thumbnail_wic;
+    use std::path::Path;
+
+    #[test]
+    fn wic_thumbnail_decoder_respects_exif_orientations_and_bgra_channels() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../test-media/photo");
+        let o1 = root.join("exif/exif-o1.jpg");
+        if !o1.is_file() {
+            return;
+        }
+        let img_o1 = decode_thumbnail_wic(&o1, 160).expect("WIC decode exif-o1.jpg");
+        let sz_o1 = img_o1.size(0);
+        assert_eq!(
+            (i32::from(sz_o1.width), i32::from(sz_o1.height)),
+            (160, 107)
+        );
+
+        let img_o3 =
+            decode_thumbnail_wic(&root.join("exif/exif-o3.jpg"), 160).expect("WIC decode exif-o3");
+        let sz_o3 = img_o3.size(0);
+        assert_eq!(
+            (i32::from(sz_o3.width), i32::from(sz_o3.height)),
+            (160, 107)
+        );
+
+        // EXIF orientations 6 (90° CW) and 8 (270° CW) must transpose 3000×2000 -> 107×160.
+        for name in ["exif/exif-o6.jpg", "exif/exif-o8.jpg"] {
+            let img = decode_thumbnail_wic(&root.join(name), 160).expect(name);
+            let sz = img.size(0);
+            assert_eq!(
+                (i32::from(sz.width), i32::from(sz.height)),
+                (107, 160),
+                "unexpected oriented size for {name}"
+            );
+        }
+
+        // Verify straight BGRA channel layout on pure sRGB red PNG (B≈0, G≈0, R≈255, A=255).
+        let red_png = root.join("icc/red-srgb.png");
+        if red_png.is_file() {
+            let red = decode_thumbnail_wic(&red_png, 64).expect("WIC decode red-srgb.png");
+            let bytes = red.as_bytes(0).expect("frame 0 bytes");
+            assert!(
+                bytes[0] < 5 && bytes[1] < 5 && bytes[2] > 250 && bytes[3] == 255,
+                "expected BGRA pure red [0,0,255,255], got {:?}",
+                &bytes[..4]
+            );
+        }
+
+        // HEIC: succeeds with oriented dimensions when system HEIF WIC codec is present, or returns None cleanly.
+        let heic_o6 = root.join("exif/heic-o6.heic");
+        if heic_o6.is_file()
+            && let Some(heic_img) = decode_thumbnail_wic(&heic_o6, 160)
+        {
+            let sz = heic_img.size(0);
+            assert!(i32::from(sz.width) > 0 && i32::from(sz.height) > 0);
         }
     }
 }

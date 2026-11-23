@@ -416,6 +416,11 @@ pub(super) struct ThumbCache {
 }
 
 impl ThumbCache {
+    #[cfg(any(debug_assertions, feature = "devtools"))]
+    pub(super) fn len(&self) -> usize {
+        self.entries.len()
+    }
+
     pub(super) fn get(&self, path: &Path) -> Option<Arc<RenderImage>> {
         self.entries.get(path).map(|(_, img)| img.clone())
     }

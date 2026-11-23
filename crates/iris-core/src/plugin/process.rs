@@ -141,7 +141,10 @@ impl ExternalProcess {
                 "python3"
             };
             let mut c = ProcessCommand::new(py);
-            c.arg("-u").arg(&canonical_entry);
+            c.env("PYTHONUTF8", "1")
+                .env("PYTHONIOENCODING", "utf-8")
+                .arg("-u")
+                .arg(&canonical_entry);
             c
         } else {
             ProcessCommand::new(&canonical_entry)

@@ -6,6 +6,7 @@ mod inspect;
 mod model;
 mod prepare;
 
+use std::cell::Cell;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -17,7 +18,7 @@ use url::Url;
 use crate::library::{self, Entry, FolderEntry, Kind, SortBy, SortOrder};
 use crate::media_uri::MediaUri;
 use crate::photo::Photo;
-use crate::settings::{OnEof, Settings};
+use crate::settings::{Hwdec, OnEof, Settings};
 use crate::vfs::{self, http_client::sanitize_headers};
 
 pub use model::{
@@ -38,9 +39,11 @@ pub struct Session {
     pub(super) current_title: Option<String>,
     pub(super) kind: Option<Kind>,
     pub(super) photo_meta: Option<Photo>,
+    pub(super) last_remote: Option<RemoteMediaRequest>,
     expected_mpv_path: Option<String>,
     pending_remote_subs: Vec<String>,
     pub(super) extra_rotate: u16,
+    pub(super) user_hwdec: Cell<Hwdec>,
     pub(super) subtitle_inset: f64,
     pub(super) tracks_dirty: bool,
     pub(super) chapters_dirty: bool,
@@ -67,9 +70,11 @@ impl Session {
             current_title: None,
             kind: None,
             photo_meta: None,
+            last_remote: None,
             expected_mpv_path: None,
             pending_remote_subs: Vec::new(),
             extra_rotate: 0,
+            user_hwdec: Cell::new(Hwdec::AutoSafe),
             subtitle_inset: 0.,
             tracks_dirty: false,
             chapters_dirty: false,
@@ -176,6 +181,7 @@ impl Session {
         self.pending_remote_subs.clear();
         self.kind = None;
         self.photo_meta = None;
+        self.last_remote = None;
         self.extra_rotate = 0;
         self.state.photo_colour = None;
         self.state.photo_exif = None;
@@ -276,6 +282,7 @@ impl Session {
         settings: &Settings,
         resume: f64,
     ) -> Result<()> {
+        let saved_remote = req.clone();
         let main_url = vfs::validate_stream_url(&req.playback_url)?;
         let clean_headers = sanitize_headers(&req.headers);
         let mut owned_opts: Vec<(&'static str, String)> = Vec::new();
@@ -335,10 +342,11 @@ impl Session {
             req.is_live,
             req.photo,
         );
+        self.last_remote = Some(saved_remote);
         Ok(())
     }
 
-    fn load(
+    pub(super) fn load(
         &mut self,
         path: &Path,
         kind: Option<Kind>,
@@ -370,6 +378,7 @@ impl Session {
             false,
             photo,
         );
+        self.last_remote = None;
         Ok(())
     }
 

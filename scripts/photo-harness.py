@@ -263,6 +263,8 @@ try:
     if "icc" in TESTS:
         r = {}
         for name in sorted(os.listdir(os.path.join(MEDIA, "icc"))):
+            if name.lower().endswith(".icc"):
+                continue
             f = os.path.join(MEDIA, "icc", name)
             load = iris.open_and_wait(f)
             time.sleep(0.4)

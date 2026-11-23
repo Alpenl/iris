@@ -13,6 +13,7 @@ use std::thread::JoinHandle;
 use anyhow::{Context as _, Result, anyhow};
 use cocoa::base::{NO, YES, id, nil};
 use cocoa::foundation::NSRect;
+use futures::channel::mpsc::{UnboundedReceiver, unbounded};
 use iris_mpv::render::{RenderContext, RenderHandle};
 use objc::declare::ClassDecl;
 use objc::rc::autoreleasepool;
@@ -272,7 +273,10 @@ fn layer_class() -> &'static Class {
 impl VideoSurface {
     /// Creates the GL context and mpv render context, and inserts the video
     /// view under GPUI's view. Must run on the main thread.
-    pub(crate) fn attach(window: &gpui::Window, mpv: RenderHandle) -> Result<Self> {
+    pub(crate) fn attach(
+        window: &gpui::Window,
+        mpv: RenderHandle,
+    ) -> Result<(Self, UnboundedReceiver<()>)> {
         let gpui_view: id = match HasWindowHandle::window_handle(window)
             .map_err(|e| anyhow!("{e:?}"))?
             .as_raw()
@@ -374,14 +378,17 @@ impl VideoSurface {
                 })?;
 
             let _: () = msg_send![layer, setNeedsDisplay];
-            Ok(Self {
-                state,
-                view,
-                layer,
-                redraw_tx: Some(tx),
-                worker: Some(worker),
-                scale,
-            })
+            Ok((
+                Self {
+                    state,
+                    view,
+                    layer,
+                    redraw_tx: Some(tx),
+                    worker: Some(worker),
+                    scale,
+                },
+                unbounded().1,
+            ))
         }
     }
 
@@ -432,6 +439,9 @@ impl VideoSurface {
             self.request_redraw();
         }
     }
+
+    #[cfg(any(debug_assertions, feature = "devtools"))]
+    pub(crate) fn debug_force_device_reset(&self) {}
 
     /// Stops mpv render callbacks, joins the video thread, detaches the layer's
     /// state pointer, and frees the render context with its GL context current.

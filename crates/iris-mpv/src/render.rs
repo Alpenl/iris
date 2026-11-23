@@ -33,6 +33,30 @@ impl RenderHandle {
     pub fn set_display_icc_profile(&self, path: &str) -> Result<()> {
         self.0.set_property_string("icc-profile", path)
     }
+
+    /// Returns the currently selected concrete video track id (e.g. `"1"`), if any.
+    pub fn active_vid(&self) -> Option<String> {
+        self.0
+            .get_property_string("vid")
+            .ok()
+            .filter(|v| !v.is_empty() && v != "no" && v != "auto")
+    }
+
+    /// Re-attaches `vid` after recreating a GPU render context so hardware decoding
+    /// (`d3d11va`) and `vo=libmpv` bind to the new device. Returns `false` if `mpv`
+    /// unloaded the file while the VO was closed (e.g. still images or silent clips).
+    pub fn restore_vid(&self, vid: &str) -> bool {
+        if self
+            .0
+            .get_property_string("path")
+            .is_ok_and(|p| !p.is_empty())
+        {
+            let _ = self.0.set_property_string("vid", vid);
+            true
+        } else {
+            false
+        }
+    }
 }
 
 type UpdateFn = Box<dyn Fn() + Send + Sync>;

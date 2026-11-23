@@ -236,6 +236,28 @@ fn lexical_normalize(path: &Path) -> PathBuf {
     }
 }
 
+/// Strips redundant Windows `\\?\X:\` verbatim disk prefixes on normal-length paths
+/// so UI labels, Explorer `reveal_path`, and `file://` URL roundtrips stay `X:\...` identical.
+pub(crate) fn strip_windows_verbatim_disk(path: PathBuf) -> PathBuf {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use std::path::Prefix;
+        if let Some(Component::Prefix(p)) = path.components().next()
+            && matches!(p.kind(), Prefix::VerbatimDisk(_))
+            && path.as_os_str().encode_wide().count() < 248
+            && let Some(s) = path.to_str()
+            && let Some(stripped) = s.strip_prefix(r"\\?\")
+            && !stripped
+                .split('\\')
+                .any(|seg| seg.ends_with(' ') || seg.ends_with('.'))
+        {
+            return PathBuf::from(stripped);
+        }
+    }
+    path
+}
+
 /// Resolves `path` safely across local disks and network shares.
 /// Avoids blocking `std::fs::canonicalize()` syscalls (and Windows `\\?\UNC\` rewrites)
 /// on slow network shares, falling back gracefully to lexical normalization.
@@ -243,7 +265,10 @@ pub fn safe_resolve_path(path: &Path) -> PathBuf {
     if is_slow_network_path(path) {
         return lexical_normalize(path);
     }
-    std::fs::canonicalize(path).unwrap_or_else(|_| lexical_normalize(path))
+    match std::fs::canonicalize(path) {
+        Ok(canon) => strip_windows_verbatim_disk(canon),
+        Err(_) => lexical_normalize(path),
+    }
 }
 
 fn scan_dir_with_mode(dir: &Path, slow_share: bool) -> ScanResult {

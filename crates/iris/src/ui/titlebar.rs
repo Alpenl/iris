@@ -219,7 +219,7 @@ impl IrisWindow {
                 )
                 .child(
                     win_btn("win-max", Icon::Maximize, "最大化 / 还原", false)
-                        .on_click(|_, window, _| window.zoom_window()),
+                        .on_click(|_, window, _| platform::toggle_maximize(window)),
                 )
                 .child(
                     win_btn("win-close", Icon::Close, "关闭", true)
@@ -242,13 +242,19 @@ impl IrisWindow {
             .gap(px(10.))
             .pl(px(if platform::IS_MACOS { 12. } else { 14. }))
             .pr(px(10.))
-            .on_mouse_down(MouseButton::Left, |ev: &MouseDownEvent, window, _| {
-                if ev.click_count >= 2 {
-                    window.titlebar_double_click();
-                } else {
-                    platform::begin_window_drag(window);
-                }
-            })
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, ev: &MouseDownEvent, window, _| {
+                    if ev.click_count >= 2 {
+                        this.active_mut().pending_win_drag_origin = None;
+                        platform::titlebar_double_click(window);
+                    } else if platform::IS_MACOS {
+                        platform::begin_window_drag(window);
+                    } else {
+                        this.active_mut().pending_win_drag_origin = Some(ev.position);
+                    }
+                }),
+            )
             .child(
                 div()
                     .flex_none()

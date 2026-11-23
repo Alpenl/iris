@@ -9,7 +9,7 @@ mod windows;
 #[cfg(target_os = "macos")]
 pub(crate) use macos::{
     MediaKeyBridge, PinchMonitor, SleepPreventer, begin_window_drag, hide_traffic_lights,
-    set_always_on_top,
+    set_always_on_top, titlebar_double_click, toggle_maximize,
 };
 #[cfg(any(debug_assertions, feature = "devtools"))]
 #[cfg(target_os = "macos")]
@@ -17,7 +17,7 @@ pub(crate) use macos::{snapshot_window, synth_mouse};
 #[cfg(target_os = "windows")]
 pub(crate) use windows::{
     MediaKeyBridge, PinchMonitor, SleepPreventer, begin_window_drag, hide_traffic_lights, pipe,
-    set_always_on_top,
+    set_always_on_top, titlebar_double_click, toggle_maximize,
 };
 #[cfg(any(debug_assertions, feature = "devtools"))]
 #[cfg(target_os = "windows")]

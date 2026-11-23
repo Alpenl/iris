@@ -620,9 +620,36 @@ fn builtin_webdav_plugin_modal_async_browse_mtime_and_subtitle_resolve_e2e() {
     let port = listener.local_addr().unwrap().port();
     let srv = thread::spawn(move || {
         let (mut sock, _) = listener.accept().unwrap();
+        let mut req_bytes = Vec::with_capacity(1024);
         let mut buf = [0u8; 4096];
-        let n = sock.read(&mut buf).unwrap();
-        let req = String::from_utf8_lossy(&buf[..n]);
+        loop {
+            let n = sock.read(&mut buf).unwrap();
+            if n == 0 {
+                break;
+            }
+            req_bytes.extend_from_slice(&buf[..n]);
+            if let Some(hdr_end) = req_bytes
+                .windows(4)
+                .position(|w| w == b"\r\n\r\n")
+                .map(|i| i + 4)
+            {
+                let hdr_str = String::from_utf8_lossy(&req_bytes[..hdr_end]);
+                let cl = hdr_str
+                    .lines()
+                    .find_map(|l| {
+                        let (k, v) = l.split_once(':')?;
+                        k.trim()
+                            .eq_ignore_ascii_case("content-length")
+                            .then(|| v.trim().parse::<usize>().ok())
+                            .flatten()
+                    })
+                    .unwrap_or(0);
+                if req_bytes.len() >= hdr_end + cl {
+                    break;
+                }
+            }
+        }
+        let req = String::from_utf8_lossy(&req_bytes);
         assert!(req.starts_with("PROPFIND /dav/Anime/ HTTP/1.1\r\n"));
         assert!(
             req.to_ascii_lowercase()
@@ -639,6 +666,7 @@ fn builtin_webdav_plugin_modal_async_browse_mtime_and_subtitle_resolve_e2e() {
             xml.len()
         );
         sock.write_all(resp.as_bytes()).unwrap();
+        let _ = sock.shutdown(std::net::Shutdown::Write);
     });
 
     let env = TestEnv::new("webdav-e2e");

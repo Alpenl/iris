@@ -7,6 +7,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
+use futures::channel::mpsc::{UnboundedReceiver, unbounded};
 use iris_mpv::render::{RenderContext, RenderHandle};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use windows::Win32::{
@@ -21,9 +22,10 @@ use windows::Win32::{
             DCompositionCreateDevice, IDCompositionDevice, IDCompositionTarget, IDCompositionVisual,
         },
         Dxgi::{
-            Common::*, DXGI_ERROR_DEVICE_REMOVED, DXGI_ERROR_DEVICE_RESET, DXGI_SCALING_STRETCH,
-            DXGI_SWAP_CHAIN_DESC1, DXGI_SWAP_CHAIN_FLAG, DXGI_SWAP_EFFECT_FLIP_DISCARD,
-            DXGI_USAGE_RENDER_TARGET_OUTPUT, IDXGIDevice, IDXGIFactory2, IDXGISwapChain1,
+            Common::*, DXGI_ERROR_DEVICE_HUNG, DXGI_ERROR_DEVICE_REMOVED, DXGI_ERROR_DEVICE_RESET,
+            DXGI_ERROR_DRIVER_INTERNAL_ERROR, DXGI_SCALING_STRETCH, DXGI_SWAP_CHAIN_DESC1,
+            DXGI_SWAP_CHAIN_FLAG, DXGI_SWAP_EFFECT_FLIP_DISCARD, DXGI_USAGE_RENDER_TARGET_OUTPUT,
+            IDXGIDevice, IDXGIFactory2, IDXGISwapChain1,
         },
     },
     System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoUninitialize},
@@ -37,6 +39,8 @@ struct Layout {
     rect: [f64; 4],
     scale: f64,
     monitor_check: u64,
+    #[cfg(any(debug_assertions, feature = "devtools"))]
+    force_reset: bool,
     stopped: bool,
 }
 
@@ -49,7 +53,10 @@ pub(crate) struct VideoSurface {
 }
 
 impl VideoSurface {
-    pub(crate) fn attach(window: &gpui::Window, mpv: RenderHandle) -> Result<Self> {
+    pub(crate) fn attach(
+        window: &gpui::Window,
+        mpv: RenderHandle,
+    ) -> Result<(Self, UnboundedReceiver<()>)> {
         let hwnd = match HasWindowHandle::window_handle(window)
             .map_err(|e| anyhow!("{e:?}"))?
             .as_raw()
@@ -67,10 +74,13 @@ impl VideoSurface {
             rect: [0., 0., 1., 1.],
             scale,
             monitor_check: 0,
+            #[cfg(any(debug_assertions, feature = "devtools"))]
+            force_reset: false,
             stopped: false,
         }));
         let (wake, rx) = mpsc::sync_channel(1);
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+        let (reset_tx, reset_rx) = unbounded();
         let shared = layout.clone();
         let callback_wake = wake.clone();
         let worker = std::thread::Builder::new()
@@ -88,9 +98,21 @@ impl VideoSurface {
                         let mut renderer = Some(initial_renderer);
                         let mut current_monitor = initial_monitor;
                         let mut last_check_gen = 0u64;
-                        let mut device_resets = 0u8;
+                        let mut consecutive_resets = 0u8;
                         while rx.recv().is_ok() {
-                            let layout = *shared.lock().unwrap();
+                            let layout = {
+                                #[cfg(any(debug_assertions, feature = "devtools"))]
+                                {
+                                    let mut g = shared.lock().unwrap();
+                                    let s = *g;
+                                    g.force_reset = false;
+                                    s
+                                }
+                                #[cfg(not(any(debug_assertions, feature = "devtools")))]
+                                {
+                                    *shared.lock().unwrap()
+                                }
+                            };
                             if layout.stopped {
                                 break;
                             }
@@ -110,33 +132,65 @@ impl VideoSurface {
                             let Some(active) = renderer.as_mut() else {
                                 break;
                             };
-                            if let Err(e) = unsafe { active.draw(layout) } {
-                                if is_device_lost(&e) && device_resets < 2 {
-                                    device_resets += 1;
-                                    log::warn!(
-                                        "D3D11 device lost ({e:#}); recreating video surface (attempt {device_resets})"
-                                    );
-                                    renderer = None;
-                                    match unsafe {
-                                        Renderer::new(
-                                            raw_hwnd,
-                                            render_mpv.clone(),
-                                            callback_wake.clone(),
-                                        )
-                                    } {
-                                        Ok(rebuilt) => {
-                                            renderer = Some(rebuilt);
-                                            let _ = callback_wake.try_send(());
-                                            continue;
-                                        }
-                                        Err(re) => {
-                                            log::error!("recreating D3D11 surface failed: {re:#}");
-                                            break;
+                            let draw_res = {
+                                #[cfg(any(debug_assertions, feature = "devtools"))]
+                                if layout.force_reset {
+                                    Err(windows::core::Error::from(DXGI_ERROR_DEVICE_REMOVED)
+                                        .into())
+                                } else {
+                                    unsafe { active.draw(layout) }
+                                }
+                                #[cfg(not(any(debug_assertions, feature = "devtools")))]
+                                unsafe {
+                                    active.draw(layout)
+                                }
+                            };
+                            match draw_res {
+                                Ok(()) => {
+                                    consecutive_resets = 0;
+                                }
+                                Err(e) => {
+                                    if is_device_lost(&e, &active._device) && consecutive_resets < 4
+                                    {
+                                        consecutive_resets += 1;
+                                        log::warn!(
+                                            "D3D11 device lost ({e:#}); recreating video surface (attempt {consecutive_resets})"
+                                        );
+                                        let saved_vid = render_mpv.active_vid();
+                                        renderer = None;
+                                        std::thread::sleep(Duration::from_millis(50));
+                                        match unsafe {
+                                            Renderer::new(
+                                                raw_hwnd,
+                                                render_mpv.clone(),
+                                                callback_wake.clone(),
+                                            )
+                                        } {
+                                            Ok(rebuilt) => {
+                                                if let Ok(m) =
+                                                    update_display_profile(raw_hwnd, &render_mpv)
+                                                {
+                                                    current_monitor = m;
+                                                }
+                                                if let Some(vid) = saved_vid.as_deref() {
+                                                    let _ = render_mpv.restore_vid(vid);
+                                                }
+                                                let _ = reset_tx.unbounded_send(());
+                                                renderer = Some(rebuilt);
+                                                let _ = callback_wake.try_send(());
+                                                continue;
+                                            }
+                                            Err(re) => {
+                                                log::error!(
+                                                    "recreating D3D11 surface failed: {re:#}"
+                                                );
+                                                break;
+                                            }
                                         }
                                     }
+                                    log::error!("video rendering stopped: {e:#}");
+                                    break;
                                 }
-                                log::error!("video rendering stopped: {e:#}");
-                                break;
                             }
                         }
                         // Free the mpv render context here, before the application
@@ -155,13 +209,16 @@ impl VideoSurface {
             .recv()
             .context("video initialization thread ended")?
         {
-            Ok(()) => Ok(Self {
-                layout,
-                wake,
-                worker: Some(worker),
-                scale: Cell::new(scale),
-                last_monitor_check: Instant::now(),
-            }),
+            Ok(()) => Ok((
+                Self {
+                    layout,
+                    wake,
+                    worker: Some(worker),
+                    scale: Cell::new(scale),
+                    last_monitor_check: Instant::now(),
+                },
+                reset_rx,
+            )),
             Err(e) => {
                 let _ = worker.join();
                 Err(e)
@@ -171,6 +228,12 @@ impl VideoSurface {
 
     pub(crate) fn request_redraw(&self) {
         let _ = self.wake.try_send(());
+    }
+
+    #[cfg(any(debug_assertions, feature = "devtools"))]
+    pub(crate) fn debug_force_device_reset(&self) {
+        self.layout.lock().unwrap().force_reset = true;
+        self.request_redraw();
     }
 
     pub(crate) fn set_frame(&self, x: f64, y: f64, w: f64, h: f64) {
@@ -219,10 +282,19 @@ impl Drop for VideoSurface {
     }
 }
 
-fn is_device_lost(err: &anyhow::Error) -> bool {
+fn is_device_lost(err: &anyhow::Error, device: &ID3D11Device) -> bool {
+    if unsafe { device.GetDeviceRemovedReason() }.is_err() {
+        return true;
+    }
     err.downcast_ref::<windows::core::Error>().is_some_and(|e| {
         let code = e.code();
-        code == DXGI_ERROR_DEVICE_REMOVED || code == DXGI_ERROR_DEVICE_RESET
+        matches!(
+            code,
+            DXGI_ERROR_DEVICE_REMOVED
+                | DXGI_ERROR_DEVICE_RESET
+                | DXGI_ERROR_DEVICE_HUNG
+                | DXGI_ERROR_DRIVER_INTERNAL_ERROR
+        )
     })
 }
 

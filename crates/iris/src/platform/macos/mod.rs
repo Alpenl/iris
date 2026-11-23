@@ -438,6 +438,14 @@ pub(crate) fn begin_window_drag(window: &gpui::Window) {
     }
 }
 
+pub(crate) fn toggle_maximize(window: &gpui::Window) {
+    window.zoom_window();
+}
+
+pub(crate) fn titlebar_double_click(window: &gpui::Window) {
+    window.titlebar_double_click();
+}
+
 /// Debug tooling: feeds GPUI's view a synthetic mouse move (and optional left click)
 /// at `(x, y)` in GPUI's top-left window points.
 #[cfg(any(debug_assertions, feature = "devtools"))]

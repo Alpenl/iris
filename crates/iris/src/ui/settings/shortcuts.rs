@@ -14,15 +14,18 @@ use super::super::kit::form::{chip_button, segmented};
 use crate::platform::IS_MACOS;
 use crate::theme::{FONT_MONO, FONT_UI, ThemeTokens};
 
-fn context_short_label(ctx: &str) -> &'static str {
-    if ctx.contains("image") {
-        "看图"
-    } else if ctx.contains("video") {
-        "视频/音频"
-    } else if ctx.contains("Viewport") {
-        "视口"
-    } else {
-        "全局"
+fn scope_short_label(entry: &keymap::ActionEntry) -> &'static str {
+    let ctxs = entry.gpui_contexts(entry.default_key);
+    let has_v = ctxs.iter().any(|c| c.contains("video"));
+    let has_a = ctxs.iter().any(|c| c.contains("audio"));
+    let has_i = ctxs.iter().any(|c| c.contains("image"));
+    match (has_v, has_a, has_i) {
+        (true, false, true) => "视频/看图",
+        (true, true, false) => "视频/音频",
+        (true, false, false) => "视频",
+        (false, false, true) => "看图",
+        _ if entry.context.contains("Viewport") => "视口",
+        _ => "全局",
     }
 }
 
@@ -278,7 +281,7 @@ impl IrisWindow {
                             self.render_shortcut_recorder_row(
                                 entry.id.to_string(),
                                 entry.title.to_string(),
-                                Some(context_short_label(entry.context)),
+                                Some(scope_short_label(entry)),
                                 entry.context.to_string(),
                                 rec_str,
                                 t,

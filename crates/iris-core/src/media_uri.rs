@@ -223,13 +223,15 @@ impl MediaUri {
 
 impl From<PathBuf> for MediaUri {
     fn from(path: PathBuf) -> Self {
-        MediaUri::Local(path)
+        MediaUri::Local(crate::library::strip_windows_verbatim_disk(path))
     }
 }
 
 impl From<&Path> for MediaUri {
     fn from(path: &Path) -> Self {
-        MediaUri::Local(path.to_path_buf())
+        MediaUri::Local(crate::library::strip_windows_verbatim_disk(
+            path.to_path_buf(),
+        ))
     }
 }
 
@@ -283,19 +285,29 @@ mod tests {
 
     #[test]
     fn three_primitives_roundtrip_and_local_emits_file_uri() {
-        let local_abs = MediaUri::Local(PathBuf::from("/tmp/Iris Media/测试 #1 %20.mkv"));
+        #[cfg(windows)]
+        let abs_path = Path::new(r"C:\Iris Media\测试 #1 %20.mkv");
+        #[cfg(not(windows))]
+        let abs_path = Path::new("/tmp/Iris Media/测试 #1 %20.mkv");
+
+        let local_abs = MediaUri::from(abs_path);
         let local_str = local_abs.to_uri_string();
         assert!(
             local_str.starts_with("file:///"),
             "expected file:// URI, got {local_str}"
         );
-        assert_eq!(
-            local_abs.as_local_path(),
-            Some(Path::new("/tmp/Iris Media/测试 #1 %20.mkv"))
-        );
+        assert_eq!(local_abs.as_local_path(), Some(abs_path));
+
+        #[cfg(windows)]
+        {
+            let verbatim = MediaUri::from(PathBuf::from(r"\\?\C:\Iris Media\测试 #1 %20.mkv"));
+            assert_eq!(verbatim, local_abs);
+            assert_eq!(MediaUri::parse(&verbatim.to_uri_string()), local_abs);
+        }
 
         let cases = [
             local_abs,
+            MediaUri::Local(PathBuf::from("/tmp/Iris Media/测试 #1 %20.mkv")),
             MediaUri::Local(PathBuf::from("relative/folder/clip.mp4")),
             MediaUri::HttpUrl("https://cdn.example.com/stream/live.m3u8?k=1".into()),
             MediaUri::Plugin {

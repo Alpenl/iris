@@ -318,17 +318,41 @@ mod tests {
         assert_eq!(session.state().eq_brightness, 100);
         assert_eq!(session.state().eq_contrast, -100);
 
+        // Video mirror filters automatically switch AutoSafe -> auto-copy and restore auto-safe when cleared.
+        session.execute(Command::ToggleHFlip).unwrap();
+        assert!(session.state().hflip);
+        let wait_hwdec = |mpv: &Mpv, want: &str| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while std::time::Instant::now() < deadline {
+                if mpv.get_property_string("hwdec").ok().as_deref() == Some(want) {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            panic!(
+                "expected hwdec={want}, got {:?}",
+                mpv.get_property_string("hwdec")
+            );
+        };
+        wait_hwdec(&session.mpv, "auto-copy");
+        session.execute(Command::ToggleHFlip).unwrap();
+        assert!(!session.state().hflip);
+        wait_hwdec(&session.mpv, "auto-safe");
+
         session.shutdown();
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn loads_real_track_list_json_from_libmpv_if_test_media_present() {
-        let mkv =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../test-media/03-bars-scope-subs.mkv");
-        if !mkv.is_file() {
+        let media_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../test-media");
+        let mkv = ["03-bars-scope-subs.mkv", "02-tracks.mkv"]
+            .into_iter()
+            .map(|n| media_dir.join(n))
+            .find(|p| p.is_file());
+        let Some(mkv) = mkv else {
             return;
-        }
+        };
         let mut session = Session::new().unwrap();
         let prepared = prepare(&mkv, None).unwrap();
         session.open(prepared, 0.).unwrap();

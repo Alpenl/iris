@@ -532,7 +532,11 @@ mod tests {
         mpv.set_option("vo", "null")?;
         mpv.set_option("ao", "null")?;
         mpv.set_option("idle", "yes")?;
-        mpv.set_option("osc", "no")?;
+        match mpv.set_option("osc", "no") {
+            Ok(()) => {}
+            Err(e) if e.code == -5 => {}
+            Err(e) => return Err(e),
+        }
         mpv.set_option("config", "no")?;
         mpv.initialize()?;
 
