@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
+use mio::{Events, Interest, Poll, Token, Waker};
 use rustls_pki_types::ServerName;
 use url::{Host, Url};
 
@@ -23,7 +24,13 @@ fn address_kind(ip: IpAddr) -> AddressKind {
     match ip.to_canonical() {
         IpAddr::V4(v4) => {
             let [a, b, ..] = v4.octets();
-            if a == 0 || v4.is_link_local() || v4.is_multicast() || a >= 240 {
+            if a == 0
+                || v4.is_link_local()
+                || v4.is_multicast()
+                || a >= 240
+                || (a == 192 && b == 0 && v4.octets()[2] == 0)
+                || (a == 198 && (18..=19).contains(&b))
+            {
                 AddressKind::Forbidden
             } else if v4.is_loopback() {
                 AddressKind::Loopback
@@ -33,14 +40,32 @@ fn address_kind(ip: IpAddr) -> AddressKind {
                 AddressKind::Public
             }
         }
-        IpAddr::V6(v6)
-            if v6.is_unspecified() || v6.is_unicast_link_local() || v6.is_multicast() =>
-        {
-            AddressKind::Forbidden
+        IpAddr::V6(v6) => {
+            let parts = v6.segments();
+            if v6.is_unspecified()
+                || v6.is_unicast_link_local()
+                || v6.is_multicast()
+                || parts[0] & 0xffc0 == 0xfec0
+                || v6 == std::net::Ipv6Addr::new(0xfd00, 0xec2, 0, 0, 0, 0, 0, 0x254)
+            {
+                AddressKind::Forbidden
+            } else if v6.is_loopback() {
+                AddressKind::Loopback
+            } else if parts[..6] == [0; 6]
+                || parts[..6] == [0x64, 0xff9b, 0, 0, 0, 0]
+                || parts[..3] == [0x64, 0xff9b, 1]
+                || parts[0] == 0x2002
+                || parts[..2] == [0x2001, 0]
+            {
+                // Embedded destinations depend on tunnel configuration. Only
+                // canonical IPv4-mapped addresses have native IPv4 semantics.
+                AddressKind::Forbidden
+            } else if v6.is_unique_local() {
+                AddressKind::Private
+            } else {
+                AddressKind::Public
+            }
         }
-        IpAddr::V6(v6) if v6.is_loopback() => AddressKind::Loopback,
-        IpAddr::V6(v6) if v6.is_unique_local() => AddressKind::Private,
-        IpAddr::V6(_) => AddressKind::Public,
     }
 }
 
@@ -59,19 +84,22 @@ impl NetworkScope {
         }
     }
 
+    pub(crate) fn source(&self) -> &Url {
+        &self.source
+    }
+
     fn permits(&self, url: &Url, addr: SocketAddr) -> bool {
         let ip = addr.ip().to_canonical();
         match address_kind(ip) {
             AddressKind::Forbidden => false,
             AddressKind::Loopback if addr.port() < 1024 => false,
             AddressKind::Public => true,
-            AddressKind::Private if self.source.origin() != url.origin() => false,
             AddressKind::Private | AddressKind::Loopback => {
-                self.source.host() == url.host()
-                    && self.private_peers.get().map_or_else(
-                        || self.source.origin() == url.origin(),
-                        |peers| peers.contains(&ip),
-                    )
+                self.source.origin() == url.origin()
+                    && self
+                        .private_peers
+                        .get()
+                        .is_none_or(|peers| peers.contains(&ip))
             }
         }
     }
@@ -86,6 +114,7 @@ struct CancelState {
     cancelled: bool,
     next_id: u64,
     sockets: BTreeMap<u64, TcpStream>,
+    connects: BTreeMap<u64, Waker>,
 }
 
 impl HttpCancel {
@@ -94,6 +123,9 @@ impl HttpCancel {
         state.cancelled = true;
         for socket in state.sockets.values() {
             let _ = socket.shutdown(Shutdown::Both);
+        }
+        for wake in state.connects.values() {
+            let _ = wake.wake();
         }
     }
 
@@ -111,6 +143,16 @@ impl HttpCancel {
         state.sockets.insert(id, socket.try_clone()?);
         Ok(SocketRegistration(self.clone(), id))
     }
+    fn register_connect(&self, wake: Waker) -> Result<ConnectRegistration> {
+        let mut state = self.0.lock().unwrap();
+        if state.cancelled {
+            bail!("HTTP request cancelled");
+        }
+        state.next_id += 1;
+        let id = state.next_id;
+        state.connects.insert(id, wake);
+        Ok(ConnectRegistration(self.clone(), id))
+    }
 }
 
 pub(crate) struct SocketRegistration(HttpCancel, u64);
@@ -121,12 +163,21 @@ impl Drop for SocketRegistration {
     }
 }
 
+struct ConnectRegistration(HttpCancel, u64);
+
+impl Drop for ConnectRegistration {
+    fn drop(&mut self) {
+        self.0.0.lock().unwrap().connects.remove(&self.1);
+    }
+}
+
 fn is_loopback_url(url: &Url) -> bool {
     match url.host() {
         Some(Host::Ipv4(v4)) => v4.is_loopback(),
         Some(Host::Ipv6(v6)) => address_kind(IpAddr::V6(v6)) == AddressKind::Loopback,
         Some(Host::Domain(d)) => {
-            d.eq_ignore_ascii_case("localhost") || d.to_ascii_lowercase().ends_with(".localhost")
+            let d = d.trim_end_matches('.');
+            d == "localhost" || d.ends_with(".localhost")
         }
         None => false,
     }
@@ -279,43 +330,88 @@ pub(super) fn remaining_timeout(
     Ok(left)
 }
 
-// The OS resolver and blocking connect cannot be interrupted portably. Bound the
-// outstanding operations and release their caller immediately on cancellation.
-fn network_setup<T: Send + 'static>(
+type LookupResult = std::result::Result<Vec<IpAddr>, String>;
+type Lookup = Arc<(Mutex<Option<LookupResult>>, std::sync::Condvar)>;
+
+fn resolve_system(
+    host: &str,
     cancel: &HttpCancel,
     deadline: Option<Instant>,
-    work: impl FnOnce() -> io::Result<T> + Send + 'static,
-) -> Result<T> {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::mpsc::{RecvTimeoutError, sync_channel};
-    static ACTIVE: AtomicUsize = AtomicUsize::new(0);
-    struct Slot;
-    impl Drop for Slot {
-        fn drop(&mut self) {
-            ACTIVE.fetch_sub(1, Ordering::Relaxed);
+) -> Result<Vec<IpAddr>> {
+    // The platform resolver preserves the hosts file, split DNS, and Bonjour.
+    // Share one outstanding lookup per host and isolate its bounded workers
+    // from numeric-address playback and TCP connection setup.
+    static LOOKUPS: Mutex<BTreeMap<String, Lookup>> = Mutex::new(BTreeMap::new());
+    let end = Instant::now() + remaining_timeout(cancel, deadline, CONNECT_TIMEOUT)?;
+    let mut pending = LOOKUPS.lock().unwrap();
+    let lookup = if let Some(lookup) = pending.get(host) {
+        lookup.clone()
+    } else {
+        if pending.len() >= 8 {
+            bail!("system DNS lookup limit reached");
         }
-    }
-    let timeout = remaining_timeout(cancel, deadline, CONNECT_TIMEOUT)?;
-    let end = Instant::now() + timeout;
-    ACTIVE
-        .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-            (n < 32).then_some(n + 1)
-        })
-        .map_err(|_| anyhow!("HTTP connection setup limit reached"))?;
-    let slot = Slot;
-    let (tx, rx) = sync_channel(1);
-    std::thread::Builder::new()
-        .name("iris-http-connect".into())
-        .spawn(move || {
-            let _slot = slot;
-            let _ = tx.send(work());
-        })?;
+        let lookup = Arc::new((Mutex::new(None), std::sync::Condvar::new()));
+        let worker = lookup.clone();
+        let hostname = host.to_owned();
+        std::thread::Builder::new()
+            .name("iris-http-dns".into())
+            .spawn(move || {
+                let result = (hostname.as_str(), 0)
+                    .to_socket_addrs()
+                    .map(|addrs| addrs.map(|addr| addr.ip()).collect())
+                    .map_err(|err| err.to_string());
+                *worker.0.lock().unwrap() = Some(result);
+                worker.1.notify_all();
+                LOOKUPS.lock().unwrap().remove(&hostname);
+            })?;
+        pending.insert(host.to_owned(), lookup.clone());
+        lookup
+    };
+    drop(pending);
+
+    let mut result = lookup.0.lock().unwrap();
     loop {
         let left = remaining_timeout(cancel, Some(end), Duration::from_millis(50))?;
-        match rx.recv_timeout(left) {
-            Ok(result) => return Ok(result?),
-            Err(RecvTimeoutError::Timeout) => (),
-            Err(RecvTimeoutError::Disconnected) => bail!("HTTP setup interrupted"),
+        if let Some(result) = result.as_ref() {
+            return result
+                .clone()
+                .map_err(|err| anyhow!("system DNS lookup failed: {err}"));
+        }
+        result = lookup.1.wait_timeout(result, left).unwrap().0;
+    }
+}
+
+fn connect_tcp(
+    addr: SocketAddr,
+    cancel: &HttpCancel,
+    deadline: Option<Instant>,
+) -> Result<TcpStream> {
+    const SOCKET: Token = Token(0);
+    const CANCEL: Token = Token(1);
+    let end = Instant::now() + remaining_timeout(cancel, deadline, CONNECT_TIMEOUT)?;
+    let mut poll = Poll::new()?;
+    let _wake = cancel.register_connect(Waker::new(poll.registry(), CANCEL)?)?;
+    let mut socket = mio::net::TcpStream::connect(addr)?;
+    poll.registry()
+        .register(&mut socket, SOCKET, Interest::WRITABLE)?;
+    let mut events = Events::with_capacity(2);
+    loop {
+        let left = remaining_timeout(cancel, Some(end), CONNECT_TIMEOUT)?;
+        match poll.poll(&mut events, Some(left)) {
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+            other => other?,
+        }
+        remaining_timeout(cancel, Some(end), CONNECT_TIMEOUT)?;
+        if events.iter().any(|event| event.token() == SOCKET) {
+            if let Some(err) = socket.take_error()? {
+                return Err(err.into());
+            }
+            if socket.peer_addr().is_ok() {
+                poll.registry().deregister(&mut socket)?;
+                let tcp: TcpStream = socket.into();
+                tcp.set_nonblocking(false)?;
+                return Ok(tcp);
+            }
         }
     }
 }
@@ -335,22 +431,17 @@ pub(super) fn connect_transport(
     let addrs = if let Ok(ip) = host.parse::<IpAddr>() {
         vec![SocketAddr::new(ip, port)]
     } else {
-        let host = host.to_owned();
-        network_setup(cancel, deadline, move || {
-            (host.as_str(), port)
-                .to_socket_addrs()
-                .map(Iterator::collect)
-        })?
+        resolve_system(host, cancel, deadline)?
+            .into_iter()
+            .map(|ip| SocketAddr::new(ip, port))
+            .collect()
     };
     if addrs.is_empty() || addrs.iter().any(|&addr| !scope.permits(url, addr)) {
         bail!("blocked disallowed or empty HTTP destination");
     }
     let mut connected = None;
     for &addr in &addrs {
-        let timeout = remaining_timeout(cancel, deadline, CONNECT_TIMEOUT)?;
-        if let Ok(tcp) = network_setup(cancel, deadline, move || {
-            TcpStream::connect_timeout(&addr, timeout)
-        }) {
+        if let Ok(tcp) = connect_tcp(addr, cancel, deadline) {
             if scope.source.origin() == url.origin() {
                 scope.private_peers.get_or_init(|| {
                     let kind = address_kind(addr.ip());

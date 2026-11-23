@@ -212,47 +212,51 @@ impl IrisWindow {
         } else {
             self.settings.audio_device.trim()
         };
-        let devices: Vec<_> = session.audio_devices().into_iter().take(8).collect();
-        let device_rows = devices.into_iter().enumerate().map(|(i, dev)| {
-            let active = dev.name == cur_dev;
-            let dev_name = dev.name.clone();
-            let dev_label = if dev.name == "auto" {
-                "自动选择设备".to_string()
-            } else {
-                dev.description.clone()
-            };
-            let osd_label = dev_label.clone();
-            div()
-                .id(("audio-dev", i))
-                .h(px(26.))
-                .px(px(10.))
-                .flex()
-                .items_center()
-                .gap(px(8.))
-                .cursor_pointer()
-                .text_size(px(11.))
-                .when(active, |d| d.bg(t.selected).text_color(t.text))
-                .when(!active, |d| {
-                    d.text_color(t.text_muted)
-                        .hover(|s| s.bg(t.hover).text_color(t.text))
-                })
-                .child(
-                    div()
-                        .w(px(14.))
-                        .flex_none()
-                        .flex()
-                        .justify_center()
-                        .when(active, |d| d.child(icon(Icon::Check, 12., t.accent))),
-                )
-                .child(div().flex_1().min_w(px(0.)).truncate().child(dev_label))
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.settings.audio_device = dev_name.clone();
-                    this.persist_user_settings();
-                    this.command(Command::SetAudioDevice(dev_name.clone()), cx);
-                    this.overlays.popover = None;
-                    this.show_osd(format!("音频输出 · {osd_label}"), cx);
-                }))
-        });
+        let device_rows = session
+            .audio_devices()
+            .into_iter()
+            .enumerate()
+            .map(|(i, dev)| {
+                let active = dev.name == cur_dev;
+                let dev_name = dev.name.clone();
+                let dev_label = if dev.name == "auto" {
+                    "自动选择设备".to_string()
+                } else {
+                    dev.description.clone()
+                };
+                let osd_label = dev_label.clone();
+                div()
+                    .id(("audio-dev", i))
+                    .h(px(26.))
+                    .flex_none()
+                    .px(px(10.))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .cursor_pointer()
+                    .text_size(px(11.))
+                    .when(active, |d| d.bg(t.selected).text_color(t.text))
+                    .when(!active, |d| {
+                        d.text_color(t.text_muted)
+                            .hover(|s| s.bg(t.hover).text_color(t.text))
+                    })
+                    .child(
+                        div()
+                            .w(px(14.))
+                            .flex_none()
+                            .flex()
+                            .justify_center()
+                            .when(active, |d| d.child(icon(Icon::Check, 12., t.accent))),
+                    )
+                    .child(div().flex_1().min_w(px(0.)).truncate().child(dev_label))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.settings.audio_device = dev_name.clone();
+                        this.persist_user_settings();
+                        this.command(Command::SetAudioDevice(dev_name.clone()), cx);
+                        this.overlays.popover = None;
+                        this.show_osd(format!("音频输出 · {osd_label}"), cx);
+                    }))
+            });
 
         div()
             .w_full()

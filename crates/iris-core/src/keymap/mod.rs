@@ -12,6 +12,22 @@ use crate::fs_util;
 
 pub use catalog::{ACTIONS, ActionEntry, KeymapScheme, actions, find_action};
 
+/// Fixed application shortcuts shared by runtime registration and conflict detection.
+pub const RESERVED_SHORTCUTS: [(&str, &str, &str); 4] = [
+    ("secondary-i", "toggle_info", "媒体信息（固定快捷键）"),
+    (
+        "secondary-shift-p",
+        "open_palette",
+        "命令面板（固定快捷键）",
+    ),
+    ("escape", "exit_fullscreen", "退出全屏（固定快捷键）"),
+    (
+        "secondary-alt-shift-r",
+        "reset_appearance",
+        "恢复外观（固定快捷键）",
+    ),
+];
+
 /// Returns the user keymap JSON path (`IRIS_KEYMAP` override or `<data_dir>/keymap.json`).
 pub fn keymap_path() -> Option<PathBuf> {
     if let Some(p) = std::env::var_os("IRIS_KEYMAP") {
@@ -29,7 +45,7 @@ fn split_keystroke(spec: &str) -> Option<(Vec<&str>, &str)> {
         return Some((Vec::new(), "-"));
     }
     if let Some(prefix) = trimmed.strip_suffix("--") {
-        let mods: Vec<&str> = prefix.split('-').filter(|s| !s.is_empty()).collect();
+        let mods: Vec<&str> = prefix.split('-').collect();
         return Some((mods, "-"));
     }
     let mut parts: Vec<&str> = trimmed.split('-').collect();
@@ -37,40 +53,46 @@ fn split_keystroke(spec: &str) -> Option<(Vec<&str>, &str)> {
     (!key.is_empty()).then_some((parts, key))
 }
 
-fn has_primary_modifier_or_f1_f12(spec: &str) -> bool {
-    let Some((mods, raw_key)) = split_keystroke(spec) else {
-        return false;
-    };
-    mods.iter().any(|m| {
-        matches!(
-            m.to_ascii_lowercase().as_str(),
-            "secondary"
-                | "cmd"
-                | "command"
-                | "platform"
-                | "super"
-                | "meta"
-                | "win"
-                | "ctrl"
-                | "control"
-                | "alt"
-                | "option"
-        )
-    }) || raw_key
-        .to_ascii_lowercase()
-        .strip_prefix('f')
-        .and_then(|n| n.parse::<u8>().ok())
-        .is_some_and(|n| (1..=12).contains(&n))
+fn safe_while_typing(chord: &CanonicalChord, is_macos: bool) -> bool {
+    if chord.alt {
+        return false; // Option and AltGr can produce text, including dead keys.
+    }
+    let primary = if is_macos { chord.cmd } else { chord.ctrl };
+    if primary {
+        return !matches!(
+            chord.key.as_str(),
+            "a" | "c"
+                | "v"
+                | "x"
+                | "y"
+                | "z"
+                | "backspace"
+                | "delete"
+                | "left"
+                | "right"
+                | "up"
+                | "down"
+                | "home"
+                | "end"
+                | "insert"
+        );
+    }
+    !chord.cmd
+        && !chord.ctrl
+        && chord
+            .key
+            .strip_prefix('f')
+            .and_then(|n| n.parse::<u8>().ok())
+            .is_some_and(|n| (1..=12).contains(&n))
 }
 
-/// Resolves a declared GPUI `KeyContext` predicate for `keystroke`, enforcing the
-/// `!TextInput` firewall: any `"Workspace"` binding lacking `secondary-`/`cmd-`/`ctrl-`/`alt-`
-/// (and not `f1..f12`) is automatically guarded as `"Workspace && !TextInput"`.
+/// Resolves a GPUI predicate while preserving text entry, navigation, and editing chords.
 pub fn effective_gpui_context(declared_ctx: &str, keystroke: &str) -> Option<&'static str> {
-    split_keystroke(keystroke)?;
+    let is_macos = cfg!(target_os = "macos");
+    let chord = canonicalize_for_host(keystroke, is_macos)?;
     match declared_ctx.trim() {
         "Workspace" => {
-            if has_primary_modifier_or_f1_f12(keystroke) {
+            if safe_while_typing(&chord, is_macos) {
                 Some("Workspace")
             } else {
                 Some("Workspace && !TextInput")
@@ -85,8 +107,8 @@ pub fn effective_gpui_context(declared_ctx: &str, keystroke: &str) -> Option<&'s
     }
 }
 
-/// Converts raw GPUI key-down inputs into a normalized GPUI keystroke spec
-/// (e.g. `"alt-1"`, `"shift-g"`, `"cmd-p"`). Returns `None` for pure modifier keys.
+/// Converts a GPUI key-down to a portable shortcut, recording the native primary modifier
+/// as `secondary` and preserving the other physical modifiers.
 pub fn normalize_gpui_keystroke(
     key: &str,
     modifiers_cmd: bool,
@@ -94,42 +116,112 @@ pub fn normalize_gpui_keystroke(
     modifiers_alt: bool,
     modifiers_shift: bool,
 ) -> Option<String> {
-    let base = if key == " " {
-        "space".to_string()
-    } else {
-        key.trim().to_ascii_lowercase()
-    };
-    if base.is_empty() || base.chars().any(|c| c.is_whitespace() || c.is_control()) {
-        return None;
-    }
-    let normalized_key = match base.as_str() {
-        "shift" | "control" | "ctrl" | "alt" | "option" | "cmd" | "command" | "platform"
-        | "super" | "meta" | "win" | "capslock" | "fn" => return None,
-        "esc" => "escape",
-        "return" => "enter",
-        "pgup" => "pageup",
-        "pgdn" => "pagedown",
-        "del" => "delete",
-        "arrowleft" => "left",
-        "arrowright" => "right",
-        "arrowup" => "up",
-        "arrowdown" => "down",
-        other => other,
-    };
-
-    let mut parts = Vec::with_capacity(5);
-    for (on, name) in [
-        (modifiers_cmd, "cmd"),
-        (modifiers_ctrl, "ctrl"),
-        (modifiers_alt, "alt"),
-        (modifiers_shift, "shift"),
+    let is_macos = cfg!(target_os = "macos");
+    let key = if key == " " { "space" } else { key };
+    let mut spec = String::new();
+    for (on, prefix) in [
+        (
+            if is_macos {
+                modifiers_cmd
+            } else {
+                modifiers_ctrl
+            },
+            "secondary-",
+        ),
+        (modifiers_cmd && !is_macos, "cmd-"),
+        (modifiers_ctrl && is_macos, "ctrl-"),
+        (modifiers_alt, "alt-"),
+        (modifiers_shift, "shift-"),
     ] {
         if on {
-            parts.push(name);
+            spec.push_str(prefix);
         }
     }
-    parts.push(normalized_key);
-    Some(parts.join("-"))
+    spec.push_str(key);
+    canonical_binding(&spec)
+}
+
+fn normalize_key(raw: &str) -> Option<String> {
+    let base = raw.to_ascii_lowercase();
+    if base.is_empty()
+        || (base.contains('-') && base != "-")
+        || base.chars().any(|c| c.is_whitespace() || c.is_control())
+    {
+        return None;
+    }
+    Some(match base.as_str() {
+        "shift" | "control" | "ctrl" | "alt" | "option" | "cmd" | "command" | "platform"
+        | "super" | "meta" | "win" | "capslock" | "fn" | "function" | "secondary" => return None,
+        "esc" => "escape".into(),
+        "return" => "enter".into(),
+        "pgup" => "pageup".into(),
+        "pgdn" => "pagedown".into(),
+        "del" => "delete".into(),
+        "arrowleft" => "left".into(),
+        "arrowright" => "right".into(),
+        "arrowup" => "up".into(),
+        "arrowdown" => "down".into(),
+        _ => base,
+    })
+}
+
+/// Normalizes spelling and rejects malformed chords before handing them to GPUI.
+pub fn canonical_binding(spec: &str) -> Option<String> {
+    let (mods, raw_key) = split_keystroke(spec)?;
+    let (cmd, ctrl, alt, mut shift) = parse_mods(&mods, false)?;
+    let secondary = mods.iter().any(|m| m.eq_ignore_ascii_case("secondary"));
+    let explicit_ctrl = mods
+        .iter()
+        .any(|m| m.eq_ignore_ascii_case("ctrl") || m.eq_ignore_ascii_case("control"));
+    let key = normalize_key(raw_key)?;
+    shift |= raw_key.len() == 1 && raw_key.as_bytes()[0].is_ascii_uppercase();
+    // GPUI's platform keystrokes can encode shifted punctuation by its resulting glyph.
+    let shifted_glyph = shift.then(|| shifted_punctuation(&key)).flatten();
+    let key = if let Some(glyph) = shifted_glyph {
+        shift = false;
+        glyph
+    } else if shift && SHIFTED_PUNCTUATION.contains(key.as_str()) {
+        shift = false;
+        &key
+    } else {
+        &key
+    };
+    let mut out = String::with_capacity(spec.len());
+    for (on, prefix) in [
+        (secondary, "secondary-"),
+        (cmd, "cmd-"),
+        (ctrl && explicit_ctrl, "ctrl-"),
+        (alt, "alt-"),
+        (shift, "shift-"),
+    ] {
+        if on {
+            out.push_str(prefix);
+        }
+    }
+    out.push_str(key);
+    Some(out)
+}
+
+const SHIFTED_PUNCTUATION: &str = "~!@#$%^&*()_+{}|:\"<>?";
+
+fn shifted_punctuation(key: &str) -> Option<&'static str> {
+    if key.len() != 1 {
+        return None;
+    }
+    let i = "`1234567890-=[]\\;',./".find(key)?;
+    SHIFTED_PUNCTUATION.get(i..i + 1)
+}
+
+/// Whether a chord is owned by an invariant application shortcut on this platform.
+pub fn reserved_shortcut(keystroke: &str) -> Option<(&'static str, &'static str)> {
+    reserved_for_os(keystroke, cfg!(target_os = "macos"))
+}
+
+fn reserved_for_os(keystroke: &str, is_macos: bool) -> Option<(&'static str, &'static str)> {
+    let needle = canonicalize_for_host(keystroke, is_macos)?;
+    RESERVED_SHORTCUTS.into_iter().find_map(|(key, id, title)| {
+        (canonicalize_for_host(key, is_macos).as_ref() == Some(&needle)).then_some((id, title))
+    })
 }
 
 fn parse_mods(mods: &[&str], is_macos: bool) -> Option<(bool, bool, bool, bool)> {
@@ -150,9 +242,10 @@ fn parse_mods(mods: &[&str], is_macos: bool) -> Option<(bool, bool, bool, bool)>
 
 /// Formats a GPUI keystroke string for UI badges and menus.
 pub fn format_keystroke_display(spec: &str, is_macos: bool) -> String {
-    let Some((mods, raw_key)) = split_keystroke(spec) else {
+    let Some(normalized) = canonical_binding(spec) else {
         return String::new();
     };
+    let (mods, raw_key) = split_keystroke(&normalized).expect("canonical binding has a key");
     let (has_cmd, has_ctrl, has_alt, has_shift) =
         parse_mods(&mods, is_macos).unwrap_or((false, false, false, false));
     let key_lower = raw_key.to_ascii_lowercase();
@@ -219,16 +312,10 @@ struct CanonicalChord {
 }
 
 fn canonicalize_for_host(spec: &str, is_macos: bool) -> Option<CanonicalChord> {
-    let (mods, raw_key) = split_keystroke(spec)?;
+    let normalized = canonical_binding(spec)?;
+    let (mods, raw_key) = split_keystroke(&normalized)?;
     let (cmd, ctrl, alt, shift) = parse_mods(&mods, is_macos)?;
-    let key = match raw_key.to_ascii_lowercase().as_str() {
-        "esc" => "escape".into(),
-        "return" => "enter".into(),
-        "pgup" => "pageup".into(),
-        "pgdn" => "pagedown".into(),
-        "del" => "delete".into(),
-        other => other.to_string(),
-    };
+    let key = raw_key.to_string();
     Some(CanonicalChord {
         cmd,
         ctrl,
@@ -346,12 +433,16 @@ impl Keymap {
         if target.is_empty() {
             return;
         }
-        let clean: String = keystroke
-            .chars()
-            .filter(|c| !c.is_control())
-            .collect::<String>()
-            .trim()
-            .to_string();
+        let clean = if keystroke.trim().is_empty() {
+            String::new()
+        } else if let Some(spec) = canonical_binding(&keystroke) {
+            if reserved_shortcut(&spec).is_some() {
+                return;
+            }
+            spec
+        } else {
+            return;
+        };
         if clean.is_empty() && find_action(target).is_none() {
             self.overrides.remove(target);
         } else {
@@ -410,6 +501,9 @@ impl Keymap {
         is_macos: bool,
     ) -> Option<String> {
         let needle = canonicalize_for_host(keystroke, is_macos)?;
+        if let Some((_, title)) = reserved_for_os(keystroke, is_macos) {
+            return Some(title.into());
+        }
         let target_mask = if let Some(entry) = find_action(ignore_id) {
             if context.trim().is_empty() {
                 scope_mask_for_action(entry)
@@ -469,7 +563,10 @@ mod tests {
                         km.find_conflict_for_os(entry.context, &key, entry.id, is_macos),
                         None
                     );
-                    if !has_primary_modifier_or_f1_f12(&key) {
+                    if !safe_while_typing(
+                        &canonicalize_for_host(&key, cfg!(target_os = "macos")).unwrap(),
+                        cfg!(target_os = "macos"),
+                    ) {
                         for &ctx in entry.gpui_contexts(&key) {
                             assert_ne!(ctx, "Workspace", "bare Workspace leak on {key}");
                         }
@@ -482,18 +579,72 @@ mod tests {
             }
         }
         assert_eq!(effective_gpui_context("Workspace", ""), None);
-        for single in ["q", "s", "shift-g", "space", "tab", "1", "-", "f13"] {
+        for single in [
+            "q",
+            "s",
+            "shift-g",
+            "space",
+            "tab",
+            "1",
+            "-",
+            "f13",
+            "alt-w",
+            "secondary-v",
+            "secondary-shift-left",
+        ] {
             assert_eq!(
                 effective_gpui_context("Workspace", single),
                 Some("Workspace && !TextInput")
             );
         }
-        for chord in ["secondary-p", "cmd-q", "ctrl-o", "alt-w", "f1", "f5", "f12"] {
+        for chord in [
+            "secondary-p",
+            "secondary-q",
+            "secondary-o",
+            "secondary-,",
+            "f1",
+            "f5",
+            "f12",
+        ] {
             assert_eq!(
                 effective_gpui_context("Workspace", chord),
                 Some("Workspace")
             );
         }
+    }
+
+    #[test]
+    fn reserved_and_equivalent_chords_are_detected_on_both_hosts() {
+        let km = Keymap::default();
+        assert_eq!(canonical_binding("ctrl--a"), None);
+        assert_eq!(canonical_binding("ctrl---"), None);
+        assert_eq!(canonical_binding("control--").as_deref(), Some("ctrl--"));
+        for (is_macos, primary) in [(true, "cmd"), (false, "ctrl")] {
+            for (key, action, _) in RESERVED_SHORTCUTS {
+                let physical = key.replace("secondary", primary);
+                assert_eq!(
+                    reserved_for_os(&physical, is_macos).map(|(id, _)| id),
+                    Some(action)
+                );
+                assert!(
+                    km.find_conflict_for_os("Viewport", &physical, "zoom_in", is_macos)
+                        .is_some()
+                );
+            }
+            assert_eq!(
+                canonicalize_for_host("shift-,", is_macos),
+                canonicalize_for_host("<", is_macos)
+            );
+            assert_eq!(
+                canonicalize_for_host("arrowleft", is_macos),
+                canonicalize_for_host("left", is_macos)
+            );
+        }
+        let mac = cfg!(target_os = "macos");
+        assert_eq!(
+            normalize_gpui_keystroke("p", mac, !mac, false, true).as_deref(),
+            Some("secondary-shift-p")
+        );
     }
 
     #[test]

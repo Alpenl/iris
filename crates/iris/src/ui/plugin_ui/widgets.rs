@@ -40,23 +40,34 @@ fn step_clamped(cur: f64, delta: f64, min: f64, max: f64) -> f64 {
 }
 
 fn sanitize_range(value: f64, min: f64, max: f64, step: f64) -> (f64, f64, f64, f64) {
-    let lo = if min.is_finite() { min } else { 0.0 };
-    let hi = if max.is_finite() && max > lo {
-        max
+    const LIMIT: f64 = 1e9;
+    let lo = if min.is_finite() {
+        min.clamp(-LIMIT, LIMIT)
     } else {
-        lo + 100.0
+        0.
+    };
+    let hi = max.clamp(-LIMIT, LIMIT);
+    let (lo, hi) = if hi.is_finite() && hi > lo {
+        (lo, hi)
+    } else if lo <= LIMIT - 100. {
+        (lo, lo + 100.)
+    } else {
+        (LIMIT - 100., LIMIT)
     };
     let st = if step.is_finite() && step.abs() > 1e-6 {
-        step.abs()
+        step.abs().min(LIMIT)
     } else {
         1.0
     };
-    let fb = if value.is_finite() {
+    (lo, hi, st, finite_value(value, lo, hi, lo))
+}
+
+fn finite_value(value: f64, lo: f64, hi: f64, fallback: f64) -> f64 {
+    if value.is_finite() {
         value.clamp(lo, hi)
     } else {
-        lo
-    };
-    (lo, hi, st, fb)
+        fallback
+    }
 }
 
 fn txt(s: impl Into<SharedString>, size: f32, col: Rgba) -> Div {
@@ -225,7 +236,7 @@ pub(super) fn render_plugin_widget(
         WidgetSurface::Sidebar => None,
     };
 
-    match widget {
+    let content = match widget {
         Widget::Label { text, muted, mono } => {
             txt(text, 11., if muted { t.text_dim } else { t.text })
                 .font_family(if mono { FONT_MONO } else { FONT_UI })
@@ -276,8 +287,7 @@ pub(super) fn render_plugin_widget(
                 .as_ref()
                 .and_then(|k| win.text_inputs.form_fields.get(k))
                 .and_then(|s| s.text().trim().parse::<f64>().ok())
-                .unwrap_or(fallback)
-                .clamp(lo, hi);
+                .map_or(fallback, |v| finite_value(v, lo, hi, fallback));
             let ratio = ((cur_val - lo) / (hi - lo)).clamp(0.0, 1.0) as f32;
             let val_str = format_slider_value(cur_val, st);
             let readout = unit
@@ -289,8 +299,7 @@ pub(super) fn render_plugin_widget(
                     .as_deref()
                     .and_then(|k| this.text_inputs.form_fields.get(k))
                     .and_then(|s| s.text().trim().parse::<f64>().ok())
-                    .unwrap_or(cur_val)
-                    .clamp(lo, hi);
+                    .map_or(cur_val, |v| finite_value(v, lo, hi, cur_val));
                 let next_s = format_slider_value(step_clamped(base, delta, lo, hi), st);
                 let target = (&pid_owned[..], &id[..], Some(&action_id[..]), mk.as_deref());
                 dispatch_widget_value(this, target, next_s, w, cx);
@@ -333,29 +342,19 @@ pub(super) fn render_plugin_widget(
         }))
         .into_any_element(),
 
-        Widget::ButtonGroup { buttons } => {
-            div()
-                .flex()
-                .flex_wrap()
-                .gap(px(4.))
-                .children(buttons.into_iter().enumerate().map(|(bi, btn)| {
-                    let (pid_b, act) = (pid_owned.clone(), btn.action_id);
-                    let g = btn.icon.as_deref().and_then(Icon::from_name);
-                    icon_pill_button(
-                        ("pl-gbtn", base_id * 32 + bi),
-                        btn.label,
-                        g,
-                        btn.accent,
-                        24.,
-                        rest_bg,
-                        t,
-                    )
+        Widget::ButtonGroup { buttons } => div()
+            .flex()
+            .flex_wrap()
+            .gap(px(4.))
+            .children(buttons.into_iter().enumerate().map(|(bi, btn)| {
+                let (pid_b, act) = (pid_owned.clone(), btn.action_id);
+                let g = btn.icon.as_deref().and_then(Icon::from_name);
+                icon_pill_button(("pl-gbtn", bi), btn.label, g, btn.accent, 24., rest_bg, t)
                     .on_click(cx.listener(move |this, _, w, cx| {
                         this.invoke_plugin_action(&pid_b, &act, w, cx)
                     }))
-                }))
-                .into_any_element()
-        }
+            }))
+            .into_any_element(),
 
         Widget::Input {
             id,
@@ -482,7 +481,7 @@ pub(super) fn render_plugin_widget(
             });
             let chips = options.into_iter().enumerate().map(|(oi, opt)| {
                 let (cb, val) = (on_sel.clone(), opt.value);
-                chip_button(("pl-sel", base_id * 32 + oi), opt.label, val == cur_sel, t)
+                chip_button(("pl-sel", oi), opt.label, val == cur_sel, t)
                     .h(px(if is_modal { 26. } else { 24. }))
                     .on_click(cx.listener(move |this, _, w, cx| cb(this, val.clone(), w, cx)))
             });
@@ -571,5 +570,30 @@ pub(super) fn render_plugin_widget(
             .my(px(2.))
             .bg(t.line)
             .into_any_element(),
+    };
+    div()
+        .id(("plugin-widget", base_id))
+        .child(content)
+        .into_any_element()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{finite_value, sanitize_range, step_clamped};
+
+    #[test]
+    fn slider_extreme_ranges_and_invalid_drafts_stay_finite() {
+        for (min, max) in [
+            (-1e308, 1e308),
+            (1e308, 1e308),
+            (f64::NAN, f64::NAN),
+            (100., -100.),
+        ] {
+            let (lo, hi, step, value) = sanitize_range(1e308, min, max, 1e308);
+            assert!(lo < hi && lo.abs() <= 1e9 && hi.abs() <= 1e9);
+            assert!((0. ..=1.).contains(&((value - lo) / (hi - lo))));
+            assert_eq!(finite_value(f64::NAN, lo, hi, value), value);
+            assert!((lo..=hi).contains(&step_clamped(value, step, lo, hi)));
+        }
     }
 }

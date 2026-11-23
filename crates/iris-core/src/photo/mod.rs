@@ -34,26 +34,47 @@ pub struct Photo {
     pub colour: Option<Colour>,
     /// Stored pixel size, before any rotation.
     pub size: Option<(u32, u32)>,
-    /// HEIF only (mpv handles JPEG EXIF itself). Applied as: mirror first, then rotate CW.
+    /// HEIF only. Applied as: mirror in source space, then rotate clockwise.
     pub mirror: Option<Mirror>,
     pub rotate_cw: u16,
+    /// EXIF value before decoder-owned orientation is applied.
+    pub exif_orientation: Option<u16>,
+    pub(crate) heif: bool,
     pub exif: Option<ExifSummary>,
 }
 
 impl Photo {
-    /// Video filter chain with an optional extra clockwise rotation (`0/90/180/270`).
-    pub(crate) fn vf_chain(&self, extra_rotate_cw: u16) -> Option<String> {
-        self.vf_chain_with_transforms(extra_rotate_cw, false, false)
+    pub fn is_heif(&self) -> bool {
+        self.heif
     }
 
-    /// Video filter chain combining optional user `hflip`/`vflip` (in upright image space)
-    /// and extra clockwise rotation while keeping `format=primaries=...:gamma=...:rotate=...`
-    /// at the tail so `lavfi` mirror filters never strip wide-gamut or rotation metadata.
+    /// Clockwise orientation of the displayed photo, before user rotation.
+    pub fn display_rotation(&self) -> u16 {
+        if self.is_heif() {
+            self.rotate_cw
+        } else {
+            match self.exif_orientation {
+                Some(3 | 4) => 180,
+                Some(5 | 6) => 90,
+                Some(7 | 8) => 270,
+                _ => 0,
+            }
+        }
+    }
+
+    /// Video filter chain with an optional extra clockwise rotation (`0/90/180/270`).
+    pub(crate) fn vf_chain(&self, extra_rotate_cw: u16) -> Option<String> {
+        self.vf_chain_with_transforms(extra_rotate_cw, false, false, self.is_heif())
+    }
+
+    /// Combines user flips expressed in source space with a HEIF source mirror.
+    /// Keep the format filter last so the mirror filters cannot strip colour metadata.
     pub(crate) fn vf_chain_with_transforms(
         &self,
         extra_rotate_cw: u16,
         extra_hflip: bool,
         extra_vflip: bool,
+        set_filter_rotation: bool,
     ) -> Option<String> {
         let mut vf = Vec::new();
         if let Some((w, h)) = self.size
@@ -65,13 +86,8 @@ impl Photo {
                 format!("scale=w=-2:h={MAX_SIDE}")
             });
         }
-        let (pre_h, pre_v) = if self.rotate_cw.is_multiple_of(180) {
-            (extra_hflip, extra_vflip)
-        } else {
-            (extra_vflip, extra_hflip)
-        };
-        let net_hflip = (self.mirror == Some(Mirror::Horizontal)) ^ pre_h;
-        let net_vflip = (self.mirror == Some(Mirror::Vertical)) ^ pre_v;
+        let net_hflip = (self.mirror == Some(Mirror::Horizontal)) ^ extra_hflip;
+        let net_vflip = (self.mirror == Some(Mirror::Vertical)) ^ extra_vflip;
         if net_hflip {
             vf.push("hflip".into());
         }
@@ -80,8 +96,8 @@ impl Photo {
         }
         let colour = self.colour.and_then(|c| c.mpv_format());
         let mut format: Vec<String> = colour.into_iter().collect();
-        let rot = (self.rotate_cw + extra_rotate_cw) % 360;
-        if rot != 0 {
+        let rot = (self.rotate_cw + extra_rotate_cw % 360) % 360;
+        if set_filter_rotation && (rot != 0 || self.rotate_cw != 0) {
             format.push(format!("rotate={rot}"));
         }
         if !format.is_empty() {
@@ -103,7 +119,7 @@ impl Photo {
     }
 }
 
-fn finish_header(h: Header) -> Photo {
+fn finish_header(h: Header, fmt: PhotoFormat) -> Photo {
     let colour = match h.colour {
         Some(ColourTag::Icc(raw)) => icc::classify_icc(&raw),
         Some(ColourTag::Nclx {
@@ -117,6 +133,8 @@ fn finish_header(h: Header) -> Photo {
         size: h.size,
         mirror: h.mirror,
         rotate_cw: h.rotate_cw,
+        exif_orientation: h.exif_orientation,
+        heif: fmt == PhotoFormat::Heif,
         exif: h.exif.filter(|e| !e.is_empty()),
     }
 }
@@ -169,7 +187,7 @@ pub fn probe(path: &Path) -> Photo {
     let Some(fmt) = detect_photo_format(prefix, hint) else {
         return Photo::default();
     };
-    finish_header(run_probe(&mut r, fmt))
+    finish_header(run_probe(&mut r, fmt), fmt)
 }
 
 /// Probes a photo header from in-memory bytes (e.g. a Range fetch of a remote photo),
@@ -178,7 +196,7 @@ pub fn probe_bytes(bytes: &[u8], name_or_ext_hint: Option<&str>) -> Photo {
     let Some(fmt) = detect_photo_format(bytes, name_or_ext_hint) else {
         return Photo::default();
     };
-    finish_header(run_probe(&mut Cursor::new(bytes), fmt))
+    finish_header(run_probe(&mut Cursor::new(bytes), fmt), fmt)
 }
 
 #[cfg(test)]
@@ -232,6 +250,7 @@ mod tests {
             }),
             size: Some((4000, 40000)),
             rotate_cw: 90,
+            heif: true,
             ..Default::default()
         };
         assert_eq!(
@@ -254,9 +273,11 @@ mod tests {
         containers::add_mirror(&mut h, Mirror::Vertical);
         assert_eq!((h.mirror, h.rotate_cw), (None, 270));
 
-        // User mirror on a wide-gamut portrait HEIF commutes before `rotate=90` and preserves P3 format tail.
+        // A source-space vertical flip preserves the P3 format tail.
         assert_eq!(
-            portrait.vf_chain_with_transforms(0, true, false).as_deref(),
+            portrait
+                .vf_chain_with_transforms(0, false, true, true)
+                .as_deref(),
             Some("scale=w=-2:h=8192,vflip,format=primaries=display-p3:gamma=srgb:rotate=90")
         );
         let p3_png = Photo {
@@ -268,7 +289,9 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            p3_png.vf_chain_with_transforms(0, true, false).as_deref(),
+            p3_png
+                .vf_chain_with_transforms(0, true, false, false)
+                .as_deref(),
             Some("hflip,format=primaries=display-p3:gamma=srgb")
         );
     }
@@ -304,6 +327,7 @@ mod tests {
         let disguised = dir.join("extensionless_jpeg");
         std::fs::write(&disguised, &jpeg_bytes).unwrap();
         assert_eq!(exif_orientation(&disguised), 6);
+        assert_eq!(probe(&disguised).display_rotation(), 90);
         assert_eq!(probe(&disguised).size, Some((4000, 3000)));
         assert_eq!(probe_bytes(&jpeg_bytes, None).size, Some((4000, 3000)));
 

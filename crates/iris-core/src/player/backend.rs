@@ -1,8 +1,10 @@
 //! Hardened `libmpv` instance initialization, property observation, event pump,
 //! and backend command/filter execution on [`Session`].
 
-use std::path::Path;
-use std::sync::Arc;
+use std::cell::Cell;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, Weak};
+use std::thread::{self, JoinHandle};
 
 use anyhow::Result;
 use futures::channel::mpsc::{UnboundedReceiver, unbounded};
@@ -12,7 +14,11 @@ use crate::library::Kind;
 use crate::settings::{Hwdec, OnEof, Settings, SubLang};
 
 use super::Session;
-use super::model::{AspectMode, Command, SessionEvent};
+use super::model::{AspectMode, Command, MAX_SPEED, MIN_SPEED, SessionEvent, SessionUpdate};
+use super::relay::Service;
+
+const HOOK_LOAD: u64 = 1;
+const HOOK_PRELOADED: u64 = 2;
 
 pub(super) mod prop {
     pub const TIME_POS: u64 = 1;
@@ -36,6 +42,7 @@ pub(super) mod prop {
     pub const CHAPTER_COUNT: u64 = 19;
     pub const PAUSED_FOR_CACHE: u64 = 20;
     pub const CACHE_DURATION: u64 = 21;
+    pub const SOURCE_ROTATION: u64 = 22;
 }
 
 pub(super) fn create() -> Result<Arc<Mpv>> {
@@ -49,7 +56,9 @@ pub(super) fn create() -> Result<Arc<Mpv>> {
         ("input-default-bindings", "no"),
         ("input-vo-keyboard", "no"),
         ("config", "no"),
+        ("volume-max", "100"),
         ("terminal", "no"),
+        ("access-references", "no"),
         ("sub-auto", "fuzzy"),
         (
             "slang",
@@ -105,46 +114,176 @@ pub(super) fn create() -> Result<Arc<Mpv>> {
             "demuxer-cache-duration",
             Format::Double,
         ),
+        (
+            prop::SOURCE_ROTATION,
+            "video-dec-params/rotate",
+            Format::Int,
+        ),
     ] {
         mpv.observe_property(id, name, format)?;
     }
+    mpv.add_hook(HOOK_LOAD, "on_load")?;
+    mpv.add_hook(HOOK_PRELOADED, "on_preloaded")?;
     Ok(Arc::new(mpv))
 }
 
-pub(super) fn spawn_event_pump(mpv: Arc<Mpv>) -> UnboundedReceiver<SessionEvent> {
+pub(super) struct EventPump {
+    done: Arc<AtomicBool>,
+    relay: Arc<Mutex<Weak<Service>>>,
+    thread: Cell<Option<JoinHandle<()>>>,
+}
+
+impl EventPump {
+    pub(super) fn set_relay(&self, relay: Weak<Service>) -> Weak<Service> {
+        std::mem::replace(&mut *self.relay.lock().unwrap(), relay)
+    }
+
+    pub(super) fn stop(&self, mpv: &Mpv) {
+        if let Some(thread) = self.thread.take() {
+            // Continue any in-flight load hook until mpv acknowledges quit.
+            if mpv.command_async(&["quit"]).is_err() {
+                self.done.store(true, Ordering::Release);
+                mpv.wakeup();
+            }
+            let _ = thread.join();
+        }
+    }
+}
+
+pub(super) fn spawn_event_pump(
+    mpv: Arc<Mpv>,
+) -> Result<(EventPump, UnboundedReceiver<SessionUpdate>)> {
     let (tx, rx) = unbounded();
-    std::thread::Builder::new()
+    let done = Arc::new(AtomicBool::new(false));
+    let stopped = done.clone();
+    let relay = Arc::new(Mutex::new(Weak::<Service>::new()));
+    let source = relay.clone();
+    let thread = thread::Builder::new()
         .name("iris-mpv-events".into())
         .spawn(move || {
-            loop {
-                match mpv.wait_event(-1.0) {
-                    Some(Event::Shutdown) => break,
-                    Some(Event::Log {
+            let mut playing = None;
+            let mut hls = false;
+            while !stopped.load(Ordering::Acquire) {
+                let Some(raw) = mpv.wait_event(-1.0) else {
+                    continue;
+                };
+                let scope = match &raw {
+                    Event::Shutdown => break,
+                    Event::StartFile(id) => {
+                        hls = false;
+                        playing = Some(*id);
+                        continue;
+                    }
+                    Event::EndFile {
+                        playlist_entry_id, ..
+                    } => {
+                        if playing == Some(*playlist_entry_id) {
+                            playing = None;
+                        }
+                        Some(*playlist_entry_id)
+                    }
+                    Event::Hook { userdata, id } => {
+                        match *userdata {
+                            HOOK_LOAD => {
+                                let service = source.lock().unwrap().upgrade();
+                                if let Some(service) = service {
+                                    match enable_hls(&mpv, &service) {
+                                        Ok(prepared) => hls = prepared,
+                                        Err(_) => {
+                                            let _ = disable_hls(&mpv);
+                                            log::warn!("could not prepare scoped HLS playback");
+                                        }
+                                    }
+                                }
+                            }
+                            HOOK_PRELOADED if hls => {
+                                // The HLS demuxer captures its open policy. Future
+                                // attachments must see the restrictive defaults.
+                                if disable_hls(&mpv).is_err() {
+                                    log::error!("could not restore mpv reference policy");
+                                    let _ = mpv.command_async(&["stop"]);
+                                }
+                                hls = false;
+                            }
+                            _ => (),
+                        }
+                        let _ = mpv.continue_hook(*id);
+                        continue;
+                    }
+                    Event::QueueOverflow => {
+                        playing = None;
+                        log::warn!("mpv event queue overflow; waiting for a new file boundary");
+                        continue;
+                    }
+                    Event::Log {
                         prefix,
                         level,
                         text,
-                    }) => {
-                        // Demuxers include stream URLs and relative signed paths in errors.
+                    } => {
                         let detail = if text.contains("://") || text.contains('?') {
                             "media URL omitted"
                         } else {
                             text.trim_end()
                         };
                         log::warn!(target: "iris::mpv", "{prefix}/{level}: {detail}");
+                        continue;
                     }
-                    Some(ev) => {
-                        if let Some(event) = SessionEvent::from_backend(ev)
-                            && tx.unbounded_send(event).is_err()
-                        {
-                            break;
-                        }
+                    Event::PropertyChange { id, .. }
+                        if matches!(
+                            *id,
+                            prop::VOLUME | prop::MUTE | prop::SPEED | prop::SUB_VISIBLE
+                        ) =>
+                    {
+                        None
                     }
-                    None => {}
+                    _ => match playing {
+                        Some(id) => Some(id),
+                        None => continue,
+                    },
+                };
+                if let Some(event) = SessionEvent::from_backend(raw) {
+                    let _ = tx.unbounded_send(SessionUpdate {
+                        playlist_entry_id: scope,
+                        event,
+                    });
                 }
             }
-        })
-        .expect("spawn mpv event thread");
-    rx
+        })?;
+    Ok((
+        EventPump {
+            done,
+            relay,
+            thread: Cell::new(Some(thread)),
+        },
+        rx,
+    ))
+}
+
+fn enable_hls(mpv: &Mpv, service: &Service) -> Result<bool> {
+    let path = mpv.get_property_string("stream-open-filename")?;
+    let Some(playlist) = service.playlist_url(&path)? else {
+        return Ok(false);
+    };
+    const PROTOCOLS: &str = "http,tcp,crypto";
+    const FORMATS: &str = "hls,mpegts,mov,aac,ac3,eac3,mp3,webvtt";
+    let options = format!(
+        "protocol_whitelist=%{}%{PROTOCOLS},format_whitelist=%{}%{FORMATS}",
+        PROTOCOLS.len(),
+        FORMATS.len()
+    );
+    mpv.set_property_string("file-local-options/demuxer", "lavf")?;
+    mpv.set_property_string("file-local-options/demuxer-lavf-format", "hls")?;
+    mpv.set_property_string("file-local-options/demuxer-lavf-o", &options)?;
+    mpv.set_property_string("stream-open-filename", &playlist)?;
+    mpv.set_property_string("file-local-options/access-references", "yes")?;
+    Ok(true)
+}
+
+fn disable_hls(mpv: &Mpv) -> Result<()> {
+    mpv.set_property_string("file-local-options/access-references", "no")?;
+    mpv.set_property_string("file-local-options/demuxer-lavf-format", "")?;
+    mpv.set_property_string("file-local-options/demuxer-lavf-o", "")?;
+    Ok(())
 }
 
 impl SessionEvent {
@@ -170,6 +309,7 @@ impl SessionEvent {
                 (prop::AUDIO, Value::Str(v)) => Self::Audio(v),
                 (prop::AUDIO, Value::None) => Self::Audio(String::new()),
                 (prop::ROTATION, Value::Int(v)) => Self::Rotation(v),
+                (prop::SOURCE_ROTATION, Value::Int(v)) => Self::SourceRotation(v),
                 (prop::TRACK_COUNT, Value::Int(_)) => Self::TracksChanged,
                 (prop::LOOP_FILE, Value::Str(v)) => Self::LoopFile(v == "inf" || v == "yes"),
                 (prop::CHAPTER, Value::Int(v)) => Self::Chapter(v),
@@ -186,6 +326,7 @@ impl SessionEvent {
             Event::EndFile {
                 reason: iris_mpv::EndReason::Error,
                 error,
+                ..
             } => Self::Error(error),
             _ => return None,
         })
@@ -225,9 +366,19 @@ impl Session {
             .set_property_f64_async("sub-scale", scale.clamp(0.5, 2.5));
     }
 
+    pub(super) fn loop_value(&self, live: bool) -> &'static str {
+        if !live && self.on_eof.get() == OnEof::Loop {
+            "inf"
+        } else {
+            "no"
+        }
+    }
+
     pub fn set_on_eof_loop(&self, on_eof: OnEof) {
-        let loop_val = if on_eof == OnEof::Loop { "inf" } else { "no" };
-        let _ = self.mpv.command_async(&["set", "loop-file", loop_val]);
+        self.on_eof.set(on_eof);
+        let _ = self
+            .mpv
+            .command_async(&["set", "loop-file", self.loop_value(self.state.is_live)]);
     }
 
     pub fn apply_settings(&self, settings: &Settings) {
@@ -282,23 +433,29 @@ impl Session {
     }
 
     fn is_current_heif(&self) -> bool {
-        if self.kind != Some(Kind::Photo) {
-            return false;
+        self.photo_meta
+            .as_ref()
+            .is_some_and(crate::photo::Photo::is_heif)
+    }
+
+    /// Clockwise rotation of source axes into the display axes.
+    pub fn display_rotation(&self) -> u16 {
+        let base = if let Some(photo) = &self.photo_meta {
+            photo.display_rotation()
+        } else {
+            self.source_rotation
+        };
+        (base + self.extra_rotate) % 360
+    }
+
+    pub fn display_size(&self) -> (i64, i64) {
+        let (w, h) = self.state.video_size;
+        // HEIF container transforms are already baked into the filtered frame.
+        if !self.is_current_heif() && self.display_rotation() % 180 == 90 {
+            (h, w)
+        } else {
+            (w, h)
         }
-        if let Some(ext) = self
-            .current
-            .as_deref()
-            .and_then(Path::extension)
-            .and_then(|e| e.to_str())
-        {
-            return matches!(ext.to_ascii_lowercase().as_str(), "heic" | "heif");
-        }
-        self.current_uri
-            .as_deref()
-            .and_then(|u| u.split(['?', '#']).next())
-            .and_then(|u| Path::new(u).extension())
-            .and_then(|e| e.to_str())
-            .is_some_and(|e| matches!(e.to_ascii_lowercase().as_str(), "heic" | "heif"))
     }
 
     fn apply_vf_filters(&self) -> Result<()> {
@@ -307,9 +464,10 @@ impl Session {
             let fallback = crate::photo::Photo::default();
             let meta = self.photo_meta.as_ref().unwrap_or(&fallback);
             meta.vf_chain_with_transforms(
-                if is_heif { self.extra_rotate } else { 0 },
+                self.extra_rotate,
                 self.state.hflip,
                 self.state.vflip,
+                is_heif,
             )
             .unwrap_or_default()
         } else {
@@ -368,7 +526,7 @@ impl Session {
             let (kind, photo) = (self.kind, self.photo_meta.clone());
             self.load(&path, kind, photo, pos).is_ok()
         } else if let Some(req) = self.last_remote.clone() {
-            self.open_remote(req, settings, pos).is_ok()
+            self.load_remote(req, settings, pos).is_ok()
         } else {
             false
         };
@@ -438,11 +596,16 @@ impl Session {
             Command::FrameBackStep => self.mpv.command_async(&["frame-back-step"])?,
             Command::ToggleMute => self.mpv.command_async(&["cycle", "mute"])?,
             Command::VolumeBy(delta) => {
-                let next = (self.state.volume + delta).clamp(0., 100.);
-                if next > 0. && self.state.muted {
-                    self.mpv.command_async(&["set", "mute", "no"])?;
+                if delta.is_finite() && delta != 0. {
+                    self.mpv.command(&["add", "volume", &delta.to_string()])?;
+                    if self
+                        .mpv
+                        .get_property_f64("volume")
+                        .is_ok_and(|volume| volume > 0.)
+                    {
+                        self.mpv.command_async(&["set", "mute", "no"])?;
+                    }
                 }
-                self.mpv.set_property_f64_async("volume", next)?;
             }
             Command::SetVolume(volume) => {
                 let clamped = volume.clamp(0., 100.);
@@ -453,7 +616,7 @@ impl Session {
             }
             Command::SetSpeed(s) => self
                 .mpv
-                .set_property_f64_async("speed", s.clamp(0.25, 4.))?,
+                .set_property_f64_async("speed", s.clamp(MIN_SPEED, MAX_SPEED))?,
             Command::ToggleSubtitles => self.mpv.command_async(&["cycle", "sub-visibility"])?,
             Command::NextSubtitle => {
                 if !self.state.subs_visible {
@@ -499,8 +662,15 @@ impl Session {
                 self.state.audio_device = clean;
             }
             Command::SetLoop(enable) => {
-                self.mpv
-                    .command_async(&["set", "loop-file", if enable { "inf" } else { "no" }])?;
+                self.mpv.command_async(&[
+                    "set",
+                    "loop-file",
+                    if enable && !self.state.is_live {
+                        "inf"
+                    } else {
+                        "no"
+                    },
+                ])?;
             }
             Command::SetAspect(mode) => {
                 self.state.aspect = mode;
@@ -560,12 +730,13 @@ impl Session {
                     ])?;
                 }
             }
-            Command::ToggleHFlip => {
-                self.state.hflip = !self.state.hflip;
-                self.apply_vf_filters()?;
-            }
-            Command::ToggleVFlip => {
-                self.state.vflip = !self.state.vflip;
+            command @ (Command::ToggleHFlip | Command::ToggleVFlip) => {
+                let horizontal = matches!(command, Command::ToggleHFlip);
+                if horizontal != (self.display_rotation() % 180 == 90) {
+                    self.state.hflip = !self.state.hflip;
+                } else {
+                    self.state.vflip = !self.state.vflip;
+                }
                 self.apply_vf_filters()?;
             }
             Command::NextChapter => self.mpv.command_async(&["add", "chapter", "1"])?,
@@ -631,7 +802,7 @@ mod tests {
                     Instant::now() < deadline,
                     "expected {text} at {start}s, got {subtitle:?} at {position:?}"
                 );
-                let _ = mpv.wait_event(0.05);
+                thread::sleep(Duration::from_millis(10));
             }
         };
         wait_for_cue(&session.mpv, "First", 1.0);

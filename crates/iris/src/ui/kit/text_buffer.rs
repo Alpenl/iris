@@ -6,6 +6,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::ops::Range;
 
 use iris_api::{PluginModal, Widget};
+use unicode_segmentation::UnicodeSegmentation;
 
 #[derive(Clone, Default)]
 pub(in crate::ui) struct TextInputState {
@@ -19,7 +20,8 @@ pub(in crate::ui) struct TextInputState {
 
 impl TextInputState {
     pub(in crate::ui) fn with_text(s: impl Into<String>) -> Self {
-        let content = s.into();
+        let mut content = s.into();
+        content.retain(|c| !c.is_control());
         let len = content.len();
         Self {
             content,
@@ -84,7 +86,7 @@ impl TextInputState {
         let p = if !self.selected_range.is_empty() {
             self.selected_range.start
         } else {
-            self.prev_char_boundary(self.selected_range.start)
+            self.prev_grapheme_boundary(self.selected_range.start)
         };
         self.selected_range = p..p;
     }
@@ -94,7 +96,7 @@ impl TextInputState {
         let p = if !self.selected_range.is_empty() {
             self.selected_range.end
         } else {
-            self.next_char_boundary(self.selected_range.end)
+            self.next_grapheme_boundary(self.selected_range.end)
         };
         self.selected_range = p..p;
     }
@@ -111,10 +113,14 @@ impl TextInputState {
     }
 
     pub(in crate::ui) fn backspace(&mut self) {
+        if self.selected_range == (0..0) {
+            return;
+        }
         let r = if !self.selected_range.is_empty() {
             self.clamped_range(self.selected_range.clone())
         } else {
-            self.prev_char_boundary(self.selected_range.start)..self.selected_range.start
+            let pos = self.selected_range.start;
+            self.prev_grapheme_boundary(pos)..self.next_grapheme_boundary(pos.saturating_sub(1))
         };
         self.replace_utf8(r, "");
     }
@@ -123,7 +129,8 @@ impl TextInputState {
         let r = if !self.selected_range.is_empty() {
             self.clamped_range(self.selected_range.clone())
         } else {
-            self.selected_range.end..self.next_char_boundary(self.selected_range.end)
+            let pos = self.selected_range.end;
+            self.grapheme_start(pos)..self.next_grapheme_boundary(pos)
         };
         self.replace_utf8(r, "");
     }
@@ -148,10 +155,11 @@ impl TextInputState {
     pub(super) fn display_text(&self, focused: bool) -> String {
         let cursor = focused.then(|| self.clamped_boundary(self.selected_range.end));
         if self.secret.get() {
-            let mask_bytes = self.content.chars().count() * '•'.len_utf8();
+            let mask_bytes = self.content.graphemes(true).count() * '•'.len_utf8();
             let cursor_bytes = if focused { '▏'.len_utf8() } else { 0 };
             let mut masked = String::with_capacity(mask_bytes + cursor_bytes);
-            for (offset, _) in self.content.char_indices() {
+            let cursor = cursor.map(|p| self.grapheme_start(p));
+            for (offset, _) in self.content.grapheme_indices(true) {
                 if cursor == Some(offset) {
                     masked.push('▏');
                 }
@@ -169,6 +177,19 @@ impl TextInputState {
             shown
         } else {
             self.content.clone()
+        }
+    }
+
+    pub(super) fn display_caret_index(&self) -> usize {
+        let cursor = self.clamped_boundary(self.selected_range.end);
+        if self.secret.get() {
+            self.content
+                .grapheme_indices(true)
+                .take_while(|(offset, segment)| offset + segment.len() <= cursor)
+                .count()
+                * '•'.len_utf8()
+        } else {
+            cursor
         }
     }
 
@@ -223,22 +244,22 @@ impl TextInputState {
                 .or_else(|| self.marked_range.clone())
                 .unwrap_or_else(|| self.selected_range.clone()),
         );
-        self.content.replace_range(range.clone(), new_text);
-        if !new_text.is_empty() {
-            self.marked_range = Some(range.start..range.start + new_text.len());
-        } else {
-            self.marked_range = None;
-        }
-        self.selected_range = new_selected_utf16
-            .map(|r| {
-                let s = utf16_to_utf8_in(new_text, r.start);
-                let e = utf16_to_utf8_in(new_text, r.end.max(r.start));
-                (range.start + s)..(range.start + e)
-            })
-            .unwrap_or_else(|| {
-                let end = range.start + new_text.len();
-                end..end
-            });
+        // IME selection offsets refer to the unfiltered UTF-16 composition string.
+        let filtered_offset = |offset| {
+            new_text[..utf16_to_utf8_in(new_text, offset)]
+                .chars()
+                .filter(|c| !c.is_control())
+                .map(char::len_utf8)
+                .sum::<usize>()
+        };
+        let clean: String = new_text.chars().filter(|c| !c.is_control()).collect();
+        self.content.replace_range(range.clone(), &clean);
+        let end = range.start + clean.len();
+        self.marked_range = (!clean.is_empty()).then_some(range.start..end);
+        self.selected_range = new_selected_utf16.map_or(end..end, |r| {
+            (range.start + filtered_offset(r.start))
+                ..(range.start + filtered_offset(r.end.max(r.start)))
+        });
     }
 
     fn clamped_boundary(&self, pos: usize) -> usize {
@@ -254,19 +275,26 @@ impl TextInputState {
         s..self.clamped_boundary(r.end).max(s)
     }
 
-    fn prev_char_boundary(&self, pos: usize) -> usize {
-        self.content[..self.clamped_boundary(pos)]
-            .char_indices()
-            .next_back()
+    fn grapheme_start(&self, pos: usize) -> usize {
+        self.prev_grapheme_boundary(pos.saturating_add(1))
+    }
+
+    fn prev_grapheme_boundary(&self, pos: usize) -> usize {
+        if pos > self.content.len() {
+            return self.content.len();
+        }
+        self.content
+            .grapheme_indices(true)
+            .take_while(|(i, _)| *i < pos)
+            .last()
             .map_or(0, |(i, _)| i)
     }
 
-    fn next_char_boundary(&self, pos: usize) -> usize {
-        let pos = self.clamped_boundary(pos);
-        self.content[pos..]
-            .chars()
-            .next()
-            .map_or(self.content.len(), |c| pos + c.len_utf8())
+    fn next_grapheme_boundary(&self, pos: usize) -> usize {
+        self.content
+            .grapheme_indices(true)
+            .find(|(i, _)| *i > pos)
+            .map_or(self.content.len(), |(i, _)| i)
     }
 }
 
@@ -447,6 +475,21 @@ mod tests {
         assert_eq!(input.display_text(false), "•••");
     }
 
+    #[test]
+    fn grapheme_edits_keep_combining_marks_flags_and_joined_emoji_intact() {
+        let mut input = TextInputState::with_text("e\u{301}🇨🇳👩‍👩‍👧‍👦");
+        input.backspace();
+        assert_eq!(input.text(), "e\u{301}🇨🇳");
+        input.move_left();
+        input.delete_forward();
+        assert_eq!(input.text(), "e\u{301}");
+        input.backspace();
+        assert!(input.is_empty());
+
+        input.replace_and_mark_utf16(None, "你\n🎬\t好", Some(2..4));
+        assert_eq!(input.text(), "你🎬好");
+        assert_eq!(input.range_to_utf16(&input.selected_range), 1..3);
+    }
     #[test]
     fn secret_composition_and_selection_are_editable_but_cannot_be_read_back() {
         let mut input = TextInputState::with_text("前🔑後");

@@ -38,6 +38,14 @@ fn validate_stream_url_enforces_schemes_loopback_ports_and_link_local_blocks() {
         "http://127.0.0.1:80/admin",
         "http://localhost:22/ssh",
         "http://[::1]:1023/low_port",
+        "http://localhost.:80/audio",
+        "http://[::127.0.0.1]:9000/audio",
+        "http://[64:ff9b::7f00:1]:9000/audio",
+        "http://[2002:7f00:1::]:9000/audio",
+        "http://[fec0::1]:9000/audio",
+        "http://[fd00:ec2::254]:9000/audio",
+        "http://192.0.0.42/audio",
+        "http://198.18.0.1/audio",
     ] {
         assert!(
             validate_stream_url(invalid).is_err(),
@@ -91,67 +99,34 @@ fn crlf_injection_is_stripped_on_wire_and_head_bytes_are_bounded() {
 }
 
 #[test]
-fn chunked_decoding_and_credential_stripping_across_redirect() {
-    let target_listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let target_port = target_listener.local_addr().unwrap().port();
-    let target_req = Arc::new(Mutex::new(String::new()));
-    let target_req_clone = Arc::clone(&target_req);
-
-    let target_srv = thread::spawn(move || {
-        let (mut sock, _) = target_listener.accept().unwrap();
-        let mut buf = [0u8; 4096];
-        let n = sock.read(&mut buf).unwrap();
-        *target_req_clone.lock().unwrap() = String::from_utf8_lossy(&buf[..n]).into_owned();
-        let body = concat!(
-            "HTTP/1.1 206 Partial Content\r\n",
-            "Transfer-Encoding: chunked\r\n",
-            "Connection: close\r\n\r\n",
-            "5;ext=1\r\nhello\r\n",
-            "6\r\n world\r\n",
-            "0\r\nX-Trailer: done\r\n\r\n"
-        );
-        sock.write_all(body.as_bytes()).unwrap();
+fn informational_headers_and_chunked_decoding_survive_same_origin_redirect() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let (mut first, _) = listener.accept().unwrap();
+        let _ = first.read(&mut [0; 2048]).unwrap();
+        first
+            .write_all(b"HTTP/1.1 302 Found\r\nLocation: /audio\r\nContent-Length: 0\r\n\r\n")
+            .unwrap();
+        let (mut final_response, _) = listener.accept().unwrap();
+        let mut buf = [0; 2048];
+        let n = final_response.read(&mut buf).unwrap();
+        let forwarded = std::str::from_utf8(&buf[..n]).unwrap();
+        assert!(forwarded.contains("Authorization: Bearer fixture\r\n"));
+        assert!(forwarded.contains("Range: bytes=0-63\r\n"));
+        final_response.write_all(concat!(
+            "HTTP/1.1 103 Early Hints\r\nLink: </audio>; rel=preload\r\n\r\n",
+            "HTTP/1.1 100 Continue\r\n\r\n",
+            "HTTP/1.1 206 Partial Content\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+            "5;ext=1\r\nhello\r\n6\r\n world\r\n0\r\nX-Trailer: done\r\n\r\n",
+        ).as_bytes()).unwrap();
     });
-
-    let redirect_listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let redirect_port = redirect_listener.local_addr().unwrap().port();
-    let redirect_srv = thread::spawn(move || {
-        let (mut sock, _) = redirect_listener.accept().unwrap();
-        let mut buf = [0u8; 2048];
-        let _ = sock.read(&mut buf);
-        let resp = format!(
-            "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{target_port}/img.jpg\r\nContent-Length: 0\r\n\r\n"
-        );
-        sock.write_all(resp.as_bytes()).unwrap();
-    });
-
-    let mut headers = BTreeMap::new();
-    headers.insert("Authorization".into(), "Bearer super-secret".into());
-    headers.insert("Proxy-Authorization".into(), "Basic dXNlcjpwYXNz".into());
-    headers.insert("Cookie".into(), "sid=12345".into());
-    headers.insert("X-Iris-Bridge-Token".into(), "source-only".into());
-    headers.insert("Referer".into(), "https://origin.example/signed".into());
-    headers.insert("User-Agent".into(), "private-user-agent".into());
-
-    let payload = fetch_head_bytes(
-        &format!("http://127.0.0.1:{redirect_port}/start"),
-        &headers,
-        64,
-    )
-    .unwrap();
-    assert_eq!(payload, b"hello world");
-
-    redirect_srv.join().unwrap();
-    target_srv.join().unwrap();
-
-    let forwarded = target_req.lock().unwrap().to_ascii_lowercase();
-    assert!(!forwarded.contains("authorization:"));
-    assert!(!forwarded.contains("proxy-authorization:"));
-    assert!(!forwarded.contains("cookie:"));
-    assert!(!forwarded.contains("x-iris-bridge-token:"));
-    assert!(!forwarded.contains("referer:"));
-    assert!(!forwarded.contains("private-user-agent"));
-    assert!(forwarded.contains("range: bytes=0-63"));
+    let headers = BTreeMap::from([("Authorization".into(), "Bearer fixture".into())]);
+    assert_eq!(
+        fetch_head_bytes(&format!("http://{addr}/start"), &headers, 64).unwrap(),
+        b"hello world"
+    );
+    server.join().unwrap();
 }
 
 #[test]
@@ -161,8 +136,9 @@ fn redirects_revalidate_schemes_and_private_hosts_before_connecting() {
         "http://localhost:{}/other",
         second.local_addr().unwrap().port()
     );
+    let other_port = format!("http://{}/other", second.local_addr().unwrap());
     second.set_nonblocking(true).unwrap();
-    for location in ["ftp://localhost/unsupported", &other_host] {
+    for location in ["ftp://localhost/unsupported", &other_host, &other_port] {
         let origin = TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}/media", origin.local_addr().unwrap());
         thread::scope(|scope| {
@@ -178,5 +154,27 @@ fn redirects_revalidate_schemes_and_private_hosts_before_connecting() {
             assert!(fetch_head_bytes(&url, &BTreeMap::new(), 32).is_err());
         });
         assert!(matches!(second.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock));
+    }
+}
+
+#[test]
+fn malformed_chunk_and_conflicting_headers_fail_closed() {
+    for response in [
+        &b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\ndata"[..],
+        &b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\ndata\r\n0\r\n"[..],
+        &b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nContent-Length: 3\r\n\r\ndata"[..],
+    ] {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        thread::scope(|scope| {
+            scope.spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                let _ = socket.read(&mut [0; 2048]).unwrap();
+                socket.write_all(response).unwrap();
+            });
+            assert!(
+                fetch_head_bytes(&format!("http://{addr}/audio"), &BTreeMap::new(), 64).is_err()
+            );
+        });
     }
 }

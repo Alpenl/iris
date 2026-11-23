@@ -7,6 +7,7 @@
 //!   `RenderContext` keeps an `Arc<Mpv>` so the handle outlives it.
 
 use std::ffi::{c_char, c_int, c_void};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr;
 use std::sync::Arc;
 
@@ -63,7 +64,7 @@ type UpdateFn = Box<dyn Fn() + Send + Sync>;
 
 pub struct RenderContext {
     ctx: *mut sys::mpv_render_context,
-    update: Option<Box<UpdateFn>>,
+    update: Option<ptr::NonNull<UpdateFn>>,
     _mpv: Arc<Mpv>,
 }
 
@@ -77,6 +78,8 @@ impl RenderContext {
     ///
     /// # Safety
     /// `get_proc_address` must resolve GL symbols for the current context.
+    /// The caller must also make the same GL context current when dropping the
+    /// returned render context.
     pub unsafe fn new_gl(
         mpv: RenderHandle,
         get_proc_address: GetProcAddress,
@@ -203,17 +206,25 @@ impl RenderContext {
     /// It runs on an mpv thread: only signal from it, never call mpv.
     pub fn set_update_callback(&mut self, f: impl Fn() + Send + Sync + 'static) {
         unsafe extern "C" fn trampoline(data: *mut c_void) {
-            // SAFETY: `data` points to a heap-allocated `UpdateFn` kept alive in `self.update`
-            // until the callback is replaced or cleared in `Drop`.
-            let f = unsafe { &*(data as *const UpdateFn) };
-            f();
+            // SAFETY: Registration owns this allocation until mpv replaces the
+            // callback under its update lock or synchronously unregisters it.
+            let f = unsafe { &*data.cast::<UpdateFn>() };
+            if let Err(payload) = catch_unwind(AssertUnwindSafe(f)) {
+                // A custom panic payload can itself panic when dropped.
+                std::mem::forget(payload);
+            }
         }
-        let boxed: Box<UpdateFn> = Box::new(Box::new(f));
-        let data = &*boxed as *const UpdateFn as *mut c_void;
-        // SAFETY: `self.ctx` is valid and `boxed` has a stable heap address stored in `self.update`
-        // before any replacement or context teardown drops it.
-        unsafe { sys::mpv_render_context_set_update_callback(self.ctx, Some(trampoline), data) };
-        self.update = Some(boxed);
+        let callback: UpdateFn = Box::new(f);
+        let data = Box::into_raw(Box::new(callback));
+        // Register only after releasing ownership into a raw pointer. libmpv can
+        // invoke the new callback before this function returns.
+        unsafe {
+            sys::mpv_render_context_set_update_callback(self.ctx, Some(trampoline), data.cast())
+        };
+        // SAFETY: libmpv has replaced and finished using the previous callback.
+        if let Some(old) = self.update.replace(ptr::NonNull::new(data).unwrap()) {
+            unsafe { drop(Box::from_raw(old.as_ptr())) };
+        }
     }
 
     /// Returns `MPV_RENDER_UPDATE_*` flags. Call before deciding whether to render.
@@ -223,7 +234,11 @@ impl RenderContext {
     }
 
     /// Renders the current frame into the given GL framebuffer.
-    pub fn render_gl(
+    ///
+    /// # Safety
+    /// The GL context used to create this render context must be current, and
+    /// the framebuffer must be a valid target in that context.
+    pub unsafe fn render_gl(
         &self,
         fbo: i32,
         w: i32,
@@ -280,6 +295,8 @@ impl Drop for RenderContext {
             sys::mpv_render_context_set_update_callback(self.ctx, None, ptr::null_mut());
             sys::mpv_render_context_free(self.ctx);
         }
-        self.update = None;
+        if let Some(callback) = self.update.take() {
+            unsafe { drop(Box::from_raw(callback.as_ptr())) };
+        }
     }
 }

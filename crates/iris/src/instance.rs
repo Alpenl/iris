@@ -68,24 +68,40 @@ mod wire {
 
 #[cfg(target_os = "windows")]
 mod imp {
-    use futures::channel::mpsc::UnboundedSender;
+    use futures::channel::{mpsc::Sender, oneshot};
     use std::ffi::OsString;
-    use std::fs::OpenOptions;
-    use std::io::{self, Write};
+    use std::fs::{File, OpenOptions};
+    use std::io::{self, Read, Write};
     use std::os::windows::ffi::{OsStrExt, OsStringExt};
     use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
     use std::path::PathBuf;
+    use std::ptr::null;
     use std::time::{Duration, Instant};
+    use windows::Win32::UI::WindowsAndMessaging::AllowSetForegroundWindow;
     use windows_sys::Win32::Foundation::{
-        ERROR_ALREADY_EXISTS, ERROR_PIPE_CONNECTED, GetLastError,
+        ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, ERROR_NO_DATA, ERROR_PIPE_BUSY,
+        ERROR_PIPE_CONNECTED, GetLastError,
     };
+    use windows_sys::Win32::Storage::FileSystem::{ReadFile, WriteFile};
     use windows_sys::Win32::System::Pipes::{
-        ConnectNamedPipe, DisconnectNamedPipe, GetNamedPipeServerSessionId,
+        ConnectNamedPipe, DisconnectNamedPipe, GetNamedPipeClientSessionId,
+        GetNamedPipeServerProcessId, GetNamedPipeServerSessionId, PIPE_NOWAIT, PIPE_WAIT,
+        SetNamedPipeHandleState,
     };
     use windows_sys::Win32::System::RemoteDesktop::ProcessIdToSessionId;
     use windows_sys::Win32::System::Threading::{CreateMutexW, GetCurrentProcessId};
 
     use super::wire::{MAX_BATCH_UNITS, MAX_PATHS, MAX_UNITS, read_batch};
+
+    const IO_TIMEOUT: Duration = Duration::from_secs(3);
+    const POLL_INTERVAL: Duration = Duration::from_millis(10);
+    const ACCEPTED: u8 = 1;
+    const REJECTED: u8 = 0;
+
+    pub(crate) struct OpenRequest {
+        pub(crate) paths: Vec<PathBuf>,
+        pub(crate) ack: oneshot::Sender<()>,
+    }
 
     /// Holds the per-session mutex for the life of the primary instance.
     pub(crate) struct Guard {
@@ -97,6 +113,8 @@ mod imp {
         Primary(Guard),
         /// The path went to the running instance; this process should exit.
         Forwarded,
+        /// The primary instance could not accept this request.
+        Rejected,
     }
 
     fn session_id() -> io::Result<u32> {
@@ -111,7 +129,7 @@ mod imp {
     /// Becomes the primary instance or hands `initial` to the existing one.
     /// Files later sent by other processes arrive on `opened`. Isolated test
     /// instances (`IRIS_SETTINGS`) never take part.
-    pub(crate) fn claim(initial: &[PathBuf], opened: UnboundedSender<Vec<PathBuf>>) -> Claim {
+    pub(crate) fn claim(initial: &[PathBuf], opened: Sender<OpenRequest>) -> Claim {
         if std::env::var_os("IRIS_SETTINGS").is_some() {
             return Claim::Primary(Guard { _handle: None });
         }
@@ -119,43 +137,51 @@ mod imp {
             (Ok(session), Ok(sid)) => (session, sid),
             (Err(e), _) | (_, Err(e)) => {
                 log::error!("single instance: {e}");
-                return Claim::Primary(Guard { _handle: None });
+                return Claim::Rejected;
             }
         };
-        let endpoint = format!(r"\\.\pipe\iris-open-batch-{session}-{sid}");
+        let endpoint = format!(r"\\.\pipe\iris-open-batch-v2-{session}-{sid}");
         let name: Vec<u16> = format!(r"Local\Iris.Player.Batch.{sid}")
             .encode_utf16()
             .chain(Some(0))
             .collect();
         // SAFETY: NUL-terminated name; a non-null handle immediately gains an owner.
         let (mutex, exists) = unsafe {
-            let handle = CreateMutexW(std::ptr::null(), 0, name.as_ptr());
+            let handle = CreateMutexW(null(), 0, name.as_ptr());
+            if handle.is_null() {
+                log::error!("single-instance mutex: {}", io::Error::last_os_error());
+                return Claim::Rejected;
+            }
             let exists = GetLastError() == ERROR_ALREADY_EXISTS;
-            (
-                (!handle.is_null()).then(|| OwnedHandle::from_raw_handle(handle)),
-                exists,
-            )
+            (OwnedHandle::from_raw_handle(handle), exists)
         };
         if exists {
-            match forward(&endpoint, session, initial) {
-                Ok(()) => return Claim::Forwarded,
-                Err(e) => log::error!("forwarding to the running instance: {e}; starting another"),
-            }
-            return Claim::Primary(Guard { _handle: mutex });
+            return match forward(&endpoint, session, initial) {
+                Ok(()) => Claim::Forwarded,
+                Err(e) => {
+                    log::error!("forwarding to the running instance: {e}");
+                    Claim::Rejected
+                }
+            };
         }
         let wide: Vec<u16> = endpoint.encode_utf16().chain(Some(0)).collect();
-        match crate::platform::pipe::create_inbound(&wide, (MAX_UNITS * 2 + 4) as u32) {
-            Ok(pipe) => {
-                if let Err(e) = std::thread::Builder::new()
-                    .name("iris-open-files".into())
-                    .spawn(move || serve(pipe, opened))
-                {
-                    log::error!("starting file-open listener: {e}");
-                }
+        let pipe = match crate::platform::pipe::create_duplex(&wide, (MAX_UNITS * 2 + 4) as u32) {
+            Ok(pipe) => pipe,
+            Err(e) => {
+                log::error!("file-open pipe: {e}");
+                return Claim::Rejected;
             }
-            Err(e) => log::error!("file-open pipe: {e}"),
+        };
+        if let Err(e) = std::thread::Builder::new()
+            .name("iris-open-files".into())
+            .spawn(move || serve(pipe, session, opened))
+        {
+            log::error!("starting file-open listener: {e}");
+            return Claim::Rejected;
         }
-        Claim::Primary(Guard { _handle: mutex })
+        Claim::Primary(Guard {
+            _handle: Some(mutex),
+        })
     }
 
     fn forward(endpoint: &str, session: u32, paths: &[PathBuf]) -> io::Result<()> {
@@ -185,12 +211,15 @@ mod imp {
             message[start..start + 4].copy_from_slice(&(len as u32).to_le_bytes());
             remaining -= len;
         }
-        let deadline = Instant::now() + Duration::from_secs(3);
-        let mut pipe = loop {
-            match OpenOptions::new().write(true).open(endpoint) {
+        let deadline = Instant::now() + IO_TIMEOUT;
+        let pipe = loop {
+            match OpenOptions::new().read(true).write(true).open(endpoint) {
                 Ok(pipe) => break pipe,
-                Err(e) if Instant::now() >= deadline => return Err(e),
-                Err(_) => std::thread::sleep(Duration::from_millis(50)),
+                Err(e) if matches!(e.raw_os_error(), Some(code) if code == ERROR_PIPE_BUSY as i32 || code == ERROR_FILE_NOT_FOUND as i32) =>
+                {
+                    wait_for_io(deadline)?;
+                }
+                Err(e) => return Err(e),
             }
         };
         let mut server = u32::MAX;
@@ -203,38 +232,260 @@ mod imp {
                 "pipe server is in another session",
             ));
         }
-        pipe.write_all(&message)
+        let mut pid = 0;
+        if unsafe { GetNamedPipeServerProcessId(pipe.as_raw_handle(), &mut pid) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // Windows only honors the grant when this launch is allowed to set focus.
+        let _ = unsafe { AllowSetForegroundWindow(pid) };
+        set_pipe_mode(&pipe, PIPE_NOWAIT)?;
+        let mut io = PipeIo {
+            pipe: &pipe,
+            deadline,
+        };
+        io.write_all(&message)?;
+        let mut reply = [0];
+        io.read_exact(&mut reply)?;
+        // Confirm the read before the server disconnects and discards unread bytes.
+        let _ = io.write_all(&reply);
+        if reply[0] == ACCEPTED {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::ConnectionRefused,
+                "primary window is closing or unavailable",
+            ))
+        }
     }
 
-    fn serve(mut pipe: std::fs::File, opened: UnboundedSender<Vec<PathBuf>>) {
+    fn serve(pipe: File, session: u32, mut opened: Sender<OpenRequest>) {
         while !opened.is_closed() {
-            // SAFETY: the pipe handle is owned by `pipe` for the whole loop.
-            if unsafe { ConnectNamedPipe(pipe.as_raw_handle(), std::ptr::null_mut()) } == 0 {
-                let error = io::Error::last_os_error();
-                if error.raw_os_error() != Some(ERROR_PIPE_CONNECTED as i32) {
-                    log::error!("accepting file-open pipe: {error}");
-                    return;
-                }
-            }
-            match read_batch(&mut pipe, |units| PathBuf::from(OsString::from_wide(units))) {
-                Ok(paths) => {
-                    let _ = opened.unbounded_send(paths);
-                }
-                Err(e) => log::warn!("file-open message: {e}"),
-            }
-            if unsafe { DisconnectNamedPipe(pipe.as_raw_handle()) } == 0 {
-                log::error!(
-                    "disconnecting file-open pipe: {}",
-                    io::Error::last_os_error()
-                );
+            if let Err(error) = serve_connection(&pipe, session, &mut opened) {
+                log::error!("file-open pipe listener: {error}");
                 return;
             }
+        }
+    }
+
+    fn serve_connection(
+        pipe: &File,
+        session: u32,
+        opened: &mut Sender<OpenRequest>,
+    ) -> io::Result<()> {
+        // The idle accept blocks. Connected reads and writes have a deadline.
+        let connected =
+            if unsafe { ConnectNamedPipe(pipe.as_raw_handle(), std::ptr::null_mut()) } != 0 {
+                true
+            } else {
+                let error = io::Error::last_os_error();
+                match error.raw_os_error().map(|code| code as u32) {
+                    Some(ERROR_PIPE_CONNECTED) => true,
+                    // A client can open and close before ConnectNamedPipe runs.
+                    Some(ERROR_NO_DATA) => false,
+                    _ => return Err(error),
+                }
+            };
+        if connected && let Err(e) = handle_request(pipe, session, opened) {
+            log::warn!("file-open message: {e}");
+        }
+        if unsafe { DisconnectNamedPipe(pipe.as_raw_handle()) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        set_pipe_mode(pipe, PIPE_WAIT)
+    }
+
+    fn handle_request(
+        pipe: &File,
+        session: u32,
+        opened: &mut Sender<OpenRequest>,
+    ) -> io::Result<()> {
+        let mut peer_session = u32::MAX;
+        if unsafe { GetNamedPipeClientSessionId(pipe.as_raw_handle(), &mut peer_session) } == 0
+            || peer_session != session
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "pipe client is in another session",
+            ));
+        }
+        set_pipe_mode(pipe, PIPE_NOWAIT)?;
+        let deadline = Instant::now() + IO_TIMEOUT;
+        let mut io = PipeIo { pipe, deadline };
+        let paths = read_batch(&mut io, |units| PathBuf::from(OsString::from_wide(units)))?;
+        let (ack, mut acknowledged) = oneshot::channel();
+        let accepted = opened.try_send(OpenRequest { paths, ack }).is_ok()
+            && loop {
+                match acknowledged.try_recv() {
+                    Ok(Some(())) => break true,
+                    Err(_) => break false,
+                    Ok(None) if wait_for_io(deadline).is_err() => break false,
+                    Ok(None) => {}
+                }
+            };
+        drop(acknowledged);
+        // Reserve a short response window even if the UI took the whole deadline.
+        io.deadline = Instant::now() + Duration::from_millis(100);
+        let response = if accepted { ACCEPTED } else { REJECTED };
+        io.write_all(&[response])?;
+        let mut receipt = [0];
+        io.read_exact(&mut receipt)?;
+        Ok(())
+    }
+
+    fn set_pipe_mode(pipe: &File, mode: u32) -> io::Result<()> {
+        if unsafe { SetNamedPipeHandleState(pipe.as_raw_handle(), &mode, null(), null()) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    fn wait_for_io(deadline: Instant) -> io::Result<()> {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "file-open pipe timed out",
+            ));
+        }
+        std::thread::sleep(POLL_INTERVAL.min(remaining));
+        Ok(())
+    }
+
+    struct PipeIo<'a> {
+        pipe: &'a File,
+        deadline: Instant,
+    }
+
+    impl PipeIo<'_> {
+        fn transfer(&self, mut call: impl FnMut(*mut u32) -> i32) -> io::Result<usize> {
+            loop {
+                if Instant::now() >= self.deadline {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "file-open pipe timed out",
+                    ));
+                }
+                let mut transferred = 0;
+                if call(&mut transferred) != 0 {
+                    if transferred != 0 {
+                        return Ok(transferred as usize);
+                    }
+                } else {
+                    let e = io::Error::last_os_error();
+                    if e.raw_os_error() != Some(ERROR_NO_DATA as i32) {
+                        return Err(e);
+                    }
+                }
+                wait_for_io(self.deadline)?;
+            }
+        }
+    }
+
+    impl Read for PipeIo<'_> {
+        fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+            if bytes.is_empty() {
+                return Ok(0);
+            }
+            self.transfer(|transferred| unsafe {
+                ReadFile(
+                    self.pipe.as_raw_handle(),
+                    bytes.as_mut_ptr(),
+                    bytes.len() as u32,
+                    transferred,
+                    std::ptr::null_mut(),
+                )
+            })
+        }
+    }
+
+    impl Write for PipeIo<'_> {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if bytes.is_empty() {
+                return Ok(0);
+            }
+            self.transfer(|transferred| unsafe {
+                WriteFile(
+                    self.pipe.as_raw_handle(),
+                    bytes.as_ptr(),
+                    bytes.len() as u32,
+                    transferred,
+                    std::ptr::null_mut(),
+                )
+            })
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            // Writes go straight to the pipe. The receipt synchronizes final delivery.
+            Ok(())
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use futures::channel::mpsc::{self, Receiver, TryRecvError};
+        use std::sync::mpsc as sync;
+        use std::thread;
+
+        fn request_from(receiver: &mut Receiver<OpenRequest>) -> OpenRequest {
+            let deadline = Instant::now() + IO_TIMEOUT;
+            loop {
+                match receiver.try_recv() {
+                    Ok(request) => return request,
+                    Err(TryRecvError::Empty) => wait_for_io(deadline).unwrap(),
+                    Err(error) => panic!("{error}"),
+                }
+            }
+        }
+
+        #[test]
+        fn activation_waits_for_admission_and_unanswered_requests_expire() {
+            let session = session_id().unwrap();
+            let endpoint = format!(r"\\.\pipe\iris-test-open-{}", std::process::id());
+            let wide: Vec<_> = endpoint.encode_utf16().chain(Some(0)).collect();
+            let pipe = crate::platform::pipe::create_duplex(&wide, 4096).unwrap();
+            let (mut opened, mut receiver) = mpsc::channel(0);
+            let server = thread::spawn(move || {
+                for _ in 0..2 {
+                    serve_connection(&pipe, session, &mut opened).unwrap();
+                }
+            });
+
+            let (finished, result) = sync::channel();
+            let first = endpoint.clone();
+            let client =
+                thread::spawn(move || finished.send(forward(&first, session, &[])).unwrap());
+            let request = request_from(&mut receiver);
+            assert!(request.paths.is_empty());
+            assert!(matches!(
+                result.recv_timeout(Duration::from_millis(30)),
+                Err(sync::RecvTimeoutError::Timeout)
+            ));
+            request.ack.send(()).unwrap();
+            result.recv_timeout(IO_TIMEOUT).unwrap().unwrap();
+            client.join().unwrap();
+
+            let (finished, result) = sync::channel();
+            let client =
+                thread::spawn(move || finished.send(forward(&endpoint, session, &[])).unwrap());
+            let request = request_from(&mut receiver);
+            let error = result
+                .recv_timeout(IO_TIMEOUT + Duration::from_secs(1))
+                .unwrap()
+                .unwrap_err();
+            assert!(matches!(
+                error.kind(),
+                io::ErrorKind::TimedOut | io::ErrorKind::ConnectionRefused
+            ));
+            client.join().unwrap();
+            server.join().unwrap();
+            assert!(request.ack.send(()).is_err());
         }
     }
 }
 
 #[cfg(target_os = "windows")]
-pub(crate) use imp::{Claim, claim};
+pub(crate) use imp::{Claim, OpenRequest, claim};
 
 #[cfg(test)]
 mod tests {

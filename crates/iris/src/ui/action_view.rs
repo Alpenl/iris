@@ -153,20 +153,27 @@ impl IrisWindow {
         if session.current().is_none() && session.current_uri().is_none() {
             return;
         }
-        let stem = session
-            .current()
-            .and_then(|p| p.file_stem())
-            .map(|s| s.to_string_lossy().into_owned())
-            .or_else(|| {
-                session.current_title().map(|t| {
-                    t.chars()
-                        .map(|c| if c.is_alphanumeric() { c } else { '_' })
-                        .take(24)
-                        .collect()
-                })
-            })
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "iris".into());
+        let mut stem = String::new();
+        if let Some(name) = session.current().and_then(Path::file_stem) {
+            for ch in name
+                .to_string_lossy()
+                .chars()
+                .map(|ch| if ch.is_control() { '_' } else { ch })
+            {
+                if stem.len() + ch.len_utf8() > 180 {
+                    break;
+                }
+                stem.push(ch);
+            }
+        } else if let Some(title) = session.current_title() {
+            stem.extend(
+                title
+                    .chars()
+                    .take(24)
+                    .map(|ch| if ch.is_alphanumeric() { ch } else { '_' }),
+            );
+        }
+        let stem = if stem.is_empty() { "iris" } else { &stem };
         let out = platform::default_screenshot_dir()
             .join(format!("Iris-{stem}-{}.png", format_screenshot_stamp()));
         let with_subs = self.settings.screenshot_subs;
@@ -233,7 +240,7 @@ impl IrisWindow {
             self.text_inputs.search_focus.focus(window);
         } else {
             self.text_inputs.search_input.clear();
-            self.rebuild_directory_rows();
+            self.filter_directory_rows();
             self.focus.focus(window);
         }
         cx.notify();
@@ -257,16 +264,26 @@ impl IrisWindow {
             self.browse_plugin_source(&pid, &sid, fid, None, q, cx);
             return;
         }
+        if self.media_load_pending() {
+            return;
+        }
         let Some(folder) = self.active().session.folder().map(Path::to_path_buf) else {
             return;
         };
+        let generation = self.active().load_generation;
         let f_scan = folder.clone();
         let task = cx
             .background_executor()
             .spawn(async move { library::scan_local_or_share(&f_scan) });
-        cx.spawn(async move |this, cx| {
+        self.catalog.directory_refresh = Some(cx.spawn(async move |this, cx| {
             let scan = task.await;
             let _ = this.update(cx, |this, cx| {
+                if this.active().load_generation != generation
+                    || !this.catalog.active_source.is_local()
+                    || this.active().session.folder() != Some(folder.as_path())
+                {
+                    return;
+                }
                 this.active_mut().session.set_directory(
                     Some(folder),
                     scan.entries,
@@ -274,19 +291,23 @@ impl IrisWindow {
                 );
                 this.rebuild_directory_rows();
                 this.scroll_directory_to_current();
+                this.ensure_filmstrip_thumbnails(cx);
                 this.show_toast("目录已刷新", cx);
             });
-        })
-        .detach();
+        }));
     }
 
     pub(super) fn open_settings(
         &mut self,
         _: &OpenSettings,
-        _: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.plugins.active_modal().is_some() {
+            return;
+        }
         self.overlays.toggle_settings();
+        self.focus.focus(window);
         self.bump_activity(cx);
         cx.notify();
     }
@@ -297,6 +318,9 @@ impl IrisWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.plugins.active_modal().is_some() {
+            return;
+        }
         if self.overlays.toggle_palette() {
             self.text_inputs.palette_input.clear();
             self.overlays.palette_index = 0;
@@ -345,11 +369,12 @@ impl IrisWindow {
                 cx.notify();
             }
             EscapeStep::CloseSettings | EscapeStep::ClosePopover | EscapeStep::CloseDirPopup => {
+                self.focus.focus(window);
                 self.bump_activity(cx);
                 cx.notify();
             }
             EscapeStep::CloseSearch => {
-                self.rebuild_directory_rows();
+                self.filter_directory_rows();
                 self.focus.focus(window);
                 cx.notify();
             }
@@ -364,6 +389,9 @@ impl IrisWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.image_geometry_ready() {
+            return;
+        }
         let (viewport, media) = self.image_geometry();
         self.active_mut()
             .image
@@ -377,16 +405,18 @@ impl IrisWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.image_geometry_ready() {
+            return;
+        }
         if self.active().image.zoomed() {
             self.active_mut().image.reset();
             self.apply_image_view(cx);
         } else {
             let (viewport, media) = self.image_geometry();
-            let cur_scale = self
-                .active()
-                .image
-                .pixel_scale(viewport, media, window.scale_factor() as f64)
-                .max(0.0001);
+            let cur_scale =
+                self.active()
+                    .image
+                    .pixel_scale(viewport, media, window.scale_factor() as f64);
             self.zoom_at((1. / cur_scale).log2(), Some(point), cx);
         }
     }
@@ -411,26 +441,39 @@ impl IrisWindow {
     }
 
     pub(super) fn toggle_hflip(&mut self, _: &ToggleHFlip, _: &mut Window, cx: &mut Context<Self>) {
-        self.command(Command::ToggleHFlip, cx);
-        let on = self.active().session.state().hflip;
-        self.show_osd(
-            if on {
-                "水平镜像"
-            } else {
-                "还原水平镜像"
-            },
-            cx,
-        );
+        self.flip_display_axis(true, cx);
     }
 
     pub(super) fn toggle_vflip(&mut self, _: &ToggleVFlip, _: &mut Window, cx: &mut Context<Self>) {
-        self.command(Command::ToggleVFlip, cx);
-        let on = self.active().session.state().vflip;
+        self.flip_display_axis(false, cx);
+    }
+
+    fn flip_display_axis(&mut self, horizontal: bool, cx: &mut Context<Self>) {
+        let command = if horizontal {
+            Command::ToggleHFlip
+        } else {
+            Command::ToggleVFlip
+        };
+        if let Err(error) = self.active_mut().session.execute(command) {
+            self.show_toast(format!("操作失败 · {error}"), cx);
+            return;
+        }
+        self.active_mut().image.pan[usize::from(!horizontal)] *= -1.;
+        self.apply_image_view(cx);
+        let session = &self.active().session;
+        let source_horizontal = horizontal ^ (session.display_rotation().rem_euclid(180) == 90);
+        let state = session.state();
+        let on = if source_horizontal {
+            state.hflip
+        } else {
+            state.vflip
+        };
         self.show_osd(
-            if on {
-                "垂直镜像"
-            } else {
-                "还原垂直镜像"
+            match (horizontal, on) {
+                (true, true) => "水平镜像",
+                (true, false) => "还原水平镜像",
+                (false, true) => "垂直镜像",
+                (false, false) => "还原垂直镜像",
             },
             cx,
         );
@@ -444,9 +487,7 @@ impl IrisWindow {
     ) {
         self.settings.photo_filmstrip = !self.settings.photo_filmstrip;
         self.persist_user_settings();
-        if self.settings.photo_filmstrip {
-            self.ensure_filmstrip_thumbnails(cx);
-        }
+        self.ensure_filmstrip_thumbnails(cx);
         cx.notify();
     }
 

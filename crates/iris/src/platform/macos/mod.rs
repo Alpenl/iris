@@ -4,8 +4,10 @@
 mod imageio;
 
 use std::ffi::{c_char, c_void};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr;
 use std::sync::Once;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use cocoa::base::{NO, YES, id, nil};
 use cocoa::foundation::{NSPoint, NSRect, NSString};
@@ -197,7 +199,7 @@ struct PinchTargetState {
 }
 
 extern "C" fn on_magnify(this: &Object, _: Sel, recognizer: id) {
-    unsafe {
+    if let Err(payload) = catch_unwind(AssertUnwindSafe(|| unsafe {
         let p: *mut c_void = *this.get_ivar("irisPinch");
         if p.is_null() {
             return;
@@ -220,6 +222,8 @@ extern "C" fn on_magnify(this: &Object, _: Sel, recognizer: id) {
             delta: mag * 1.6,
             position: [loc.x, y],
         });
+    })) {
+        std::mem::forget(payload);
     }
 }
 
@@ -294,17 +298,26 @@ unsafe extern "C" {
 
 struct MediaTargetState {
     tx: UnboundedSender<MediaKey>,
+    enabled: AtomicBool,
 }
 
 fn send_media_key(this: &Object, key: MediaKey) -> isize {
-    unsafe {
+    const COMMAND_FAILED: isize = 200;
+    catch_unwind(AssertUnwindSafe(|| unsafe {
         let p: *mut c_void = *this.get_ivar("irisMedia");
-        if !p.is_null() {
-            let state = &*(p as *const MediaTargetState);
-            let _ = state.tx.unbounded_send(key);
+        let Some(state) = p.cast::<MediaTargetState>().as_ref() else {
+            return COMMAND_FAILED;
+        };
+        if state.enabled.load(Ordering::Acquire) && state.tx.unbounded_send(key).is_ok() {
+            0 // MPRemoteCommandHandlerStatusSuccess
+        } else {
+            COMMAND_FAILED
         }
-    }
-    0 // MPRemoteCommandHandlerStatusSuccess
+    }))
+    .unwrap_or_else(|payload| {
+        std::mem::forget(payload);
+        COMMAND_FAILED
+    })
 }
 
 extern "C" fn cmd_play(this: &Object, _: Sel, _: id) -> isize {
@@ -323,6 +336,30 @@ extern "C" fn cmd_prev(this: &Object, _: Sel, _: id) -> isize {
     send_media_key(this, MediaKey::Prev)
 }
 
+extern "C" fn media_target_dealloc(this: &Object, _: Sel) {
+    if let Err(payload) = catch_unwind(AssertUnwindSafe(|| unsafe {
+        let state: *mut c_void = *this.get_ivar("irisMedia");
+        if !state.is_null() {
+            drop(Box::from_raw(state.cast::<MediaTargetState>()));
+        }
+    })) {
+        std::mem::forget(payload);
+    }
+    unsafe {
+        let _: () = msg_send![super(this, class!(NSObject)), dealloc];
+    }
+}
+
+fn media_commands() -> [(Sel, Sel); 5] {
+    [
+        (sel!(playCommand), sel!(onPlay:)),
+        (sel!(pauseCommand), sel!(onPause:)),
+        (sel!(togglePlayPauseCommand), sel!(onToggle:)),
+        (sel!(nextTrackCommand), sel!(onNext:)),
+        (sel!(previousTrackCommand), sel!(onPrev:)),
+    ]
+}
+
 fn media_target_class() -> &'static Class {
     static REGISTER: Once = Once::new();
     REGISTER.call_once(|| {
@@ -330,6 +367,10 @@ fn media_target_class() -> &'static Class {
             .expect("IrisMediaKeyTarget class");
         decl.add_ivar::<*mut c_void>("irisMedia");
         unsafe {
+            decl.add_method(
+                sel!(dealloc),
+                media_target_dealloc as extern "C" fn(&Object, Sel),
+            );
             for (s, f) in [
                 (
                     sel!(onPlay:),
@@ -351,6 +392,7 @@ fn media_target_class() -> &'static Class {
 pub(crate) struct MediaKeyBridge {
     target: id,
     state: *mut MediaTargetState,
+    command_center: id,
 }
 
 impl MediaKeyBridge {
@@ -370,29 +412,48 @@ impl MediaKeyBridge {
                 return None;
             }
             let (tx, rx) = unbounded();
-            let state = Box::into_raw(Box::new(MediaTargetState { tx }));
+            let state = Box::into_raw(Box::new(MediaTargetState {
+                tx,
+                enabled: AtomicBool::new(false),
+            }));
             let target: id = msg_send![media_target_class(), new];
             (*target).set_ivar("irisMedia", state as *mut c_void);
 
-            for (cmd_sel, action) in [
-                (sel!(playCommand), sel!(onPlay:)),
-                (sel!(pauseCommand), sel!(onPause:)),
-                (sel!(togglePlayPauseCommand), sel!(onToggle:)),
-                (sel!(nextTrackCommand), sel!(onNext:)),
-                (sel!(previousTrackCommand), sel!(onPrev:)),
-            ] {
+            for (cmd_sel, action) in media_commands() {
                 let cmd: id = msg_send![center, performSelector: cmd_sel];
                 if cmd != nil {
-                    let _: () = msg_send![cmd, setEnabled: YES];
+                    let _: () = msg_send![cmd, setEnabled: NO];
                     let _: () = msg_send![cmd, addTarget: target action: action];
                 }
             }
 
-            Some((Self { target, state }, rx))
+            Some((
+                Self {
+                    target,
+                    state,
+                    command_center: center,
+                },
+                rx,
+            ))
+        }
+    }
+
+    fn set_commands_enabled(&self, enabled: bool) {
+        // The target owns state. This bridge retains the target until Drop.
+        if unsafe { (*self.state).enabled.swap(enabled, Ordering::AcqRel) } == enabled {
+            return;
+        }
+        let enabled = if enabled { YES } else { NO };
+        unsafe {
+            for (selector, _) in media_commands() {
+                let cmd: id = msg_send![self.command_center, performSelector: selector];
+                let _: () = msg_send![cmd, setEnabled: enabled];
+            }
         }
     }
 
     pub(crate) fn update_now_playing(&mut self, media: Option<NowPlaying<'_>>) {
+        self.set_commands_enabled(media.is_some());
         unsafe {
             let Some(info_cls) = Class::get("MPNowPlayingInfoCenter") else {
                 return;
@@ -442,35 +503,13 @@ impl MediaKeyBridge {
 
 impl Drop for MediaKeyBridge {
     fn drop(&mut self) {
+        self.update_now_playing(None);
         unsafe {
-            if let Some(center_cls) = Class::get("MPRemoteCommandCenter") {
-                let center: id = msg_send![center_cls, sharedCommandCenter];
-                if center != nil {
-                    for cmd_sel in [
-                        sel!(playCommand),
-                        sel!(pauseCommand),
-                        sel!(togglePlayPauseCommand),
-                        sel!(nextTrackCommand),
-                        sel!(previousTrackCommand),
-                    ] {
-                        let cmd: id = msg_send![center, performSelector: cmd_sel];
-                        if cmd != nil {
-                            let _: () = msg_send![cmd, removeTarget: self.target];
-                            let _: () = msg_send![cmd, setEnabled: NO];
-                        }
-                    }
-                }
+            for (selector, _) in media_commands() {
+                let cmd: id = msg_send![self.command_center, performSelector: selector];
+                let _: () = msg_send![cmd, removeTarget: self.target];
             }
-            if let Some(info_cls) = Class::get("MPNowPlayingInfoCenter") {
-                let center: id = msg_send![info_cls, defaultCenter];
-                if center != nil {
-                    let _: () = msg_send![center, setNowPlayingInfo: nil];
-                    let _: () = msg_send![center, setPlaybackState: 0usize];
-                }
-            }
-            (*self.target).set_ivar("irisMedia", ptr::null_mut::<c_void>());
             let _: () = msg_send![self.target, release];
-            drop(Box::from_raw(self.state));
         }
     }
 }
@@ -482,7 +521,11 @@ pub(crate) fn begin_window_drag(window: &gpui::Window) {
         let app: id = msg_send![class!(NSApplication), sharedApplication];
         let event: id = msg_send![app, currentEvent];
         if event != nil {
-            let _: () = msg_send![win, performWindowDragWithEvent: event];
+            let event_type: usize = msg_send![event, type];
+            let source_window: id = msg_send![event, window];
+            if matches!(event_type, 1 | 6) && source_window == win {
+                let _: () = msg_send![win, performWindowDragWithEvent: event];
+            }
         }
     }
 }
@@ -504,9 +547,14 @@ pub(crate) fn synth_mouse(
     x: f64,
     y: f64,
 ) -> Option<Box<dyn FnOnce()>> {
-    let view = ns_view(window)?;
-    let win = ns_window(window)?;
+    let view = unsafe { objc::rc::StrongPtr::retain(ns_view(window)?) };
+    let win = unsafe { objc::rc::StrongPtr::retain(ns_window(window)?) };
     Some(Box::new(move || unsafe {
+        let (view, win) = (*view, *win);
+        let current: id = msg_send![view, window];
+        if current != win {
+            return;
+        }
         let content: id = msg_send![win, contentView];
         let frame: NSRect = msg_send![content, frame];
         let loc = NSPoint::new(x, frame.size.height - y);

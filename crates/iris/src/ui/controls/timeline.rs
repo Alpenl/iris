@@ -74,9 +74,7 @@ impl IrisWindow {
         }
 
         let duration = state.duration;
-        let pct = if let Some(r) = self.chrome.scrub.seek_preview_ratio
-            && self.chrome.scrub.seeking
-        {
+        let pct = if let Some(r) = self.chrome.scrub.seek_preview_ratio {
             r.clamp(0., 1.)
         } else if duration > 0. {
             (state.time_pos / duration).clamp(0., 1.) as f32
@@ -179,6 +177,10 @@ impl IrisWindow {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, ev: &MouseDownEvent, _, cx| {
+                    if this.active().session.state().duration <= 0. {
+                        return;
+                    }
+                    this.chrome.scrub.seek_preview_timeout = None;
                     this.chrome.scrub.seeking = true;
                     this.chrome.scrub.last_seek_drag = Instant::now();
                     this.update_seek_preview(ev.position.x);

@@ -94,15 +94,18 @@ impl IrisWindow {
     }
 
     pub(super) fn volume_up(&mut self, _: &VolumeUp, _: &mut Window, cx: &mut Context<Self>) {
-        let next = (self.active().session.state().volume + 5.).clamp(0., 100.);
-        self.command(Command::SetVolume(next), cx);
-        self.show_osd(format!("音量 · {next:.0}%"), cx);
+        self.adjust_volume_by(5., cx);
     }
 
     pub(super) fn volume_down(&mut self, _: &VolumeDown, _: &mut Window, cx: &mut Context<Self>) {
-        let next = (self.active().session.state().volume - 5.).clamp(0., 100.);
-        self.command(Command::SetVolume(next), cx);
-        self.show_osd(format!("音量 · {next:.0}%"), cx);
+        self.adjust_volume_by(-5., cx);
+    }
+
+    pub(super) fn adjust_volume_by(&mut self, delta: f64, cx: &mut Context<Self>) {
+        match self.active_mut().session.execute(Command::VolumeBy(delta)) {
+            Ok(()) => self.active_mut().announce_volume = Some(std::time::Instant::now()),
+            Err(error) => self.show_toast(format!("操作失败 · {error}"), cx),
+        }
     }
 
     pub(super) fn toggle_mute(&mut self, _: &ToggleMute, _: &mut Window, cx: &mut Context<Self>) {

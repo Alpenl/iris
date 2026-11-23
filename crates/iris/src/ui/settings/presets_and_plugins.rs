@@ -351,9 +351,6 @@ impl IrisWindow {
                                     .on_click(cx.listener(
                                         move |this, _, w, cx| {
                                             this.invoke_plugin_command(&pid_add, &cmd_id, w, cx);
-                                            if this.plugins.active_modal().is_some() {
-                                                this.overlays.settings_open = false;
-                                            }
                                         },
                                     )),
                                 )
@@ -428,9 +425,6 @@ impl IrisWindow {
                                 chip_button(("pl-src-auth", row_ix), "登录", true, t).on_click(
                                     cx.listener(move |this, _, w, cx| {
                                         this.invoke_plugin_command(&pid_auth, &cmd_id, w, cx);
-                                        if this.plugins.active_modal().is_some() {
-                                            this.overlays.settings_open = false;
-                                        }
                                     }),
                                 ),
                             )
@@ -446,9 +440,6 @@ impl IrisWindow {
                                             w,
                                             cx,
                                         );
-                                        if this.plugins.active_modal().is_some() {
-                                            this.overlays.settings_open = false;
-                                        }
                                     }),
                                 ),
                             )

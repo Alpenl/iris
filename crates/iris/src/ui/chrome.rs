@@ -117,6 +117,7 @@ pub(super) struct WindowChromeState {
     pub(super) show_remaining: bool,
     pub(super) resizing_dir: Option<(f32, f32)>,
     pub(super) last_window_size: Option<(f32, f32)>,
+    pub(super) pending_window_size: Option<(f32, f32)>,
     pub(super) last_activity: Instant,
     pub(super) hide_armed: bool,
     pub(super) mouse_pos: Option<Point<Pixels>>,
@@ -126,6 +127,8 @@ pub(super) struct WindowChromeState {
     pub(super) osd_seq: u64,
     pub(super) last_render_sec: i64,
     pub(super) last_render_bar_px: i32,
+    pub(super) last_render_cache_px: i32,
+    pub(super) last_cache_tick: Instant,
     pub(super) last_bar_tick: Instant,
     pub(super) last_scale: f64,
     pub(super) render_count: u64,
@@ -141,6 +144,7 @@ impl WindowChromeState {
             titlebar_hover: false,
             show_remaining: false,
             resizing_dir: None,
+            pending_window_size: None,
             last_window_size: None,
             last_activity: now,
             hide_armed: false,
@@ -151,6 +155,8 @@ impl WindowChromeState {
             osd_seq: 0,
             last_render_sec: -1,
             last_render_bar_px: -1,
+            last_render_cache_px: -1,
+            last_cache_tick: now,
             last_bar_tick: now,
             last_scale: initial_scale,
             render_count: 0,
@@ -183,7 +189,7 @@ impl IrisWindow {
         let fs = window.is_fullscreen();
         if fs == self.chrome.fullscreen {
             // Windows reports a move onto another monitor via window hover loss.
-            if fs && !window.is_window_hovered() {
+            if !platform::IS_MACOS && !window.is_window_hovered() {
                 self.on_window_pointer_exit(window, cx);
             }
             return;
@@ -200,6 +206,9 @@ impl IrisWindow {
             self.bump_activity(cx);
         } else {
             platform::hide_traffic_lights(window);
+            if let Some((w, h)) = self.chrome.pending_window_size.take() {
+                window.resize(gpui::size(px(w), px(h)));
+            }
         }
     }
 
@@ -240,6 +249,7 @@ impl IrisWindow {
                 return Some(delay - idle);
             }
             self.chrome.chrome_visible = false;
+            self.chrome.scrub.timeline_hover = false;
             cx.notify();
         }
         self.chrome.hide_armed = false;
@@ -409,6 +419,11 @@ impl IrisWindow {
 
     pub(super) fn on_window_pointer_exit(&mut self, window: &Window, cx: &mut Context<Self>) {
         self.chrome.mouse_pos = None;
+        let changed = std::mem::take(&mut self.chrome.titlebar_hover)
+            | std::mem::take(&mut self.chrome.scrub.timeline_hover);
+        if changed {
+            cx.notify();
+        }
         if self.overlays.dir_popup == DirectoryPopup::Hover && self.directory_hover_allowed(window)
         {
             self.overlays.dir_popup = DirectoryPopup::Hidden;
@@ -449,7 +464,11 @@ impl IrisWindow {
             }
         }
         let hot_h = f32::from(t.titlebar_h) + 8.;
-        let in_hot = !self.chrome.fullscreen && f32::from(ev.position.y) <= hot_h;
+        let in_hot = !self.chrome.fullscreen
+            && ev.position.x >= px(0.)
+            && ev.position.x < window.viewport_size().width
+            && ev.position.y >= px(0.)
+            && ev.position.y <= px(hot_h);
         if in_hot != self.chrome.titlebar_hover {
             self.chrome.titlebar_hover = in_hot;
             if self.effective_hide_titlebar() {
@@ -489,25 +508,32 @@ impl IrisWindow {
                     self.seek_to_x(ev.position.x, false);
                 }
             } else {
-                self.chrome.scrub.seeking = false;
-                self.chrome.scrub.seek_preview_ratio = None;
+                self.finish_seek(ev.position.x, cx);
             }
             cx.notify();
-        } else if self.chrome.scrub.timeline_hover {
+        } else if self.chrome_shown() && self.chrome.scrub.timeline_hover {
             cx.notify();
         }
         if ev.pressed_button == Some(MouseButton::Left) {
-            if let Some(start) = self.active().pending_win_drag_origin {
-                let dist =
-                    f32::from(ev.position.x - start.x).hypot(f32::from(ev.position.y - start.y));
-                if dist > 5.0 {
-                    self.active_mut().pending_win_drag_origin = None;
-                    self.chrome.scrub.click_seq += 1;
-                    platform::begin_window_drag(window);
-                    return;
-                }
+            if self
+                .active()
+                .pending_click_origin
+                .is_some_and(|start| pointer_distance(start, ev.position) > 5.)
+            {
+                self.active_mut().pending_click_origin = None;
             }
-            if let Some(origin) = self.active().drag_origin {
+            if let Some(start) = self.active().pending_win_drag_origin
+                && pointer_distance(start, ev.position) > 5.
+            {
+                self.active_mut().pending_win_drag_origin = None;
+                self.active_mut().pending_click_origin = None;
+                self.chrome.scrub.click_seq += 1;
+                platform::begin_window_drag(window);
+                return;
+            }
+            if let Some(origin) = self.active().drag_origin
+                && self.image_geometry_ready()
+            {
                 self.active_mut().drag_origin = Some(ev.position);
                 let delta = [
                     f32::from(ev.position.x - origin.x) as f64,
@@ -519,6 +545,7 @@ impl IrisWindow {
             }
         } else {
             self.active_mut().pending_win_drag_origin = None;
+            self.active_mut().pending_click_origin = None;
             if self.active_mut().drag_origin.take().is_some() {
                 cx.notify();
             }
@@ -531,10 +558,39 @@ impl IrisWindow {
     pub(super) fn on_root_mouse_up(
         &mut self,
         ev: &MouseUpEvent,
-        _: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         self.active_mut().pending_win_drag_origin = None;
+        if let Some(start) = self.active_mut().pending_click_origin.take()
+            && pointer_distance(start, ev.position) <= 5.
+            && ev.position.x >= px(0.)
+            && ev.position.y >= px(0.)
+            && ev.position.x < window.viewport_size().width
+            && ev.position.y < window.viewport_size().height
+            && !self.input_context().overlay
+        {
+            self.chrome.scrub.click_seq += 1;
+            let seq = self.chrome.scrub.click_seq;
+            let generation = self.active().load_generation;
+            cx.spawn(async move |this, cx| {
+                cx.background_executor()
+                    .timer(Duration::from_millis(200))
+                    .await;
+                let _ = this.update(cx, |this, cx| {
+                    if this.chrome.scrub.click_seq == seq
+                        && this.active().load_generation == generation
+                        && !this.input_context().overlay
+                    {
+                        let state = this.active().session.state();
+                        let pause = !state.paused && !state.ended;
+                        this.command(Command::TogglePlayback, cx);
+                        this.show_osd(if pause { "暂停" } else { "播放" }, cx);
+                    }
+                });
+            })
+            .detach();
+        }
         if self.chrome.resizing_dir.take().is_some() {
             self.persist_user_settings();
             cx.notify();
@@ -546,13 +602,33 @@ impl IrisWindow {
         if self.active_mut().drag_origin.take().is_some() {
             cx.notify();
         }
-        if self.chrome.scrub.seeking {
-            self.chrome.scrub.seeking = false;
-            self.chrome.scrub.seek_preview_ratio = None;
-            self.seek_to_x(ev.position.x, true);
-            cx.notify();
-        }
+        self.finish_seek(ev.position.x, cx);
     }
+
+    fn finish_seek(&mut self, x: Pixels, cx: &mut Context<Self>) {
+        if !std::mem::take(&mut self.chrome.scrub.seeking) {
+            return;
+        }
+        self.update_seek_preview(x);
+        self.seek_to_x(x, true);
+        self.chrome.scrub.seek_preview_timeout = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(350))
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if !this.chrome.scrub.seeking
+                    && this.chrome.scrub.seek_preview_ratio.take().is_some()
+                {
+                    cx.notify();
+                }
+            });
+        }));
+        cx.notify();
+    }
+}
+
+fn pointer_distance(a: Point<Pixels>, b: Point<Pixels>) -> f32 {
+    f32::from(a.x - b.x).hypot(f32::from(a.y - b.y))
 }
 
 #[cfg(test)]

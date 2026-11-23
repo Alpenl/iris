@@ -172,6 +172,8 @@ pub(in crate::ui) fn modal_shell(
         .items_center()
         .justify_center()
         .bg(t.scrim)
+        .p(px(12.))
+        .occlude()
         .on_mouse_down(
             MouseButton::Left,
             cx.listener(move |this, _, w, cx| {
@@ -179,12 +181,15 @@ pub(in crate::ui) fn modal_shell(
                 cx.stop_propagation();
             }),
         )
+        .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
         .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
         .child(
             div()
                 .id((spec.id_prefix, 1usize))
                 .w(px(spec.width))
+                .max_w(gpui::relative(1.))
                 .when_some(spec.fixed_height, |d, h| d.h(px(h)))
+                .when(spec.fixed_height.is_some(), |d| d.max_h(gpui::relative(1.)))
                 .when(spec.fixed_height.is_none(), |d| {
                     d.max_h(px(spec.max_height))
                 })
@@ -200,6 +205,7 @@ pub(in crate::ui) fn modal_shell(
                 })
                 .overflow_hidden()
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
                 .child(header)
                 .child(body_wrap)
                 .children(footer),

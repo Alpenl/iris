@@ -175,8 +175,13 @@ pub(super) struct CatalogState {
     pub(super) filter: MediaFilter,
     pub(super) rows: Vec<DirRow>,
     pub(super) items: Vec<CatalogItem>,
+    pub(super) sorted_source_items: Vec<CatalogItem>,
+    pub(super) favorite_uris: Vec<iris_core::media_uri::MediaUri>,
+    pub(super) favorite_items: Vec<CatalogItem>,
+    pub(super) favorite_scan: Option<gpui::Task<()>>,
     pub(super) photo_paths: Vec<PathBuf>,
-    pub(super) video_audio_count: usize,
+    pub(super) video_count: usize,
+    pub(super) audio_count: usize,
     pub(super) photo_count: usize,
     pub(super) favorite_count: usize,
     pub(super) thumbs: ThumbCache,
@@ -185,6 +190,8 @@ pub(super) struct CatalogState {
     pub(super) pending_source: Option<PendingSource>,
     pub(super) source_timeout: Option<gpui::Task<()>>,
     pub(super) remote_load: Option<RemoteLoad>,
+    pub(super) directory_refresh: Option<gpui::Task<()>>,
+    pub(super) filmstrip_index: usize,
     pub(super) remote_work_slot: Arc<futures::lock::Mutex<()>>,
 }
 
@@ -274,8 +281,13 @@ impl Default for CatalogState {
             filter: MediaFilter::All,
             rows: Vec::new(),
             items: Vec::new(),
+            sorted_source_items: Vec::new(),
+            favorite_uris: Vec::new(),
+            favorite_items: Vec::new(),
+            favorite_scan: None,
             photo_paths: Vec::new(),
-            video_audio_count: 0,
+            video_count: 0,
+            audio_count: 0,
             photo_count: 0,
             favorite_count: 0,
             thumbs: ThumbCache::default(),
@@ -284,6 +296,8 @@ impl Default for CatalogState {
             pending_source: None,
             source_timeout: None,
             remote_load: None,
+            directory_refresh: None,
+            filmstrip_index: 0,
             remote_work_slot: Arc::new(futures::lock::Mutex::new(())),
         }
     }
@@ -304,6 +318,7 @@ pub(super) struct OverlayState {
     pub(super) recording_shortcut: Option<(String, String)>,
     pub(super) shortcut_conflict: Option<String>,
     pub(super) submitting_plugin_modal: Option<(String, String)>,
+    pub(super) plugin_modal_focus_pending: bool,
 }
 
 impl Default for OverlayState {
@@ -322,6 +337,7 @@ impl Default for OverlayState {
             recording_shortcut: None,
             shortcut_conflict: None,
             submitting_plugin_modal: None,
+            plugin_modal_focus_pending: false,
         }
     }
 }
@@ -339,16 +355,8 @@ impl OverlayState {
             || self.dialog.is_some()
     }
 
-    /// True when single-key playback bindings must be suppressed (`TextInput` KeyContext).
-    pub(super) fn is_text_input_active(
-        &self,
-        buffers: &TextInputBuffers,
-        search_focused: bool,
-        palette_focused: bool,
-        form_focused: bool,
-    ) -> bool {
-        buffers.is_focused_given(search_focused, palette_focused, form_focused)
-            || self.recording_shortcut.is_some()
+    pub(super) fn is_recording(&self, focused: bool) -> bool {
+        self.settings_open && self.recording_shortcut.is_some() && focused
     }
 
     pub(super) fn close_menus(&mut self) {
@@ -447,15 +455,6 @@ impl OverlayState {
         }
     }
 
-    pub(super) fn complete_plugin_modal_close(
-        &mut self,
-        buffers: &mut TextInputBuffers,
-        next_modal: Option<(&str, &PluginModal)>,
-    ) {
-        self.submitting_plugin_modal = None;
-        buffers.sync_plugin_modal(next_modal);
-    }
-
     pub(super) fn cancel_plugin_modal_state(&mut self, buffers: &mut TextInputBuffers) {
         self.submitting_plugin_modal = None;
         buffers.clear_modal_fields();
@@ -510,6 +509,7 @@ pub(super) struct ScrubState {
     pub(super) timeline_hover: bool,
     pub(super) seeking: bool,
     pub(super) seek_preview_ratio: Option<f32>,
+    pub(super) seek_preview_timeout: Option<gpui::Task<()>>,
     pub(super) last_seek_drag: Instant,
     pub(super) dragging_volume: bool,
     pub(super) wheel_accum: f64,
@@ -522,6 +522,7 @@ impl Default for ScrubState {
             timeline_hover: false,
             seeking: false,
             seek_preview_ratio: None,
+            seek_preview_timeout: None,
             last_seek_drag: Instant::now(),
             dragging_volume: false,
             wheel_accum: 0.,
@@ -558,17 +559,13 @@ impl ThumbCache {
         }
     }
 
-    pub(super) fn generation(&self) -> u64 {
-        self.generation
-    }
-
     pub(super) fn enqueue_window(&mut self, prioritized: Vec<PathBuf>) {
         self.generation = self.generation.wrapping_add(1);
         self.pending.clear();
         for p in prioritized {
             if self.entries.contains_key(&p) {
                 self.touch(&p);
-            } else if !self.inflight.contains(&p) {
+            } else {
                 self.pending.push_back(p);
             }
         }
@@ -577,10 +574,15 @@ impl ThumbCache {
     pub(super) fn pop_next_batch(&mut self) -> Vec<(u64, PathBuf)> {
         let mut out = Vec::new();
         while self.active_tasks < MAX_THUMB_CONCURRENT {
-            let Some(path) = self.pending.pop_front() else {
+            let Some(index) = self
+                .pending
+                .iter()
+                .position(|path| !self.inflight.contains(path))
+            else {
                 break;
             };
-            if self.entries.contains_key(&path) || self.inflight.contains(&path) {
+            let path = self.pending.remove(index).expect("pending thumbnail index");
+            if self.entries.contains_key(&path) {
                 continue;
             }
             self.inflight.insert(path.clone());
@@ -590,10 +592,17 @@ impl ThumbCache {
         out
     }
 
-    pub(super) fn finish(&mut self, path: PathBuf, decoded: Option<Arc<RenderImage>>) {
+    pub(super) fn finish(
+        &mut self,
+        generation: u64,
+        path: PathBuf,
+        decoded: Option<Arc<RenderImage>>,
+    ) -> bool {
         self.inflight.remove(&path);
         self.active_tasks = self.active_tasks.saturating_sub(1);
-        if let Some(img) = decoded {
+        if generation == self.generation
+            && let Some(img) = decoded
+        {
             self.tick += 1;
             let stamp = self.tick;
             if self.entries.len() >= MAX_THUMB_CACHE
@@ -607,7 +616,9 @@ impl ThumbCache {
                 self.entries.remove(&oldest);
             }
             self.entries.insert(path, (stamp, img));
+            return true;
         }
+        false
     }
 }
 

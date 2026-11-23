@@ -62,6 +62,8 @@ pub const MPV_EVENT_AUDIO_RECONFIG: mpv_event_id = 18;
 pub const MPV_EVENT_SEEK: mpv_event_id = 20;
 pub const MPV_EVENT_PLAYBACK_RESTART: mpv_event_id = 21;
 pub const MPV_EVENT_PROPERTY_CHANGE: mpv_event_id = 22;
+pub const MPV_EVENT_QUEUE_OVERFLOW: mpv_event_id = 24;
+pub const MPV_EVENT_HOOK: mpv_event_id = 25;
 
 pub const MPV_END_FILE_REASON_EOF: c_int = 0;
 pub const MPV_END_FILE_REASON_STOP: c_int = 2;
@@ -97,12 +99,23 @@ pub struct mpv_event_log_message {
 }
 
 #[repr(C)]
+pub struct mpv_event_start_file {
+    pub playlist_entry_id: i64,
+}
+
+#[repr(C)]
 pub struct mpv_event_end_file {
     pub reason: c_int,
     pub error: c_int,
     pub playlist_entry_id: i64,
     pub playlist_insert_id: i64,
     pub playlist_insert_num_entries: c_int,
+}
+
+#[repr(C)]
+pub struct mpv_event_hook {
+    pub name: *const c_char,
+    pub id: u64,
 }
 
 // render.h
@@ -179,11 +192,6 @@ unsafe extern "C" {
         reply_userdata: u64,
         args: *mut *const c_char,
     ) -> c_int;
-    pub fn mpv_command_node_async(
-        ctx: *mut mpv_handle,
-        reply_userdata: u64,
-        args: *mut mpv_node,
-    ) -> c_int;
     pub fn mpv_free_node_contents(node: *mut mpv_node);
     pub fn mpv_set_property_string(
         ctx: *mut mpv_handle,
@@ -212,6 +220,14 @@ unsafe extern "C" {
     ) -> c_int;
     pub fn mpv_request_log_messages(ctx: *mut mpv_handle, min_level: *const c_char) -> c_int;
     pub fn mpv_wait_event(ctx: *mut mpv_handle, timeout: f64) -> *mut mpv_event;
+    pub fn mpv_wakeup(ctx: *mut mpv_handle);
+    pub fn mpv_hook_add(
+        ctx: *mut mpv_handle,
+        userdata: u64,
+        name: *const c_char,
+        priority: c_int,
+    ) -> c_int;
+    pub fn mpv_hook_continue(ctx: *mut mpv_handle, id: u64) -> c_int;
 
     pub fn mpv_render_context_create(
         res: *mut *mut mpv_render_context,

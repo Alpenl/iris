@@ -33,6 +33,9 @@ impl IrisWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.plugins.active_modal().is_some() {
+            return;
+        }
         match &dialog {
             BuiltinDialog::OpenUrl => {
                 self.set_form_value("url", "");
@@ -94,8 +97,8 @@ impl IrisWindow {
         let dialog = self.overlays.dialog.clone()?;
         let t = ThemeTokens::of(cx);
         let vp = window.viewport_size();
-        let modal_w = (f32::from(vp.width) - 32.).clamp(320., 460.);
-        let max_h = (f32::from(vp.height) - 32.).clamp(240., 520.);
+        let modal_w = (f32::from(vp.width) - 32.).clamp(0., 460.);
+        let max_h = (f32::from(vp.height) - 32.).clamp(0., 520.);
 
         let cancel_cb: ModalCallback = Rc::new(|this, w, cx| {
             this.overlays.dialog = None;

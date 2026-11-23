@@ -6,7 +6,9 @@ use iris_api::{HostCommand, PluginModal, SelectOption, SourceDescriptor, Widget,
 
 use crate::vfs::validate_stream_url;
 
-use super::protocol::{WebDavAuth, WebDavConnection, normalize_dav_path};
+use super::protocol::{
+    WebDavAuth, WebDavConnection, auth_needs_confirmation, has_userinfo, normalize_dav_path,
+};
 
 pub(super) const ADD_MODAL_ID: &str = "webdav.add";
 pub(super) const EDIT_MODAL_PREFIX: &str = "webdav.edit:";
@@ -154,6 +156,12 @@ pub(super) fn build_modal(existing: Option<&WebDavConnection>, has_secret: bool)
             },
             input_widget("username", "用户名", username, "Basic 认证必填", false),
             input_widget("secret", "密码 / 令牌", "", sec_hint, true),
+            Widget::Toggle {
+                id: "allow_insecure_auth".into(),
+                label: "允许通过不加密的 HTTP 发送账号和密码或令牌".into(),
+                checked: false,
+                action_id: None,
+            },
         ],
         submit_label: Some("保存".into()),
         cancel_label: Some("取消".into()),
@@ -188,8 +196,13 @@ pub(super) fn validate_modal_submit(
         .get("endpoint")
         .or_else(|| values.get("url"))
         .map_or("", |s| s.trim());
-    let parsed_url =
-        validate_stream_url(endpoint_raw).map_err(|e| format!("WebDAV 服务器地址无效：{e}"))?;
+    let mut parsed_url = validate_stream_url(endpoint_raw)
+        .map_err(|_| "WebDAV 服务器地址无效，请输入 HTTP 或 HTTPS 地址".to_string())?;
+    if has_userinfo(&parsed_url) {
+        return Err("请勿在 WebDAV 地址中填写用户名或密码，请使用下方的认证字段".into());
+    }
+    parsed_url.set_query(None);
+    parsed_url.set_fragment(None);
     let norm_base = normalize_dav_path(values.get("base_path").map_or("/", String::as_str));
     let base_path = if norm_base == "/" {
         String::new()
@@ -237,6 +250,14 @@ pub(super) fn validate_modal_submit(
         }
         other => return Err(format!("未知的 WebDAV 认证方式：{other}")),
     };
+    let needs_confirmation = auth_needs_confirmation(&parsed_url, &auth);
+    let allow_insecure_auth = needs_confirmation
+        && values
+            .get("allow_insecure_auth")
+            .is_some_and(|value| value == "true");
+    if needs_confirmation && !allow_insecure_auth {
+        return Err("请改用 HTTPS，或勾选允许通过不加密的 HTTP 发送凭据".into());
+    }
 
     Ok(Some(ValidatedServer {
         is_edit: edit_id.is_some(),
@@ -246,6 +267,7 @@ pub(super) fn validate_modal_submit(
             endpoint: parsed_url.to_string(),
             base_path,
             auth,
+            allow_insecure_auth,
         },
         secret,
     }))
@@ -271,18 +293,30 @@ mod tests {
             Some(784_111_777)
         );
         assert_eq!(parse_http_date("Thu, 01 Jan 1970 00:00:00 GMT"), Some(0));
+        assert_eq!(
+            parse_http_date("Thu, 01 Jan 9223372036854775807 00:00:00 GMT"),
+            None
+        );
 
         let xml = r#"<?xml version="1.0" encoding="utf-8"?><D:multistatus xmlns:D="DAV:">
             <D:response><D:href>/dav/Anime/</D:href><D:propstat><D:prop><D:resourcetype><D:collection/></D:resourcetype></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>
+            <D:response><D:href>Anime/</D:href></D:response>
+            <D:response><D:href>/DAV/Anime/Season%202/</D:href></D:response>
+            <D:response><D:href>Season%2F99/</D:href></D:response>
+            <D:response><D:href>Season%5C99/</D:href></D:response>
+            <D:response><D:href>https://elsewhere.example/dav/Anime/Foreign/</D:href></D:response>
+            <response xmlns="urn:unrelated"><D:href>Foreign/</D:href></response>
             <D:response><D:href>/dav/Anime/Season%2010/</D:href><D:propstat><D:prop><D:resourcetype><D:collection/></D:resourcetype></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>
-            <D:response><D:href>/dav/Anime/Season%202/</D:href><D:propstat><D:prop><D:resourcetype><D:collection/></D:resourcetype></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>
+            <D:response><D:href>Season%202/</D:href><D:propstat><D:prop><D:resourcetype><D:collection/></D:resourcetype></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>
             <D:response><D:href>/dav/Anime/ep10.mkv</D:href><D:propstat><D:prop><D:resourcetype/><D:getcontentlength>104857600</D:getcontentlength><D:getlastmodified>Sun, 06 Nov 1994 08:49:37 GMT</D:getlastmodified></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>
             <D:response><D:href>/dav/Anime/ep2%20%E7%89%B9%E5%85%B8.mkv</D:href><D:propstat><D:prop><D:resourcetype/><D:getcontentlength>52428800</D:getcontentlength><D:getlastmodified>Wed, 21 Oct 2015 07:28:00 GMT</D:getlastmodified></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>
             <D:response><D:href>/dav/Anime/ep2%20%E7%89%B9%E5%85%B8.zh-Hans.ass</D:href><D:propstat><D:prop><D:resourcetype/></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>
         </D:multistatus>"#;
 
-        let parsed = parse_propfind_xml(xml, &["dav".into()], "/Anime").unwrap();
+        let request = url::Url::parse("https://nas.example/dav/Anime/").unwrap();
+        let parsed = parse_propfind_xml(xml, &request, &["dav".into()], "/Anime").unwrap();
         assert_eq!(parsed.parent_path.as_deref(), Some("/"));
+        assert_eq!(parsed.subfolders.len(), 2);
         assert_eq!(parsed.subfolders[0].name, "Season 2");
         assert_eq!(parsed.subfolders[1].name, "Season 10");
         assert_eq!(parsed.entries[0].name, "ep2 特典.mkv");
@@ -293,9 +327,41 @@ mod tests {
             matching_subtitles(&parsed.subtitles, "ep2 特典.mkv").len(),
             1
         );
+        let accented = super::super::protocol::WebDavSubtitle {
+            path: "/Äccent.ass".into(),
+            name: "Äccent.FR.ass".into(),
+        };
+        assert_eq!(matching_subtitles(&[accented], "äccent.mkv").len(), 1);
 
         assert!(
             validate_modal_submit(&[], &BTreeMap::new(), ADD_MODAL_ID, &BTreeMap::new()).is_err()
         );
+    }
+
+    #[test]
+    fn auth_over_http_requires_confirmation_and_rejects_userinfo() {
+        let mut values = BTreeMap::from([
+            ("name".into(), "NAS".into()),
+            (
+                "endpoint".into(),
+                "https://alice:example@nas.example/dav".into(),
+            ),
+            ("auth".into(), "basic".into()),
+            ("username".into(), "alice".into()),
+            ("secret".into(), "example".into()),
+        ]);
+        let secrets = BTreeMap::new();
+        let error = validate_modal_submit(&[], &secrets, ADD_MODAL_ID, &values)
+            .err()
+            .unwrap();
+        assert!(!error.contains("alice") && !error.contains("example"));
+        values.insert("endpoint".into(), "http://nas.example/dav".into());
+        assert!(validate_modal_submit(&[], &secrets, ADD_MODAL_ID, &values).is_err());
+        values.insert("allow_insecure_auth".into(), "true".into());
+        let accepted = validate_modal_submit(&[], &secrets, ADD_MODAL_ID, &values)
+            .unwrap()
+            .unwrap();
+        assert!(accepted.conn.allow_insecure_auth);
+        assert!(accepted.conn.build_url("/", true).is_ok());
     }
 }

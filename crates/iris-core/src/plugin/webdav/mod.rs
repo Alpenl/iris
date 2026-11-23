@@ -3,7 +3,7 @@
 mod modal;
 mod protocol;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -15,17 +15,130 @@ use iris_api::{
 };
 
 use crate::library::{self, Kind};
+use crate::vault::CredentialVault;
+use crate::vfs::http_client::HttpCancel;
 
 use modal::{build_modal, source_descriptors, toast, validate_modal_submit};
 use protocol::{
-    WebDavConnection, WebDavListResult, WebDavSubtitle, matching_subtitles, normalize_dav_path,
-    parent_dav_path,
+    WebDavAuth, WebDavConnection, WebDavListResult, WebDavSubtitle, has_userinfo,
+    matching_subtitles, normalize_dav_path, parent_dav_path,
 };
 
 const MAX_INFLIGHT_BROWSE: usize = 4;
 const MAX_CACHED_FOLDERS: usize = 128;
 
-type SubtitleCache = BTreeMap<(String, String), Vec<WebDavSubtitle>>;
+#[derive(Default)]
+struct SubtitleCache {
+    cancels: BTreeMap<String, HttpCancel>,
+    folders: VecDeque<(String, String, Vec<WebDavSubtitle>)>,
+}
+
+impl SubtitleCache {
+    fn invalidate(&mut self, source_id: &str) {
+        if let Some(cancel) = self.cancels.remove(source_id) {
+            cancel.cancel();
+        }
+        self.folders.retain(|(source, _, _)| source != source_id);
+    }
+
+    fn cancellation(&mut self, source: &str) -> HttpCancel {
+        self.cancels.entry(source.to_owned()).or_default().clone()
+    }
+
+    fn clear(&mut self) {
+        for (_, cancel) in std::mem::take(&mut self.cancels) {
+            cancel.cancel();
+        }
+        self.folders.clear();
+    }
+
+    fn get(&mut self, source: &str, path: &str) -> Option<&[WebDavSubtitle]> {
+        let index = self
+            .folders
+            .iter()
+            .position(|(s, p, _)| s == source && p == path)?;
+        let item = self.folders.remove(index).unwrap();
+        self.folders.push_back(item);
+        self.folders
+            .back()
+            .map(|(_, _, subtitles)| subtitles.as_slice())
+    }
+
+    fn insert(&mut self, source: String, path: String, subtitles: Vec<WebDavSubtitle>) {
+        if let Some(index) = self
+            .folders
+            .iter()
+            .position(|(s, p, _)| *s == source && *p == path)
+        {
+            self.folders.remove(index);
+        } else if self.folders.len() == MAX_CACHED_FOLDERS {
+            self.folders.pop_front();
+        }
+        self.folders.push_back((source, path, subtitles));
+    }
+}
+
+pub(super) fn reconcile_state(
+    state: &mut BTreeMap<String, String>,
+    vault: &CredentialVault,
+) -> bool {
+    let Some(raw) = state.get_mut("servers") else {
+        return false;
+    };
+    let Ok(mut servers) = serde_json::from_str::<Vec<WebDavConnection>>(raw) else {
+        // A malformed legacy record cannot be shown safely.
+        state.remove("servers");
+        return true;
+    };
+    let mut dirty = false;
+    for conn in &mut servers {
+        let Ok(mut url) = crate::vfs::validate_stream_url(&conn.endpoint) else {
+            dirty |= !conn.endpoint.is_empty();
+            conn.endpoint.clear();
+            continue;
+        };
+        if has_userinfo(&url) {
+            let username = percent_encoding::percent_decode_str(url.username()).decode_utf8();
+            let password = url.password().map(percent_encoding::percent_decode_str);
+            if let Ok(username) = username
+                && !username.is_empty()
+                && !username.contains([':', '\r', '\n', '\0'])
+                && is_valid_id(&conn.id)
+                && (conn.auth == WebDavAuth::None
+                    || matches!(&conn.auth, WebDavAuth::Basic { username: existing } if existing == &username))
+            {
+                let key = format!("secret.{}", conn.id);
+                let scope = "builtin.iris.webdav";
+                let stored = if let Some(password) = password {
+                    vault.get_secret(scope, &key).is_some()
+                        || password
+                            .decode_utf8()
+                            .is_ok_and(|value| vault.set_secret(scope, &key, Some(&value)).is_ok())
+                } else {
+                    true
+                };
+                if stored {
+                    conn.auth = WebDavAuth::Basic {
+                        username: username.into_owned(),
+                    };
+                }
+            }
+            let _ = url.set_password(None);
+            let _ = url.set_username("");
+            conn.allow_insecure_auth = false;
+        }
+        url.set_query(None);
+        url.set_fragment(None);
+        if conn.endpoint != url.as_str() {
+            conn.endpoint = url.into();
+            dirty = true;
+        }
+    }
+    if dirty {
+        *raw = serde_json::to_string(&servers).expect("WebDAV connection state is serializable");
+    }
+    dirty
+}
 
 struct InflightGuard(Arc<AtomicUsize>);
 
@@ -131,7 +244,12 @@ impl WebDavPlugin {
         self.sub_cache
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .retain(|(sid, _), _| sid != source_id);
+            .invalidate(source_id);
+    }
+
+    fn clear_subtitle_cache(&self) {
+        let mut cache = self.sub_cache.lock().unwrap_or_else(|e| e.into_inner());
+        cache.clear();
     }
 
     fn submit_modal(
@@ -224,25 +342,29 @@ impl WebDavPlugin {
             .as_deref()
             .map_or_else(|| "/".into(), normalize_dav_path);
         let cache = Arc::clone(&self.sub_cache);
+        let cancel = cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .cancellation(&source_id);
         let req_bg = request_id.clone();
 
         let spawned = std::thread::Builder::new()
             .name(format!("iris-webdav-{source_id}"))
             .spawn(move || {
                 let _slot = guard;
-                let cmd = match conn.list_dir(secret.as_deref(), &rel_path) {
+                let listing = conn.list_dir(secret.as_deref(), &rel_path, &cancel);
+                let mut cache = cache.lock().unwrap_or_else(|e| e.into_inner());
+                if cancel.is_cancelled() {
+                    responder(source_err(req_bg, "WebDAV 连接已更改"));
+                    return;
+                }
+                let cmd = match listing {
                     Ok(mut listing) => {
-                        {
-                            let mut map = cache.lock().unwrap_or_else(|e| e.into_inner());
-                            let key = (source_id.clone(), listing.path.clone());
-                            if !map.contains_key(&key)
-                                && map.len() >= MAX_CACHED_FOLDERS
-                                && let Some(oldest) = map.keys().next().cloned()
-                            {
-                                map.remove(&oldest);
-                            }
-                            map.insert(key, std::mem::take(&mut listing.subtitles));
-                        }
+                        cache.insert(
+                            source_id.clone(),
+                            listing.path.clone(),
+                            std::mem::take(&mut listing.subtitles),
+                        );
                         HostCommand::ProvideSourcePage {
                             request_id: req_bg,
                             page: Box::new(build_source_page(
@@ -271,7 +393,6 @@ impl WebDavPlugin {
         &self,
         request_id: &str,
         source_id: &str,
-        folder_id: Option<&str>,
         entry_id: &str,
     ) -> Vec<HostCommand> {
         let Some(conn) = self.servers.iter().find(|s| s.id == source_id) else {
@@ -295,42 +416,92 @@ impl WebDavPlugin {
             _ => SourceEntryKind::Video,
         };
 
-        let mut subtitles = Vec::new();
-        if kind == SourceEntryKind::Video {
-            let parent = parent_dav_path(&rel_entry)
-                .or_else(|| folder_id.map(normalize_dav_path))
-                .unwrap_or_else(|| "/".into());
-            let guard = self.sub_cache.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(cached) = guard.get(&(source_id.to_string(), parent)) {
-                for sub in matching_subtitles(cached, &file_name) {
-                    if let Ok(sub_url) = conn.build_url(&sub.path, false) {
-                        subtitles.push(SubtitleAttachment {
-                            url: sub_url.to_string(),
-                            label: sub.name.clone(),
-                            lang: None,
-                            headers: headers.clone(),
-                        });
-                    }
-                }
-            }
+        let mut stream = StreamSpec {
+            source_id: Some(source_id.to_string()),
+            entry_id: Some(rel_entry.clone()),
+            url: url.to_string(),
+            headers,
+            title: Some(file_name.clone()),
+            kind: Some(kind),
+            is_live: false,
+            variants: Vec::new(),
+            active_variant: None,
+            subtitles: Vec::new(),
+        };
+        if kind != SourceEntryKind::Video {
+            return resolved(request_id.to_owned(), stream);
         }
 
-        vec![HostCommand::ResolveStream {
-            request_id: Some(request_id.to_string()),
-            stream: Box::new(StreamSpec {
-                source_id: Some(source_id.to_string()),
-                entry_id: Some(rel_entry),
-                url: url.to_string(),
-                headers,
-                title: Some(file_name),
-                kind: Some(kind),
-                is_live: false,
-                variants: Vec::new(),
-                active_variant: None,
-                subtitles,
-            }),
-        }]
+        let parent = parent_dav_path(&rel_entry).unwrap_or_else(|| "/".into());
+        let mut cache = self.sub_cache.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(cached) = cache.get(source_id, &parent) {
+            attach_subtitles(&mut stream, conn, cached, &file_name);
+            return resolved(request_id.to_owned(), stream);
+        }
+        let cancel = cache.cancellation(source_id);
+        drop(cache);
+
+        let Some(responder) = self.responder.clone() else {
+            return source_err(request_id, "WebDAV 异步响应通道未就绪");
+        };
+        let Some(slot) = self.try_acquire_browse_slot() else {
+            return source_err(request_id, "WebDAV 目录请求繁忙，请稍后重试");
+        };
+        let conn = conn.clone();
+        let secret = self.secrets.get(source_id).cloned();
+        let cache = Arc::clone(&self.sub_cache);
+        let id = request_id.to_owned();
+        let spawned = std::thread::Builder::new()
+            .name(format!("iris-webdav-{}", conn.id))
+            .spawn(move || {
+                let _slot = slot;
+                let listing = conn.list_dir(secret.as_deref(), &parent, &cancel);
+                let mut cache = cache.lock().unwrap_or_else(|e| e.into_inner());
+                if cancel.is_cancelled() {
+                    responder(source_err(id, "WebDAV 连接已更改"));
+                    return;
+                }
+                if let Some(cached) = cache.get(&conn.id, &parent) {
+                    attach_subtitles(&mut stream, &conn, cached, &file_name);
+                } else if let Ok(listing) = listing {
+                    attach_subtitles(&mut stream, &conn, &listing.subtitles, &file_name);
+                    cache.insert(conn.id, parent, listing.subtitles);
+                }
+                // A failed optional subtitle lookup must not prevent playback.
+                responder(resolved(id, stream));
+            });
+        match spawned {
+            Ok(_) => Vec::new(),
+            Err(e) => source_err(request_id, format!("无法启动 WebDAV 工作线程：{e}")),
+        }
     }
+}
+
+fn attach_subtitles(
+    stream: &mut StreamSpec,
+    conn: &WebDavConnection,
+    cached: &[WebDavSubtitle],
+    file_name: &str,
+) {
+    stream.subtitles = matching_subtitles(cached, file_name)
+        .into_iter()
+        .filter_map(|sub| {
+            let url = conn.build_url(&sub.path, false).ok()?;
+            Some(SubtitleAttachment {
+                url: url.into(),
+                label: sub.name.clone(),
+                lang: None,
+                headers: stream.headers.clone(),
+            })
+        })
+        .collect();
+}
+
+fn resolved(request_id: String, stream: StreamSpec) -> Vec<HostCommand> {
+    vec![HostCommand::ResolveStream {
+        request_id: Some(request_id),
+        stream: Box::new(stream),
+    }]
 }
 
 impl BuiltinPlugin for WebDavPlugin {
@@ -384,13 +555,14 @@ impl BuiltinPlugin for WebDavPlugin {
                         self.secrets.insert(conn.id.clone(), sec.clone());
                     }
                 }
-                self.sub_cache
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .clear();
+                self.clear_subtitle_cache();
                 vec![HostCommand::SetSources {
                     sources: source_descriptors(&self.servers),
                 }]
+            }
+            HostEvent::Shutdown => {
+                self.clear_subtitle_cache();
+                Vec::new()
             }
             HostEvent::Command { id, .. } | HostEvent::Action { id, .. } if id == "add_server" => {
                 vec![HostCommand::OpenModal {
@@ -448,10 +620,9 @@ impl BuiltinPlugin for WebDavPlugin {
             HostEvent::SourceResolve {
                 request_id,
                 source_id,
-                folder_id,
                 entry_id,
                 ..
-            } => self.resolve_stream(request_id, source_id, folder_id.as_deref(), entry_id),
+            } => self.resolve_stream(request_id, source_id, entry_id),
             _ => Vec::new(),
         }
     }

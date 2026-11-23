@@ -30,6 +30,14 @@ fn resolve_overlay_color(color: &Color, opacity: f32, t: ThemeTokens) -> Rgba {
     c
 }
 
+fn finite_clamp(value: f32, min: f32, max: f32) -> f32 {
+    if value.is_finite() {
+        value.clamp(min, max)
+    } else {
+        min
+    }
+}
+
 impl IrisWindow {
     pub(in crate::ui) fn render_plugin_overlay(
         &self,
@@ -67,10 +75,10 @@ impl IrisWindow {
                     elements.push(
                         div()
                             .absolute()
-                            .left(relative(x.clamp(0., 1.)))
-                            .top(relative(y.clamp(0., 1.)))
-                            .w(relative(w.clamp(0., 1.)))
-                            .h(relative(h.clamp(0., 1.)))
+                            .left(relative(finite_clamp(x, 0., 1.)))
+                            .top(relative(finite_clamp(y, 0., 1.)))
+                            .w(relative(finite_clamp(w, 0., 1.)))
+                            .h(relative(finite_clamp(h, 0., 1.)))
                             .when_some(fill.as_ref(), |d, fc| {
                                 d.bg(resolve_overlay_color(fc, opacity, t))
                             })
@@ -97,6 +105,7 @@ impl IrisWindow {
                     } else {
                         1.
                     };
+                    let [x1, y1, x2, y2] = [x1, y1, x2, y2].map(|v| finite_clamp(v, 0., 1.));
                     let dx = (x2 - x1).abs();
                     let dy = (y2 - y1).abs();
                     if dx <= dy {
@@ -165,9 +174,9 @@ impl IrisWindow {
                     opacity,
                 } => {
                     let c = resolve_overlay_color(color, opacity, t);
-                    let cx_pos = x.clamp(0., 1.);
-                    let cy_pos = y.clamp(0., 1.);
-                    let arm = size.clamp(0.01, 0.5);
+                    let cx_pos = finite_clamp(x, 0., 1.);
+                    let cy_pos = finite_clamp(y, 0., 1.);
+                    let arm = finite_clamp(size, 0.01, 0.5);
                     elements.push(
                         div()
                             .absolute()
@@ -206,7 +215,8 @@ impl IrisWindow {
                         12.
                     };
                     let fg = resolve_overlay_color(color, opacity, t);
-                    let y_clamped = y.clamp(0., 0.98);
+                    let x = finite_clamp(x, 0., 1.);
+                    let y_clamped = finite_clamp(y, 0., 0.98);
                     let chip = div()
                         .font_family(if mono { FONT_MONO } else { FONT_UI })
                         .text_size(px(sz))
@@ -267,10 +277,10 @@ impl IrisWindow {
                         elements.push(
                             div()
                                 .absolute()
-                                .left(relative(x.clamp(0., 1.)))
-                                .top(relative(y.clamp(0., 1.)))
-                                .w(relative(w.clamp(0., 1.)))
-                                .h(relative(h.clamp(0., 1.)))
+                                .left(relative(finite_clamp(x, 0., 1.)))
+                                .top(relative(finite_clamp(y, 0., 1.)))
+                                .w(relative(finite_clamp(w, 0., 1.)))
+                                .h(relative(finite_clamp(h, 0., 1.)))
                                 .flex()
                                 .items_end()
                                 .gap(px(1.))
@@ -299,8 +309,8 @@ impl IrisWindow {
                         div()
                             .id(btn_id)
                             .absolute()
-                            .left(relative(x.clamp(0., 0.95)))
-                            .top(relative(y.clamp(0., 0.95)))
+                            .left(relative(finite_clamp(x, 0., 0.95)))
+                            .top(relative(finite_clamp(y, 0., 0.95)))
                             .h(px(26.))
                             .px(px(10.))
                             .flex()
@@ -331,5 +341,23 @@ impl IrisWindow {
             }
         }
         Some(div().absolute().inset_0().children(elements))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::finite_clamp;
+
+    #[test]
+    fn overlay_geometry_is_finite_before_arithmetic() {
+        for value in [
+            f32::NAN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::MAX,
+            -f32::MAX,
+        ] {
+            assert!((0. ..=1.).contains(&finite_clamp(value, 0., 1.)));
+        }
     }
 }

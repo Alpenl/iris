@@ -47,11 +47,13 @@ pub fn prepare(path: &Path, cached: Option<(PathBuf, ScanResult)>) -> Result<Pre
     let meta = std::fs::metadata(&path)?;
     let (folder, file) = if meta.is_dir() {
         (path, None)
-    } else {
+    } else if meta.is_file() {
         (
             path.parent().unwrap_or(Path::new(".")).to_path_buf(),
             Some(path),
         )
+    } else {
+        anyhow::bail!("media path is not a regular file or directory");
     };
     let ScanResult {
         entries,
@@ -69,6 +71,11 @@ pub fn prepare(path: &Path, cached: Option<(PathBuf, ScanResult)>) -> Result<Pre
             .first()
             .map_or((None, None), |e| (Some(e.path.clone()), Some(e.kind))),
     };
+    if let Some(path) = &target
+        && !std::fs::metadata(path)?.is_file()
+    {
+        anyhow::bail!("media path is not a regular file");
+    }
     let photo = (kind == Some(Kind::Photo))
         .then(|| target.as_deref().map(photo::probe))
         .flatten();
@@ -142,7 +149,7 @@ pub fn prepare_queue(paths: Vec<PathBuf>) -> Option<PreparedQueue> {
 mod tests {
     use std::collections::BTreeMap;
 
-    use iris_mpv::{Event, Format, Mpv, Value};
+    use iris_mpv::Mpv;
 
     use super::*;
     use crate::media_uri::MediaUri;
@@ -210,27 +217,19 @@ mod tests {
     fn speed_steps_and_subtitle_safe_area_update_backend() {
         assert_eq!(step_speed(1.0, 1), 1.25);
         assert_eq!(step_speed(1.0, -1), 0.75);
-        assert_eq!(step_speed(3.0, 1), 3.0);
+        assert_eq!(step_speed(3.0, 1), 4.0);
+        assert_eq!(step_speed(4.0, 1), 4.0);
         assert_eq!(step_speed(0.25, -1), 0.25);
 
         let mut session = Session::new().unwrap();
         let _render = session.render_handle();
-        session
-            .mpv
-            .observe_property(100, "sub-margin-y-offset", Format::Int)
-            .unwrap();
         let wait_for = |mpv: &Mpv, value| {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
             while std::time::Instant::now() < deadline {
-                if let Some(Event::PropertyChange {
-                    id: 100,
-                    value: Value::Int(actual),
-                    ..
-                }) = mpv.wait_event(0.05)
-                    && actual == value
-                {
+                if mpv.get_property_f64("sub-margin-y-offset").ok() == Some(value as f64) {
                     return;
                 }
+                std::thread::sleep(std::time::Duration::from_millis(10));
             }
             panic!("subtitle safe margin never became {value}");
         };
@@ -242,7 +241,7 @@ mod tests {
     }
 
     #[test]
-    fn open_local_sets_canonical_file_uri_and_open_remote_guards_subtitle_auth_leak() {
+    fn session_validates_local_uri_and_remote_subtitles() {
         let dir = std::env::temp_dir().join(format!("iris-session-uri-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -278,27 +277,20 @@ mod tests {
 
         let mut auth_headers = BTreeMap::new();
         auth_headers.insert("Authorization".into(), "Bearer top-secret".into());
-        let cross_sub_leak = RemoteMediaRequest {
-            uri: MediaUri::Plugin {
-                plugin_id: "iris.webdav".into(),
-                source_id: "nas".into(),
-                entry_id: "/ep1.mkv".into(),
-            },
-            title: "EP1".into(),
-            playback_url: "https://nas.example.com/dav/ep1.mkv".into(),
-            headers: auth_headers.clone(),
+        let invalid_attachment = RemoteMediaRequest {
+            uri: MediaUri::HttpUrl("http://127.0.0.1:19999/media".into()),
+            title: "Caption validation".into(),
+            playback_url: "http://127.0.0.1:19999/media".into(),
+            headers: BTreeMap::new(),
             kind: Kind::Video,
             is_live: false,
             photo: None,
-            subtitles: vec![RemoteSubtitle::Url(
-                "https://thirdparty-subs.example.org/ep1.ass".into(),
-            )],
+            subtitles: vec![RemoteSubtitle::InlineText("\u{feff}#EXTM3U\n".into())],
         };
         assert!(
             session
-                .open_remote(cross_sub_leak, &Settings::default(), 0.)
-                .is_err(),
-            "cross-origin subtitle URL must be rejected when Authorization header is set"
+                .open_remote(invalid_attachment, &Settings::default(), 0.)
+                .is_err()
         );
 
         let safe_remote = RemoteMediaRequest {
@@ -382,14 +374,16 @@ mod tests {
             return;
         };
         let mut session = Session::new().unwrap();
+        let mut events = session.events().unwrap();
+        assert!(session.events().is_none());
         let prepared = prepare(&mkv, None).unwrap();
         session.open(prepared, 0.).unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
         while std::time::Instant::now() < deadline && !session.state().loaded {
-            if let Some(ev) = session.mpv.wait_event(0.05)
-                && let Some(se) = SessionEvent::from_backend(ev)
-            {
-                session.apply(&se);
+            if let Ok(update) = events.try_recv() {
+                session.apply_update(&update);
+            } else {
+                std::thread::sleep(std::time::Duration::from_millis(5));
             }
         }
         session.flush_deferred();

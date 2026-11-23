@@ -104,7 +104,7 @@ pub(super) fn bordered_button(
             d.bg(t.accent)
                 .border_color(t.accent)
                 .font_weight(FontWeight::MEDIUM)
-                .text_color(t.text)
+                .text_color(t.window_bg)
                 .hover(|s| s.opacity(0.9))
         })
         .when(!primary, |d| {

@@ -32,7 +32,8 @@ impl IrisWindow {
         if !stats.file_format.is_empty() {
             rows.push(("容器", stats.file_format));
         }
-        if let Some((w, h)) = stats.resolution {
+        let (w, h) = self.active().session.display_size();
+        if w > 0 && h > 0 && kind != Some(Kind::Audio) {
             rows.push(("分辨率", format!("{w} × {h}")));
         }
         match kind {

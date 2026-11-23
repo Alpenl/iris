@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use serde::{Deserialize, Serialize};
 
 use crate::PROTOCOL_VERSION;
@@ -56,6 +58,23 @@ pub fn is_valid_id(s: &str) -> bool {
         && s.len() <= 64
         && s.chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+}
+
+/// Validates static and runtime media source lists against the same limits.
+pub fn validate_sources(sources: &[SourceDescriptor]) -> Result<(), &'static str> {
+    if sources.len() > 256 {
+        return Err("too many source descriptors");
+    }
+    let mut ids = HashSet::with_capacity(sources.len());
+    for source in sources {
+        if !is_valid_id(&source.id) || source.name.trim().is_empty() {
+            return Err("invalid source descriptor");
+        }
+        if !ids.insert(source.id.as_str()) {
+            return Err("duplicate source id");
+        }
+    }
+    Ok(())
 }
 
 /// Command contributed to the host Command Palette (`⌘P` / `Ctrl+P`) and Keymap.
@@ -149,9 +168,14 @@ impl PluginManifest {
         if self.protocol != PROTOCOL_VERSION {
             return Err("unsupported protocol version");
         }
-        for src in &self.sources {
-            if !is_valid_id(&src.id) || src.name.trim().is_empty() {
-                return Err("invalid source descriptor");
+        validate_sources(&self.sources)?;
+        let mut commands = HashSet::with_capacity(self.commands.len());
+        for command in &self.commands {
+            if !is_valid_id(&command.id) {
+                return Err("invalid command id");
+            }
+            if !commands.insert(command.id.as_str()) {
+                return Err("duplicate command id");
             }
         }
         if !self.sources.is_empty() && !self.has_permission(Permission::MediaSource) {
@@ -238,6 +262,23 @@ mod tests {
         m.permissions.push(Permission::MediaSource);
         assert!(m.validate().is_ok());
         assert!(m.has_permission(Permission::Secrets));
+        let source = SourceDescriptor {
+            id: "drive".into(),
+            name: "Drive".into(),
+            ..Default::default()
+        };
+        m.sources = vec![source.clone(), source];
+        assert_eq!(m.validate(), Err("duplicate source id"));
+        m.sources.clear();
+        let command = CommandSpec {
+            id: "go".into(),
+            title: "Go".into(),
+            subtitle: None,
+            shortcut_hint: None,
+        };
+        m.commands = vec![command.clone(), command];
+        assert_eq!(m.validate(), Err("duplicate command id"));
+        m.commands.clear();
 
         m.source_provider = Some(SourceProviderSpec {
             label: "   ".into(),

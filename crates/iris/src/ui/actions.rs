@@ -140,6 +140,8 @@ fn push_action_binding(out: &mut Vec<KeyBinding>, action_id: &str, key: &str, ct
         "cycle_preset" => KeyBinding::new(key, CyclePreset, Some(ctx)),
         "toggle_favorite" => KeyBinding::new(key, ToggleFavorite, Some(ctx)),
         "quit" => KeyBinding::new(key, Quit, Some(ctx)),
+        "exit_fullscreen" => KeyBinding::new(key, ExitFullscreen, Some(ctx)),
+        "reset_appearance" => KeyBinding::new(key, ResetAppearance, Some(ctx)),
         _ => return,
     };
     out.push(b);
@@ -152,33 +154,34 @@ pub(crate) fn rebind_keys(cx: &mut App, keymap: &Keymap) {
 
     for entry in keymap::actions() {
         let key = keymap.effective_key(entry.id);
+        if keymap::reserved_shortcut(&key).is_some() {
+            continue;
+        }
+        let Some(key) = keymap::canonical_binding(&key) else {
+            continue;
+        };
         for &ctx in entry.gpui_contexts(&key) {
             push_action_binding(&mut bindings, entry.id, &key, ctx);
         }
     }
 
-    bindings.push(KeyBinding::new(
-        "secondary-i",
-        ToggleInfo,
-        Some("Workspace"),
-    ));
-    bindings.push(KeyBinding::new(
-        "secondary-shift-p",
-        OpenCommandPalette,
-        Some("Workspace"),
-    ));
-    bindings.push(KeyBinding::new(
-        "escape",
-        ExitFullscreen,
-        Some("Workspace && !TextInput"),
-    ));
+    for (key, action, _) in keymap::RESERVED_SHORTCUTS {
+        let context = match action {
+            "exit_fullscreen" => "Workspace && !TextInput",
+            "reset_appearance" => "Workspace || ShortcutRecorder",
+            _ => "Workspace",
+        };
+        push_action_binding(&mut bindings, action, key, context);
+    }
 
     for (preset_id, key) in keymap.preset_bindings() {
-        if gpui::Keystroke::parse(key).is_ok()
-            && let Some(ctx) = keymap::effective_gpui_context("Workspace", key)
+        if keymap::reserved_shortcut(key).is_none()
+            && let Some(key) = keymap::canonical_binding(key)
+            && gpui::Keystroke::parse(&key).is_ok()
+            && let Some(ctx) = keymap::effective_gpui_context("Workspace", &key)
         {
             bindings.push(KeyBinding::new(
-                key,
+                &key,
                 ActivatePreset {
                     id: preset_id.to_string(),
                 },
@@ -188,11 +191,13 @@ pub(crate) fn rebind_keys(cx: &mut App, keymap: &Keymap) {
     }
 
     for (plugin_id, cmd_id, key) in keymap.plugin_bindings() {
-        if gpui::Keystroke::parse(key).is_ok()
-            && let Some(ctx) = keymap::effective_gpui_context("Workspace", key)
+        if keymap::reserved_shortcut(key).is_none()
+            && let Some(key) = keymap::canonical_binding(key)
+            && gpui::Keystroke::parse(&key).is_ok()
+            && let Some(ctx) = keymap::effective_gpui_context("Workspace", &key)
         {
             bindings.push(KeyBinding::new(
-                key,
+                &key,
                 TriggerPluginCommand {
                     plugin_id: plugin_id.to_string(),
                     command_id: cmd_id.to_string(),

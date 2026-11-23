@@ -10,7 +10,7 @@ Iris 是一个以 [mpv](https://mpv.io) 为播放核心的高性能跨平台照�
 
 - **视频、音频与远程流播放**：
   - libmpv 原生硬解（macOS VideoToolbox，Windows D3D11VA），支持软硬解切换、精确/大步跳转、逐帧步进（`,` / `.`）、播完策略、本地与远程统一 `MediaUri` 续播记忆。
-  - 60fps 跟手时间轴拖拽、**网络流已缓冲区间灰条**、**直播流（`LIVE`）自适应模式**、**多清晰度/线路实时切换**、MKV/MP4 章节刻度、连续音量条与倍速档位（`0.25×–3.00×`）。
+  - 可拖动时间轴、网络流缓冲区间、直播模式、多清晰度和线路切换、MKV/MP4 章节、连续音量条与 `0.25×–4.00×` 倍速。
   - 画面比例与铺满裁剪（`C`）、临时旋转（`R`）与镜像（`H`）、**画面均衡器（亮度 / 对比度 / 饱和度 / 伽马微调）**、**音频输出设备实时枚举与切换**、截图保存（`⌘S` / `Ctrl+S`）、播放期防休眠，以及 macOS 控制中心和 Windows 系统媒体控件。
 - **广色域照片浏览（本地 & 远程/网盘同享）**：
   - 滚轮 / macOS 触控板双指捏合围绕光标缩放、拖拽平移、`0` 适应窗口、`Space` 或双击切换 1:1、底部内存缩略图条（`G`）。
@@ -18,7 +18,7 @@ Iris 是一个以 [mpv](https://mpv.io) 为播放核心的高性能跨平台照�
 - **四合一统一侧栏与全插件化远程存储**：
   - 侧栏支持 **「目录 / 数据源 / 队列 / 插件」** 四视图，可拖拽调宽、左右换边。进入全屏时目录自动收起，鼠标移到停靠侧边缘即可展开，移回画面后收起。全屏播放栏贴合画面底边，目录展开时视频与进度条保持原位。
   - **统一目录项（`CatalogItem`）与独立播放队列（`PlayQueue`）**：跨文件夹/跨远程源自由排队，切集绝不冲掉自定义队列；支持常驻位置书签与慢速 SMB/UNC 网络共享盘免 `stat` 风暴快速扫描。
-  - **远程源与凭据**：无自定义请求头的 HTTP(S) 流由 libmpv 直接打开。需要请求头的流经会话专属转发器播放，凭据只发给授权源。内置 `iris.webdav` 支持多台 NAS、系统凭据库和外挂字幕，`⌘U` / `Ctrl+U` 可打开网络直链。
+  - **远程源与凭据**：HTTP(S) 流由宿主的会话转发器打开，凭据只发给授权源。内置 `iris.webdav` 支持多台 NAS、系统凭据库和外挂字幕，`⌘U` / `Ctrl+U` 可打开网络直链。
 - **工作区与场景预设（`1B+` 稀疏场景宏）**：
   - 标题栏一键切换或通过 `Alt+W` / `⌘P` 秒切预设；内置 **「默认工作区」「沉浸观影」「审片与选片」「精听与学习」「小窗置顶」** 五套预设，并支持保存自定义预设（可选包含布局、播放策略与插件差量组合）。
   - `settings.conf` 始终保护用户的纯净个人日常基线，切换预设自动通过内存 `PresetRevert` 回正上个预设改动的参数并触发退出指令，手动微调实时感知且绝不误启无关禁用插件。
@@ -54,11 +54,12 @@ Iris 是一个以 [mpv](https://mpv.io) 为播放核心的高性能跨平台照�
 | `A` / `C` / `R` / `H` | 切换音轨 / 画面比例 / 旋转 90° / 镜像翻转 |
 | `G` | 照片底部内存缩略图条开关 |
 | `⌘S` / `Ctrl+S` | 保存当前帧截图 |
+| `⌘⌥⇧R` / `Ctrl+Alt+Shift+R` | 恢复默认外观（固定快捷键） |
 | `Esc` | 依次关闭键位录制 / 弹窗 / 菜单 / 命令面板 / 设置 / 浮层 / 搜索，最后退出全屏 |
 
 ## 构建与验证
 
-需要 Rust `1.100.0`（2024 edition）与 libmpv（macOS：`brew install mpv`，Windows：设置 `MPV_LIB_DIR`）。
+需要 Rust `1.100.0`（2024 edition）与 libmpv。macOS 可用 `brew install mpv` 开发。Windows x64 MSVC 可设置 `MPV_LIB_DIR`，或将开发用 `mpv.lib` 放到 `target/deps/mpv/`，并将运行库所在目录加入 `PATH`。
 
 ```bash
 cargo build --release                      # 本地开发构建（仅开发用，不得用 Homebrew libmpv 分发）
@@ -67,6 +68,8 @@ python3 scripts/check-project.py           # 架构边界、模块行数门禁�
 cargo test --locked --workspace            # 全量单元与端到端集成测试
 cargo clippy --locked --workspace --all-targets -- -D warnings
 ```
+
+`iris --help` 显示用法，`iris --version` 显示版本。用 `iris -- -clip.mp4` 打开以 `-` 开头的路径。
 
 ## 个人数据与配置存储
 
@@ -82,6 +85,7 @@ cargo clippy --locked --workspace --all-targets -- -D warnings
 - `locations.json`：常驻位置书签
 - `records.tsv` / `recent.tsv`：保存收藏、续播进度与最近打开记录。包含用户信息、查询或片段的 HTTP(S) 直链仅用于当前会话；具有稳定条目 ID 的插件媒体仍可收藏与续播。
 - `plugin_state/<id>.json`：各内置/外部插件私有非敏感配置（含 `iris.webdav` 服务器列表；敏感密码分桶加密存于系统凭据库）
+- `credential_index.json` 仅索引凭据的作用域和键名。密钥正文保存在系统凭据库。
 - `plugins/`：外部插件目录（支持 `IRIS_PLUGINS` 覆盖）
 
 ## 代码结构
@@ -91,10 +95,10 @@ crates/
   iris-mpv/            libmpv 手写 Rust FFI（client API + mpv_node 结构化传参 + RenderHandle 窄能力封装）
   iris-api/            无头插件协议（protocol: 1，拆分为 manifest / source / workbench / overlay / wire）
   iris-core/           无头内核（零 GPUI 依赖）
-    src/player/        视口会话状态机、结构化远程流加载、后台准备器与媒体检查器
+    src/player/        视口会话状态机、HTTP(S) 会话转发、后台准备器与媒体检查器
     src/photo/         魔数优先单遍照片头解析（JPEG/PNG/WebP/HEIF/TIFF）、EXIF 与 ICC 色彩匹配
     src/plugin/        插件管理器、外部 stdio 进程引擎、DirtySlots 脏检测、内置插件与标准 iris.webdav
-    src/keymap/        50 动作三方案目录、!TextInput 打字防火墙与冲突检测
+    src/keymap/        三方案动作目录、文本输入保护与冲突检测
     src/vfs/           常驻书签与有界 HTTP 控制面客户端（含跨源凭据剥离与 30x 回环 SSRF 拦截）
     src/{catalog,media_uri,vault,preset,store,settings,library,geometry,input,logging}.rs
   iris/                GPUI 桌面应用

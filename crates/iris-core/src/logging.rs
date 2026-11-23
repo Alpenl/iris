@@ -25,6 +25,9 @@ impl Write for LogOutput {
 
 pub fn log_path() -> Option<PathBuf> {
     std::env::var_os("IRIS_LOG").map(PathBuf::from).or_else(|| {
+        if let Some(dir) = std::env::var_os("IRIS_LOG_DIR").filter(|dir| !dir.is_empty()) {
+            return Some(PathBuf::from(dir).join("iris.log"));
+        }
         #[cfg(target_os = "windows")]
         let base = std::env::var_os("LOCALAPPDATA")
             .map(PathBuf::from)
@@ -45,16 +48,13 @@ pub fn init() {
     );
     builder.format_timestamp_millis();
     if let Some(path) = log_path() {
-        let opened = path
-            .parent()
-            .map_or(Ok(()), std::fs::create_dir_all)
-            .and_then(|_| {
-                OpenOptions::new()
-                    .create(true)
-                    .truncate(true)
-                    .write(true)
-                    .open(&path)
-            });
+        let opened = crate::fs_util::create_parent(&path).and_then(|_| {
+            OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .open(&path)
+        });
         match opened {
             Ok(file) => {
                 builder.target(env_logger::Target::Pipe(Box::new(LogOutput {

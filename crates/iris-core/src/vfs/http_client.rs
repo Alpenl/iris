@@ -10,7 +10,7 @@ pub use connection::{HttpCancel, validate_stream_url};
 use connection::{SocketRegistration, connect_transport, remaining_timeout};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
 use url::Url;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -86,20 +86,25 @@ fn header_ci<'a>(headers: &'a BTreeMap<String, String>, name: &str) -> Option<&'
         .map(|(_, v)| v.as_str())
 }
 
-struct ChunkedReader<R: Read> {
-    inner: BufReader<R>,
+type ResponseReader = io::Chain<Cursor<Vec<u8>>, connection::Transport>;
+
+struct ChunkedReader {
+    inner: BufReader<ResponseReader>,
     remaining: u64,
     need_crlf: bool,
     eof: bool,
 }
 
-impl<R: Read> ChunkedReader<R> {
-    fn read_line_capped(&mut self) -> io::Result<String> {
+impl ChunkedReader {
+    fn read_line_capped(&mut self) -> io::Result<Vec<u8>> {
         let mut line = Vec::with_capacity(64);
         loop {
             let buf = self.inner.fill_buf()?;
             if buf.is_empty() {
-                break;
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "truncated chunk framing",
+                ));
             }
             let take = buf
                 .iter()
@@ -117,49 +122,53 @@ impl<R: Read> ChunkedReader<R> {
                 break;
             }
         }
-        String::from_utf8(line).map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad utf8"))
+        if !line.ends_with(b"\r\n") {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "missing chunk line CRLF",
+            ));
+        }
+        line.truncate(line.len() - 2);
+        Ok(line)
     }
 }
 
-impl<R: Read> Read for ChunkedReader<R> {
+impl Read for ChunkedReader {
     fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
         if out.is_empty() || self.eof {
             return Ok(0);
         }
         while self.remaining == 0 {
-            if self.need_crlf
-                && !self
-                    .read_line_capped()?
-                    .trim_matches(['\r', '\n'])
-                    .is_empty()
-            {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "missing chunk CRLF",
-                ));
+            if self.need_crlf {
+                let mut end = [0; 2];
+                self.inner.read_exact(&mut end)?;
+                if end != *b"\r\n" {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "missing chunk CRLF",
+                    ));
+                }
             }
             self.need_crlf = false;
             let line = self.read_line_capped()?;
-            let hex = line
-                .trim_end_matches(['\r', '\n'])
-                .split(';')
-                .next()
-                .unwrap_or("")
-                .trim();
+            let hex = line.split(|&b| b == b';').next().unwrap_or_default();
+            let hex = std::str::from_utf8(hex)
+                .ok()
+                .filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_hexdigit()))
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "bad chunk size"))?;
             let size = u64::from_str_radix(hex, 16)
                 .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad chunk size"))?;
             if size == 0 {
                 for _ in 0..64 {
-                    if self
-                        .read_line_capped()?
-                        .trim_end_matches(['\r', '\n'])
-                        .is_empty()
-                    {
-                        break;
+                    if self.read_line_capped()?.is_empty() {
+                        self.eof = true;
+                        return Ok(0);
                     }
                 }
-                self.eof = true;
-                return Ok(0);
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "too many chunk trailers",
+                ));
             }
             self.remaining = size;
         }
@@ -177,12 +186,50 @@ impl<R: Read> Read for ChunkedReader<R> {
     }
 }
 
+enum HttpBody {
+    Empty,
+    Chunked(Box<ChunkedReader>),
+    Fixed(ResponseReader, u64),
+    CloseDelimited(ResponseReader),
+}
+
+impl Read for HttpBody {
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Self::Empty => Ok(0),
+            Self::Chunked(body) => body.read(out),
+            Self::CloseDelimited(body) => body.read(out),
+            Self::Fixed(body, left) => {
+                let cap = (*left).min(out.len() as u64) as usize;
+                if cap == 0 {
+                    return Ok(0);
+                }
+                let n = body.read(&mut out[..cap])?;
+                if n == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "truncated HTTP body",
+                    ));
+                }
+                *left -= n as u64;
+                Ok(n)
+            }
+        }
+    }
+}
+
 pub(crate) struct HttpStream {
     pub status: u16,
     pub url: Url,
     pub headers: BTreeMap<String, String>,
-    pub body: Box<dyn Read>,
+    body: HttpBody,
     _socket: SocketRegistration,
+}
+
+impl HttpStream {
+    pub(crate) fn body(&mut self) -> &mut impl Read {
+        &mut self.body
+    }
 }
 
 pub(crate) struct Request<'a> {
@@ -200,6 +247,16 @@ pub(crate) fn open_stream(
     cancel: &HttpCancel,
     deadline: Option<Instant>,
 ) -> Result<HttpStream> {
+    open_stream_with_credentials(req, scope.source(), scope, cancel, deadline)
+}
+
+fn open_stream_with_credentials(
+    req: Request<'_>,
+    credential_origin: &Url,
+    scope: &NetworkScope,
+    cancel: &HttpCancel,
+    deadline: Option<Instant>,
+) -> Result<HttpStream> {
     let Request {
         method,
         url,
@@ -211,8 +268,8 @@ pub(crate) fn open_stream(
     if cur_method.is_empty() || !cur_method.bytes().all(is_tchar) {
         bail!("invalid HTTP method");
     }
-    let mut cur_headers = if url.origin() == scope.source.origin() {
-        origin_headers(&scope.source, headers)
+    let mut cur_headers = if url.origin() == credential_origin.origin() {
+        origin_headers(credential_origin, headers)
     } else {
         BTreeMap::new()
     };
@@ -271,39 +328,61 @@ pub(crate) fn open_stream(
         transport.flush()?;
 
         let (mut raw, mut tmp) = (Vec::with_capacity(2048), [0u8; 4096]);
-        let header_end = loop {
-            remaining_timeout(cancel, deadline, IO_TIMEOUT)?;
-            if let Some(i) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
-                break i + 4;
+        let mut header_start = 0;
+        let mut scan = 0;
+        let mut interim = 0;
+        let (status, header_end, mut resp_headers) = loop {
+            remaining_timeout(cancel, Some(header_deadline), IO_TIMEOUT)?;
+            let Some(i) = raw[scan..].windows(4).position(|w| w == b"\r\n\r\n") else {
+                if raw.len() >= MAX_RESPONSE_HEADER_BYTES {
+                    bail!("HTTP response headers exceed limit");
+                }
+                scan = raw.len().saturating_sub(3).max(header_start);
+                let n = transport
+                    .read(&mut tmp[..(MAX_RESPONSE_HEADER_BYTES - raw.len()).min(4096)])?;
+                if n == 0 {
+                    bail!("unexpected EOF reading HTTP response headers");
+                }
+                raw.extend_from_slice(&tmp[..n]);
+                continue;
+            };
+            let end = scan + i + 4;
+            let mut slots = [httparse::EMPTY_HEADER; 128];
+            let mut parsed = httparse::Response::new(&mut slots);
+            if !parsed.parse(&raw[header_start..end])?.is_complete() {
+                bail!("incomplete HTTP response headers");
             }
-            if raw.len() >= MAX_RESPONSE_HEADER_BYTES {
-                bail!("HTTP response headers exceed limit");
+            let status = parsed.code.context("missing HTTP status")?;
+            if (100..200).contains(&status) {
+                interim += 1;
+                if status == 101 || interim > 8 {
+                    bail!("unsupported HTTP informational response");
+                }
+                header_start = end;
+                scan = end;
+                continue;
             }
-            let n =
-                transport.read(&mut tmp[..(MAX_RESPONSE_HEADER_BYTES - raw.len()).min(4096)])?;
-            if n == 0 {
-                bail!("unexpected EOF reading HTTP response headers");
+            let mut values = BTreeMap::<String, String>::new();
+            for h in parsed.headers {
+                let val = sanitize_header_value(&String::from_utf8_lossy(h.value));
+                let name = h.name.to_ascii_lowercase();
+                if let Some(prev) = values.get_mut(&name) {
+                    match name.as_str() {
+                        "content-length" if *prev == val => (),
+                        "content-length" | "content-range" | "content-type" | "location" => {
+                            bail!("duplicate HTTP {name} header");
+                        }
+                        _ => {
+                            prev.push_str(", ");
+                            prev.push_str(&val);
+                        }
+                    }
+                } else {
+                    values.insert(name, val);
+                }
             }
-            raw.extend_from_slice(&tmp[..n]);
+            break (status, end, values);
         };
-
-        let mut slots = [httparse::EMPTY_HEADER; 128];
-        let mut parsed = httparse::Response::new(&mut slots);
-        if matches!(parsed.parse(&raw[..header_end])?, httparse::Status::Partial) {
-            bail!("incomplete HTTP response headers");
-        }
-        let status = parsed.code.ok_or_else(|| anyhow!("missing HTTP status"))?;
-        let mut resp_headers = BTreeMap::<String, String>::new();
-        for h in parsed.headers.iter().filter(|h| !h.name.is_empty()) {
-            let val = sanitize_header_value(&String::from_utf8_lossy(h.value));
-            resp_headers
-                .entry(h.name.to_ascii_lowercase())
-                .and_modify(|e| {
-                    e.push_str(", ");
-                    e.push_str(&val);
-                })
-                .or_insert(val);
-        }
 
         if matches!(status, 301 | 302 | 303 | 307 | 308)
             && let Some(loc) = header_ci(&resp_headers, "location").filter(|s| !s.is_empty())
@@ -312,6 +391,9 @@ pub(crate) fn open_stream(
                 bail!("exceeded maximum HTTP redirects ({MAX_REDIRECTS})");
             }
             let next_url = validate_stream_url(cur_url.join(loc)?.as_str())?;
+            if cur_url.scheme() == "https" && next_url.scheme() != "https" {
+                bail!("refusing an HTTPS redirect to an insecure transport");
+            }
             let changed_origin = cur_url.origin() != next_url.origin();
             if changed_origin {
                 cur_headers.clear();
@@ -339,25 +421,27 @@ pub(crate) fn open_stream(
         let mut prefix = Cursor::new(raw);
         prefix.set_position(header_end as u64);
         let chained = prefix.chain(transport);
-        let is_chunked = header_ci(&resp_headers, "transfer-encoding").is_some_and(|te| {
-            te.split(',')
-                .any(|p| p.trim().eq_ignore_ascii_case("chunked"))
-        });
-        let body: Box<dyn Read> = if cur_method == "HEAD"
-            || (100..200).contains(&status)
-            || matches!(status, 204 | 304)
-        {
-            Box::new(io::empty())
+        let is_chunked = match header_ci(&resp_headers, "transfer-encoding") {
+            Some(te) if te.eq_ignore_ascii_case("chunked") => {
+                resp_headers.remove("content-length");
+                true
+            }
+            Some(_) => bail!("unsupported HTTP Transfer-Encoding"),
+            None => false,
+        };
+        let body = if cur_method == "HEAD" || matches!(status, 204 | 304) {
+            HttpBody::Empty
         } else if is_chunked {
-            resp_headers.remove("content-length");
-            Box::new(ChunkedReader {
+            HttpBody::Chunked(Box::new(ChunkedReader {
                 inner: BufReader::new(chained),
                 remaining: 0,
                 need_crlf: false,
                 eof: false,
-            })
+            }))
+        } else if let Some(len) = content_len {
+            HttpBody::Fixed(chained, len)
         } else {
-            Box::new(chained.take(content_len.unwrap_or(u64::MAX)))
+            HttpBody::CloseDelimited(chained)
         };
         return Ok(HttpStream {
             status,
@@ -406,23 +490,6 @@ fn read_bounded(
     Ok(out)
 }
 
-pub(crate) fn request_bytes(
-    method: &str,
-    url: &str,
-    headers: &BTreeMap<String, String>,
-    body: Option<&[u8]>,
-    max_bytes: usize,
-) -> Result<HttpBytesResponse> {
-    request_bytes_cancellable(
-        method,
-        url,
-        headers,
-        body,
-        max_bytes,
-        &HttpCancel::default(),
-    )
-}
-
 pub(crate) fn request_bytes_cancellable(
     method: &str,
     url: &str,
@@ -455,6 +522,40 @@ pub(crate) fn request_bytes_cancellable(
         status: response.status,
         body,
     })
+}
+
+pub(crate) fn fetch_subtitle_bytes(
+    url: Url,
+    headers: &BTreeMap<String, String>,
+    credential_origin: &Url,
+    scope: &NetworkScope,
+    cancel: &HttpCancel,
+) -> Result<Vec<u8>> {
+    let deadline = Instant::now() + CONNECT_TIMEOUT + IO_TIMEOUT;
+    let mut response = open_stream_with_credentials(
+        Request {
+            method: "GET",
+            url,
+            headers,
+            body: None,
+            range: None,
+        },
+        credential_origin,
+        scope,
+        cancel,
+        Some(deadline),
+    )?;
+    if response.status != 200 {
+        bail!("subtitle HTTP fetch failed with status {}", response.status);
+    }
+    if response
+        .headers
+        .get("content-encoding")
+        .is_some_and(|v| !v.eq_ignore_ascii_case("identity"))
+    {
+        bail!("unsupported subtitle content encoding");
+    }
+    read_bounded(&mut response, 8 * 1024 * 1024, false, deadline)
 }
 
 pub fn fetch_head_bytes(
@@ -542,7 +643,7 @@ pub(crate) fn fetch_range(
         last.parse::<u64>()?,
         total.parse::<u64>()?,
     );
-    if total <= start || first != start || last != end.min(total - 1) {
+    if first != start || last < first || last > end || last >= total {
         bail!("unexpected Content-Range");
     }
     let size = (last - first + 1) as usize;
@@ -587,6 +688,15 @@ mod tests {
             )
             .unwrap(),
             (b"ab".to_vec(), Some(6))
+        );
+        assert_eq!(
+            read_range(
+                b"HTTP/1.1 206 OK\r\nContent-Range: bytes 4-5/10\r\nContent-Length: 2\r\n\r\nab",
+                4,
+                6
+            )
+            .unwrap(),
+            (b"ab".to_vec(), Some(10))
         );
         assert_eq!(
             read_range(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nabcd", 0, 2).unwrap(),

@@ -11,6 +11,7 @@ use super::icc::{be16, be32};
 pub(super) const MAX_ICC: usize = 4 << 20;
 pub(super) const MAX_EXIF: usize = 1 << 20;
 const MAX_CHUNKS: usize = 4096;
+const MAX_JPEG_FILL_BYTES: usize = 1 << 20;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum PhotoFormat {
@@ -87,18 +88,22 @@ pub(super) fn jpeg<R: Read + Seek>(
     }
     let mut chunks: Vec<Option<Vec<u8>>> = Vec::new();
     let (mut total, mut received, mut invalid_icc) = (0, 0, false);
+    let mut fill_budget = MAX_JPEG_FILL_BYTES;
     for _ in 0..MAX_CHUNKS {
         let mut m = [0u8; 2];
         if r.read_exact(&mut m).is_err() || m[0] != 0xFF {
             break;
         }
+        while m[1] == 0xFF {
+            if fill_budget == 0 || r.read_exact(&mut m[1..]).is_err() {
+                return None;
+            }
+            fill_budget -= 1;
+        }
         let marker = m[1];
         match marker {
-            0xFF => {
-                r.seek(SeekFrom::Current(-1)).ok()?;
-                continue;
-            }
             0xD8 | 0x01 | 0xD0..=0xD7 => continue,
+            0x00 => break,
             0xDA | 0xD9 => break,
             _ => {}
         }

@@ -9,7 +9,7 @@ mod widgets;
 use std::rc::Rc;
 
 use gpui::{
-    AnyElement, Context, InteractiveElement, IntoElement, MouseButton, ParentElement,
+    AnyElement, Context, InteractiveElement, IntoElement, MouseButton, ParentElement, SharedString,
     StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder, px,
 };
 use iris_api::{SidebarPanel, StatusBadge};
@@ -88,7 +88,7 @@ impl IrisWindow {
         let t = ThemeTokens::of(cx);
 
         let mut panel_els: Vec<AnyElement> = Vec::with_capacity(panels.len());
-        for (pi, (pid, panel_data)) in panels.into_iter().enumerate() {
+        for (pid, panel_data) in panels {
             let mut section_els: Vec<AnyElement> = Vec::with_capacity(panel_data.sections.len());
             for (si, section) in panel_data.sections.into_iter().enumerate() {
                 let mut widget_els: Vec<AnyElement> = Vec::with_capacity(section.widgets.len());
@@ -96,7 +96,7 @@ impl IrisWindow {
                     widget_els.push(render_plugin_widget(
                         self,
                         &pid,
-                        pi * 10000 + si * 100 + wi,
+                        wi,
                         widget,
                         WidgetSurface::Sidebar,
                         t,
@@ -105,6 +105,7 @@ impl IrisWindow {
                 }
                 section_els.push(
                     div()
+                        .id(("plugin-section", si))
                         .flex()
                         .flex_col()
                         .gap(px(6.))
@@ -122,6 +123,7 @@ impl IrisWindow {
             }
             panel_els.push(
                 div()
+                    .id(SharedString::from(format!("plugin-panel:{pid}")))
                     .flex()
                     .flex_col()
                     .gap(px(8.))
@@ -197,8 +199,8 @@ impl IrisWindow {
 
         let t = ThemeTokens::of(cx);
         let vp = window.viewport_size();
-        let modal_w = (f32::from(vp.width) - 32.).clamp(340., 460.);
-        let max_h = (f32::from(vp.height) - 32.).clamp(240., 540.);
+        let modal_w = (f32::from(vp.width) - 24.).clamp(0., 460.);
+        let max_h = (f32::from(vp.height) - 24.).clamp(0., 540.);
 
         let is_submitting = self
             .overlays
@@ -233,7 +235,7 @@ impl IrisWindow {
             widget_nodes.push(render_plugin_widget(
                 self,
                 &pid,
-                1_000_000 + wi,
+                wi,
                 widget,
                 WidgetSurface::Modal {
                     modal_id: &modal.id,
@@ -246,6 +248,11 @@ impl IrisWindow {
         }
 
         let body = div()
+            .id(SharedString::from(format!(
+                "plugin-modal-content:{}:{pid}:{}",
+                pid.len(),
+                modal.id
+            )))
             .flex()
             .flex_col()
             .gap(px(12.))

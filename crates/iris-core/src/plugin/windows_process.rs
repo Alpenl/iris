@@ -22,7 +22,7 @@ use windows_sys::Win32::System::JobObjects::{
 use windows_sys::Win32::System::SystemInformation::{GetSystemDirectoryW, GetWindowsDirectoryW};
 use windows_sys::Win32::System::Threading::{
     CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DeleteProcThreadAttributeList,
-    EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess, INFINITE, InitializeProcThreadAttributeList,
+    EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess, InitializeProcThreadAttributeList,
     PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROC_THREAD_ATTRIBUTE_JOB_LIST, PROCESS_INFORMATION,
     STARTF_USESTDHANDLES, STARTUPINFOEXW, UpdateProcThreadAttribute, WaitForSingleObject,
 };
@@ -46,9 +46,8 @@ impl Child {
         }
     }
 
-    pub(super) fn close_job_and_wait(&mut self) {
+    pub(super) fn close_job(&mut self) {
         drop(self.job.take());
-        unsafe { WaitForSingleObject(self.process.as_raw_handle(), INFINITE) };
     }
 }
 
@@ -147,8 +146,7 @@ fn executable(program: &OsStr) -> io::Result<Vec<u16>> {
     if path.is_absolute() {
         return terminate_wide(program.encode_wide().collect());
     }
-    // The only looked-up program is the Python interpreter. Match Command's Windows search
-    // order and never implicitly search the working directory supplied by a plugin.
+    // Python comes from absolute search roots, never a relative PATH entry.
     let filename = path.with_extension("exe");
     let paths = env::var_os("PATH").unwrap_or_default();
     let dirs = env::current_exe()
@@ -157,16 +155,14 @@ fn executable(program: &OsStr) -> io::Result<Vec<u16>> {
         .into_iter()
         .chain(std::iter::once_with(|| system_dir(GetSystemDirectoryW)).flatten())
         .chain(std::iter::once_with(|| system_dir(GetWindowsDirectoryW)).flatten())
-        .chain(env::split_paths(&paths).filter(|p| !p.as_os_str().is_empty()));
+        .chain(env::split_paths(&paths).filter(|p| p.is_absolute()));
     for dir in dirs {
         let candidate = dir.join(&filename);
-        if candidate.symlink_metadata().is_ok() {
-            return terminate_wide(
-                std::path::absolute(candidate)?
-                    .as_os_str()
-                    .encode_wide()
-                    .collect(),
-            );
+        if candidate
+            .metadata()
+            .is_ok_and(|meta| meta.is_file() && meta.len() != 0)
+        {
+            return terminate_wide(candidate.as_os_str().encode_wide().collect());
         }
     }
     Err(io::Error::new(
@@ -175,8 +171,7 @@ fn executable(program: &OsStr) -> io::Result<Vec<u16>> {
     ))
 }
 
-// Inherit the environment directly for native plugins. For Python, merge its two ASCII
-// overrides into a Windows case-insensitively sorted, double-NUL-terminated environment block.
+// Merge environment overrides and removals into a case-insensitively sorted block.
 fn environment(cmd: &Command) -> Option<Vec<u16>> {
     cmd.get_envs().next()?;
     let inherited =
@@ -184,8 +179,12 @@ fn environment(cmd: &Command) -> Option<Vec<u16>> {
     let overrides = cmd
         .get_envs()
         .filter_map(|(k, v)| Some((k.to_owned(), v?.to_owned())));
-    let mut pairs: Vec<_> = inherited
-        .chain(overrides)
+    Some(environment_block(inherited.chain(overrides)))
+}
+
+fn environment_block(pairs: impl IntoIterator<Item = (OsString, OsString)>) -> Vec<u16> {
+    let mut pairs: Vec<_> = pairs
+        .into_iter()
         .map(|(k, v)| (k.encode_wide().collect::<Vec<_>>(), v))
         .collect();
     pairs.sort_unstable_by(|(a, _), (b, _)| {
@@ -201,8 +200,43 @@ fn environment(cmd: &Command) -> Option<Vec<u16>> {
         block.extend(value.encode_wide());
         block.push(0);
     }
+    if block.is_empty() {
+        block.push(0);
+    }
     block.push(0);
-    Some(block)
+    block
+}
+
+fn current_directory(path: &Path) -> io::Result<Vec<u16>> {
+    use std::path::{Component, Prefix};
+    let mut parts = path.components();
+    let ordinary = match parts.next() {
+        Some(Component::Prefix(p)) => match p.kind() {
+            Prefix::VerbatimDisk(disk) => Some(PathBuf::from(format!("{}:\\", char::from(disk)))),
+            Prefix::VerbatimUNC(server, share) => {
+                let mut root = OsString::from(r"\\");
+                root.push(server);
+                root.push(r"\");
+                root.push(share);
+                Some(PathBuf::from(root))
+            }
+            _ => None,
+        },
+        _ => None,
+    };
+    let dir = ordinary.map(|mut dir| {
+        for part in parts.filter(|part| !matches!(part, Component::RootDir)) {
+            dir.push(part);
+        }
+        dir
+    });
+    terminate_wide(
+        dir.as_deref()
+            .unwrap_or(path)
+            .as_os_str()
+            .encode_wide()
+            .collect(),
+    )
 }
 
 // The API provides an opaque dynamically-sized structure. Store it in pointer-aligned memory.
@@ -239,10 +273,7 @@ pub(super) fn spawn(cmd: &Command) -> io::Result<Launch> {
 fn create(cmd: &Command, extra_flags: u32) -> io::Result<Launch> {
     let exe = executable(cmd.get_program())?;
     let mut line = command_line(cmd)?;
-    let dir = cmd
-        .get_current_dir()
-        .map(|p| terminate_wide(p.as_os_str().encode_wide().collect()))
-        .transpose()?;
+    let dir = cmd.get_current_dir().map(current_directory).transpose()?;
     let env = environment(cmd);
     let job = kill_on_close_job()?;
     let (child_stdin, stdin) = io::pipe()?;
@@ -325,6 +356,27 @@ mod tests {
     use std::io::{Read, Write};
     use windows_sys::Win32::System::JobObjects::IsProcessInJob;
     use windows_sys::Win32::System::Threading::{CREATE_SUSPENDED, CreateEventW, TerminateProcess};
+
+    #[test]
+    fn environment_is_case_insensitively_sorted_and_double_terminated() {
+        assert_eq!(environment_block([]), [0, 0]);
+        let block = environment_block([("b".into(), "2".into()), ("A".into(), "1".into())]);
+        assert_eq!(String::from_utf16(&block).unwrap(), "A=1\0b=2\0\0");
+    }
+
+    #[test]
+    fn child_current_dir_uses_normal_dos_and_unc_paths() {
+        let dos = current_directory(Path::new(r"\\?\C:\Iris\Plugins")).unwrap();
+        let unc = current_directory(Path::new(r"\\?\UNC\server\share\plugins")).unwrap();
+        assert_eq!(
+            String::from_utf16(&dos[..dos.len() - 1]).unwrap(),
+            r"C:\Iris\Plugins"
+        );
+        assert_eq!(
+            String::from_utf16(&unc[..unc.len() - 1]).unwrap(),
+            r"\\server\share\plugins"
+        );
+    }
 
     #[test]
     fn plugin_is_born_in_its_job_before_first_instruction() {

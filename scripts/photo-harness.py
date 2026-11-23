@@ -70,6 +70,10 @@ class Iris:
             self.log = open(os.path.join(OUT, "iris-stderr.log"), "a", encoding="utf-8")
             env = dict(os.environ, IRIS_CONTROL=self.endpoint,
                        IRIS_SETTINGS=os.path.join(self.private.name, "settings.conf"))
+            env.update(IRIS_LOG_DIR=os.path.join(self.private.name, "logs"),
+                       IRIS_PLUGINS=os.path.join(self.private.name, "plugins"),
+                       IRIS_TEST_VAULT=os.path.join(self.private.name, "vault.json"))
+            env.pop("IRIS_LOG", None)
             env.pop("GPUI_DISABLE_DIRECT_COMPOSITION", None)
             self.proc = subprocess.Popen([BIN], env=env, stderr=subprocess.PIPE,
                                          text=True, encoding="utf-8", errors="replace", bufsize=1)
@@ -263,18 +267,21 @@ try:
     if "icc" in TESTS:
         r = {}
         for name in sorted(os.listdir(os.path.join(MEDIA, "icc"))):
-            if name.lower().endswith(".icc"):
+            if os.path.splitext(name)[1].lower() not in {".png", ".jpg", ".jpeg", ".webp"}:
                 continue
             f = os.path.join(MEDIA, "icc", name)
             load = iris.open_and_wait(f)
             time.sleep(0.4)
             st = iris.state()
             snap = os.path.join(OUT, f"icc-{name}.png")
-            iris.snap(snap)
-            r[name] = dict(load=load, rect=video_rect(st), snap=snap,
+            if load is None or not iris.snap(snap):
+                raise RuntimeError(f"Could not load or capture ICC fixture {f}")
+            r[name] = dict(load=load, rect=video_rect(st), snap=snap, source=f,
                            **props(iris, ["video-params/primaries", "video-params/gamma",
                                           "video-params/colormatrix"]),
                            mpv=list(iris.mpv_msgs))
+        if not r:
+            raise RuntimeError("No ICC fixtures found")
         results["icc"] = r
 
     if "huge" in TESTS:

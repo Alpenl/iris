@@ -10,7 +10,11 @@ use crate::library::Kind;
 use crate::media_uri::MediaUri;
 use crate::photo::{ExifSummary, Photo};
 
-pub const SPEED_STEPS: &[f64] = &[0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0];
+pub const MIN_SPEED: f64 = 0.25;
+pub const MAX_SPEED: f64 = 4.0;
+pub const SPEED_STEPS: &[f64] = &[
+    MIN_SPEED, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0, MAX_SPEED,
+];
 
 pub fn step_speed(current: f64, dir: isize) -> f64 {
     if dir > 0 {
@@ -18,14 +22,14 @@ pub fn step_speed(current: f64, dir: isize) -> f64 {
             .iter()
             .copied()
             .find(|&s| s > current + 0.01)
-            .unwrap_or(*SPEED_STEPS.last().unwrap())
+            .unwrap_or(MAX_SPEED)
     } else if dir < 0 {
         SPEED_STEPS
             .iter()
             .rev()
             .copied()
             .find(|&s| s < current - 0.01)
-            .unwrap_or(SPEED_STEPS[0])
+            .unwrap_or(MIN_SPEED)
     } else {
         current
     }
@@ -145,9 +149,7 @@ pub struct AudioDevice {
 /// External subtitle attachment for [`RemoteMediaRequest`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RemoteSubtitle {
-    /// Direct HTTP(S) subtitle URL without independent custom headers.
-    /// Attached via `sub-files-append` when same-origin with the primary URL
-    /// (or when the primary stream carries no custom headers).
+    /// HTTP(S) subtitle without independent custom headers, loaded through the relay.
     Url(String),
     /// Pre-fetched subtitle text loaded via `sub-add` `"memory://<content>"`,
     /// isolating third-party or custom-header subtitles from main stream credentials.
@@ -161,21 +163,76 @@ impl RemoteSubtitle {
         headers: &BTreeMap<String, String>,
         cancel: &crate::vfs::HttpCancel,
     ) -> Result<Self> {
-        const MAX_SUBTITLE_BYTES: usize = 8 * 1024 * 1024;
-        let resp = crate::vfs::http_client::request_bytes_cancellable(
-            "GET",
-            url,
-            headers,
-            None,
-            MAX_SUBTITLE_BYTES,
-            cancel,
-        )?;
-        if !(200..300).contains(&resp.status) {
-            bail!("subtitle HTTP fetch failed with status {}", resp.status);
-        }
-        let text = String::from_utf8(resp.body).context("subtitle payload is not UTF-8")?;
+        let url = crate::vfs::validate_stream_url(url)?;
+        let scope = crate::vfs::http_client::NetworkScope::new(url.clone());
+        let text = fetch_subtitle(&url, headers, &url, &scope, cancel)?;
         Ok(Self::InlineText(text))
     }
+
+    /// Fetches an attachment within the media's network scope. Its explicit
+    /// credentials belong to its own origin, including after redirects.
+    pub fn prefetch_for_media(
+        media_url: &url::Url,
+        subtitle_url: &url::Url,
+        media_headers: &BTreeMap<String, String>,
+        subtitle_headers: &BTreeMap<String, String>,
+        cancel: &crate::vfs::HttpCancel,
+    ) -> Result<Self> {
+        let media_url = crate::vfs::validate_stream_url(media_url.as_str())?;
+        let subtitle_url = crate::vfs::validate_stream_url(subtitle_url.as_str())?;
+        let scope = crate::vfs::http_client::NetworkScope::new(media_url.clone());
+        let (headers, credentials) = if subtitle_headers.is_empty()
+            && media_url.origin() == subtitle_url.origin()
+            && subtitle_url.username().is_empty()
+            && subtitle_url.password().is_none()
+        {
+            (media_headers, &media_url)
+        } else {
+            (subtitle_headers, &subtitle_url)
+        };
+        let text = fetch_subtitle(&subtitle_url, headers, credentials, &scope, cancel)?;
+        Ok(Self::InlineText(text))
+    }
+}
+
+pub(super) fn fetch_subtitle(
+    url: &url::Url,
+    headers: &BTreeMap<String, String>,
+    credentials: &url::Url,
+    scope: &crate::vfs::http_client::NetworkScope,
+    cancel: &crate::vfs::HttpCancel,
+) -> Result<String> {
+    let body = crate::vfs::http_client::fetch_subtitle_bytes(
+        url.clone(),
+        headers,
+        credentials,
+        scope,
+        cancel,
+    )?;
+    let mut text = String::from_utf8(body).context("subtitle payload is not UTF-8")?;
+    let start = text.len() - subtitle_text(&text)?.len();
+    text.drain(..start);
+    Ok(text)
+}
+
+pub(super) fn subtitle_text(text: &str) -> Result<&str> {
+    let text = text.trim_start_matches('\u{feff}');
+    let header = text.trim_start();
+    let starts = |magic: &str| {
+        header
+            .get(..magic.len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(magic))
+    };
+    if header.is_empty()
+        || text.len() > 8 * 1024 * 1024
+        || text.contains('\0')
+        || ["# mpv EDL", "#EXTM3U", "[playlist]", "<asx", "<?xml"]
+            .into_iter()
+            .any(starts)
+    {
+        bail!("invalid external subtitle text");
+    }
+    Ok(text)
 }
 
 /// Request descriptor for opening a direct HTTP(S) or plugin-resolved media stream.
@@ -228,6 +285,7 @@ pub enum SessionEvent {
     Ended(bool),
     Audio(String),
     Rotation(i64),
+    SourceRotation(i64),
     LoopFile(bool),
     Chapter(i64),
     ChaptersChanged,
@@ -237,6 +295,13 @@ pub enum SessionEvent {
     Loaded,
     Reconfigured,
     Error(i32),
+}
+
+/// Event metadata retained from mpv's ordered event stream.
+#[derive(Debug)]
+pub struct SessionUpdate {
+    pub(super) playlist_entry_id: Option<i64>,
+    pub(super) event: SessionEvent,
 }
 
 #[derive(Clone, Debug)]

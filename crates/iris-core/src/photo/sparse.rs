@@ -32,7 +32,7 @@ impl<'a, F: FnMut(u64, usize) -> Reply> Sparse<'a, F> {
         }
         let (prefix, total) = fetch(0, PREFIX).ok()?;
         let end = total.unwrap_or(prefix.len() as u64);
-        if prefix.is_empty() || prefix.len() as u64 != end.min(PREFIX as u64) {
+        if prefix.is_empty() || prefix.len() as u64 > end.min(PREFIX as u64) {
             return None;
         }
         Some(Self {
@@ -71,9 +71,11 @@ impl<'a, F: FnMut(u64, usize) -> Reply> Sparse<'a, F> {
             return Err(io::Error::other("photo metadata budget exhausted"));
         }
         self.remaining_requests -= 1;
-        self.remaining_bytes -= len;
         match (self.fetch)(self.pos, len) {
-            Ok((bytes, Some(total))) if total == self.end && bytes.len() == len => {
+            Ok((bytes, Some(total)))
+                if total == self.end && !bytes.is_empty() && bytes.len() <= len =>
+            {
+                self.remaining_bytes -= bytes.len();
                 self.windows.push((self.pos, bytes));
                 Ok(&self.windows.last().unwrap().1)
             }
@@ -128,10 +130,19 @@ pub fn probe_remote(
     ) else {
         return Photo::default();
     };
-    let Some(fmt) = detect_photo_format(&input.windows[0].1, name_hint) else {
+    let mut head = [0; 12];
+    let mut len = 0;
+    while len < head.len() {
+        match input.read(&mut head[len..]) {
+            Ok(n) if n > 0 => len += n,
+            _ => break,
+        }
+    }
+    input.pos = 0;
+    let Some(fmt) = detect_photo_format(&head[..len], name_hint) else {
         return Photo::default();
     };
-    finish_header(run_probe(&mut input, fmt))
+    finish_header(run_probe(&mut input, fmt), fmt)
 }
 
 #[cfg(test)]

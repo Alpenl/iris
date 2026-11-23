@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::fs_util;
-use crate::player::AspectMode;
+use crate::player::{AspectMode, MAX_SPEED, MIN_SPEED};
 use crate::settings::{
     self, DEFAULT_DIRECTORY_WIDTH, MAX_DIRECTORY_WIDTH, MIN_DIRECTORY_WIDTH, OnEof, PhotoDefault,
     Settings, Side,
@@ -125,11 +125,18 @@ macro_rules! def_preset_bits {
     };
 }
 
+fn window_dimension_matches(a: Option<f32>, b: Option<f32>) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => (a - b).abs() <= 1.,
+        _ => a == b,
+    }
+}
+
 def_preset_bits! {
     (0, DIR_SIDE, |a, b| a.directory_side == b.directory_side, |d, s| d.directory_side = s.directory_side),
     (1, DIR_WIDTH, |a, b| (a.directory_width - b.directory_width).abs() <= 0.5, |d, s| d.directory_width = s.directory_width),
     (2, DIR_OPEN, |a, b| a.directory_open == b.directory_open, |d, s| d.directory_open = s.directory_open),
-    (3, WIN_SIZE, |a, b| (a.window_width, a.window_height) == (b.window_width, b.window_height), |d, s| { d.window_width = s.window_width; d.window_height = s.window_height; }),
+    (3, WIN_SIZE, |a, b| window_dimension_matches(a.window_width, b.window_width) && window_dimension_matches(a.window_height, b.window_height), |d, s| { d.window_width = s.window_width; d.window_height = s.window_height; }),
     (4, ON_TOP, |a, b| a.always_on_top == b.always_on_top, |d, s| d.always_on_top = s.always_on_top),
     (5, FILMSTRIP, |a, b| a.photo_filmstrip == b.photo_filmstrip, |d, s| d.photo_filmstrip = s.photo_filmstrip),
     (6, THEME, |a, b| a.theme_id == b.theme_id, |d, s| d.theme_id.clone_from(&s.theme_id)),
@@ -145,12 +152,22 @@ def_preset_bits! {
     (16, CLICK_PAUSE, |a, b| a.single_click_pause == b.single_click_pause, |d, s| d.single_click_pause = s.single_click_pause),
 }
 
+pub const DEFAULT_WINDOW_SIZE: (f32, f32) = (1440., 900.);
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct PresetLayout {
+    pub sidebar_mode: SidebarMode,
+    pub window_size: Option<(f32, f32)>,
+}
+
 /// In-memory revert state tracking fields owned by the active preset.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct PresetRevert {
     initial_mask: u32,
     active_mask: u32,
     applied: Settings,
+    previous_layout: PresetLayout,
+    had_sidebar_mode: bool,
     had_aspect: bool,
     plugin_overrides: BTreeMap<String, bool>,
     on_exit_commands: Vec<(String, String)>,
@@ -221,6 +238,18 @@ impl PresetRuntime {
             loaded.active_preset = "default".into();
         }
         let mut active = loaded.clone();
+        let (default_w, default_h) = DEFAULT_WINDOW_SIZE;
+        let initial_layout = PresetLayout {
+            sidebar_mode: SidebarMode::default(),
+            window_size: Some(if loaded.remember_window_size {
+                (
+                    loaded.window_width.unwrap_or(default_w).clamp(480., 7680.),
+                    loaded.window_height.unwrap_or(default_h).clamp(300., 4320.),
+                )
+            } else {
+                DEFAULT_WINDOW_SIZE
+            }),
+        };
         let mut rt = Self {
             baseline: loaded,
             revert: PresetRevert::default(),
@@ -229,7 +258,8 @@ impl PresetRuntime {
             settings_path,
         };
         let cmds = resolved.map_or_else(Vec::new, |p| {
-            rt.apply_in_memory(Some(&p), &mut active).plugin_commands
+            rt.apply_in_memory(Some(&p), &mut active, initial_layout)
+                .plugin_commands
         });
         (active, rt, cmds)
     }
@@ -256,6 +286,7 @@ impl PresetRuntime {
         &mut self,
         target: Option<&WorkspacePreset>,
         active: &mut Settings,
+        current_layout: PresetLayout,
     ) -> PresetTransition {
         let prev = std::mem::take(&mut self.revert);
         copy_masked_fields(prev.active_mask, active, &self.baseline);
@@ -268,9 +299,11 @@ impl PresetRuntime {
         }
         let mut trans = PresetTransition {
             preset_id: target.map_or_else(|| "default".into(), |p| p.id.clone()),
-            sidebar_mode: None,
+            sidebar_mode: prev
+                .had_sidebar_mode
+                .then_some(prev.previous_layout.sidebar_mode),
             window_size: (prev.active_mask & mask::WIN_SIZE != 0)
-                .then(|| self.baseline.window_width.zip(self.baseline.window_height))
+                .then_some(prev.previous_layout.window_size)
                 .flatten(),
             aspect: prev.had_aspect.then_some(AspectMode::Original),
             speed: (prev.active_mask & mask::SPEED != 0).then(|| active.speed.unwrap_or(1.0)),
@@ -284,6 +317,11 @@ impl PresetRuntime {
         };
 
         let (mut bits, mut had_aspect) = (0u32, false);
+        let previous_layout = PresetLayout {
+            sidebar_mode: trans.sidebar_mode.unwrap_or(current_layout.sidebar_mode),
+            window_size: trans.window_size.or(current_layout.window_size),
+        };
+        let mut had_sidebar_mode = false;
         macro_rules! put {
             ($(($opt:expr, $field:ident, $m:ident)),+ $(,)?) => {
                 $(if let Some(v) = $opt { active.$field = v; bits |= mask::$m; })+
@@ -308,7 +346,10 @@ impl PresetRuntime {
                 (l.compact_controls, compact_controls, COMPACT),
                 (l.hidden_dock_buttons.clone(), hidden_dock_buttons, HIDDEN_BTNS),
             }
-            trans.sidebar_mode = l.sidebar_mode;
+            if let Some(mode) = l.sidebar_mode {
+                trans.sidebar_mode = Some(mode);
+                had_sidebar_mode = true;
+            }
             if let Some((w, h)) = l
                 .window_size
                 .filter(|(w, h)| w.is_finite() && h.is_finite())
@@ -320,7 +361,7 @@ impl PresetRuntime {
             }
         }
         if let Some(pb) = &preset.playback {
-            if let Some(sp) = pb.speed.map(|s| s.clamp(0.25, 4.0)) {
+            if let Some(sp) = pb.speed.map(|s| s.clamp(MIN_SPEED, MAX_SPEED)) {
                 (active.speed, trans.speed) = (Some(sp), Some(sp));
                 bits |= mask::SPEED;
             }
@@ -354,6 +395,8 @@ impl PresetRuntime {
             initial_mask: bits,
             active_mask: bits,
             applied: active.clone(),
+            previous_layout,
+            had_sidebar_mode,
             had_aspect,
             plugin_overrides,
             on_exit_commands,
@@ -366,9 +409,10 @@ impl PresetRuntime {
         mgr: &PresetManager,
         id: &str,
         active_settings: &mut Settings,
+        current_layout: PresetLayout,
     ) -> PresetTransition {
         let target = (id != "default").then(|| mgr.get(id)).flatten().cloned();
-        let trans = self.apply_in_memory(target.as_ref(), active_settings);
+        let trans = self.apply_in_memory(target.as_ref(), active_settings, current_layout);
         self.baseline.active_preset.clone_from(&trans.preset_id);
         self.persist_baseline();
         trans
@@ -458,7 +502,7 @@ fn sanitize_preset(preset: &mut WorkspacePreset) {
         });
     }
     if let Some(pb) = &mut preset.playback {
-        pb.speed = clamp_opt(pb.speed, 0.25, 4.0);
+        pb.speed = clamp_opt(pb.speed, MIN_SPEED, MAX_SPEED);
         pb.seek_step = clamp_opt(pb.seek_step, 1.0, 60.0);
         pb.sub_scale = clamp_opt(pb.sub_scale, 0.5, 2.5);
     }
@@ -582,6 +626,7 @@ impl PresetManager {
         description: impl Into<String>,
         scope: PresetCaptureScope,
         s: &Settings,
+        baseline: &Settings,
         mode: SidebarMode,
         win: Option<(f32, f32)>,
         sp: f64,
@@ -610,12 +655,23 @@ impl PresetManager {
             .or(s.speed)
             .unwrap_or(1.0);
         let playback = scope.playback.then(|| some_struct! { PlaybackPatch {
-            speed: eff_sp.clamp(0.25, 4.0), on_eof: s.on_eof,
+            speed: eff_sp.clamp(MIN_SPEED, MAX_SPEED), on_eof: s.on_eof,
             seek_step: s.seek_step.clamp(1.0, 60.0), sub_scale: s.sub_scale.clamp(0.5, 2.5),
             aspect: asp, photo_default: s.photo_default, single_click_pause: s.single_click_pause,
         }});
         let plugins = scope.plugins.then(|| PluginPatch {
-            disable_plugins: s.disabled_plugins.clone(),
+            enable_plugins: baseline
+                .disabled_plugins
+                .iter()
+                .filter(|id| !s.disabled_plugins.contains(id))
+                .cloned()
+                .collect(),
+            disable_plugins: s
+                .disabled_plugins
+                .iter()
+                .filter(|id| !baseline.disabled_plugins.contains(id))
+                .cloned()
+                .collect(),
             ..Default::default()
         });
         let mut p = WorkspacePreset {
@@ -658,6 +714,7 @@ impl PresetManager {
         id: &str,
         scope: PresetCaptureScope,
         s: &Settings,
+        baseline: &Settings,
         mode: SidebarMode,
         win: Option<(f32, f32)>,
         sp: f64,
@@ -672,7 +729,7 @@ impl PresetManager {
             .plugins
             .as_ref()
             .map(|p| (p.plugin_commands.clone(), p.on_exit_commands.clone()));
-        let mut up = Self::capture_from_current(id, n, d, scope, s, mode, win, sp, asp);
+        let mut up = Self::capture_from_current(id, n, d, scope, s, baseline, mode, win, sp, asp);
         if let (Some(pl), Some((cmds, exit))) = (&mut up.plugins, hooks) {
             (pl.plugin_commands, pl.on_exit_commands) = (cmds, exit);
         }

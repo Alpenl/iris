@@ -27,6 +27,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use gpui::RenderImage;
+use image::ImageDecoder as _;
 
 pub(crate) const IS_MACOS: bool = cfg!(target_os = "macos");
 
@@ -74,6 +75,9 @@ pub(crate) fn default_screenshot_dir() -> PathBuf {
     }
     #[cfg(target_os = "windows")]
     {
+        if let Some(path) = windows::known_screenshot_dir() {
+            return path;
+        }
         if let Some(home) = std::env::var_os("USERPROFILE") {
             let pics = PathBuf::from(&home).join("Pictures");
             if pics.is_dir() {
@@ -91,6 +95,7 @@ pub(crate) fn default_screenshot_dir() -> PathBuf {
 
 /// Decodes a compact straight-BGRA `RenderImage` thumbnail entirely in memory.
 pub(crate) fn decode_thumbnail(path: &Path, max_dim: u32) -> Option<Arc<RenderImage>> {
+    let max_dim = max_dim.clamp(1, 2048);
     #[cfg(target_os = "macos")]
     if let Some(img) = macos::decode_thumbnail_imageio(path, max_dim) {
         return Some(img);
@@ -102,15 +107,30 @@ pub(crate) fn decode_thumbnail(path: &Path, max_dim: u32) -> Option<Arc<RenderIm
     decode_thumbnail_fallback(path, max_dim)
 }
 
+const MAX_SOURCE_DIM: u32 = 16_384;
+
+fn valid_thumbnail_source(width: u64, height: u64) -> bool {
+    let limit = u64::from(MAX_SOURCE_DIM);
+    (1..=limit).contains(&width) && (1..=limit).contains(&height) && width * height <= 100_000_000
+}
+
 /// Bounded cross-platform thumbnail decoder fallback with EXIF orientation support.
 fn decode_thumbnail_fallback(path: &Path, max_dim: u32) -> Option<Arc<RenderImage>> {
+    const MAX_BYTES: u64 = 128 * 1024 * 1024;
     let mut reader = image::ImageReader::open(path).ok()?;
     let mut limits = image::Limits::default();
-    limits.max_alloc = Some(128 * 1024 * 1024);
-    limits.max_image_width = Some(16_384);
-    limits.max_image_height = Some(16_384);
-    reader.limits(limits);
-    let img = reader.decode().ok()?;
+    limits.max_alloc = Some(MAX_BYTES);
+    limits.max_image_width = Some(MAX_SOURCE_DIM);
+    limits.max_image_height = Some(MAX_SOURCE_DIM);
+    reader.limits(limits.clone());
+    let mut decoder = reader.into_decoder().ok()?;
+    let (width, height) = decoder.dimensions();
+    if !valid_thumbnail_source(width.into(), height.into()) {
+        return None;
+    }
+    limits.reserve(decoder.total_bytes()).ok()?;
+    decoder.set_limits(limits).ok()?;
+    let img = image::DynamicImage::from_decoder(decoder).ok()?;
     let thumb = apply_exif_orientation(
         img.thumbnail(max_dim, max_dim),
         iris_core::photo::exif_orientation(path),

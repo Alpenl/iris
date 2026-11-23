@@ -220,7 +220,7 @@ pub(super) fn tiff<R: Read + Seek>(r: &mut R, h: &mut Header, mode: Mode) -> Opt
                     })
                 }
                 (0x829d, 5) => summary.aperture = e.rational(r).map(|v| format!("f/{v:.1}")),
-                (0x8827, 3) => summary.iso = e.integer().map(|v| v as u32),
+                (0x8827, 3 | 4) => summary.iso = e.integer().and_then(|v| u32::try_from(v).ok()),
                 (0x9003, 2) => {
                     if let Some(date) = e.ascii(r) {
                         summary.date_taken = Some(date);

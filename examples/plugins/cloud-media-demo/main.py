@@ -221,7 +221,6 @@ class CloudDemoPlugin:
     def __init__(self) -> None:
         self.token: str = ""
         self.cdn: str = "auto"
-        self.last_browse: dict[str, Any] | None = None
 
     @property
     def authenticated(self) -> bool:
@@ -480,17 +479,6 @@ class CloudDemoPlugin:
             "subtitles": [],
         }
 
-    def refresh_last_browse(self) -> list[dict[str, Any]]:
-        if not self.last_browse:
-            return []
-        return [
-            self.build_browse_response(
-                request_id=self.last_browse["request_id"],
-                source_id=self.last_browse["source_id"],
-                folder_id=self.last_browse.get("folder_id"),
-                query=self.last_browse.get("query"),
-            )
-        ]
 
     def handle_action(self, act: str, value: str | None = None) -> list[dict[str, Any]]:
         if act == "login":
@@ -503,7 +491,7 @@ class CloudDemoPlugin:
                 {"command": "set_state", "key": "cdn", "value": None},
             ]
             cmds.extend(self.build_ui_slots())
-            cmds.extend(self.refresh_last_browse())
+            cmds.append({"command": "refresh_source", "source_id": SOURCE_ID})
             cmds.append({"command": "show_toast", "message": "已退出云盘演示账号"})
             return cmds
 
@@ -568,7 +556,7 @@ class CloudDemoPlugin:
                     {"command": "close_modal"},
                 ]
                 cmds.extend(self.build_ui_slots())
-                cmds.extend(self.refresh_last_browse())
+                cmds.append({"command": "refresh_source", "source_id": SOURCE_ID})
                 cmds.append({"command": "show_toast", "message": "云盘账号已连接"})
                 return cmds
             return []
@@ -581,12 +569,6 @@ class CloudDemoPlugin:
             src_id = str(ev.get("source_id") or SOURCE_ID)
             folder_id = ev.get("folder_id")
             query = ev.get("query")
-            self.last_browse = {
-                "request_id": req_id,
-                "source_id": src_id,
-                "folder_id": folder_id,
-                "query": query,
-            }
             return [self.build_browse_response(req_id, src_id, folder_id, query)]
 
         if kind == "source_resolve":

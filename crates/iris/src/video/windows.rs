@@ -29,10 +29,12 @@ use windows::Win32::{
         },
     },
     System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoUninitialize},
+    UI::WindowsAndMessaging::IsIconic,
 };
 use windows::core::Interface;
 
 const MONITOR_POLL_INTERVAL: Duration = Duration::from_millis(500);
+const MAX_TEXTURE_DIM: f64 = 16_384.;
 
 #[derive(Clone, Copy, PartialEq)]
 struct Layout {
@@ -67,7 +69,7 @@ impl VideoSurface {
         // SDR output; use the monitor's ICC when one is installed. HDR/EDR is
         // intentionally not inferred from a 10-bit source or an HDR desktop.
         mpv.set_display_color_target("bt.709", "srgb")?;
-        let initial_monitor = update_display_profile(HWND(hwnd as *mut _), &mpv)?;
+        let initial_monitor = update_display_profile(HWND(hwnd as *mut _), &mpv);
         let render_mpv = mpv.clone();
         let scale = window.scale_factor() as f64;
         let layout = Arc::new(Mutex::new(Layout {
@@ -89,17 +91,25 @@ impl VideoSurface {
                 // COM and every D3D/render resource remain on this thread.
                 let initialized = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }.is_ok();
                 let raw_hwnd = HWND(hwnd as *mut _);
-                let renderer = unsafe {
-                    Renderer::new(raw_hwnd, render_mpv.clone(), callback_wake.clone())
-                };
+                let renderer =
+                    unsafe { Renderer::new(raw_hwnd, render_mpv.clone(), callback_wake.clone()) };
                 match renderer {
                     Ok(initial_renderer) => {
                         let _ = ready_tx.send(Ok(()));
-                        let mut renderer = Some(initial_renderer);
+                        let mut renderer = initial_renderer;
                         let mut current_monitor = initial_monitor;
                         let mut last_check_gen = 0u64;
-                        let mut consecutive_resets = 0u8;
-                        while rx.recv().is_ok() {
+                        let mut retry_frame = false;
+                        let mut logged_frame_error = false;
+                        loop {
+                            if retry_frame {
+                                match rx.recv_timeout(Duration::from_millis(100)) {
+                                    Ok(()) | Err(mpsc::RecvTimeoutError::Timeout) => {}
+                                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                                }
+                            } else if rx.recv().is_err() {
+                                break;
+                            }
                             let layout = {
                                 #[cfg(any(debug_assertions, feature = "devtools"))]
                                 {
@@ -121,81 +131,60 @@ impl VideoSurface {
                                 last_check_gen = layout.monitor_check;
                                 let m = monitor_of(raw_hwnd);
                                 if m != current_monitor {
-                                    match update_display_profile(raw_hwnd, &render_mpv) {
-                                        Ok(updated) => current_monitor = updated,
-                                        Err(e) => {
-                                            log::error!("updating display color profile: {e:#}")
-                                        }
-                                    }
+                                    current_monitor = update_display_profile(raw_hwnd, &render_mpv);
                                 }
                             }
-                            let Some(active) = renderer.as_mut() else {
-                                break;
-                            };
                             let draw_res = {
                                 #[cfg(any(debug_assertions, feature = "devtools"))]
                                 if layout.force_reset {
                                     Err(windows::core::Error::from(DXGI_ERROR_DEVICE_REMOVED)
                                         .into())
                                 } else {
-                                    unsafe { active.draw(layout) }
+                                    unsafe { renderer.draw(raw_hwnd, layout) }
                                 }
                                 #[cfg(not(any(debug_assertions, feature = "devtools")))]
                                 unsafe {
-                                    active.draw(layout)
+                                    renderer.draw(raw_hwnd, layout)
                                 }
                             };
                             match draw_res {
                                 Ok(()) => {
-                                    consecutive_resets = 0;
+                                    retry_frame = false;
+                                    logged_frame_error = false;
+                                }
+                                Err(e) if is_device_lost(&e, &renderer._device) => {
+                                    log::warn!("D3D11 device lost: {e:#}");
+                                    let saved_vid = render_mpv.active_vid();
+                                    drop(renderer);
+                                    let Some(rebuilt) = rebuild_renderer(
+                                        raw_hwnd,
+                                        &render_mpv,
+                                        &callback_wake,
+                                        &shared,
+                                        &rx,
+                                    ) else {
+                                        break;
+                                    };
+                                    current_monitor = update_display_profile(raw_hwnd, &render_mpv);
+                                    if let Some(vid) = saved_vid.as_deref() {
+                                        let _ = render_mpv.restore_vid(vid);
+                                    }
+                                    let _ = reset_tx.unbounded_send(());
+                                    renderer = rebuilt;
+                                    let _ = callback_wake.try_send(());
                                 }
                                 Err(e) => {
-                                    if is_device_lost(&e, &active._device) && consecutive_resets < 4
-                                    {
-                                        consecutive_resets += 1;
-                                        log::warn!(
-                                            "D3D11 device lost ({e:#}); recreating video surface (attempt {consecutive_resets})"
-                                        );
-                                        let saved_vid = render_mpv.active_vid();
-                                        renderer = None;
-                                        std::thread::sleep(Duration::from_millis(50));
-                                        match unsafe {
-                                            Renderer::new(
-                                                raw_hwnd,
-                                                render_mpv.clone(),
-                                                callback_wake.clone(),
-                                            )
-                                        } {
-                                            Ok(rebuilt) => {
-                                                if let Ok(m) =
-                                                    update_display_profile(raw_hwnd, &render_mpv)
-                                                {
-                                                    current_monitor = m;
-                                                }
-                                                if let Some(vid) = saved_vid.as_deref() {
-                                                    let _ = render_mpv.restore_vid(vid);
-                                                }
-                                                let _ = reset_tx.unbounded_send(());
-                                                renderer = Some(rebuilt);
-                                                let _ = callback_wake.try_send(());
-                                                continue;
-                                            }
-                                            Err(re) => {
-                                                log::error!(
-                                                    "recreating D3D11 surface failed: {re:#}"
-                                                );
-                                                break;
-                                            }
-                                        }
+                                    if !logged_frame_error {
+                                        log::warn!("video frame failed: {e:#}");
+                                        logged_frame_error = true;
                                     }
-                                    log::error!("video rendering stopped: {e:#}");
-                                    break;
+                                    renderer.layout = None;
+                                    // A new frame/layout wakes us sooner. A paused frame
+                                    // also gets one retry, without polling a broken surface.
+                                    retry_frame = !retry_frame;
                                 }
                             }
                         }
-                        // Free the mpv render context here, before the application
-                        // sends quit to the client API, never from its callback.
-                        drop(renderer.take());
                     }
                     Err(e) => {
                         let _ = ready_tx.send(Err(e));
@@ -279,6 +268,38 @@ impl VideoSurface {
 impl Drop for VideoSurface {
     fn drop(&mut self) {
         self.shutdown();
+    }
+}
+
+fn rebuild_renderer(
+    hwnd: HWND,
+    mpv: &RenderHandle,
+    wake: &mpsc::SyncSender<()>,
+    layout: &Mutex<Layout>,
+    rx: &mpsc::Receiver<()>,
+) -> Option<Renderer> {
+    let mut delay = Duration::from_millis(50);
+    loop {
+        let deadline = Instant::now() + delay;
+        loop {
+            if layout.lock().unwrap().stopped {
+                return None;
+            }
+            match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                Err(mpsc::RecvTimeoutError::Timeout) => break,
+                Err(mpsc::RecvTimeoutError::Disconnected) => return None,
+                Ok(()) if Instant::now() >= deadline => break,
+                Ok(()) => {}
+            }
+        }
+        if layout.lock().unwrap().stopped {
+            return None;
+        }
+        match unsafe { Renderer::new(hwnd, mpv.clone(), wake.clone()) } {
+            Ok(renderer) => return Some(renderer),
+            Err(e) => log::warn!("recreating D3D11 surface failed: {e:#}"),
+        }
+        delay = (delay * 2).min(Duration::from_secs(2));
     }
 }
 
@@ -380,7 +401,11 @@ impl Renderer {
         })
     }
 
-    unsafe fn draw(&mut self, layout: Layout) -> Result<()> {
+    unsafe fn draw(&mut self, hwnd: HWND, layout: Layout) -> Result<()> {
+        if layout.rect[2] <= 0. || layout.rect[3] <= 0. || unsafe { IsIconic(hwnd).as_bool() } {
+            self.layout = None;
+            return Ok(());
+        }
         let geometry_changed = self
             .layout
             .is_none_or(|prev| prev.rect != layout.rect || prev.scale != layout.scale);
@@ -388,12 +413,13 @@ impl Renderer {
         if !geometry_changed && update & RenderContext::UPDATE_FRAME == 0 {
             return Ok(());
         }
-        if layout.rect[2] <= 0. || layout.rect[3] <= 0. {
-            return Ok(());
-        }
         let size = (
-            (layout.rect[2] * layout.scale).round().max(1.) as u32,
-            (layout.rect[3] * layout.scale).round().max(1.) as u32,
+            (layout.rect[2] * layout.scale)
+                .round()
+                .clamp(1., MAX_TEXTURE_DIM) as u32,
+            (layout.rect[3] * layout.scale)
+                .round()
+                .clamp(1., MAX_TEXTURE_DIM) as u32,
         );
         if size != self.size {
             unsafe {
@@ -440,12 +466,30 @@ impl Drop for Renderer {
     }
 }
 
-fn update_display_profile(hwnd: HWND, mpv: &RenderHandle) -> Result<isize> {
+fn update_display_profile(hwnd: HWND, mpv: &RenderHandle) -> isize {
+    let monitor = monitor_of(hwnd);
+    let result = monitor_profile(monitor).and_then(|path| {
+        mpv.set_display_icc_profile(&path)?;
+        if !path.is_empty() {
+            log::info!("display ICC: {path}");
+        }
+        Ok(())
+    });
+    if let Err(e) = result {
+        log::warn!("display ICC unavailable, using SDR sRGB: {e:#}");
+        if let Err(e) = mpv.set_display_icc_profile("") {
+            log::warn!("clearing display ICC profile: {e}");
+        }
+    }
+    monitor
+}
+
+fn monitor_profile(monitor: isize) -> Result<String> {
     use windows::Win32::Graphics::Gdi::*;
     use windows::Win32::UI::ColorSystem::GetICMProfileW;
     use windows::core::{PCWSTR, PWSTR};
     unsafe {
-        let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+        let monitor = HMONITOR(monitor as *mut _);
         let mut info = MONITORINFOEXW::default();
         info.monitorInfo.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
         GetMonitorInfoW(monitor, &mut info.monitorInfo).ok()?;
@@ -467,13 +511,9 @@ fn update_display_profile(hwnd: HWND, mpv: &RenderHandle) -> Result<isize> {
                 .iter()
                 .position(|c| *c == 0)
                 .unwrap_or(profile.len());
-            let path = String::from_utf16(&profile[..end])?;
-            mpv.set_display_icc_profile(&path)?;
-            log::info!("display ICC: {path}");
+            Ok(String::from_utf16(&profile[..end])?)
         } else {
-            mpv.set_display_icc_profile("")?;
-            log::info!("display has no ICC profile; using SDR sRGB output");
+            Ok(String::new())
         }
-        Ok(monitor.0 as isize)
     }
 }

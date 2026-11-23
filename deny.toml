@@ -1,5 +1,5 @@
-# cargo-deny: licence gate for the Rust dependency tree.
-#   cargo install cargo-deny && cargo deny check licenses
+# cargo-deny policy for the Rust dependency tree.
+#   cargo install cargo-deny && cargo deny --locked check advisories licenses bans sources
 #
 # Iris uses MIT OR Apache-2.0 (route B, see docs/DECISIONS.md), so every
 # crate must be usable in permissive or closed-source builds. GPL / AGPL /
@@ -15,6 +15,10 @@ targets = [
     "x86_64-pc-windows-msvc",
 ]
 
+[advisories]
+unmaintained = "workspace"
+yanked = "deny"
+
 [licenses]
 allow = [
     "MIT",
@@ -28,7 +32,6 @@ allow = [
     "MPL-2.0",
     "CC0-1.0",
     "BSL-1.0",
-    "NCSA",
 ]
 confidence-threshold = 0.9
 
@@ -39,7 +42,8 @@ ignore = true
 [bans]
 multiple-versions = "allow"
 deny = [
-    { name = "bindgen" },
+    # GPUI's published builds generate native bindings; local crates are also checked directly.
+    { name = "bindgen", wrappers = ["gpui", "gpui_media"] },
 ]
 
 [sources]

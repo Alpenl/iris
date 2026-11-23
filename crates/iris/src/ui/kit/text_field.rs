@@ -5,16 +5,17 @@ use std::ops::{Deref, DerefMut, Range};
 use std::rc::Rc;
 
 use gpui::{
-    AnyElement, Bounds, ClipboardItem, Context, ElementInputHandler, EntityInputHandler,
-    FocusHandle, InteractiveElement, IntoElement, KeyContext, KeyDownEvent, MouseButton,
-    ParentElement, Pixels, Point, SharedString, Styled, UTF16Selection, Window, canvas, div,
-    prelude::FluentBuilder, px,
+    AnyElement, Bounds, ClipboardItem, ContentMask, Context, ElementInputHandler,
+    EntityInputHandler, FocusHandle, InteractiveElement, IntoElement, KeyContext, KeyDownEvent,
+    MouseButton, ParentElement, Pixels, Point, SharedString, Styled, TextRun, UTF16Selection,
+    Window, canvas, div, prelude::FluentBuilder, px,
 };
 
 use super::super::IrisWindow;
 use super::icon;
 pub(in crate::ui) use super::text_buffer::{TextInputBuffers, TextInputState};
 use crate::assets::Icon;
+use crate::platform::IS_MACOS;
 use crate::theme::ThemeTokens;
 
 pub(in crate::ui) type FormEnterCallback =
@@ -24,6 +25,7 @@ pub(in crate::ui) struct TextInputHub {
     pub(in crate::ui) search_focus: FocusHandle,
     pub(in crate::ui) palette_focus: FocusHandle,
     pub(in crate::ui) form_focus: FocusHandle,
+    pub(in crate::ui) recorder_focus: FocusHandle,
     pub(in crate::ui) buffers: TextInputBuffers,
 }
 
@@ -47,6 +49,7 @@ impl TextInputHub {
             search_focus: cx.focus_handle(),
             palette_focus: cx.focus_handle(),
             form_focus: cx.focus_handle(),
+            recorder_focus: cx.focus_handle(),
             buffers: TextInputBuffers::default(),
         }
     }
@@ -152,7 +155,7 @@ impl IrisWindow {
 
     fn notify_slot_edited(&mut self, slot: ActiveSlot, cx: &mut Context<Self>) {
         match slot {
-            ActiveSlot::Search => self.rebuild_directory_rows(),
+            ActiveSlot::Search => self.filter_directory_rows(),
             ActiveSlot::Palette => {
                 self.overlays.palette_index = 0;
                 self.overlays.palette_scroll.scroll_to_item(0);
@@ -232,7 +235,37 @@ impl IrisWindow {
         let (kind_click, kind_key) = (spec.kind.clone(), spec.kind);
         let (focus_ime, entity_ime) = (focus_handle.clone(), cx.entity().clone());
 
-        let text_el = if !is_empty {
+        let text_el = if focused && !is_empty {
+            let caret = state_ref.display_caret_index();
+            let shown = SharedString::from(shown);
+            canvas(
+                move |_, w, _| {
+                    let run = TextRun {
+                        len: shown.len(),
+                        font: w.text_style().font(),
+                        color: t.text.into(),
+                        background_color: None,
+                        underline: None,
+                        strikethrough: None,
+                    };
+                    w.text_system().shape_line(shown, px(12.), &[run], None)
+                },
+                move |bounds, line, w, cx| {
+                    let right = line.x_for_index(caret + '▏'.len_utf8());
+                    let mut origin = bounds.origin;
+                    origin.x -= (right - bounds.size.width).max(px(0.));
+                    let line_height = px(16.);
+                    origin.y += (bounds.size.height - line_height) * 0.5;
+                    w.with_content_mask(Some(ContentMask { bounds }), |w| {
+                        let _ = line.paint(origin, line_height, w, cx);
+                    });
+                },
+            )
+            .flex_1()
+            .min_w(px(0.))
+            .h_full()
+            .into_any_element()
+        } else if !is_empty {
             div()
                 .flex_1()
                 .min_w(px(0.))
@@ -352,8 +385,23 @@ impl IrisWindow {
             return;
         }
         let mods = ev.keystroke.modifiers;
-        if mods.secondary() && !mods.alt {
-            match ev.keystroke.key.as_str() {
+        let key = ev.keystroke.key.as_str();
+        let edit = match key {
+            "a" | "c" | "x" if mods.secondary() && !mods.alt && !mods.shift => Some(key),
+            "v" if mods.secondary() && !mods.alt => Some("v"),
+            "insert" if !IS_MACOS && !mods.alt && !mods.platform && mods.control && !mods.shift => {
+                Some("c")
+            }
+            "insert" if !IS_MACOS && !mods.alt && !mods.platform && !mods.control && mods.shift => {
+                Some("v")
+            }
+            "delete" if !IS_MACOS && !mods.alt && !mods.platform && !mods.control && mods.shift => {
+                Some("x")
+            }
+            _ => None,
+        };
+        if let Some(edit) = edit {
+            match edit {
                 "a" => {
                     if let Some(i) = self.slot_mut(slot) {
                         i.select_all();
@@ -367,11 +415,9 @@ impl IrisWindow {
                 }
                 "x" => {
                     if let Some(i) = self.slot_mut(slot)
-                        && !i.selected_range.is_empty()
+                        && let Some(text) = i.clipboard_text(false)
                     {
-                        if let Some(text) = i.clipboard_text(false) {
-                            cx.write_to_clipboard(ClipboardItem::new_string(text.to_owned()));
-                        }
+                        cx.write_to_clipboard(ClipboardItem::new_string(text.to_owned()));
                         i.backspace();
                         self.notify_slot_edited(slot, cx);
                     }
@@ -384,9 +430,12 @@ impl IrisWindow {
                         self.notify_slot_edited(slot, cx);
                     }
                 }
-                _ => {}
+                _ => unreachable!("unknown text editing shortcut"),
             }
             cx.stop_propagation();
+            return;
+        }
+        if mods.alt || mods.control || mods.platform {
             return;
         }
         match ev.keystroke.key.as_str() {
@@ -394,7 +443,7 @@ impl IrisWindow {
                 match kind {
                     TextFieldKind::Search if !self.text_inputs.search_input.is_empty() => {
                         self.text_inputs.search_input.clear();
-                        self.rebuild_directory_rows();
+                        self.filter_directory_rows();
                     }
                     TextFieldKind::Search => {
                         self.text_inputs.search_open = false;

@@ -2,7 +2,7 @@
 
 Iris 的插件架构从第一性原理出发，围绕四根支柱构建单一、正交的控制面协议（`PROTOCOL_VERSION = 1`）：
 
-1. **远程数据源（`media_source`）**：插件通过统一的 `MediaSource` 协议提供目录、搜索、分页、多服务器、授权、播放线路和外挂字幕。提供 `source_id` 与 `entry_id` 可让收藏和续播跨授权更新保持有效。无自定义请求头的媒体由 libmpv 直接打开。带头的媒体经播放会话专属的本地转发器读取，宿主将凭据限定到获授权的源。插件也可自行提供仅绑定回环高端口的流。远程照片从 256 KiB 前缀起步，在请求和字节预算内按需读取后置元数据。
+1. **远程数据源（`media_source`）**：插件通过 `MediaSource` 提供目录、搜索、分页、多服务器、授权、播放线路和外挂字幕。稳定的 `source_id` 与 `entry_id` 维持收藏和续播关联。HTTP(S) 播放经过会话专属的本地转发器，凭据只发给授权源。插件也可提供高端口回环流。远程照片从 256 KiB 前缀起步，在请求和字节预算内读取后置元数据。
 2. **高自由度参数化工作台与统一声明式控件树（`UiTheme` / `UiToolbar` / `UiSidebar` / `UiModal` / `UiStatus` / `UiOverlay`）**：本体默认保持方向 C 视觉一致，但不限制插件自由度——UI 插件可动态接管全套主题配色令牌（`#RRGGBB[AA]`）、圆角与栏高尺度、无边框影院窗口（`hide_titlebar`，宿主自动提供顶缘叠层唤醒标题栏、视口拖拽与最低对比度逃生护栏）、悬浮控制栏（`floating_dock`）与底栏常驻按钮显隐；侧栏面板（`SidebarPanel`）与非破坏性异步校验弹窗（`PluginModal`）共用同一套 13 种声明式 `Widget` 控件；视口层通过归一化 `OverlayNode` 绘制边框/填充卡片、辅助线、时间码/字幕文本、频谱柱状条与可点击 HUD 按钮。
 3. **原子握手、状态持久化与分桶加密凭据库（`SetState` / `SetSecret`）**：非敏感偏好键值（`state`）由宿主自动落盘，敏感密码/令牌（`secrets`，单条上限 2048B）按 `builtin.<id>` / `ext.<id>` 物理隔离存入系统凭据库（macOS Keychain / Windows Credential Manager，失败显式报错，绝不降级明文文件），并在插件启动时通过单次原子 `Init` 事件连同当前播放快照一并注入。
 4. **像素与安全严格隔离**：解码、色彩空间转换与原生交换链由内核独占，插件绝不经手实时像素数据，且通过 `DirtySlots` 值相等脏检测守住全屏隐藏控制栏下的 `0 Hz` 空转防线。
@@ -14,7 +14,7 @@ Iris 的插件架构从第一性原理出发，围绕四根支柱构建单一、
 ## 1. 内置官方插件与外部参考插件
 
 ### 内置官方插件（编译进内核，`iris.*` 保留命名空间，可在「设置 → 插件」启停）
-1. **WebDAV 远程存储（`iris.webdav`）**：100% 遵循标准 `iris-api` 协议实现的官方免挂载 WebDAV 插件（零内核特权），支持添加/编辑/移除多台 NAS 服务器、Basic/Bearer 认证（密码存系统凭据库）、后台工作线程非阻塞 `PROPFIND`（经 `PluginResponder` 异步回推，解析 RFC 1123 修改时间）、同目录外挂字幕自动挂载与广色域原图直看。
+1. **WebDAV 远程存储（`iris.webdav`）**：支持多台 NAS 管理、Basic/Bearer 认证、有界的后台 `PROPFIND`、同目录外挂字幕和广色域原图。用户名和口令使用独立字段，凭据存入系统凭据库。向非回环 `http://` 地址发送口令需要用户确认。
 2. **构图辅助线（`iris.guides`）**：三分线（3×3）、黄金分割线、中心十字、2.39:1 电影画幅框与 90%/80% 安全区；可被「审片与选片」工作区预设联动开启并在退出预设时自动关闭。
 3. **A-B 循环与标记（`iris.ab-loop`）**：视频/音频 A-B 区间循环与时间点书签（同时支持本地与远程插件流 `MediaUri`）。
 
@@ -42,7 +42,7 @@ Iris 的插件架构从第一性原理出发，围绕四根支柱构建单一、
 
 ## 3. 权限模型（`Permission`）
 
-`SetState`（插件私有非敏感配置持久化）为基础能力，无需额外权限；其余命令与事件均受 `plugin.json` 权限白名单严格门控：
+`SetState` 用于持久化插件自己的非敏感配置，单插件最多 512 KiB。其余命令与事件受 `plugin.json` 权限白名单门控。
 
 | 权限名 | 说明 | 允许接收的事件 / 发送的命令 |
 |---|---|---|
@@ -54,7 +54,7 @@ Iris 的插件架构从第一性原理出发，围绕四根支柱构建单一、
 | `ui_toolbar` | 底栏自定义工具按钮 | `set_toolbar`（`buttons: Vec<ToolbarButton>`） |
 | `ui_modal` | 交互式配置、OAuth 与扫码弹窗 | `open_modal`、`close_modal`（`PluginModal`，与侧栏共用统一 `Widget` 列表） |
 | `ui_theme` | 动态主题令牌与窗口/底栏结构定制 | 清单静态声明或运行时发送 `set_theme`（`UiThemeSpec` + `ChromeLayoutSpec`） |
-| `media_source` | 虚拟数据源与加密凭据（自动隐含 `secrets`） | 清单声明 `sources` 或 `source_provider`；接收 `source_browse`、`source_resolve`、`source_manage`；发送 `set_sources`、`provide_source_page`、`resolve_stream`、`source_error`、`set_secret` |
+| `media_source` | 虚拟数据源与加密凭据（自动隐含 `secrets`） | 清单声明 `sources` 或 `source_provider`；接收 `source_browse`、`source_resolve`、`source_manage`；发送 `set_sources`、`refresh_source`、`provide_source_page`、`resolve_stream`、`source_error`、`set_secret` |
 | `secrets` | 独立使用系统加密凭据库 | 接收 `init.secrets`；发送 `set_secret`（无需声明 `sources`） |
 | `notifications` | 顶部轻提示 | `show_toast` |
 
@@ -89,7 +89,11 @@ Iris 的插件架构从第一性原理出发，围绕四根支柱构建单一、
      ```
 4. **非破坏性弹窗交互**：用户点击确认时宿主保持弹窗开启（保留已输入内容）并发送 `modal_submit { id, values }`，插件校验成功后显式发送 `close_modal` 关闭弹窗（校验失败仅发 `show_toast` 或更新同 `id` 弹窗即可原地提示）；用户按 `Esc` 或取消时宿主强制立即关窗并发送 `modal_cancel { id }`。
 5. **虚拟数据源请求**：`source_browse` 和 `source_resolve` 的应答须回传收到的 `request_id`。只接受当前插件当前请求的一次应答；浏览和解析请求 30 秒超时。插件主动打开媒体时省略 `resolve_stream.request_id`。`source_manage` 处理服务器配置与移除。
-6. **退出清理**：插件应在 `shutdown` 或 stdin EOF 时停止工作并关闭自己的子进程和监听端口。Windows 在创建插件进程时就将其加入宿主持有的 Job。即使 Iris 在插件执行第一条指令前退出，系统也会回收该进程。
+6. **退出清理**：插件应在 `shutdown` 或 stdin EOF 时关闭自己的子进程和监听端口。Windows 在创建进程时就把插件加入宿主持有的 Job，宿主异常退出时由系统回收。Unix 宿主停止插件时清理插件进程组。自行创建新会话的辅助进程由插件负责回收。
+
+- `refresh_source` 携带 `source_id`，通知宿主为当前显示的该数据源重新发起浏览请求，例如登录完成后刷新列表。插件使用新 `source_browse` 事件中的 `request_id` 回包。
+
+外部插件以当前用户身份运行。消息权限控制它可以请求的 Iris 功能。只安装来源可信的插件。
 
 ### 4.2 统一声明式控件 `Widget`（侧栏与弹窗同构复用）
 

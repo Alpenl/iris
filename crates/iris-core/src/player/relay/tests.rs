@@ -3,6 +3,7 @@ use crate::library::Kind;
 use crate::media_uri::MediaUri;
 use crate::player::{RemoteMediaRequest, RemoteSubtitle, Session};
 use crate::settings::Settings;
+use std::net::TcpListener;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
 
@@ -14,7 +15,7 @@ fn playlist_routes_bind_urls_extensions_and_playback_keys() {
     let base = Url::parse("https://media.example/season/list.m3u8?token=source-secret").unwrap();
     let playlist = concat!(
         "#EXTM3U\n",
-        "#EXT-X-MEDIA:TYPE=SUBTITLES,NAME=\"zh, tw\",URI=\"/text/subtitles.m3u8\"\n",
+        "#EXT-X-MEDIA:TYPE=SUBTITLES,NAME=\"zh, tw\",URI=\"/text/subtitles\"\n",
         "#EXT-X-KEY:METHOD=AES-128,URI=\"key?token=source-secret\"\n",
         "#EXT-X-MAP:URI=\"../init.mp4\",BYTERANGE=\"128@0\"\n",
         "#EXT-X-STREAM-INF:BANDWIDTH=80000\n",
@@ -37,12 +38,16 @@ fn playlist_routes_bind_urls_extensions_and_playback_keys() {
         let local = Url::parse(raw).unwrap();
         assert!(other.open(local.path()).is_err());
         assert!(key.open(&format!("{}.mp4", local.path())).is_err());
-        urls.push(key.open(local.path()).unwrap().to_string());
+        let (upstream, _) = key.open(local.path()).unwrap();
+        if upstream.path() == "/text/subtitles" {
+            assert!(local.path().ends_with(".m3u8"));
+        }
+        urls.push(upstream.to_string());
     }
     assert_eq!(
         urls,
         [
-            "https://media.example/text/subtitles.m3u8",
+            "https://media.example/text/subtitles",
             "https://media.example/season/key?token=source-secret",
             "https://media.example/init.mp4",
             "https://cdn.example/variant.m3u8",
@@ -53,6 +58,15 @@ fn playlist_routes_bind_urls_extensions_and_playback_keys() {
     assert!(valid_range("bytes=0-"));
     assert!(valid_range("bytes=128-255"));
     assert!(!valid_range("bytes=3-4,10-20"));
+    assert!(is_hls(b"\xef\xbb\xbf#EXTM3U"));
+    assert!(
+        rewrite_playlist(
+            "#EXTM3U\n#EXT-X-DEFINE:NAME=\"a\",VALUE=\"b\"\n",
+            &base,
+            &key
+        )
+        .is_err()
+    );
 }
 
 /// Static fixture origins run entirely on loopback. Every requested resource and
@@ -78,7 +92,7 @@ impl Fixture {
                     thread::park_timeout(Duration::from_millis(5));
                     continue;
                 };
-                let Ok(raw) = read_request(&mut socket) else {
+                let Ok(raw) = read_request(&mut socket, CLIENT_TIMEOUT) else {
                     continue;
                 };
                 let req = String::from_utf8(raw).unwrap();
@@ -121,25 +135,18 @@ fn silent_mp3() -> Vec<u8> {
 
 #[test]
 fn authenticated_hls_plays_through_native_session() {
-    let cdn = Fixture::new(|_| {
-        (
-            "200 OK",
-            "Content-Type: audio/mpeg\r\n".into(),
-            silent_mp3(),
-        )
-    });
-    let cdn_addr = cdn.address;
-    let origin = Fixture::new(move |path| {
+    let origin = Fixture::new(|path| {
         match path {
         "/start" => ("302 Found", "Location: /hls/master.m3u8\r\n".into(), Vec::new()),
         "/hls/master.m3u8" => ("200 OK", "Content-Type: application/vnd.apple.mpegurl\r\n".into(), b"#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=128000\ntracks/list.m3u8\n".to_vec()),
         "/hls/tracks/list.m3u8" => ("200 OK", "Content-Type: application/vnd.apple.mpegurl\r\n".into(), b"#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:3\n#EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:2.09,\npart.mp3\n#EXT-X-ENDLIST\n".to_vec()),
-        "/hls/tracks/part.mp3" => ("302 Found", format!("Location: http://{cdn_addr}/part.mp3\r\n"), Vec::new()),
+        "/hls/tracks/part.mp3" => ("200 OK", "Content-Type: audio/mpeg\r\n".into(), silent_mp3()),
         "/captions.srt" => ("200 OK", "Content-Type: text/plain\r\n".into(), b"1\n00:00:00,000 --> 00:00:01,000\nLocal fixture\n".to_vec()),
         _ => ("404 Not Found", String::new(), Vec::new()),
     }
     });
     let mut session = Session::new().unwrap();
+    let mut events = session.events().unwrap();
     session.mpv.set_property_string("ao", "null").unwrap();
     let playback_url = format!("http://{}/start", origin.address);
     session
@@ -164,12 +171,16 @@ fn authenticated_hls_plays_through_native_session() {
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut loaded = false;
     while Instant::now() < deadline {
-        match session.mpv.wait_event(0.05) {
-            Some(iris_mpv::Event::FileLoaded) => loaded = true,
-            Some(iris_mpv::Event::EndFile { error, .. }) if error < 0 => {
-                panic!("native playback failed: {error}")
+        if let Ok(update) = events.try_recv() {
+            match session.apply_update(&update) {
+                Some(crate::player::SessionEvent::Loaded) => loaded = true,
+                Some(crate::player::SessionEvent::Error(error)) => {
+                    panic!("native playback failed: {error}")
+                }
+                _ => (),
             }
-            _ => (),
+        } else {
+            thread::sleep(Duration::from_millis(5));
         }
         if loaded
             && origin
@@ -200,9 +211,6 @@ fn authenticated_hls_plays_through_native_session() {
             "missing authorized {path}, requests: {origin_hits:?}"
         );
     }
-    let cdn_hits = cdn.seen.lock().unwrap();
-    assert!(cdn_hits.iter().any(|(p, _)| p == "/part.mp3"));
-    assert!(cdn_hits.iter().all(|(_, auth)| !auth));
 }
 
 #[test]
@@ -211,7 +219,8 @@ fn playback_seek_preserves_range_and_representation_length() {
     let url = Url::parse(&format!("http://{}/clip.mp4", origin.local_addr().unwrap())).unwrap();
     let upstream = thread::spawn(move || {
         let (mut socket, _) = origin.accept().unwrap();
-        let request = String::from_utf8(read_request(&mut socket).unwrap()).unwrap();
+        let request =
+            String::from_utf8(read_request(&mut socket, CLIENT_TIMEOUT).unwrap()).unwrap();
         assert!(request.lines().any(|line| line == "Range: bytes=10-13"));
         assert!(request.lines().any(|line| line == "X-Media-Key: fixture"));
         socket.write_all(b"HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 10-13/100\r\nContent-Length: 4\r\nAccept-Ranges: bytes\r\n\r\nabcd").unwrap();
@@ -238,4 +247,40 @@ fn playback_seek_preserves_range_and_representation_length() {
     assert!(reply.contains("content-range: bytes 10-13/100\r\n"));
     assert!(reply.contains("content-length: 4\r\n"));
     assert!(reply.ends_with("\r\n\r\nabcd"));
+}
+
+#[test]
+fn relay_terminates_clean_chunks_only() {
+    for (body, clean) in [
+        (&b"4\r\ndata\r\n0\r\n\r\n"[..], true),
+        (b"4\r\ndata", false),
+    ] {
+        let origin = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let url = Url::parse(&format!("http://{}/audio", origin.local_addr().unwrap())).unwrap();
+        let upstream = thread::spawn(move || {
+            let (mut socket, _) = origin.accept().unwrap();
+            read_request(&mut socket, CLIENT_TIMEOUT).unwrap();
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n")
+                .unwrap();
+            socket.write_all(body).unwrap();
+        });
+        let relay = PlaybackRelay::start(url.clone(), BTreeMap::new()).unwrap();
+        let local = Url::parse(&relay.url(&url).unwrap()).unwrap();
+        let authority = relay.service.routes.authority;
+        let mut client = TcpStream::connect(authority).unwrap();
+        client.set_read_timeout(Some(CLIENT_TIMEOUT)).unwrap();
+        write!(
+            client,
+            "GET {} HTTP/1.1\r\nHost: {authority}\r\n\r\n",
+            local.path()
+        )
+        .unwrap();
+        let mut reply = String::new();
+        client.read_to_string(&mut reply).unwrap();
+        upstream.join().unwrap();
+        assert!(reply.contains("Transfer-Encoding: chunked\r\n"));
+        assert!(reply.contains("\r\n\r\n4\r\ndata\r\n"));
+        assert_eq!(reply.ends_with("0\r\n\r\n"), clean);
+    }
 }

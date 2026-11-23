@@ -2,6 +2,7 @@
 name = "iris-core"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 publish.workspace = true
 license.workspace = true
 
@@ -26,6 +27,7 @@ percent-encoding = "2.3"
 base64 = "0.22"
 roxmltree = "0.20"
 httparse = "1.10"
+mio = { version = "1", features = ["net", "os-poll"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-native-certs = "0.8"
 rustls-pki-types = "1"
@@ -38,7 +40,7 @@ libc = "0.2"
 security-framework = "3.7"
 
 [target.'cfg(target_os = "windows")'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Globalization", "Win32_Security", "Win32_Security_Credentials", "Win32_System_JobObjects", "Win32_System_SystemInformation", "Win32_System_Threading"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Globalization", "Win32_Security", "Win32_Security_Credentials", "Win32_Storage_FileSystem", "Win32_System_JobObjects", "Win32_System_SystemInformation", "Win32_System_Threading"] }
 
 [lints]
 workspace = true

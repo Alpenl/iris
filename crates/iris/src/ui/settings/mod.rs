@@ -36,8 +36,8 @@ impl IrisWindow {
     ) -> impl IntoElement {
         let t = ThemeTokens::of(cx);
         let vp = window.viewport_size();
-        let modal_w = (f32::from(vp.width) - 24.).clamp(420., 700.);
-        let modal_h = (f32::from(vp.height) - 24.).clamp(260., 532.);
+        let modal_w = (f32::from(vp.width) - 24.).clamp(0., 700.);
+        let modal_h = (f32::from(vp.height) - 24.).clamp(0., 532.);
         let is_recording = self.overlays.recording_shortcut.is_some();
 
         let page: AnyElement = match self.overlays.settings_tab {
@@ -53,6 +53,7 @@ impl IrisWindow {
         let nav_rail = div()
             .id("settings-nav-rail")
             .w(px(144.))
+            .max_w(gpui::relative(0.35))
             .flex_none()
             .h_full()
             .overflow_y_scroll()
@@ -126,7 +127,7 @@ impl IrisWindow {
             kc.add("ShortcutRecorder");
             kc.add("TextInput");
             content = content
-                .track_focus(&self.text_inputs.form_focus)
+                .track_focus(&self.text_inputs.recorder_focus)
                 .key_context(kc)
                 .on_key_down(cx.listener(Self::handle_shortcut_recorder_key));
         }

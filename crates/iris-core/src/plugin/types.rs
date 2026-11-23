@@ -1,8 +1,8 @@
 //! Public plugin status, metadata, [`PollReport`] types, and plugin start/dispatch helpers.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::mpsc::Sender;
+use std::sync::{Arc, Weak};
 
 use iris_api::{
     HostCommand, HostEvent, PROTOCOL_VERSION, Permission, PlaybackSnapshot, PluginManifest,
@@ -14,10 +14,12 @@ use crate::vault::CredentialVault;
 use super::process::{ExternalProcess, WakeSignal, encode_event};
 use super::slots::{
     DirtySlots, LoadedPlugin, Runtime, apply_plugin_commands, load_plugin_secrets,
-    load_plugin_state,
+    load_plugin_state, save_plugin_state,
 };
 
 pub(super) const RESERVED_NAMESPACE_ERR: &str = "reserved 'iris.*' namespace";
+
+pub(super) type BuiltinReply = (String, Weak<()>, Vec<HostCommand>);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PluginSource {
@@ -114,13 +116,14 @@ pub(super) fn discover_external_manifests(dir: &Path) -> Vec<(PathBuf, PluginMan
         }
         found.push((pdir, manifest));
     }
+    found.sort_unstable_by(|a, b| a.0.cmp(&b.0));
     found
 }
 
 pub(super) fn start_loaded_plugin(
     host_version: &str,
     wake: Option<WakeSignal>,
-    builtin_tx: &Sender<(String, Vec<HostCommand>)>,
+    builtin_tx: &Sender<BuiltinReply>,
     vault: &CredentialVault,
     state_dir: Option<&Path>,
     snapshot: &PlaybackSnapshot,
@@ -136,13 +139,23 @@ pub(super) fn start_loaded_plugin(
         };
     }
     let mut dirty = loaded.seed_manifest_theme();
-    let state = load_plugin_state(state_dir, &loaded.manifest.id);
-    loaded.state = state.clone();
+    let mut state = loaded
+        .state_writer
+        .as_ref()
+        .and_then(|writer| writer.pending(&loaded.manifest.id))
+        .unwrap_or_else(|| Arc::new(load_plugin_state(state_dir, &loaded.manifest.id)));
+    if matches!(loaded.source, PluginSource::Builtin)
+        && loaded.manifest.id == "iris.webdav"
+        && super::webdav::reconcile_state(Arc::make_mut(&mut state), vault)
+    {
+        save_plugin_state(state_dir, &loaded.manifest.id, &state);
+    }
+    loaded.state = Arc::clone(&state);
     let secrets = load_plugin_secrets(vault, &loaded.source, &loaded.manifest);
     let init = HostEvent::Init {
         protocol: PROTOCOL_VERSION,
         host_version: host_version.to_string(),
-        state,
+        state: (*state).clone(),
         secrets,
         snapshot: if loaded.manifest.has_permission(Permission::ReadState) {
             snapshot.clone()
@@ -154,9 +167,13 @@ pub(super) fn start_loaded_plugin(
     match &mut loaded.runtime {
         Runtime::Builtin(b) => {
             let (tx, wake_cb, cb_id) = (builtin_tx.clone(), wake, pid.clone());
+            let generation = Arc::new(());
+            let token = Arc::downgrade(&generation);
+            loaded.builtin_generation = Some(generation);
             b.bind_responder(Arc::new(move |cmds| {
                 if !cmds.is_empty()
-                    && tx.send((cb_id.clone(), cmds)).is_ok()
+                    && token.strong_count() != 0
+                    && tx.send((cb_id.clone(), token.clone(), cmds)).is_ok()
                     && let Some(w) = &wake_cb
                 {
                     w.notify();

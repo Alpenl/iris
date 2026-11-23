@@ -1,8 +1,9 @@
 //! Shared filesystem helpers: application data directory lookup and atomic file writes.
 
-use std::io::Write;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -13,8 +14,16 @@ static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 /// - Other Unix: `$XDG_CONFIG_HOME/iris` or `~/.config/iris`.
 pub(crate) fn data_dir() -> Option<PathBuf> {
     if let Some(p) = std::env::var_os("IRIS_SETTINGS") {
-        let pb = PathBuf::from(p);
-        return pb.parent().map(Path::to_path_buf);
+        return Path::new(&p)
+            .parent()
+            .map(|dir| {
+                if dir.as_os_str().is_empty() {
+                    Path::new(".")
+                } else {
+                    dir
+                }
+            })
+            .map(Path::to_path_buf);
     }
     #[cfg(target_os = "macos")]
     {
@@ -35,16 +44,54 @@ pub(crate) fn data_dir() -> Option<PathBuf> {
 
 /// Keep the lock on a stable sibling: the data files themselves are replaced by rename.
 /// Closing the returned file releases the OS lock, including on process exit.
-pub(crate) fn lock_store(dir: &Path) -> std::io::Result<std::fs::File> {
-    std::fs::create_dir_all(dir)?;
-    let lock = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(dir.join("records.lock"))?;
-    lock.lock()?;
-    Ok(lock)
+pub(crate) fn lock_file(path: &Path) -> io::Result<std::fs::File> {
+    create_parent(path)?;
+    let lock = retry_sharing_violation(|| {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)
+    })?;
+    for attempt in 0.. {
+        match lock.try_lock() {
+            Ok(()) => return Ok(lock),
+            Err(std::fs::TryLockError::WouldBlock) if attempt < 4 => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(std::fs::TryLockError::WouldBlock) => {
+                return Err(io::Error::from(io::ErrorKind::WouldBlock));
+            }
+            Err(std::fs::TryLockError::Error(e)) => return Err(e),
+        }
+    }
+    unreachable!()
+}
+
+pub(crate) fn create_parent(path: &Path) -> io::Result<()> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn retry_sharing_violation<T>(mut op: impl FnMut() -> io::Result<T>) -> io::Result<T> {
+    for attempt in 1.. {
+        match op() {
+            Err(e) if cfg!(windows) && attempt < 5 && windows_sharing_violation(&e) => {
+                std::thread::sleep(Duration::from_millis(10 * attempt));
+            }
+            result => return result,
+        }
+    }
+    unreachable!()
+}
+
+fn windows_sharing_violation(e: &io::Error) -> bool {
+    e.kind() == io::ErrorKind::PermissionDenied || matches!(e.raw_os_error(), Some(32 | 33 | 1224))
 }
 
 /// Atomically writes `bytes` to `path` via a unique sibling `.tmp` file,
@@ -55,79 +102,66 @@ pub(crate) fn atomic_write(path: &Path, bytes: impl AsRef<[u8]>) -> std::io::Res
 }
 
 /// Atomically writes sensitive `bytes` to `path` with owner-only `0600` permissions
-/// on Unix (`fsync` before rename) and transient sharing-lock retries on Windows.
+/// on Unix, with data synchronized before rename and sharing-lock retries on Windows.
 pub(crate) fn atomic_write_private(path: &Path, bytes: impl AsRef<[u8]>) -> std::io::Result<()> {
     write_impl(path, bytes.as_ref(), true)
 }
 
-fn write_impl(path: &Path, bytes: &[u8], private: bool) -> std::io::Result<()> {
-    if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        std::fs::create_dir_all(parent)?;
+fn write_impl(path: &Path, bytes: &[u8], private: bool) -> io::Result<()> {
+    create_parent(path)?;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    if private {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
     }
-    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
-    let tmp = path.with_extension(format!("{}.{}.tmp", std::process::id(), seq));
 
-    let write_res = (|| -> std::io::Result<()> {
-        let mut opts = std::fs::OpenOptions::new();
-        opts.write(true).create(true).truncate(true);
-        #[cfg(unix)]
+    let (tmp, mut file) = loop {
+        let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let tmp = path.with_extension(format!("{}.{}.tmp", std::process::id(), seq));
+        match retry_sharing_violation(|| opts.open(&tmp)) {
+            Ok(file) => break (tmp, file),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    };
+    let write = file.write_all(bytes).and_then(|()| {
         if private {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
+            file.sync_all()
+        } else {
+            file.sync_data()
         }
-        let mut file = opts.open(&tmp)?;
-        file.write_all(bytes)?;
-        if private {
-            file.sync_all()?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
-            }
-        }
-        Ok(())
-    })();
-
-    if let Err(e) = write_res {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e);
+    });
+    drop(file);
+    let result = write.and_then(|()| retry_sharing_violation(|| std::fs::rename(&tmp, path)));
+    if result.is_err() {
+        let _ = retry_sharing_violation(|| std::fs::remove_file(&tmp));
     }
-
-    let attempts = if cfg!(windows) { 5 } else { 1 };
-    let mut last_err = None;
-    for attempt in 0..attempts {
-        match std::fs::rename(&tmp, path) {
-            Ok(()) => {
-                #[cfg(unix)]
-                if private {
-                    use std::os::unix::fs::PermissionsExt;
-                    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
-                }
-                return Ok(());
-            }
-            Err(e)
-                if cfg!(windows)
-                    && attempt + 1 < attempts
-                    && e.kind() == std::io::ErrorKind::PermissionDenied =>
-            {
-                last_err = Some(e);
-                std::thread::sleep(std::time::Duration::from_millis(10 * (attempt + 1) as u64));
-            }
-            Err(e) => {
-                let _ = std::fs::remove_file(&tmp);
-                return Err(e);
-            }
-        }
-    }
-    let _ = std::fs::remove_file(&tmp);
-    Err(last_err.unwrap_or_else(|| std::io::Error::other("atomic rename failed")))
+    result
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn retries_windows_sharing_errors() {
+        for code in [32, 33, 1224] {
+            let mut calls = 0;
+            retry_sharing_violation(|| {
+                calls += 1;
+                if calls == 1 {
+                    Err(io::Error::from_raw_os_error(code))
+                } else {
+                    Ok(())
+                }
+            })
+            .unwrap();
+            assert_eq!(calls, 2);
+        }
+    }
 
     #[test]
     fn atomic_write_and_private_mode_roundtrip() {

@@ -13,7 +13,6 @@ use gpui::{
     div, prelude::FluentBuilder, px,
 };
 use iris_core::library::Kind;
-use iris_core::player::Command;
 use iris_core::settings::Side;
 
 use super::IrisWindow;
@@ -209,9 +208,7 @@ impl IrisWindow {
             .on_scroll_wheel(cx.listener(|this, ev: &ScrollWheelEvent, _, cx| {
                 let delta = this.damped_volume_delta(ev);
                 if delta.abs() >= 0.5 {
-                    this.command(Command::VolumeBy(delta), cx);
-                    let next = (this.active().session.state().volume + delta).clamp(0., 100.);
-                    this.show_osd(format!("音量 · {next:.0}%"), cx);
+                    this.adjust_volume_by(delta, cx);
                 }
                 cx.stop_propagation();
             }))

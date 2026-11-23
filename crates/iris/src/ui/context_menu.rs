@@ -8,7 +8,6 @@ use gpui::{
 use iris_core::catalog::QueueItem;
 use iris_core::library::Kind;
 use iris_core::media_uri::MediaUri;
-use iris_core::vfs::PinnedBookmark;
 
 use super::IrisWindow;
 use super::actions::{
@@ -422,14 +421,7 @@ impl IrisWindow {
                 menu_row("cm-m-bm", Some(Icon::Pin), "固定到常驻书签", None, false, t)
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.overlays.context_menu = None;
-                        let id = format!("bm-{}", this.locations.bookmarks.len() + 1);
-                        this.locations.add_bookmark(PinnedBookmark {
-                            id,
-                            name: ttl_bm.clone(),
-                            uri: u_bm.clone(),
-                            folder_id: folder_id.clone(),
-                        });
-                        this.show_toast(format!("已固定书签 · {ttl_bm}"), cx);
+                        this.pin_bookmark(ttl_bm.clone(), u_bm.clone(), folder_id.clone(), cx);
                     }))
                     .into_any_element(),
             );

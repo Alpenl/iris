@@ -16,6 +16,7 @@ Then click "重新扫描插件" in Iris Settings -> 插件.
 from __future__ import annotations
 
 import json
+import math
 import sys
 import time
 from typing import Any
@@ -118,7 +119,9 @@ def main() -> None:
             state = ev.get("state") or {}
             try:
                 watched = max(0.0, float(state.get("watched_secs") or 0.0))
-            except (TypeError, ValueError):
+                if not math.isfinite(watched):
+                    watched = 0.0
+            except (TypeError, ValueError, OverflowError):
                 watched = 0.0
             snap = ev.get("snapshot") or {}
             current_title = str(snap.get("title") or "")

@@ -19,11 +19,48 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import urllib.parse
 import urllib.request
 import zipfile
 
 ROOT = Path(__file__).resolve().parents[2]
 LOCK = ROOT / "scripts/release/sources.lock.json"
+SOURCE_LICENSES = frozenset({
+    "LGPL-2.1-only", "LGPL-2.1-or-later", "FTL", "MIT", "ISC", "BSD-2-Clause",
+    "BSD-3-Clause", "Zlib", "Apache-2.0", "Apache-2.0 WITH LLVM-exception",
+    "BSD-3-Clause AND MIT AND Apache-2.0", "Apache-2.0 OR MIT",
+    "MIT AND Apache-2.0", "ZPL-2.1 AND BSD-3-Clause AND MIT",
+})
+
+
+def https_url(value):
+    url = urllib.parse.urlsplit(value)
+    if url.scheme != "https" or not url.hostname or url.username is not None or url.password is not None or url.fragment:
+        raise RuntimeError(f"An HTTPS URL without user info or fragments is required: {value!r}")
+    return url
+
+
+def validate_lock(lock):
+    def validate_pin(name, pin):
+        if not re.fullmatch(r"[0-9a-f]{64}", pin["sha256"]):
+            raise RuntimeError(f"Invalid source checksum: {name}")
+        return https_url(pin["url"])
+
+    for name, pin in lock["sources"].items():
+        url = validate_pin(name, pin)
+        revision = pin["revision"]
+        if not re.fullmatch(r"[0-9a-f]{40}", revision) or not url.path.endswith("/" + revision) or url.query:
+            raise RuntimeError(f"Source URL must point to a full revision: {name}")
+        if pin["license"] not in SOURCE_LICENSES:
+            raise RuntimeError(f"Disallowed source license: {name}: {pin['license']}")
+    for name in ("windows_toolchain", "linux_windows_toolchain"):
+        validate_pin(name, lock[name])
+
+
+class HttpsRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        https_url(newurl)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
 def run(args, cwd=None, env=None):
@@ -38,7 +75,8 @@ def run(args, cwd=None, env=None):
 
 def download(pin, destination):
     if not destination.exists():
-        with urllib.request.urlopen(pin["url"], timeout=180) as response, destination.open("wb") as out:
+        client = urllib.request.build_opener(HttpsRedirect())
+        with client.open(pin["url"], timeout=180) as response, destination.open("wb") as out:
             shutil.copyfileobj(response, out)
     digest = hashlib.file_digest(destination.open("rb"), "sha256").hexdigest()
     if digest != pin["sha256"]:
@@ -102,6 +140,7 @@ def main():
     evidence = output / "compliance"
     evidence.mkdir(exist_ok=args.resume)
     lock = json.loads(LOCK.read_text())
+    validate_lock(lock)
     epoch = lock["source_date_epoch"]
     identity_path = work / "build-identity.json"
     identity = {"target": args.target, "output": str(output)}
@@ -176,8 +215,6 @@ def main():
         needed = [n for n in needed if n not in {"shaderc", "spirv-cross", "spirv-headers", "spirv-tools", "glslang", "llvm-mingw", "mingw-w64", "llvm-runtime"}]
     for name in needed:
         pin = lock["sources"][name]
-        if re.search(r"(?<!L)GPL|nonfree", pin["license"], re.I):
-            raise RuntimeError(f"Disallowed source license: {name}")
         archive = cache / (name + ".tar.gz")
         download(pin, archive)
         if not (src / name).exists():

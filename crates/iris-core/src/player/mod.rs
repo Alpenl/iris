@@ -7,11 +7,11 @@ mod model;
 mod prepare;
 mod relay;
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{Result, bail};
+use anyhow::Result;
 use futures::channel::mpsc::UnboundedReceiver;
 use iris_mpv::{Mpv, RenderHandle};
 use relay::PlaybackRelay;
@@ -23,14 +23,16 @@ use crate::settings::{Hwdec, OnEof, Settings};
 use crate::vfs::{self, http_client::origin_headers};
 
 pub use model::{
-    AspectMode, AudioDevice, Chapter, Command, MediaStats, PlaybackState, RemoteMediaRequest,
-    RemoteSubtitle, SPEED_STEPS, SessionEvent, Track, TrackKind, format_time, friendly_error,
-    step_speed,
+    AspectMode, AudioDevice, Chapter, Command, MAX_SPEED, MIN_SPEED, MediaStats, PlaybackState,
+    RemoteMediaRequest, RemoteSubtitle, SPEED_STEPS, SessionEvent, SessionUpdate, Track, TrackKind,
+    format_time, friendly_error, step_speed,
 };
 pub use prepare::{Prepared, PreparedQueue, prepare, prepare_queue};
 
 pub struct Session {
     pub(super) mpv: Arc<Mpv>,
+    event_pump: backend::EventPump,
+    event_rx: RefCell<Option<UnboundedReceiver<SessionUpdate>>>,
     pub(super) state: PlaybackState,
     folder: Option<PathBuf>,
     entries: Vec<Entry>,
@@ -41,11 +43,13 @@ pub struct Session {
     pub(super) kind: Option<Kind>,
     pub(super) photo_meta: Option<Photo>,
     pub(super) last_remote: Option<RemoteMediaRequest>,
-    expected_mpv_path: Option<String>,
+    playlist_entry_id: Option<i64>,
     pending_remote_subs: Vec<String>,
     playback_relay: Option<PlaybackRelay>,
     pub(super) extra_rotate: u16,
+    source_rotation: u16,
     pub(super) user_hwdec: Cell<Hwdec>,
+    on_eof: Cell<OnEof>,
     pub(super) subtitle_inset: f64,
     pub(super) tracks_dirty: bool,
     pub(super) chapters_dirty: bool,
@@ -53,8 +57,12 @@ pub struct Session {
 
 impl Session {
     pub fn new() -> Result<Self> {
+        let mpv = backend::create()?;
+        let (event_pump, event_rx) = backend::spawn_event_pump(mpv.clone())?;
         Ok(Self {
-            mpv: backend::create()?,
+            mpv,
+            event_pump,
+            event_rx: RefCell::new(Some(event_rx)),
             state: PlaybackState::default(),
             folder: None,
             entries: Vec::new(),
@@ -65,11 +73,13 @@ impl Session {
             kind: None,
             photo_meta: None,
             last_remote: None,
-            expected_mpv_path: None,
+            playlist_entry_id: None,
             pending_remote_subs: Vec::new(),
             playback_relay: None,
             extra_rotate: 0,
+            source_rotation: 0,
             user_hwdec: Cell::new(Hwdec::AutoSafe),
+            on_eof: Cell::new(OnEof::Pause),
             subtitle_inset: 0.,
             tracks_dirty: false,
             chapters_dirty: false,
@@ -80,8 +90,9 @@ impl Session {
         RenderHandle::new(self.mpv.clone())
     }
 
-    pub fn events(&self) -> UnboundedReceiver<SessionEvent> {
-        backend::spawn_event_pump(self.mpv.clone())
+    /// Takes the session's single event receiver.
+    pub fn events(&self) -> Option<UnboundedReceiver<SessionUpdate>> {
+        self.event_rx.borrow_mut().take()
     }
 
     pub fn state(&self) -> &PlaybackState {
@@ -172,9 +183,10 @@ impl Session {
         self.current = None;
         self.current_uri = None;
         self.current_title = None;
-        self.expected_mpv_path = None;
+        self.playlist_entry_id = None;
         self.pending_remote_subs.clear();
         self.playback_relay = None;
+        self.event_pump.set_relay(Default::default());
         self.kind = None;
         self.photo_meta = None;
         self.last_remote = None;
@@ -184,6 +196,7 @@ impl Session {
         self.state.tracks.clear();
         self.state.chapters.clear();
         self.state.loaded = false;
+        self.state.ended = false;
         self.state.buffering = false;
         self.state.cache_duration = 0.;
         self.state.is_live = false;
@@ -233,7 +246,7 @@ impl Session {
         current: Option<PathBuf>,
         current_uri: String,
         current_title: Option<String>,
-        expected_mpv_path: String,
+        playlist_entry_id: i64,
         pending_remote_subs: Vec<String>,
         kind: Kind,
         is_live: bool,
@@ -242,7 +255,7 @@ impl Session {
         self.current = current;
         self.current_uri = Some(current_uri);
         self.current_title = current_title;
-        self.expected_mpv_path = Some(expected_mpv_path);
+        self.playlist_entry_id = Some(playlist_entry_id);
         self.pending_remote_subs = pending_remote_subs;
         self.kind = Some(kind);
         self.state.is_live = is_live;
@@ -255,6 +268,7 @@ impl Session {
         self.state.photo_exif = photo.as_ref().and_then(|p| p.exif.clone());
         self.photo_meta = photo;
         self.extra_rotate = 0;
+        self.source_rotation = 0;
         self.state.aspect = AspectMode::Original;
         self.state.hflip = false;
         self.state.vflip = false;
@@ -263,6 +277,8 @@ impl Session {
         self.state.loaded = false;
         self.state.time_pos = 0.;
         self.state.duration = 0.;
+        self.state.video_size = (0, 0);
+        self.state.rotation = 0;
         self.state.tracks.clear();
         self.state.chapters.clear();
         self.state.current_chapter = -1;
@@ -270,9 +286,21 @@ impl Session {
         self.chapters_dirty = false;
     }
 
-    /// Opens direct HTTP(S) playback or scopes authenticated media and its HLS
-    /// resources to a cancellable per-playback relay.
+    /// Opens HTTP(S) media through a cancellable, source-scoped relay.
     pub fn open_remote(
+        &mut self,
+        req: RemoteMediaRequest,
+        settings: &Settings,
+        resume: f64,
+    ) -> Result<()> {
+        self.load_remote(
+            req,
+            settings,
+            if settings.resume_playback { resume } else { 0. },
+        )
+    }
+
+    fn load_remote(
         &mut self,
         req: RemoteMediaRequest,
         settings: &Settings,
@@ -281,20 +309,13 @@ impl Session {
         let saved_remote = req.clone();
         let main_url = vfs::validate_stream_url(&req.playback_url)?;
         let clean_headers = origin_headers(&main_url, &req.headers);
-        let relay = if clean_headers.is_empty() {
-            None
-        } else {
-            Some(PlaybackRelay::start(main_url.clone(), clean_headers)?)
-        };
-        let playback_url = match &relay {
-            Some(relay) => relay.url(&main_url)?,
-            None => main_url.to_string(),
-        };
+        let relay = PlaybackRelay::start(main_url.clone(), clean_headers)?;
+        let playback_url = relay.url(&main_url)?;
         let mut owned_opts: Vec<(&'static str, String)> = Vec::new();
+        owned_opts.push(("autoload-files", "no".into()));
         if let Some(photo) = &req.photo {
             owned_opts.extend(photo.mpv_options());
         } else if !req.is_live
-            && settings.resume_playback
             && matches!(req.kind, Kind::Video | Kind::Audio)
             && resume.is_finite()
             && resume > 0.
@@ -307,42 +328,35 @@ impl Session {
             match sub {
                 RemoteSubtitle::Url(raw_sub) => {
                     let sub_url = vfs::validate_stream_url(&raw_sub)?;
-                    let url = match &relay {
-                        Some(relay) if sub_url.origin() == main_url.origin() => {
-                            relay.url(&sub_url)?
-                        }
-                        Some(_) => bail!(
-                            "cross-origin subtitle requires a separately prefetched attachment"
-                        ),
-                        None => sub_url.into(),
-                    };
-                    owned_opts.push(("sub-files-append", url));
+                    pending_subs.push(relay.subtitle_url(&sub_url)?);
                 }
                 RemoteSubtitle::InlineText(text) => {
-                    let clean = text.replace('\0', "");
-                    if !clean.is_empty() {
-                        pending_subs.push(format!("memory://{clean}"));
-                    }
+                    pending_subs.push(format!("memory://{}", model::subtitle_text(&text)?));
                 }
             }
         }
 
         self.reset_backend_for_load()?;
-        self.set_on_eof_loop(if req.is_live {
-            OnEof::Pause
-        } else {
-            settings.on_eof
-        });
-        let opt_refs: Vec<(&str, &str)> =
-            owned_opts.iter().map(|(k, v)| (*k, v.as_str())).collect();
-        self.mpv
-            .loadfile_with_options(&playback_url, "replace", &opt_refs)?;
-        self.playback_relay = relay;
+        self.on_eof.set(settings.on_eof);
+        owned_opts.push(("loop-file", self.loop_value(req.is_live).into()));
+        let opt_refs: Vec<_> = owned_opts.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        let previous = self.event_pump.set_relay(Arc::downgrade(&relay.service()));
+        let entry_id = match self
+            .mpv
+            .loadfile_with_options(&playback_url, "replace", &opt_refs)
+        {
+            Ok(id) => id,
+            Err(err) => {
+                self.event_pump.set_relay(previous);
+                return Err(err.into());
+            }
+        };
+        self.playback_relay = Some(relay);
         self.reset_for_load(
             None,
             req.uri.to_uri_string(),
             Some(req.title),
-            playback_url,
+            entry_id,
             pending_subs,
             req.kind,
             req.is_live,
@@ -370,16 +384,19 @@ impl Session {
         }
 
         self.reset_backend_for_load()?;
+        owned_opts.push(("loop-file", self.loop_value(false).into()));
         let opt_refs: Vec<(&str, &str)> =
             owned_opts.iter().map(|(k, v)| (*k, v.as_str())).collect();
-        self.mpv
+        let entry_id = self
+            .mpv
             .loadfile_with_options(&mpv_path, "replace", &opt_refs)?;
         self.playback_relay = None;
+        self.event_pump.set_relay(Default::default());
         self.reset_for_load(
             Some(path.to_path_buf()),
             canonical_uri,
             None,
-            mpv_path,
+            entry_id,
             Vec::new(),
             kind,
             false,
@@ -410,6 +427,18 @@ impl Session {
                 self.state.duration,
                 self.state.ended,
             ))
+    }
+
+    /// Applies current-playback and session-wide events, returning the event
+    /// only when the UI should act on it.
+    pub fn apply_update<'a>(&mut self, update: &'a SessionUpdate) -> Option<&'a SessionEvent> {
+        if let Some(entry_id) = update.playlist_entry_id
+            && self.playlist_entry_id != Some(entry_id)
+        {
+            return None;
+        }
+        self.apply(&update.event);
+        Some(&update.event)
     }
 
     pub fn apply(&mut self, event: &SessionEvent) {
@@ -452,6 +481,7 @@ impl Session {
                 }
             }
             SessionEvent::Rotation(v) => self.state.rotation = *v,
+            SessionEvent::SourceRotation(v) => self.source_rotation = v.rem_euclid(360) as u16,
             SessionEvent::LoopFile(v) => self.state.loop_file = *v,
             SessionEvent::Chapter(v) => self.state.current_chapter = *v,
             SessionEvent::ChaptersChanged => self.chapters_dirty = true,
@@ -461,16 +491,18 @@ impl Session {
                 self.state.cache_duration = if v.is_finite() { v.max(0.) } else { 0. };
             }
             SessionEvent::Loaded => {
-                let actual = self.mpv.get_property_string("path").ok();
-                let expected = self.expected_mpv_path.clone();
-                self.state.loaded = expected.is_some() && actual == expected;
-                if self.state.loaded {
-                    for sub_mem in std::mem::take(&mut self.pending_remote_subs) {
-                        let _ = self.mpv.command_async(&["sub-add", &sub_mem, "auto"]);
-                    }
-                    self.tracks_dirty = true;
-                    self.chapters_dirty = true;
+                self.state.loaded = true;
+                for sub_mem in std::mem::take(&mut self.pending_remote_subs) {
+                    let _ = self.mpv.command_async(&["sub-add", &sub_mem, "auto"]);
                 }
+                self.tracks_dirty = true;
+                self.chapters_dirty = true;
+            }
+            SessionEvent::Error(_) => {
+                self.pending_remote_subs.clear();
+                self.playback_relay = None;
+                self.event_pump.set_relay(Default::default());
+                self.state.loaded = false;
             }
             _ => {}
         }
@@ -501,6 +533,51 @@ impl Session {
         if let Some(relay) = &self.playback_relay {
             relay.cancel();
         }
-        let _ = self.mpv.command(&["quit"]);
+        self.event_pump.stop(&self.mpv);
+    }
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stale_playback_updates_do_not_change_state_or_consume_subtitles() {
+        let mut session = Session::new().unwrap();
+        session.playlist_entry_id = Some(2);
+        session.pending_remote_subs.push("memory://WEBVTT\n".into());
+        for event in [
+            SessionEvent::Ended(true),
+            SessionEvent::Loaded,
+            SessionEvent::Error(-13),
+        ] {
+            assert!(
+                session
+                    .apply_update(&SessionUpdate {
+                        playlist_entry_id: Some(1),
+                        event
+                    })
+                    .is_none()
+            );
+        }
+        assert!(!session.state.ended);
+        assert!(!session.state.loaded);
+        assert_eq!(session.pending_remote_subs.len(), 1);
+        let update = SessionUpdate {
+            playlist_entry_id: Some(2),
+            event: SessionEvent::Loaded,
+        };
+        assert!(matches!(
+            session.apply_update(&update),
+            Some(SessionEvent::Loaded)
+        ));
+        assert!(session.state.loaded);
+        assert!(session.pending_remote_subs.is_empty());
     }
 }

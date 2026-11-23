@@ -1,7 +1,7 @@
 //! Synchronous WebDAV HTTP/XML protocol helpers (`PROPFIND` `Depth: 1`,
 //! `207 Multi-Status` XML parsing, HTTP-date timestamp decoding, and subtitle matching).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
@@ -12,7 +12,9 @@ use serde::{Deserialize, Serialize};
 use url::Url;
 
 use crate::library::{self, Kind};
-use crate::vfs::http_client::{request_bytes, sanitize_header_value, validate_stream_url};
+use crate::vfs::http_client::{
+    HttpCancel, request_bytes_cancellable, sanitize_header_value, validate_stream_url,
+};
 
 const MAX_PROPFIND_XML_BYTES: usize = 16 * 1024 * 1024;
 const PROPFIND_REQUEST_XML: &[u8] = br#"<?xml version="1.0" encoding="utf-8"?>
@@ -51,6 +53,8 @@ pub(super) struct WebDavConnection {
     pub base_path: String,
     #[serde(default)]
     pub auth: WebDavAuth,
+    #[serde(default)]
+    pub allow_insecure_auth: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -95,14 +99,14 @@ pub(super) fn matching_subtitles<'a>(
     else {
         return Vec::new();
     };
-    let stem_low = stem.to_ascii_lowercase();
+    let stem_low = stem.to_lowercase();
     subtitles
         .iter()
         .filter(|sub| {
             let Some(s) = Path::new(&sub.name).file_stem().and_then(|s| s.to_str()) else {
                 return false;
             };
-            let low = s.to_ascii_lowercase();
+            let low = s.to_lowercase();
             low == stem_low
                 || (low.starts_with(&stem_low)
                     && matches!(
@@ -114,7 +118,7 @@ pub(super) fn matching_subtitles<'a>(
 }
 
 pub(super) fn normalize_dav_path(raw: &str) -> String {
-    let segs = clean_decoded_segments(raw, false);
+    let segs = clean_segments(raw);
     if segs.is_empty() {
         "/".into()
     } else {
@@ -133,23 +137,44 @@ pub(super) fn parent_dav_path(normalized: &str) -> Option<String> {
     }
 }
 
-fn clean_decoded_segments(raw_path: &str, percent_decode: bool) -> Vec<String> {
+fn clean_segments(raw_path: &str) -> Vec<&str> {
     let mut stack = Vec::new();
-    for part in raw_path.split('/').filter(|p| !p.is_empty() && *p != ".") {
-        let decoded = if percent_decode {
-            percent_decode_str(part).decode_utf8_lossy().into_owned()
-        } else {
-            part.to_string()
-        };
-        match decoded.as_str() {
+    for part in raw_path.split('/') {
+        match part {
             "" | "." => {}
             ".." => {
                 stack.pop();
             }
-            _ => stack.push(decoded),
+            _ => stack.push(part),
         }
     }
     stack
+}
+
+fn href_segments(path: &str) -> Option<Vec<String>> {
+    path.split('/')
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let decoded = percent_decode_str(part).decode_utf8().ok()?;
+            (!decoded.contains(['/', '\\', '\0'])).then(|| decoded.into_owned())
+        })
+        .collect()
+}
+
+pub(super) fn has_userinfo(url: &Url) -> bool {
+    !url.username().is_empty() || url.password().is_some()
+}
+
+pub(super) fn auth_needs_confirmation(url: &Url, auth: &WebDavAuth) -> bool {
+    url.scheme() == "http"
+        && *auth != WebDavAuth::None
+        && !match url.host() {
+            Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+            Some(url::Host::Ipv6(ip)) => {
+                ip.is_loopback() || ip.to_ipv4_mapped().is_some_and(|ip| ip.is_loopback())
+            }
+            _ => false,
+        }
 }
 
 impl WebDavConnection {
@@ -179,38 +204,37 @@ impl WebDavConnection {
 
     fn root_segments(&self) -> Result<(Url, Vec<String>)> {
         let mut base_url = validate_stream_url(&self.endpoint)?;
+        if has_userinfo(&base_url) {
+            bail!("Use the dedicated WebDAV credential fields for this connection");
+        }
+        if auth_needs_confirmation(&base_url, &self.auth) && !self.allow_insecure_auth {
+            bail!("请编辑 WebDAV 连接，改用 HTTPS 或明确允许 HTTP 传输凭据");
+        }
         base_url.set_query(None);
         base_url.set_fragment(None);
-        let mut segs = clean_decoded_segments(base_url.path(), true);
-        segs.extend(clean_decoded_segments(&self.base_path, false));
+        let mut segs = href_segments(base_url.path()).context("invalid WebDAV endpoint path")?;
+        segs.extend(
+            clean_segments(&self.base_path)
+                .into_iter()
+                .map(str::to_owned),
+        );
         Ok((base_url, segs))
     }
 
     pub(super) fn build_url(&self, rel_path: &str, is_dir: bool) -> Result<Url> {
-        let (mut url, mut segs) = self.root_segments()?;
-        segs.extend(clean_decoded_segments(rel_path, false));
-        let joined = segs
-            .iter()
-            .map(|s| utf8_percent_encode(s, PATH_SEGMENT_ENCODE_SET).to_string())
-            .collect::<Vec<_>>()
-            .join("/");
-        let path = if is_dir && !joined.is_empty() {
-            format!("/{joined}/")
-        } else {
-            format!("/{joined}")
-        };
-        url.set_path(&path);
-        Ok(url)
+        let (url, root) = self.root_segments()?;
+        Ok(build_url(url, &root, rel_path, is_dir))
     }
 
     pub(super) fn list_dir(
         &self,
         secret: Option<&str>,
         rel_path: &str,
+        cancel: &HttpCancel,
     ) -> Result<WebDavListResult> {
         let normalized = normalize_dav_path(rel_path);
-        let (_, root_segs) = self.root_segments()?;
-        let url = self.build_url(&normalized, true)?;
+        let (url, root_segs) = self.root_segments()?;
+        let url = build_url(url, &root_segs, &normalized, true);
 
         let mut headers = self.auth_headers_with_secret(secret);
         headers.insert("Depth".into(), "1".into());
@@ -219,12 +243,13 @@ impl WebDavConnection {
             "application/xml; charset=utf-8".into(),
         );
 
-        let resp = request_bytes(
+        let resp = request_bytes_cancellable(
             "PROPFIND",
             url.as_str(),
             &headers,
             Some(PROPFIND_REQUEST_XML),
             MAX_PROPFIND_XML_BYTES,
+            cancel,
         )
         .with_context(|| format!("WebDAV PROPFIND failed for {}", self.name))?;
 
@@ -235,8 +260,31 @@ impl WebDavConnection {
             code => bail!("WebDAV server returned HTTP {code}"),
         }
         let xml = std::str::from_utf8(&resp.body).context("WebDAV response is not UTF-8")?;
-        parse_propfind_xml(xml, &root_segs, &normalized)
+        parse_propfind_xml(xml, &url, &root_segs, &normalized)
     }
+}
+
+fn build_url(mut url: Url, root: &[String], rel_path: &str, is_dir: bool) -> Url {
+    use std::fmt::Write;
+    let mut path = String::new();
+    for segment in root
+        .iter()
+        .map(String::as_str)
+        .chain(clean_segments(rel_path))
+    {
+        path.push('/');
+        write!(
+            path,
+            "{}",
+            utf8_percent_encode(segment, PATH_SEGMENT_ENCODE_SET)
+        )
+        .expect("cannot fail writing to String");
+    }
+    if path.is_empty() || is_dir {
+        path.push('/');
+    }
+    url.set_path(&path);
+    url
 }
 
 fn parse_month(m: &str) -> Option<u32> {
@@ -248,7 +296,7 @@ fn parse_month(m: &str) -> Option<u32> {
 }
 
 fn days_from_civil(year: i64, month: u32, day: u32) -> Option<i64> {
-    if !(1..=12).contains(&month) || !(1..=31).contains(&day) || year < 1970 {
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) || !(1970..=9999).contains(&year) {
         return None;
     }
     let y = year - i64::from(month <= 2);
@@ -291,7 +339,9 @@ pub(super) fn parse_http_date(raw: &str) -> Option<u64> {
 }
 
 fn is_tag(node: roxmltree::Node<'_, '_>, local: &str) -> bool {
-    node.is_element() && node.tag_name().name().eq_ignore_ascii_case(local)
+    node.is_element()
+        && node.tag_name().namespace() == Some("DAV:")
+        && node.tag_name().name() == local
 }
 
 fn child_by_tag<'a, 'i>(
@@ -311,17 +361,33 @@ fn status_is_ok(status_text: &str) -> bool {
 
 pub(super) fn parse_propfind_xml(
     xml: &str,
+    request_url: &Url,
     root_segments: &[String],
     queried_rel_path: &str,
 ) -> Result<WebDavListResult> {
     let normalized_dir = normalize_dav_path(queried_rel_path);
     let mut queried_full = root_segments.to_vec();
-    queried_full.extend(clean_decoded_segments(&normalized_dir, false));
+    queried_full.extend(
+        clean_segments(&normalized_dir)
+            .into_iter()
+            .map(str::to_owned),
+    );
 
     let doc = roxmltree::Document::parse(xml).context("malformed WebDAV Multi-Status XML")?;
     let (mut subfolders, mut entries, mut subtitles) = (Vec::new(), Vec::new(), Vec::new());
+    let mut seen = HashSet::new();
+    let root = doc.root_element();
+    if !is_tag(root, "multistatus") {
+        bail!("WebDAV response must be a DAV: multistatus document");
+    }
 
-    for resp_node in doc.descendants().filter(|n| is_tag(*n, "response")) {
+    for resp_node in root.children().filter(|n| is_tag(*n, "response")) {
+        if child_by_tag(resp_node, "status")
+            .and_then(|status| status.text())
+            .is_some_and(|status| !status_is_ok(status))
+        {
+            continue;
+        }
         let Some(href_raw) = child_by_tag(resp_node, "href")
             .and_then(|n| n.text())
             .map(str::trim)
@@ -375,46 +441,51 @@ pub(super) fn parse_propfind_xml(
             }
         }
 
-        let is_abs_url = href_raw
-            .get(..7)
-            .is_some_and(|p| p.eq_ignore_ascii_case("http://"))
-            || href_raw
-                .get(..8)
-                .is_some_and(|p| p.eq_ignore_ascii_case("https://"));
-        let raw_path = if is_abs_url {
-            let Ok(u) = Url::parse(href_raw) else {
-                continue;
-            };
-            u.path().to_string()
-        } else {
-            href_raw
-                .split(['?', '#'])
-                .next()
-                .unwrap_or(href_raw)
-                .to_string()
-        };
-        is_collection |= raw_path.len() > 1 && raw_path.ends_with('/');
-        let href_segs = clean_decoded_segments(&raw_path, true);
-        let child_name = if raw_path.starts_with('/') {
-            if href_segs.len() != queried_full.len() + 1 || !href_segs.starts_with(&queried_full) {
-                continue;
-            }
-            href_segs[queried_full.len()].clone()
-        } else if href_segs.len() == 1 && href_segs != queried_full {
-            href_segs[0].clone()
-        } else {
-            continue;
-        };
-        if child_name.is_empty() || child_name.starts_with('.') {
+        // Some servers spell the self response as a bare last path component.
+        // Explicit forms such as ./name/ still identify a real child of the same name.
+        let bare = href_raw.split(['?', '#']).next().unwrap_or(href_raw);
+        if let Some(component) = bare.strip_suffix('/')
+            && !component.contains('/')
+            && queried_full.last().is_some_and(|last| {
+                percent_decode_str(component)
+                    .decode_utf8()
+                    .is_ok_and(|name| name.eq_ignore_ascii_case(last))
+            })
+        {
             continue;
         }
+        if href_raw.contains('\\') {
+            continue;
+        }
+        let Ok(href) = request_url.join(href_raw) else {
+            continue;
+        };
+        if href.origin() != request_url.origin() || has_userinfo(&href) {
+            continue;
+        }
+        let Some(mut href_segs) = href_segments(href.path()) else {
+            continue;
+        };
+        if href_segs.len() != queried_full.len() + 1 {
+            continue;
+        }
+        let child_name = href_segs.pop().unwrap();
+        if !href_segs
+            .iter()
+            .zip(&queried_full)
+            .all(|(a, b)| a.eq_ignore_ascii_case(b))
+            || child_name.starts_with('.')
+        {
+            continue;
+        }
+        is_collection |= href.path().ends_with('/');
         let item_rel = if normalized_dir == "/" {
             format!("/{child_name}")
         } else {
             format!("{normalized_dir}/{child_name}")
         };
         if is_collection {
-            if !subfolders.iter().any(|f: &WebDavFolder| f.path == item_rel) {
+            if seen.insert(item_rel.clone()) {
                 subfolders.push(WebDavFolder {
                     path: item_rel,
                     name: child_name,
@@ -436,7 +507,7 @@ pub(super) fn parse_propfind_xml(
         };
 
         if let Some(kind) = library::kind_of(Path::new(&classify_name)) {
-            if !entries.iter().any(|e: &WebDavEntry| e.path == item_rel) {
+            if seen.insert(item_rel.clone()) {
                 entries.push(WebDavEntry {
                     path: item_rel,
                     name: classify_name,
@@ -445,11 +516,7 @@ pub(super) fn parse_propfind_xml(
                     modified_secs,
                 });
             }
-        } else if library::is_subtitle(Path::new(&classify_name))
-            && !subtitles
-                .iter()
-                .any(|s: &WebDavSubtitle| s.path == item_rel)
-        {
+        } else if library::is_subtitle(Path::new(&classify_name)) && seen.insert(item_rel.clone()) {
             subtitles.push(WebDavSubtitle {
                 path: item_rel,
                 name: classify_name,

@@ -213,6 +213,12 @@ mod tests {
                 Some(Permission::MediaSource),
             ),
             (
+                HostCommand::RefreshSource {
+                    source_id: "drive".into(),
+                },
+                Some(Permission::MediaSource),
+            ),
+            (
                 HostCommand::ProvideSourcePage {
                     request_id: "r".into(),
                     page: Box::new(page),

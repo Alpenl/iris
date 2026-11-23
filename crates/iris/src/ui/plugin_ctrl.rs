@@ -5,6 +5,7 @@ use gpui::{Context, Window};
 use iris_api::{HostCommand, HostEvent, PlaybackSnapshot, SourcePage};
 use iris_core::player::Command;
 use iris_core::plugin::{self, PollReport};
+use iris_core::preset::SidebarMode;
 
 use super::IrisWindow;
 use super::state::{ActiveSource, SourceOperation};
@@ -56,13 +57,12 @@ impl IrisWindow {
         let should_notify = report.should_notify_ui(
             self.chrome.fullscreen,
             self.chrome.chrome_visible,
-            self.sidebar_is_visible(),
+            self.sidebar_is_visible() && self.catalog.sidebar_mode == SidebarMode::Plugins,
         );
         let PollReport {
             commands, dirty, ..
         } = report;
 
-        let had_modal_before = self.plugins.active_modal().is_some();
         for (pid, cmd) in commands {
             self.execute_one_host_command(&pid, cmd, cx);
         }
@@ -72,22 +72,37 @@ impl IrisWindow {
         if dirty.sources && !self.catalog.active_source.is_local() {
             self.rebuild_directory_rows();
         }
-        if dirty.modal || (had_modal_before && self.plugins.active_modal().is_none()) {
+        if dirty.modal {
             self.overlays.submitting_plugin_modal = None;
-            let need_focus = self
-                .text_inputs
-                .sync_plugin_modal(self.plugins.active_modal());
-            if let Some(w) = window {
-                if need_focus {
-                    self.text_inputs.form_focus.focus(w);
-                } else if self.plugins.active_modal().is_none()
-                    && !self.text_inputs.is_any_focused(w)
-                {
-                    self.focus.focus(w);
-                }
+            self.overlays.plugin_modal_focus_pending = true;
+            if let Some(window) = window {
+                self.sync_plugin_modal_focus(window);
             }
         }
         should_notify
+    }
+
+    pub(super) fn sync_plugin_modal_focus(&mut self, window: &mut Window) {
+        if !std::mem::take(&mut self.overlays.plugin_modal_focus_pending) {
+            return;
+        }
+        let modal = self.plugins.active_modal();
+        if modal.is_some() {
+            self.overlays.close_all();
+        }
+        let focus_input = self.text_inputs.sync_plugin_modal(modal);
+        let current_modal_input = modal.is_some()
+            && self
+                .text_inputs
+                .active_form_key
+                .as_deref()
+                .is_some_and(|key| key.starts_with("modal:"))
+            && self.text_inputs.form_focus.is_focused(window);
+        if focus_input {
+            self.text_inputs.form_focus.focus(window);
+        } else if !current_modal_input {
+            self.focus.focus(window);
+        }
     }
 
     fn execute_one_host_command(&mut self, pid: &str, cmd: HostCommand, cx: &mut Context<Self>) {
@@ -124,12 +139,8 @@ impl IrisWindow {
                 request_id,
                 message,
             } => self.handle_source_error(pid, &request_id, message, cx),
-            HostCommand::CloseModal { .. } => {
-                self.plugins.dismiss_modal(pid);
-                self.overlays.complete_plugin_modal_close(
-                    &mut self.text_inputs,
-                    self.plugins.active_modal(),
-                );
+            HostCommand::RefreshSource { source_id } => {
+                self.refresh_plugin_source(pid, &source_id, cx);
             }
             HostCommand::SetState { .. }
             | HostCommand::SetSecret { .. }
@@ -138,6 +149,7 @@ impl IrisWindow {
             | HostCommand::SetOverlay { .. }
             | HostCommand::SetToolbar { .. }
             | HostCommand::OpenModal { .. }
+            | HostCommand::CloseModal { .. }
             | HostCommand::SetTheme { .. }
             | HostCommand::SetSources { .. } => {}
         }
@@ -189,23 +201,14 @@ impl IrisWindow {
             return;
         };
         self.plugins.dismiss_modal(&pid);
-        self.overlays
-            .cancel_plugin_modal_state(&mut self.text_inputs);
         let report = self
             .plugins
             .send_to(&pid, HostEvent::ModalCancel { id: modal_id });
-        if let Some(w) = window {
-            self.apply_poll_report(report, Some(w), cx);
-            if self.plugins.active_modal().is_none() && !self.text_inputs.is_any_focused(w) {
-                self.text_inputs.clear_modal_fields();
-                self.focus.focus(w);
-            }
-        } else {
-            self.apply_poll_report(report, None, cx);
-            if self.plugins.active_modal().is_none() {
-                self.text_inputs.clear_modal_fields();
-            }
-        }
+        self.overlays.submitting_plugin_modal = None;
+        self.overlays.plugin_modal_focus_pending = true;
+        // A dismissed front modal can reveal another queued modal without a dirty slot.
+        self.apply_poll_report(report, window, cx);
+        self.bump_activity(cx);
         cx.notify();
     }
 
@@ -348,7 +351,11 @@ impl IrisWindow {
             return;
         };
         match pending.operation {
-            SourceOperation::Resolve { .. } => self.active_mut().loading_visible = false,
+            SourceOperation::Resolve { .. } => {
+                let vp = self.active_mut();
+                vp.loading_visible = false;
+                vp.pending_subtitles.clear();
+            }
             SourceOperation::Browse { .. } => {
                 if let ActiveSource::Plugin(ps) = &mut self.catalog.active_source {
                     ps.error = Some(message.clone());

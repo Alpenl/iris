@@ -173,9 +173,9 @@ fn property(r: &mut (impl Read + Seek), (kind, body): Atom, h: &mut Header) -> O
         b"imir" => add_mirror(
             h,
             if body.prefix::<1>(r)?[0] & 1 == 0 {
-                Mirror::Horizontal
-            } else {
                 Mirror::Vertical
+            } else {
+                Mirror::Horizontal
             },
         ),
         _ => {}
@@ -243,19 +243,24 @@ fn exif_item(
             continue;
         }
         // v2 and v3 explicitly name the item type, with 16- or 32-bit IDs.
-        let v = info.prefix::<1>(r)?[0];
+        let Some([v]) = info.prefix::<1>(r) else {
+            continue;
+        };
         let id_width = match v {
             2 => 2,
             3 => 4,
             _ => continue,
         };
-        let fields = info.after(4)?;
-        if fields.after(id_width)?.prefix::<6>(r)? == *b"\0\0Exif" {
-            ids.push(if id_width == 2 {
-                u32::from(be16(&fields.prefix::<2>(r)?))
+        let Some(fields) = info.after(4) else {
+            continue;
+        };
+        if fields.after(id_width).and_then(|span| span.prefix::<6>(r)) == Some(*b"\0\0Exif") {
+            let id = if id_width == 2 {
+                fields.prefix::<2>(r).map(|raw| u32::from(be16(&raw)))
             } else {
-                be32(&fields.prefix::<4>(r)?)
-            });
+                fields.prefix::<4>(r).map(|raw| be32(&raw))
+            };
+            ids.extend(id);
         }
     }
     if ids.is_empty() {

@@ -3,6 +3,8 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 
+#[cfg(windows)]
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use percent_encoding::{AsciiSet, CONTROLS, percent_decode_str, utf8_percent_encode};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use url::Url;
@@ -49,22 +51,63 @@ impl MediaUri {
     pub fn to_uri_string(&self) -> String {
         match self {
             MediaUri::Local(path) => {
+                #[cfg(windows)]
+                let normalized = crate::library::windows_unverbatim_path(path);
+                #[cfg(windows)]
+                let path = normalized.as_deref().unwrap_or(path);
                 if path.is_absolute()
                     && let Ok(url) = Url::from_file_path(path)
+                    && url
+                        .path()
+                        .strip_prefix('/')
+                        .is_some_and(valid_file_url_tail)
+                    && Self::decode_local_file_url(&url).as_deref() == Some(path)
                 {
                     return url.into();
                 }
-                let raw = path.to_string_lossy();
-                if starts_with_known_scheme(&raw) {
+                if let Some(raw) = path.to_str()
+                    && !path.is_absolute()
+                    && !starts_with_known_scheme(raw)
+                {
+                    return raw.to_owned();
+                }
+                #[cfg(unix)]
+                {
+                    use std::os::unix::ffi::OsStrExt;
+                    let encoded = percent_encoding::percent_encode(
+                        path.as_os_str().as_bytes(),
+                        COMPONENT_ENCODE_SET,
+                    );
+                    format!("iris-local:{encoded}")
+                }
+                #[cfg(windows)]
+                {
+                    use std::os::windows::ffi::OsStrExt;
+                    if let Some(raw) = path.to_str() {
+                        format!(
+                            "iris-local:{}",
+                            utf8_percent_encode(raw, COMPONENT_ENCODE_SET)
+                        )
+                    } else {
+                        let bytes: Vec<u8> = path
+                            .as_os_str()
+                            .encode_wide()
+                            .flat_map(u16::to_le_bytes)
+                            .collect();
+                        let mut encoded = String::from("iris-local-windows:");
+                        URL_SAFE_NO_PAD.encode_string(bytes, &mut encoded);
+                        encoded
+                    }
+                }
+                #[cfg(not(any(unix, windows)))]
+                {
                     format!(
                         "iris-local:{}",
-                        utf8_percent_encode(&raw, COMPONENT_ENCODE_SET)
+                        utf8_percent_encode(&path.to_string_lossy(), COMPONENT_ENCODE_SET)
                     )
-                } else {
-                    raw.into_owned()
                 }
             }
-            MediaUri::HttpUrl(url) => url.trim().to_string(),
+            MediaUri::HttpUrl(url) => url.trim_end_matches([' ', '\t', '\r', '\n']).to_owned(),
             MediaUri::Plugin {
                 plugin_id,
                 source_id,
@@ -83,10 +126,8 @@ impl MediaUri {
     /// Legacy `"webdav://<conn>/<path>"` URIs are losslessly upgraded to
     /// `MediaUri::Plugin { plugin_id: "iris.webdav", source_id: conn, entry_id: path }`.
     pub fn parse(s: &str) -> Self {
-        let trimmed = s.trim();
-
-        if let Some(rest) = strip_prefix_ci(trimmed, "iris-plugin://")
-            .or_else(|| strip_prefix_ci(trimmed, "plugin://"))
+        if let Some(rest) =
+            strip_prefix_ci(s, "iris-plugin://").or_else(|| strip_prefix_ci(s, "plugin://"))
         {
             let mut parts = rest.splitn(3, '/');
             let plugin_id = parts
@@ -108,8 +149,8 @@ impl MediaUri {
             };
         }
 
-        if let Some(rest) = strip_prefix_ci(trimmed, "webdav://")
-            .or_else(|| strip_prefix_ci(trimmed, "iris-webdav://"))
+        if let Some(rest) =
+            strip_prefix_ci(s, "webdav://").or_else(|| strip_prefix_ci(s, "iris-webdav://"))
         {
             if let Some((enc_conn, query_rel)) = rest.split_once("?rel=")
                 && !enc_conn.contains('/')
@@ -131,11 +172,8 @@ impl MediaUri {
                     let conn = percent_decode_str(enc_conn)
                         .decode_utf8_lossy()
                         .into_owned();
-                    let decoded_segs: Vec<String> = enc_path
-                        .split('/')
-                        .map(|seg| percent_decode_str(seg).decode_utf8_lossy().into_owned())
-                        .collect();
-                    (conn, format!("/{}", decoded_segs.join("/")))
+                    let path = percent_decode_str(enc_path).decode_utf8_lossy();
+                    (conn, format!("/{path}"))
                 }
                 None => (
                     percent_decode_str(rest).decode_utf8_lossy().into_owned(),
@@ -149,34 +187,110 @@ impl MediaUri {
             };
         }
 
-        if strip_prefix_ci(trimmed, "http://").is_some()
-            || strip_prefix_ci(trimmed, "https://").is_some()
-        {
-            return MediaUri::HttpUrl(trimmed.to_string());
+        if strip_prefix_ci(s, "http://").is_some() || strip_prefix_ci(s, "https://").is_some() {
+            return MediaUri::HttpUrl(s.trim_end_matches([' ', '\t', '\r', '\n']).to_string());
         }
 
-        if let Some(enc_local) = strip_prefix_ci(trimmed, "iris-local:") {
-            let decoded = percent_decode_str(enc_local)
-                .decode_utf8_lossy()
-                .into_owned();
-            return MediaUri::Local(PathBuf::from(decoded));
-        }
-
-        if strip_prefix_ci(trimmed, "file://").is_some() {
-            if let Ok(url) = Url::parse(trimmed)
-                && let Ok(p) = url.to_file_path()
+        if let Some(enc_local) = strip_prefix_ci(s, "iris-local:") {
+            #[cfg(unix)]
             {
-                return MediaUri::Local(p);
+                use std::os::unix::ffi::OsStringExt;
+                let bytes: Vec<u8> = percent_decode_str(enc_local).collect();
+                if !bytes.contains(&0) {
+                    return Self::from(PathBuf::from(std::ffi::OsString::from_vec(bytes)));
+                }
             }
-            if let Some(raw_path) = strip_prefix_ci(trimmed, "file://") {
-                let decoded = percent_decode_str(raw_path)
-                    .decode_utf8_lossy()
-                    .into_owned();
-                return MediaUri::Local(PathBuf::from(decoded));
+            #[cfg(not(unix))]
+            if let Ok(decoded) = percent_decode_str(enc_local).decode_utf8()
+                && !decoded.contains('\0')
+            {
+                return Self::from(PathBuf::from(decoded.into_owned()));
             }
         }
 
-        MediaUri::Local(PathBuf::from(s))
+        #[cfg(windows)]
+        if let Some(encoded) = strip_prefix_ci(s, "iris-local-windows:")
+            && let Ok(bytes) = URL_SAFE_NO_PAD.decode(encoded)
+            && !bytes.is_empty()
+            && bytes.len().is_multiple_of(2)
+        {
+            use std::os::windows::ffi::OsStringExt;
+            let units: Vec<u16> = bytes
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .copied()
+                .map(u16::from_le_bytes)
+                .collect();
+            if !units.contains(&0) {
+                return Self::from(PathBuf::from(std::ffi::OsString::from_wide(&units)));
+            }
+        }
+
+        if let Some(path) = Self::local_file_uri_path(s) {
+            return Self::from(path);
+        }
+
+        Self::from(PathBuf::from(s))
+    }
+
+    /// Converts an unambiguous local file URL. Remote authorities, relative
+    /// paths, generated separators and URL options cannot enter this path.
+    pub fn local_file_uri_path(s: &str) -> Option<PathBuf> {
+        let rest = strip_prefix_ci(s, "file://")?;
+        let (authority, path) = rest.split_once('/')?;
+        if !authority.is_empty() && !authority.eq_ignore_ascii_case("localhost") {
+            return None;
+        }
+        if !valid_file_url_tail(path) {
+            return None;
+        }
+        Self::decode_local_file_url(&Url::parse(s).ok()?)
+    }
+
+    fn decode_local_file_url(url: &Url) -> Option<PathBuf> {
+        if url.host().is_some() || url.path().starts_with("//") {
+            return None;
+        }
+        #[cfg(windows)]
+        if !url.path().get(1..).is_some_and(|path| path.contains('/')) {
+            return None;
+        }
+        let path = url.to_file_path().ok()?;
+        #[cfg(windows)]
+        if !matches!(path.components().next(), Some(std::path::Component::Prefix(p)) if matches!(p.kind(), std::path::Prefix::Disk(_)))
+            || path.components().any(|component| {
+                matches!(component, std::path::Component::Normal(part) if part.to_str().is_some_and(crate::library::windows_verbatim_component))
+            })
+        {
+            return None;
+        }
+        path.is_absolute().then_some(path)
+    }
+
+    // Older records could serialize an explicit Windows UNC path using URL's
+    // remote FILE authority. Keep this compatibility confined to stored data.
+    #[cfg(windows)]
+    pub(crate) fn legacy_unc_file_uri_path(s: &str) -> Option<PathBuf> {
+        let rest = strip_prefix_ci(s, "file://")?;
+        let (host, tail) = rest.split_once('/')?;
+        if host.is_empty()
+            || host.eq_ignore_ascii_case("localhost")
+            || !host
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
+            || tail.is_empty()
+            || !valid_file_url_tail(tail)
+        {
+            return None;
+        }
+        let url = Url::parse(s).ok()?;
+        if url.path().trim_start_matches('/').is_empty() || url.path().starts_with("//") {
+            return None;
+        }
+        let path = url.to_file_path().ok()?;
+        matches!(path.components().next(), Some(std::path::Component::Prefix(p)) if matches!(p.kind(), std::path::Prefix::UNC(_, share) if !share.is_empty()))
+            .then_some(path)
     }
 
     /// Direct URLs with userinfo, queries or fragments are session-only. Parameter
@@ -224,16 +338,23 @@ impl MediaUri {
                 .find(|seg| !seg.is_empty())
                 .map(String::from)
                 .unwrap_or_else(|| source_id.clone()),
-            MediaUri::HttpUrl(u) => Url::parse(u)
-                .ok()
-                .and_then(|parsed| {
-                    parsed
-                        .path_segments()
-                        .and_then(|mut segs| segs.rfind(|s| !s.is_empty()))
-                        .map(|s| percent_decode_str(s).decode_utf8_lossy().into_owned())
-                })
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| u.clone()),
+            MediaUri::HttpUrl(u) => {
+                let Ok(parsed) = Url::parse(u) else {
+                    return "HTTP stream".into();
+                };
+                if !matches!(parsed.scheme(), "http" | "https") {
+                    return "HTTP stream".into();
+                }
+                parsed
+                    .path_segments()
+                    .and_then(|mut segs| segs.rfind(|s| !s.is_empty()))
+                    .map(|s| percent_decode_str(s).decode_utf8_lossy().into_owned())
+                    .filter(|label| {
+                        !label.trim().is_empty() && !label.chars().any(char::is_control)
+                    })
+                    .or_else(|| parsed.host().map(|host| host.to_string()))
+                    .unwrap_or_else(|| "HTTP stream".into())
+            }
         }
     }
 }
@@ -281,6 +402,32 @@ fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
     }
 }
 
+fn valid_file_url_tail(path: &str) -> bool {
+    if path.starts_with('/')
+        || path.ends_with(' ')
+        || path
+            .bytes()
+            .any(|b| b.is_ascii_control() || matches!(b, b'\\' | b'?' | b'#'))
+    {
+        return false;
+    }
+    let mut bytes = path.as_bytes();
+    while let Some(index) = bytes.iter().position(|&b| b == b'%') {
+        let Some(escape) = bytes.get(index + 1..index + 3) else {
+            return false;
+        };
+        if !escape.iter().all(u8::is_ascii_hexdigit)
+            || escape.eq_ignore_ascii_case(b"00")
+            || escape.eq_ignore_ascii_case(b"2f")
+            || (cfg!(windows) && escape.eq_ignore_ascii_case(b"5c"))
+        {
+            return false;
+        }
+        bytes = &bytes[index + 3..];
+    }
+    true
+}
+
 fn starts_with_known_scheme(s: &str) -> bool {
     [
         "file://",
@@ -291,6 +438,7 @@ fn starts_with_known_scheme(s: &str) -> bool {
         "plugin://",
         "iris-plugin://",
         "iris-local:",
+        "iris-local-windows:",
     ]
     .iter()
     .any(|p| strip_prefix_ci(s, p).is_some())
@@ -366,5 +514,78 @@ mod tests {
                 entry_id: "/".into(),
             }
         );
+    }
+
+    #[test]
+    fn local_urls_require_an_unambiguous_local_path() {
+        for value in [
+            "file://server/share/clip.mp4",
+            "file:////server/share/clip.mp4",
+            "file://localhost//server/share/clip.mp4",
+            "file://localhost/%2fserver/share/clip.mp4",
+            "file:///clip.mp4?x=1",
+            "file:///clip.mp4#t=0",
+            "file:///clip%00.mp4",
+            "file://u@localhost/clip.mp4",
+        ] {
+            assert!(MediaUri::local_file_uri_path(value).is_none(), "{value}");
+        }
+        #[cfg(windows)]
+        let value = (
+            "file://LOCALHOST/C:/Iris%20Media/clip.mp4",
+            r"C:\Iris Media\clip.mp4",
+        );
+        #[cfg(not(windows))]
+        let value = (
+            "file://LOCALHOST/tmp/Iris%20Media/clip.mp4",
+            "/tmp/Iris Media/clip.mp4",
+        );
+        assert_eq!(
+            MediaUri::local_file_uri_path(value.0).as_deref(),
+            Some(Path::new(value.1))
+        );
+    }
+
+    #[test]
+    fn whitespace_and_private_stream_titles_keep_their_identity() {
+        for raw in [
+            " https://example.com/movie",
+            "\u{3000}clip.mp4\u{3000}",
+            " clip.mp4 ",
+        ] {
+            let expected = MediaUri::from(PathBuf::from(raw));
+            assert_eq!(MediaUri::parse(raw), expected);
+            assert_eq!(MediaUri::parse(&expected.to_uri_string()), expected);
+        }
+        assert_eq!(
+            MediaUri::parse("https://user:secret@example.com/?token=secret#secret").display_name(),
+            "example.com"
+        );
+        assert_eq!(
+            MediaUri::parse("https://[invalid]/?token=secret").display_name(),
+            "HTTP stream"
+        );
+        assert_eq!(
+            MediaUri::parse("https://example.com/clip%20one.mp4?secret").display_name(),
+            "clip one.mp4"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_unc_stays_an_explicit_native_path() {
+        let ordinary = MediaUri::from(Path::new(r"\\nas\media\clip.mp4"));
+        let verbatim = MediaUri::from(Path::new(r"\\?\UNC\nas\media\clip.mp4"));
+        assert_eq!(ordinary, verbatim);
+        let encoded = ordinary.to_uri_string();
+        assert!(encoded.starts_with("iris-local:"));
+        assert_eq!(MediaUri::parse(&encoded), ordinary);
+        assert_eq!(
+            MediaUri::legacy_unc_file_uri_path("file://nas/media/clip.mp4").as_deref(),
+            ordinary.as_local_path()
+        );
+        use std::os::windows::ffi::OsStringExt;
+        let opaque = MediaUri::from(PathBuf::from(std::ffi::OsString::from_wide(&[0xd800, 65])));
+        assert_eq!(MediaUri::parse(&opaque.to_uri_string()), opaque);
     }
 }

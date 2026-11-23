@@ -305,9 +305,7 @@ impl IrisWindow {
             return None;
         }
         let current = self.active().session.current();
-        let cur_ix = current
-            .and_then(|p| photos.iter().position(|x| x == p))
-            .unwrap_or(0);
+        let cur_ix = self.catalog.filmstrip_index;
         const WINDOW: usize = 11;
         let start = cur_ix
             .saturating_sub(WINDOW / 2)

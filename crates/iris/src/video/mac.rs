@@ -4,10 +4,11 @@
 //! so anything GPUI doesn't paint shows the video, and GPUI can draw on top.
 
 use std::ffi::{c_char, c_int, c_void};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, SyncSender};
-use std::sync::{Arc, Mutex, Once, OnceLock};
+use std::sync::{Arc, LazyLock, Mutex, Once};
 use std::thread::JoinHandle;
 
 use anyhow::{Context as _, Result, anyhow};
@@ -79,18 +80,20 @@ unsafe extern "C" {
 }
 
 unsafe extern "C" fn gl_get_proc_address(_ctx: *mut c_void, name: *const c_char) -> *mut c_void {
-    static HANDLE: OnceLock<usize> = OnceLock::new();
-    let handle = *HANDLE.get_or_init(|| unsafe {
-        dlopen(
-            c"/System/Library/Frameworks/OpenGL.framework/OpenGL".as_ptr(),
-            RTLD_LAZY,
-        ) as usize
-    }) as *mut c_void;
-    if handle.is_null() {
-        ptr::null_mut()
-    } else {
-        unsafe { dlsym(handle, name) }
-    }
+    ffi_callback(ptr::null_mut(), || {
+        static HANDLE: LazyLock<usize> = LazyLock::new(|| unsafe {
+            dlopen(
+                c"/System/Library/Frameworks/OpenGL.framework/OpenGL".as_ptr(),
+                RTLD_LAZY,
+            ) as usize
+        });
+        let handle = *HANDLE as *mut c_void;
+        if handle.is_null() {
+            ptr::null_mut()
+        } else {
+            unsafe { dlsym(handle, name) }
+        }
+    })
 }
 
 /// Shared between the layer callbacks (CA threads), the redraw thread and the UI.
@@ -101,7 +104,7 @@ struct LayerState {
     render: Mutex<Option<RenderContext>>,
     /// Render even without a new mpv frame (resize, margins changed).
     force: AtomicBool,
-    last_size: Mutex<(i32, i32)>,
+    drawable: AtomicBool,
 }
 
 unsafe impl Send for LayerState {}
@@ -110,7 +113,12 @@ unsafe impl Sync for LayerState {}
 impl Drop for LayerState {
     fn drop(&mut self) {
         // Ensure render context is freed before releasing the GL context.
-        if let Some(render) = self.render.lock().unwrap().take() {
+        if let Some(render) = self
+            .render
+            .get_mut()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
             unsafe {
                 CGLLockContext(self.gl);
                 CGLSetCurrentContext(self.gl);
@@ -149,18 +157,38 @@ fn state_of(this: &Object) -> Option<&LayerState> {
     }
 }
 
-extern "C" fn copy_pixel_format(this: &Object, _: Sel, _mask: u32) -> CGLPixelFormatObj {
-    match state_of(this) {
-        Some(s) => unsafe { CGLRetainPixelFormat(s.pixel_format) },
-        None => ptr::null_mut(),
+// Callback fallbacks must not drop arbitrary panic payloads on the FFI stack.
+fn ffi_callback<T>(fallback: T, callback: impl FnOnce() -> T) -> T {
+    catch_unwind(AssertUnwindSafe(callback)).unwrap_or_else(|payload| {
+        std::mem::forget(payload);
+        fallback
+    })
+}
+
+extern "C" fn layer_dealloc(this: &Object, _: Sel) {
+    ffi_callback((), || unsafe {
+        let state: *mut c_void = *this.get_ivar("irisState");
+        if !state.is_null() {
+            drop(Arc::from_raw(state.cast::<LayerState>()));
+        }
+    });
+    unsafe {
+        let _: () = msg_send![super(this, class!(CAOpenGLLayer)), dealloc];
     }
 }
 
+extern "C" fn copy_pixel_format(this: &Object, _: Sel, _mask: u32) -> CGLPixelFormatObj {
+    ffi_callback(ptr::null_mut(), || {
+        state_of(this).map_or(ptr::null_mut(), |s| unsafe {
+            CGLRetainPixelFormat(s.pixel_format)
+        })
+    })
+}
+
 extern "C" fn copy_context(this: &Object, _: Sel, _pf: CGLPixelFormatObj) -> CGLContextObj {
-    match state_of(this) {
-        Some(s) => unsafe { CGLRetainContext(s.gl) },
-        None => ptr::null_mut(),
-    }
+    ffi_callback(ptr::null_mut(), || {
+        state_of(this).map_or(ptr::null_mut(), |s| unsafe { CGLRetainContext(s.gl) })
+    })
 }
 
 extern "C" fn can_draw(
@@ -171,34 +199,25 @@ extern "C" fn can_draw(
     _t: f64,
     _ts: *const c_void,
 ) -> BOOL {
-    let Some(state) = state_of(this) else {
-        return NO;
-    };
-    let size = unsafe {
-        let bounds: NSRect = msg_send![this, bounds];
-        let scale: f64 = msg_send![this, contentsScale];
-        (
-            (bounds.size.width * scale).round() as i32,
-            (bounds.size.height * scale).round() as i32,
-        )
-    };
-    let resized = {
-        let mut last = state.last_size.lock().unwrap();
-        let changed = *last != size;
-        *last = size;
-        changed
-    };
-    let force = state.force.swap(false, Ordering::AcqRel);
-    let guard = state.render.lock().unwrap();
-    let Some(render) = guard.as_ref() else {
-        return NO;
-    };
-    let flags = render.update();
-    if force || resized || flags & RenderContext::UPDATE_FRAME != 0 {
-        YES
-    } else {
-        NO
-    }
+    ffi_callback(NO, || {
+        let Some(state) = state_of(this) else {
+            return NO;
+        };
+        if !state.drawable.load(Ordering::Acquire) {
+            return NO;
+        }
+        let guard = state.render.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(render) = guard.as_ref() else {
+            return NO;
+        };
+        let force = state.force.swap(false, Ordering::AcqRel);
+        let flags = render.update();
+        if force || flags & RenderContext::UPDATE_FRAME != 0 {
+            YES
+        } else {
+            NO
+        }
+    })
 }
 
 extern "C" fn draw(
@@ -209,21 +228,30 @@ extern "C" fn draw(
     _t: f64,
     _ts: *const c_void,
 ) {
-    let Some(state) = state_of(this) else { return };
-    let guard = state.render.lock().unwrap();
-    let Some(render) = guard.as_ref() else { return };
-    let (mut fbo, mut vp) = (0 as c_int, [0 as c_int; 4]);
-    unsafe {
-        glGetIntegerv(GL_FRAMEBUFFER_BINDING, &mut fbo);
-        glGetIntegerv(GL_VIEWPORT, vp.as_mut_ptr());
-    }
-    // Never block the main thread waiting for a frame's display time.
-    let block = unsafe { pthread_main_np() } == 0;
-    if let Err(e) = render.render_gl(fbo, vp[2], vp[3], true, block) {
-        log::error!("render failed: {e}");
-    }
-    unsafe { glFlush() };
-    render.report_swap();
+    ffi_callback((), || {
+        let Some(state) = state_of(this) else { return };
+        let guard = state.render.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(render) = guard.as_ref() else { return };
+        let (mut fbo, mut vp) = (0 as c_int, [0 as c_int; 4]);
+        unsafe {
+            glGetIntegerv(GL_FRAMEBUFFER_BINDING, &mut fbo);
+            glGetIntegerv(GL_VIEWPORT, vp.as_mut_ptr());
+        }
+        if vp[2] <= 0 || vp[3] <= 0 || !state.drawable.load(Ordering::Acquire) {
+            state.force.store(true, Ordering::Release);
+            return;
+        }
+        // CA has made its FBO and the context supplied by copy_context current.
+        // Never block the main thread waiting for a frame's display time.
+        let block = unsafe { pthread_main_np() } == 0;
+        if let Err(e) = unsafe { render.render_gl(fbo, vp[2], vp[3], true, block) } {
+            state.force.store(true, Ordering::Release);
+            log::error!("render failed: {e}");
+            return;
+        }
+        unsafe { glFlush() };
+        render.report_swap();
+    });
 }
 
 fn layer_class() -> &'static Class {
@@ -233,6 +261,7 @@ fn layer_class() -> &'static Class {
             ClassDecl::new("IrisVideoLayer", class!(CAOpenGLLayer)).expect("IrisVideoLayer class");
         decl.add_ivar::<*mut c_void>("irisState");
         unsafe {
+            decl.add_method(sel!(dealloc), layer_dealloc as extern "C" fn(&Object, Sel));
             decl.add_method(
                 sel!(copyCGLPixelFormatForDisplayMask:),
                 copy_pixel_format as extern "C" fn(&Object, Sel, u32) -> CGLPixelFormatObj,
@@ -315,7 +344,7 @@ impl VideoSurface {
                 gl,
                 render: Mutex::new(None),
                 force: AtomicBool::new(true),
-                last_size: Mutex::new((0, 0)),
+                drawable: AtomicBool::new(false),
             });
 
             // The layer is tagged Display P3 (below), so mpv must output
@@ -327,21 +356,50 @@ impl VideoSurface {
             let render_res = RenderContext::new_gl(mpv, gl_get_proc_address, ptr::null_mut())
                 .context("creating mpv render context");
             CGLSetCurrentContext(ptr::null_mut());
-            let mut render = render_res?;
+            let render = render_res?;
 
-            // The layer and its hosting view.
+            // The layer owns its state from publication through Objective-C
+            // deallocation. Core Animation can retain it beyond view removal.
             let layer: id = msg_send![layer_class(), new];
-            (*layer).set_ivar("irisState", Arc::as_ptr(&state) as *mut c_void);
+            (*layer).set_ivar("irisState", Arc::into_raw(state.clone()) as *mut c_void);
+            let _: id = msg_send![layer, retain];
+            let layer_ref = SendId(layer);
+            let (tx, rx) = mpsc::sync_channel::<()>(1);
+            let worker = std::thread::Builder::new()
+                .name("iris-video".into())
+                .spawn(move || {
+                    let layer = layer_ref;
+                    while rx.recv().is_ok() {
+                        autoreleasepool(|| {
+                            let _: () = msg_send![layer.0, display];
+                            let _: () = msg_send![class!(CATransaction), flush];
+                        });
+                    }
+                    let _: () = msg_send![layer.0, release];
+                });
+            let worker = match worker {
+                Ok(worker) => worker,
+                Err(error) => {
+                    CGLSetCurrentContext(gl);
+                    drop(render);
+                    CGLSetCurrentContext(ptr::null_mut());
+                    let _: () = msg_send![layer, release];
+                    let _: () = msg_send![layer, release];
+                    return Err(error.into());
+                }
+            };
+
             let _: () = msg_send![layer, setAsynchronous: NO];
             let _: () = msg_send![layer, setOpaque: YES];
             let _: () = msg_send![layer, setNeedsDisplayOnBoundsChange: YES];
             let p3 = CGColorSpaceCreateWithName(kCGColorSpaceDisplayP3);
-            let _: () = msg_send![layer, setColorspace: p3];
-            CGColorSpaceRelease(p3);
+            if !p3.is_null() {
+                let _: () = msg_send![layer, setColorspace: p3];
+                CGColorSpaceRelease(p3);
+            }
             let ns_window: id = msg_send![gpui_view, window];
             let scale: f64 = msg_send![ns_window, backingScaleFactor];
             let _: () = msg_send![layer, setContentsScale: scale];
-
             let content: id = msg_send![ns_window, contentView];
             let frame: NSRect = msg_send![content, bounds];
             let view: id = msg_send![class!(NSView), alloc];
@@ -351,31 +409,18 @@ impl VideoSurface {
             let _: () = msg_send![view, setAutoresizingMask: NS_VIEW_WIDTH_SIZABLE | NS_VIEW_HEIGHT_SIZABLE];
             let _: () = msg_send![content, addSubview: view positioned: NS_WINDOW_BELOW relativeTo: gpui_view];
 
-            // Bounded capacity-1 channel coalesces frame signals with zero Mutex contention.
-            let (tx, rx) = mpsc::sync_channel::<()>(1);
+            state.drawable.store(
+                frame.size.width > 0. && frame.size.height > 0.,
+                Ordering::Release,
+            );
             let cb_tx = tx.clone();
+            let mut render = render;
             render.set_update_callback(move || {
                 let _ = cb_tx.try_send(());
             });
-            *state.render.lock().unwrap() = Some(render);
-
-            let _: id = msg_send![layer, retain];
-            let layer_ref = SendId(layer);
-            let keep_state = state.clone();
-            let worker = std::thread::Builder::new()
-                .name("iris-video".into())
-                .spawn(move || {
-                    let layer = layer_ref;
-                    let _keep_state = keep_state;
-                    while rx.recv().is_ok() {
-                        // Drain Objective-C autoreleased temporaries every frame.
-                        autoreleasepool(|| {
-                            let _: () = msg_send![layer.0, display];
-                            let _: () = msg_send![class!(CATransaction), flush];
-                        });
-                    }
-                    let _: () = msg_send![layer.0, release];
-                })?;
+            *state.render.lock().unwrap_or_else(|e| e.into_inner()) = Some(render);
+            // Registration may wake the worker before render is installed.
+            let _ = tx.try_send(());
 
             let _: () = msg_send![layer, setNeedsDisplay];
             Ok((
@@ -404,6 +449,8 @@ impl VideoSurface {
     /// coordinates (logical points, top-left origin). mpv's OSD and subtitles
     /// then live inside this rect, letterbox bars included.
     pub(crate) fn set_frame(&self, x: f64, y: f64, w: f64, h: f64) {
+        // Publish visibility without reading mutable layer geometry on CA threads.
+        self.state.drawable.store(false, Ordering::Release);
         unsafe {
             let superview: id = msg_send![self.view, superview];
             if superview == nil {
@@ -426,6 +473,9 @@ impl VideoSurface {
             let _: () = msg_send![self.view, setFrame: frame];
             let _: () = msg_send![class!(CATransaction), commit];
         }
+        self.state
+            .drawable
+            .store(w > 0. && h > 0., Ordering::Release);
         self.request_redraw();
     }
 
@@ -443,12 +493,17 @@ impl VideoSurface {
     #[cfg(any(debug_assertions, feature = "devtools"))]
     pub(crate) fn debug_force_device_reset(&self) {}
 
-    /// Stops mpv render callbacks, joins the video thread, detaches the layer's
-    /// state pointer, and frees the render context with its GL context current.
+    /// Stops mpv callbacks, joins the video thread, and detaches its view.
     fn shutdown(&mut self) {
         // 1. Free the render context first so mpv's update callback stops firing
         //    and releases its clone of `redraw_tx`.
-        let render = self.state.render.lock().unwrap().take();
+        self.state.drawable.store(false, Ordering::Release);
+        let render = self
+            .state
+            .render
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
         if let Some(render) = render {
             unsafe {
                 CGLLockContext(self.state.gl);
@@ -458,8 +513,7 @@ impl VideoSurface {
                 CGLUnlockContext(self.state.gl);
             }
         }
-        // 2. Drop our sender and wait for the render thread to exit completely
-        //    before mutating `irisState` or detaching the view.
+        // 2. Drop our sender and wait for the render thread before detaching.
         self.redraw_tx.take();
         if let Some(worker) = self.worker.take()
             && worker.join().is_err()
@@ -467,9 +521,6 @@ impl VideoSurface {
             log::error!("video worker panicked");
         }
         unsafe {
-            if self.layer != nil {
-                (*self.layer).set_ivar("irisState", ptr::null_mut::<c_void>());
-            }
             if self.view != nil {
                 let _: () = msg_send![self.view, removeFromSuperview];
             }

@@ -65,20 +65,20 @@ fn thumb_cache_enforces_concurrency_and_lru_eviction() {
     let first = cache.pop_next_batch();
     assert_eq!(first.len(), MAX_THUMB_CONCURRENT);
     assert!(cache.pop_next_batch().is_empty());
-    for (_, p) in first {
-        cache.finish(p, Some(dummy_img()));
+    for (generation, p) in first {
+        cache.finish(generation, p, Some(dummy_img()));
     }
     for p in &paths[3..MAX_THUMB_CACHE] {
         cache.enqueue_window(vec![p.clone()]);
-        for (_, n) in cache.pop_next_batch() {
-            cache.finish(n, Some(dummy_img()));
+        for (generation, n) in cache.pop_next_batch() {
+            cache.finish(generation, n, Some(dummy_img()));
         }
     }
     cache.touch(&paths[0]);
     for p in &paths[MAX_THUMB_CACHE..] {
         cache.enqueue_window(vec![p.clone()]);
-        for (_, n) in cache.pop_next_batch() {
-            cache.finish(n, Some(dummy_img()));
+        for (generation, n) in cache.pop_next_batch() {
+            cache.finish(generation, n, Some(dummy_img()));
         }
     }
     assert!(cache.get(&paths[0]).is_some());
@@ -86,26 +86,75 @@ fn thumb_cache_enforces_concurrency_and_lru_eviction() {
 }
 
 #[test]
-fn text_input_context_firewall_tracks_focus_and_shortcut_recorder() {
-    let mut ov = OverlayState::default();
+fn superseded_thumbnail_is_requeued_if_still_needed() {
+    let mut cache = ThumbCache::default();
+    let path = PathBuf::from("/p/a.jpg");
+    cache.enqueue_window(vec![path.clone()]);
+    let (generation, pending) = cache.pop_next_batch().pop().unwrap();
+    cache.enqueue_window(vec![path.clone()]);
+    assert!(cache.pop_next_batch().is_empty());
+    assert!(!cache.finish(generation, pending, Some(dummy_img())));
+    assert!(cache.get(&path).is_none());
+    let (generation, pending) = cache.pop_next_batch().pop().unwrap();
+    assert!(cache.finish(generation, pending, Some(dummy_img())));
+    assert!(cache.get(&path).is_some());
+}
+
+#[test]
+fn text_input_context_firewall_tracks_focus() {
     let mut buf = TextInputBuffers::default();
 
-    // (search_open, has_form_key, has_rec, search_foc, pal_foc, form_foc, expected)
     let cases = [
-        (false, false, false, false, false, false, false),
-        (false, false, false, true, false, false, false), // search closed -> ignored
-        (true, false, false, true, false, false, true),   // search open + focused
-        (false, false, false, false, true, false, true),  // palette focused
-        (false, false, false, false, false, true, false), // form focused without active key
-        (false, true, false, false, false, true, true),   // form focused with active key
-        (false, false, true, false, false, false, true),  // shortcut recorder active
+        (false, false, false, false, false, false),
+        (false, false, true, false, false, false), // search closed -> ignored
+        (true, false, true, false, false, true),   // search open + focused
+        (false, false, false, true, false, true),  // palette focused
+        (false, false, false, false, true, false), // form focused without active key
+        (false, true, false, false, true, true),   // form focused with active key
     ];
-    for (s_open, f_key, rec, sf, pf, ff, exp) in cases {
-        buf.search_open = s_open;
-        buf.active_form_key = f_key.then(|| "url".into());
-        ov.recording_shortcut = rec.then(|| ("toggle_pause".into(), "Workspace".into()));
-        assert_eq!(ov.is_text_input_active(&buf, sf, pf, ff), exp);
+    for (search_open, form_key, search, palette, form, expected) in cases {
+        buf.search_open = search_open;
+        buf.active_form_key = form_key.then(|| "url".into());
+        assert_eq!(buf.is_focused_given(search, palette, form), expected);
     }
+}
+
+#[test]
+fn shortcut_recording_needs_visible_settings_and_recorder_focus() {
+    let mut overlay = OverlayState {
+        recording_shortcut: Some(("toggle_pause".into(), "Workspace".into())),
+        ..Default::default()
+    };
+    assert!(!overlay.is_recording(true));
+    overlay.settings_open = true;
+    assert!(!overlay.is_recording(false));
+    assert!(overlay.is_recording(true));
+}
+
+#[test]
+fn platform_primary_workspace_keys_preserve_text_editing() {
+    use iris_core::keymap::{canonical_binding, effective_gpui_context, reserved_shortcut};
+
+    for key in ["secondary-q", "secondary-p", "secondary-,", "secondary-o"] {
+        assert!(gpui::Keystroke::parse(&canonical_binding(key).unwrap()).is_ok());
+        assert_eq!(effective_gpui_context("Workspace", key), Some("Workspace"));
+    }
+    for key in [
+        "secondary-v",
+        "secondary-x",
+        "secondary-shift-left",
+        "alt-e",
+        "ctrl-alt-e",
+    ] {
+        assert_eq!(
+            effective_gpui_context("Workspace", key),
+            Some("Workspace && !TextInput")
+        );
+    }
+    assert_eq!(
+        reserved_shortcut("secondary-alt-shift-r").map(|(id, _)| id),
+        Some("reset_appearance")
+    );
 }
 
 #[test]
@@ -224,7 +273,7 @@ fn plugin_modal_async_submit_retains_inputs_until_close_or_cancel() {
         ov.begin_plugin_modal_submit(&buf, "iris.webdav", &modal)
             .is_some()
     );
-    ov.complete_plugin_modal_close(&mut buf, None);
+    ov.cancel_plugin_modal_state(&mut buf);
     assert!(ov.submitting_plugin_modal.is_none());
     assert!(!buf.form_fields.keys().any(|k| k.starts_with("modal:")));
     assert_eq!(buf.form_fields["sb:notes:draft"].text(), "keep");

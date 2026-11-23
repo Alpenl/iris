@@ -11,13 +11,16 @@ pub struct Colour {
 impl Colour {
     /// Human-readable colour space label for media info chips.
     pub fn display_name(&self) -> &'static str {
-        match self.primaries {
-            "bt.709" => "sRGB",
-            "display-p3" => "Display P3",
-            "adobe" => "Adobe RGB",
-            "bt.2020" => "BT.2020",
-            "prophoto" => "ProPhoto",
-            other => other,
+        match (self.primaries, self.gamma) {
+            ("bt.709", Some("pq")) => "BT.709 PQ",
+            ("bt.709", Some("hlg")) => "BT.709 HLG",
+            ("bt.709", Some("srgb")) => "sRGB",
+            ("bt.709", _) => "BT.709",
+            ("display-p3", _) => "Display P3",
+            ("adobe", _) => "Adobe RGB",
+            ("bt.2020", _) => "BT.2020",
+            ("prophoto", _) => "ProPhoto",
+            (other, _) => other,
         }
     }
 
@@ -239,6 +242,13 @@ mod tests {
         if let Some(icc) = system("Generic RGB Profile.icc") {
             assert_eq!(classify_icc(&icc), None);
         }
+    }
+
+    #[test]
+    fn bt709_hdr_transfer_is_not_labelled_srgb() {
+        assert_eq!(classify_nclx(1, 16).unwrap().display_name(), "BT.709 PQ");
+        assert_eq!(classify_nclx(1, 18).unwrap().display_name(), "BT.709 HLG");
+        assert_eq!(classify_nclx(1, 13).unwrap().display_name(), "sRGB");
     }
 
     #[test]

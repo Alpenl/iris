@@ -59,7 +59,8 @@ impl IrisWindow {
         let t = ThemeTokens::of(cx);
         let filter = self.catalog.filter;
         let row_count = self.catalog.rows.len();
-        let all_count = self.catalog.video_audio_count + self.catalog.photo_count;
+        let all_count =
+            self.catalog.video_count + self.catalog.audio_count + self.catalog.photo_count;
 
         let source_banner = match &self.catalog.active_source {
             ActiveSource::Local => None,
@@ -182,7 +183,7 @@ impl IrisWindow {
 
         let tabs = [
             ("全部", all_count, MediaFilter::All),
-            ("视频", self.catalog.video_audio_count, MediaFilter::Video),
+            ("视频", self.catalog.video_count, MediaFilter::Video),
             ("图片", self.catalog.photo_count, MediaFilter::Photo),
             (
                 "收藏",
@@ -371,7 +372,7 @@ impl IrisWindow {
                             .child(format!("{lbl} {cnt}"))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.catalog.filter = f;
-                                this.rebuild_directory_rows();
+                                this.filter_directory_rows();
                                 cx.notify();
                             }))
                     })),
@@ -390,7 +391,16 @@ impl IrisWindow {
                                 .justify_center()
                                 .text_size(px(12.))
                                 .text_color(t.text_faint)
-                                .child("暂无匹配的目录条目"),
+                                .child(
+                                    if filter == MediaFilter::FavoritesOnly
+                                        && self.catalog.favorite_items.is_empty()
+                                        && self.catalog.favorite_count > 0
+                                    {
+                                        "正在加载收藏…"
+                                    } else {
+                                        "暂无匹配的目录条目"
+                                    },
+                                ),
                         )
                     })
                     .when(row_count > 0, |d| d.child(list).children(scrollbar)),

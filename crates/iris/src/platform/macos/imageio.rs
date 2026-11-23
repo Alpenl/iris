@@ -13,6 +13,15 @@ use super::{
     CFDictionaryCreate, CFNumberCreate, CFRelease, CFURLCreateFromFileSystemRepresentation,
     kCFBooleanTrue, kCFTypeDictionaryKeyCallBacks, kCFTypeDictionaryValueCallBacks,
 };
+use crate::platform::valid_thumbnail_source;
+
+#[link(name = "CoreFoundation", kind = "framework")]
+unsafe extern "C" {
+    fn CFDictionaryGetValue(dict: *const c_void, key: *const c_void) -> *const c_void;
+    fn CFGetTypeID(value: *const c_void) -> usize;
+    fn CFNumberGetTypeID() -> usize;
+    fn CFNumberGetValue(value: *const c_void, ty: isize, out: *mut c_void) -> u8;
+}
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -55,6 +64,11 @@ unsafe extern "C" {
 #[link(name = "ImageIO", kind = "framework")]
 unsafe extern "C" {
     fn CGImageSourceCreateWithURL(url: *const c_void, options: *const c_void) -> *mut c_void;
+    fn CGImageSourceCopyPropertiesAtIndex(
+        src: *mut c_void,
+        index: usize,
+        options: *const c_void,
+    ) -> *const c_void;
     fn CGImageSourceCreateThumbnailAtIndex(
         isrc: *mut c_void,
         index: usize,
@@ -71,9 +85,38 @@ unsafe extern "C" {
     fn CGImageDestinationAddImage(dest: *mut c_void, image: *mut c_void, props: *const c_void);
     #[cfg(any(debug_assertions, feature = "devtools"))]
     fn CGImageDestinationFinalize(dest: *mut c_void) -> bool;
-    static kCGImageSourceCreateThumbnailFromImageAlways: *const c_void;
+    static kCGImagePropertyPixelWidth: *const c_void;
+    static kCGImagePropertyPixelHeight: *const c_void;
+    static kCGImageSourceCreateThumbnailFromImageIfAbsent: *const c_void;
     static kCGImageSourceCreateThumbnailWithTransform: *const c_void;
     static kCGImageSourceThumbnailMaxPixelSize: *const c_void;
+}
+
+fn source_dimensions_valid(src: *mut c_void) -> bool {
+    unsafe {
+        let props = CGImageSourceCopyPropertiesAtIndex(src, 0, ptr::null());
+        if props.is_null() {
+            return false;
+        }
+        let dimension = |key| -> u64 {
+            let value = CFDictionaryGetValue(props, key);
+            let mut n = 0i64;
+            // kCFNumberSInt64Type = 4.
+            if value.is_null()
+                || CFGetTypeID(value) != CFNumberGetTypeID()
+                || CFNumberGetValue(value, 4, (&mut n as *mut i64).cast()) == 0
+            {
+                return 0;
+            }
+            n as u64
+        };
+        let valid = valid_thumbnail_source(
+            dimension(kCGImagePropertyPixelWidth),
+            dimension(kCGImagePropertyPixelHeight),
+        );
+        CFRelease(props);
+        valid
+    }
 }
 
 pub(in crate::platform) fn decode_thumbnail_imageio(
@@ -96,11 +139,19 @@ pub(in crate::platform) fn decode_thumbnail_imageio(
         if src.is_null() {
             return None;
         }
+        if !source_dimensions_valid(src) {
+            CFRelease(src);
+            return None;
+        }
         let max_i32 = max_dim as i32;
         // kCFNumberSInt32Type = 3.
         let num = CFNumberCreate(ptr::null(), 3, &max_i32 as *const i32 as *const c_void);
+        if num.is_null() {
+            CFRelease(src);
+            return None;
+        }
         let keys = [
-            kCGImageSourceCreateThumbnailFromImageAlways,
+            kCGImageSourceCreateThumbnailFromImageIfAbsent,
             kCGImageSourceCreateThumbnailWithTransform,
             kCGImageSourceThumbnailMaxPixelSize,
         ];
@@ -113,6 +164,11 @@ pub(in crate::platform) fn decode_thumbnail_imageio(
             &kCFTypeDictionaryKeyCallBacks as *const c_void,
             &kCFTypeDictionaryValueCallBacks as *const c_void,
         );
+        if opts.is_null() {
+            CFRelease(num);
+            CFRelease(src);
+            return None;
+        }
         let cg_img = CGImageSourceCreateThumbnailAtIndex(src, 0, opts);
         CFRelease(opts);
         CFRelease(num);
@@ -130,6 +186,10 @@ pub(in crate::platform) fn decode_thumbnail_imageio(
         let mut cs = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
         if cs.is_null() {
             cs = CGColorSpaceCreateDeviceRGB();
+        }
+        if cs.is_null() {
+            CGImageRelease(cg_img);
+            return None;
         }
         // kCGBitmapByteOrder32Little (2<<12) | kCGImageAlphaPremultipliedFirst (2) => BGRA8 premul.
         let ctx = CGBitmapContextCreate(
@@ -204,6 +264,16 @@ pub(crate) fn snapshot_window(window: &gpui::Window, path: &Path) -> anyhow::Res
             false,
         );
         let ty = super::CFStringCreateWithCString(ptr::null(), c"public.png".as_ptr(), 0x0800_0100);
+        if url.is_null() || ty.is_null() {
+            if !url.is_null() {
+                CFRelease(url);
+            }
+            if !ty.is_null() {
+                CFRelease(ty);
+            }
+            CGImageRelease(image);
+            anyhow::bail!("creating PNG destination failed");
+        }
         let dest = CGImageDestinationCreateWithURL(url, ty, 1, ptr::null());
         let ok = !dest.is_null() && {
             CGImageDestinationAddImage(dest, image, ptr::null());

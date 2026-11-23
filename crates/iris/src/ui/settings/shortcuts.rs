@@ -41,18 +41,6 @@ impl IrisWindow {
         }
         let mods = ev.keystroke.modifiers;
         let key_str = ev.keystroke.key.as_str();
-        if key_str.eq_ignore_ascii_case("escape")
-            && !mods.platform
-            && !mods.control
-            && !mods.alt
-            && !mods.shift
-        {
-            self.overlays.recording_shortcut = None;
-            self.focus.focus(w);
-            cx.stop_propagation();
-            cx.notify();
-            return;
-        }
         let Some(spec) = keymap::normalize_gpui_keystroke(
             key_str,
             mods.platform,
@@ -63,24 +51,33 @@ impl IrisWindow {
             cx.stop_propagation();
             return;
         };
-        if let Some((target_id, ctx_pred)) = self.overlays.recording_shortcut.take() {
-            let conflict = self.keymap.find_conflict(&ctx_pred, &spec, &target_id);
-            self.keymap.set_binding(&target_id, spec.clone());
-            self.keymap.save();
-            rebind_keys(cx, &self.keymap);
-            let disp = keymap::format_keystroke_display(&spec, IS_MACOS);
-            if let Some(other) = conflict {
-                let warn = format!("已绑定 {disp}（提示：与「{other}」存在同作用域冲突）");
-                self.overlays.shortcut_conflict = Some(warn.clone());
-                self.show_toast(warn, cx);
-            } else {
-                self.overlays.shortcut_conflict = None;
-                self.show_toast(format!("已绑定快捷键 · {disp}"), cx);
-            }
+        if spec == "escape" {
+            self.overlays.recording_shortcut = None;
+            self.overlays.shortcut_conflict = None;
             self.focus.focus(w);
             cx.stop_propagation();
             cx.notify();
+            return;
         }
+        if keymap::reserved_shortcut(&spec).is_some_and(|(id, _)| id == "reset_appearance") {
+            return;
+        }
+        let disp = keymap::format_keystroke_display(&spec, IS_MACOS);
+        if let Some((target_id, ctx_pred)) = self.overlays.recording_shortcut.as_ref()
+            && let Some(other) = self.keymap.find_conflict(ctx_pred, &spec, target_id)
+        {
+            let warn = format!("无法绑定 {disp}：与「{other}」冲突，请选择其他按键");
+            self.overlays.shortcut_conflict = Some(warn.clone());
+            self.show_toast(warn, cx);
+        } else if let Some((target_id, _)) = self.overlays.recording_shortcut.take() {
+            self.keymap.set_binding(&target_id, spec);
+            rebind_keys(cx, &self.keymap);
+            self.overlays.shortcut_conflict = None;
+            self.show_toast(format!("已绑定快捷键 · {disp}"), cx);
+            self.focus.focus(w);
+        }
+        cx.stop_propagation();
+        cx.notify();
     }
 
     pub(super) fn settings_shortcuts(
@@ -473,7 +470,7 @@ impl IrisWindow {
                                     this.overlays.shortcut_conflict = None;
                                     this.overlays.recording_shortcut =
                                         Some((id_rec.clone(), context_pred.clone()));
-                                    this.text_inputs.form_focus.focus(w);
+                                    this.text_inputs.recorder_focus.focus(w);
                                 }
                                 cx.notify();
                             }))

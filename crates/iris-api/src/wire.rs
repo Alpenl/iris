@@ -153,6 +153,10 @@ pub enum HostCommand {
         #[serde(default)]
         sources: Vec<SourceDescriptor>,
     },
+    /// Asks the host to issue a fresh browse request if this source is open.
+    RefreshSource {
+        source_id: String,
+    },
     ProvideSourcePage {
         request_id: String,
         page: Box<SourcePage>,
@@ -194,6 +198,7 @@ impl HostCommand {
             HostCommand::OpenModal { .. } | HostCommand::CloseModal { .. } => Permission::UiModal,
             HostCommand::SetTheme { .. } => Permission::UiTheme,
             HostCommand::SetSources { .. }
+            | HostCommand::RefreshSource { .. }
             | HostCommand::ProvideSourcePage { .. }
             | HostCommand::ResolveStream { .. }
             | HostCommand::SourceError { .. } => Permission::MediaSource,

@@ -120,41 +120,62 @@ fn is_unc_str(raw: &str) -> bool {
     false
 }
 
-/// Detects paths on potentially high-latency network mounts or external volumes:
-/// - Windows UNC paths (`\\server\share\...` and `\\?\UNC\server\share\...`)
-/// - macOS `/Volumes/<mount>/...` non-root mounts (excluding the boot volume symlink to `/`)
+/// Detects high-latency network mounts using Windows UNC/mapped-drive prefixes
+/// and macOS mount flags.
 pub fn is_slow_network_path(path: &Path) -> bool {
     #[cfg(windows)]
     {
         use std::path::Prefix;
-        if let Some(Component::Prefix(prefix)) = path.components().next()
-            && matches!(prefix.kind(), Prefix::UNC(_, _) | Prefix::VerbatimUNC(_, _))
-        {
-            return true;
-        }
-    }
+        use windows_sys::Win32::Storage::FileSystem::GetDriveTypeW;
 
-    let raw = path.to_string_lossy();
-    if is_unc_str(&raw) {
-        return true;
-    }
-
-    if let Some(after_volumes) = raw.strip_prefix("/Volumes/") {
-        let mount_name = after_volumes.split('/').next().unwrap_or("");
-        if !mount_name.is_empty() && mount_name != "." && mount_name != ".." {
-            let mount_root = Path::new("/Volumes").join(mount_name);
-            if let Ok(link_target) = std::fs::read_link(&mount_root)
-                && link_target == Path::new("/")
-            {
-                return false;
+        if let Some(Component::Prefix(prefix)) = path.components().next() {
+            match prefix.kind() {
+                Prefix::UNC(_, _) | Prefix::VerbatimUNC(_, _) => return true,
+                Prefix::Disk(drive) | Prefix::VerbatimDisk(drive) => {
+                    // Win32 DRIVE_REMOTE; the API requires a trailing separator.
+                    const DRIVE_REMOTE: u32 = 4;
+                    let root = [u16::from(drive), u16::from(b':'), u16::from(b'\\'), 0];
+                    return unsafe { GetDriveTypeW(root.as_ptr()) } == DRIVE_REMOTE;
+                }
+                _ => {}
             }
-            return true;
         }
     }
 
-    false
+    let unc = is_unc_str(&path.to_string_lossy());
+    #[cfg(target_os = "macos")]
+    let unc = unc || (path.is_absolute() && macos_network_mount(path));
+    unc
 }
 
+#[cfg(target_os = "macos")]
+fn macos_network_mount(path: &Path) -> bool {
+    use std::ffi::{CStr, OsStr};
+    use std::mem::{MaybeUninit, size_of};
+    use std::os::unix::ffi::OsStrExt;
+
+    // Use the cached mount table without waiting for a network volume to respond.
+    let count = unsafe { libc::getfsstat(std::ptr::null_mut(), 0, libc::MNT_NOWAIT) };
+    if count <= 0 {
+        return false;
+    }
+    let Ok(bytes) = i32::try_from(count as usize * size_of::<libc::statfs>()) else {
+        return false;
+    };
+    let mut mounts: Vec<MaybeUninit<libc::statfs>> = Vec::with_capacity(count as usize);
+    let filled = unsafe { libc::getfsstat(mounts.as_mut_ptr().cast(), bytes, libc::MNT_NOWAIT) };
+    let mut best = (0, false);
+    for i in 0..filled.min(count).max(0) as usize {
+        let mount = unsafe { &*mounts.as_ptr().add(i).cast::<libc::statfs>() };
+        let name = unsafe { CStr::from_ptr(mount.f_mntonname.as_ptr()) }.to_bytes();
+        if name.len() > best.0 && path.starts_with(Path::new(OsStr::from_bytes(name))) {
+            best = (name.len(), mount.f_flags & libc::MNT_LOCAL as u32 == 0);
+        }
+    }
+    best.1
+}
+
+#[cfg(not(windows))]
 fn normalize_unc_str(raw: &str) -> PathBuf {
     let (prefix, tail) = if raw.len() >= 8 && raw.as_bytes()[..8].eq_ignore_ascii_case(br"\\?\UNC\")
     {
@@ -192,9 +213,9 @@ fn normalize_unc_str(raw: &str) -> PathBuf {
 }
 
 fn lexical_normalize(path: &Path) -> PathBuf {
-    let raw = path.to_string_lossy();
-    if is_unc_str(&raw) {
-        return normalize_unc_str(&raw);
+    #[cfg(not(windows))]
+    if let Some(raw) = path.to_str().filter(|raw| is_unc_str(raw)) {
+        return normalize_unc_str(raw);
     }
 
     let base = if path.is_absolute() {
@@ -236,34 +257,88 @@ fn lexical_normalize(path: &Path) -> PathBuf {
     }
 }
 
-/// Strips redundant Windows `\\?\X:\` verbatim disk prefixes on normal-length paths
-/// so UI labels, Explorer `reveal_path`, and `file://` URL roundtrips stay `X:\...` identical.
+/// Strips redundant Windows verbatim disk and UNC prefixes when ordinary paths
+/// still address the same file. Preserve long paths and literal trailing spaces/dots.
 pub(crate) fn strip_windows_verbatim_disk(path: PathBuf) -> PathBuf {
     #[cfg(windows)]
-    {
-        use std::os::windows::ffi::OsStrExt;
-        use std::path::Prefix;
-        if let Some(Component::Prefix(p)) = path.components().next()
-            && matches!(p.kind(), Prefix::VerbatimDisk(_))
-            && path.as_os_str().encode_wide().count() < 248
-            && let Some(s) = path.to_str()
-            && let Some(stripped) = s.strip_prefix(r"\\?\")
-            && !stripped
-                .split('\\')
-                .any(|seg| seg.ends_with(' ') || seg.ends_with('.'))
-        {
-            return PathBuf::from(stripped);
-        }
+    if let Some(ordinary) = windows_unverbatim_path(&path) {
+        return ordinary;
     }
     path
+}
+
+#[cfg(windows)]
+pub(crate) fn windows_unverbatim_path(path: &Path) -> Option<PathBuf> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::path::Prefix;
+
+    let Some(Component::Prefix(prefix)) = path.components().next() else {
+        return None;
+    };
+    let raw = path.to_str()?.strip_prefix(r"\\?\")?;
+    let tail = raw.get(prefix.as_os_str().len().checked_sub(4)?..)?;
+    if !path.is_absolute()
+        || path.as_os_str().encode_wide().count() >= 248
+        || raw.contains('/')
+        || tail.split('\\').any(windows_verbatim_component)
+    {
+        return None;
+    }
+    match prefix.kind() {
+        Prefix::VerbatimDisk(_) => Some(PathBuf::from(raw)),
+        Prefix::VerbatimUNC(_, _) => Some(PathBuf::from(format!(r"\\{}", &raw[4..]))),
+        _ => None,
+    }
+}
+
+#[cfg(windows)]
+pub(crate) fn windows_verbatim_component(component: &str) -> bool {
+    if component.ends_with([' ', '.']) || component.contains(':') {
+        return true;
+    }
+    let (stem, _) = component.split_once('.').unwrap_or((component, ""));
+    let stem = stem.trim_end_matches(' ');
+    if ["CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"]
+        .iter()
+        .any(|device| stem.eq_ignore_ascii_case(device))
+    {
+        return true;
+    }
+    let Some(port) = stem.get(..3) else {
+        return false;
+    };
+    (port.eq_ignore_ascii_case("COM") || port.eq_ignore_ascii_case("LPT"))
+        && matches!(
+            &stem[3..],
+            "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+        )
 }
 
 /// Resolves `path` safely across local disks and network shares.
 /// Avoids blocking `std::fs::canonicalize()` syscalls (and Windows `\\?\UNC\` rewrites)
 /// on slow network shares, falling back gracefully to lexical normalization.
 pub fn safe_resolve_path(path: &Path) -> PathBuf {
-    if is_slow_network_path(path) {
-        return lexical_normalize(path);
+    let absolute;
+    let checked = if !path.is_absolute()
+        && let Ok(cwd) = std::env::current_dir()
+    {
+        absolute = cwd.join(path);
+        absolute.as_path()
+    } else {
+        path
+    };
+    if is_slow_network_path(path) || (checked != path && is_slow_network_path(checked)) {
+        #[cfg(not(windows))]
+        if let Some(raw) = path.to_str().filter(|raw| is_unc_str(raw)) {
+            return normalize_unc_str(raw);
+        }
+        let path = strip_windows_verbatim_disk(checked.to_path_buf());
+        #[cfg(windows)]
+        if matches!(path.components().next(), Some(Component::Prefix(p)) if p.kind().is_verbatim())
+        {
+            return path;
+        }
+        return lexical_normalize(&path);
     }
     match std::fs::canonicalize(path) {
         Ok(canon) => strip_windows_verbatim_disk(canon),

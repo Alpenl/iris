@@ -543,7 +543,7 @@ impl AbLoopPlugin {
                 });
             }
             "add_marker" => {
-                if let Some(uri) = snapshot.uri.clone().or_else(|| self.current_uri.clone()) {
+                if let Some(uri) = snapshot.uri.clone() {
                     self.current_uri.get_or_insert_with(|| uri.clone());
                     let list = self.markers.entry(uri).or_default();
                     let t = snapshot.position.max(0.0);
@@ -552,6 +552,10 @@ impl AbLoopPlugin {
                     cmds.extend(self.sync_ui());
                     let msg = format!("已添加时间标记 · {}", format_time(t));
                     cmds.push(HostCommand::ShowToast { message: msg });
+                } else {
+                    cmds.push(HostCommand::ShowToast {
+                        message: "当前媒体没有可用于保存时间标记的地址".into(),
+                    });
                 }
             }
             _ => {}

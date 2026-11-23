@@ -13,11 +13,13 @@ mod webdav;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::time::{Duration, Instant};
 
 use futures::channel::mpsc::UnboundedReceiver;
 use iris_api::{
-    BuiltinPlugin, ChromeLayoutSpec, CommandSpec, HostCommand, HostEvent, OverlayNode, Permission,
+    BuiltinPlugin, ChromeLayoutSpec, CommandSpec, HostEvent, OverlayNode, Permission,
     PlaybackSnapshot, PluginModal, SidebarPanel, SourceDescriptor, SourceProviderSpec, StatusBadge,
     ToolbarButton, UiThemeSpec,
 };
@@ -32,7 +34,8 @@ use slots::{
 };
 use snapshot::sync_cached_snapshot;
 use types::{
-    RESERVED_NAMESPACE_ERR, discover_external_manifests, dispatch_to_loaded, start_loaded_plugin,
+    BuiltinReply, RESERVED_NAMESPACE_ERR, discover_external_manifests, dispatch_to_loaded,
+    start_loaded_plugin,
 };
 use webdav::WebDavPlugin;
 
@@ -44,12 +47,14 @@ pub struct PluginManager {
     plugins: BTreeMap<String, LoadedPlugin>,
     host_version: String,
     wake: Option<WakeSignal>,
-    builtin_tx: Sender<(String, Vec<HostCommand>)>,
-    builtin_rx: Receiver<(String, Vec<HostCommand>)>,
+    builtin_tx: Sender<BuiltinReply>,
+    builtin_rx: Receiver<BuiltinReply>,
     vault: CredentialVault,
     state_dir: Option<PathBuf>,
     external_dir_override: Option<Option<PathBuf>>,
     last_snapshot: PlaybackSnapshot,
+    startup_report: PollReport,
+    state_writer: Option<slots::StateWriter>,
 }
 
 impl PluginManager {
@@ -60,6 +65,16 @@ impl PluginManager {
     ) -> (Self, UnboundedReceiver<()>) {
         let (wake, rx) = WakeSignal::new();
         let (builtin_tx, builtin_rx) = mpsc::channel();
+        let state_writer =
+            state_dir
+                .as_ref()
+                .and_then(|dir| match slots::StateWriter::new(dir.clone()) {
+                    Ok(writer) => Some(writer),
+                    Err(e) => {
+                        log::warn!("cannot start plugin state writer: {e}");
+                        None
+                    }
+                });
         (
             Self {
                 plugins: BTreeMap::new(),
@@ -71,6 +86,8 @@ impl PluginManager {
                 state_dir,
                 external_dir_override,
                 last_snapshot: PlaybackSnapshot::default(),
+                startup_report: PollReport::default(),
+                state_writer,
             },
             rx,
         )
@@ -85,7 +102,10 @@ impl PluginManager {
         vault: CredentialVault,
     ) -> (Self, UnboundedReceiver<()>) {
         let (mut mgr, rx) = Self::new_empty(default_plugin_state_dir(), None, vault);
-        let _ = mgr.reload(disabled);
+        mgr.startup_report = mgr.reload(disabled);
+        if let Some(wake) = &mgr.wake {
+            wake.notify();
+        }
         (mgr, rx)
     }
 
@@ -96,7 +116,10 @@ impl PluginManager {
         vault: CredentialVault,
     ) -> (Self, UnboundedReceiver<()>) {
         let (mut mgr, rx) = Self::new_empty(state_dir, Some(external_dir.map(Into::into)), vault);
-        let _ = mgr.reload_from(external_dir, disabled);
+        mgr.startup_report = mgr.reload_from(external_dir, disabled);
+        if let Some(wake) = &mgr.wake {
+            wake.notify();
+        }
         (mgr, rx)
     }
 
@@ -139,7 +162,7 @@ impl PluginManager {
         if self.external_dir_override.is_some() {
             self.external_dir_override = Some(external_dir.map(Path::to_path_buf));
         }
-        self.shutdown();
+        self.stop_plugins(false);
 
         let mut report = PollReport {
             commands: Vec::new(),
@@ -166,6 +189,10 @@ impl PluginManager {
                 report
                     .commands
                     .extend(self.start_loaded(&snapshot, &mut loaded).commands);
+            } else if id == "iris.webdav"
+                && webdav::reconcile_state(Arc::make_mut(&mut loaded.state), &self.vault)
+            {
+                slots::save_plugin_state(self.state_dir.as_deref(), &id, &loaded.state);
             }
             self.plugins.insert(id, loaded);
         }
@@ -192,6 +219,7 @@ impl PluginManager {
                 enabled,
                 runtime,
             );
+            loaded.state_writer.clone_from(&self.state_writer);
             if id.starts_with("iris.") {
                 log::warn!("rejected external plugin '{id}': {RESERVED_NAMESPACE_ERR}");
                 loaded.status = PluginStatus::Error(RESERVED_NAMESPACE_ERR.into());
@@ -217,9 +245,14 @@ impl PluginManager {
         )
     }
 
-    /// Deliver shutdown and release all plugin-owned processes and slots. Safe to call again.
+    /// Deliver shutdown and request termination within one bounded grace period.
     pub fn shutdown(&mut self) {
-        // Start each plugin's grace period before waiting for any one of them.
+        self.stop_plugins(true);
+    }
+
+    fn stop_plugins(&mut self, flush_state: bool) {
+        let deadline = Instant::now() + Duration::from_millis(200);
+        self.startup_report = PollReport::default();
         for plugin in self.plugins.values_mut() {
             if let Runtime::External {
                 proc: Some(process),
@@ -228,6 +261,18 @@ impl PluginManager {
             {
                 process.request_shutdown();
             }
+        }
+        for plugin in self.plugins.values() {
+            if let Runtime::External {
+                proc: Some(process),
+                ..
+            } = &plugin.runtime
+            {
+                process.wait_for_termination(deadline);
+            }
+        }
+        if flush_state && let Some(writer) = &self.state_writer {
+            writer.wait_until(deadline);
         }
         for plugin in self.plugins.values_mut() {
             plugin.stop_runtime();
@@ -255,6 +300,15 @@ impl PluginManager {
             return PollReport::default();
         }
         let report = if !enabled {
+            if let Runtime::External {
+                proc: Some(process),
+                ..
+            } = &mut loaded.runtime
+            {
+                let deadline = Instant::now() + Duration::from_millis(200);
+                process.request_shutdown();
+                process.wait_for_termination(deadline);
+            }
             loaded.stop_runtime();
             loaded.enabled = false;
             loaded.status = PluginStatus::Disabled;
@@ -362,7 +416,9 @@ impl PluginManager {
         self.plugins
             .values()
             .filter(|p| p.is_running())
-            .find_map(|p| p.modal.as_ref().map(|m| (p.manifest.id.as_str(), m)))
+            .filter(|p| p.modal.is_some())
+            .min_by_key(|p| p.modal_order)
+            .and_then(|p| p.modal.as_ref().map(|m| (p.manifest.id.as_str(), m)))
     }
 
     pub fn dismiss_modal(&mut self, plugin_id: &str) -> DirtySlots {
@@ -423,18 +479,29 @@ impl PluginManager {
         if let Some(wake) = &self.wake {
             wake.clear();
         }
-        let mut report = PollReport::default();
+        let mut report = std::mem::take(&mut self.startup_report);
         let (vault, state_dir) = (&self.vault, self.state_dir.as_deref());
 
-        for _ in 0..MAX_DRAIN_PER_POLL {
+        for index in 0..MAX_DRAIN_PER_POLL {
             match self.builtin_rx.try_recv() {
-                Ok((pid, cmds)) => {
-                    if let Some(loaded) = self.plugins.get_mut(&pid).filter(|l| l.is_running()) {
+                Ok((pid, token, cmds)) => {
+                    if let Some(loaded) = self.plugins.get_mut(&pid).filter(|loaded| {
+                        loaded.is_running()
+                            && loaded
+                                .builtin_generation
+                                .as_ref()
+                                .is_some_and(|generation| token.as_ptr() == Arc::as_ptr(generation))
+                    }) {
                         let (fwd, dirty) = apply_plugin_commands(loaded, vault, state_dir, cmds);
                         report.dirty.merge(dirty);
                         report
                             .commands
                             .extend(fwd.into_iter().map(|c| (pid.clone(), c)));
+                    }
+                    if index + 1 == MAX_DRAIN_PER_POLL
+                        && let Some(wake) = &self.wake
+                    {
+                        wake.notify();
                     }
                 }
                 Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
@@ -510,6 +577,97 @@ impl Drop for PluginManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use iris_api::HostCommand;
+
+    #[test]
+    fn modals_keep_arrival_order_when_another_plugin_opens_one() {
+        let (mut manager, _) =
+            PluginManager::new_empty(None, Some(None), CredentialVault::in_memory());
+        let make_modal = || HostCommand::OpenModal {
+            modal: Box::new(PluginModal {
+                id: "modal".into(),
+                title: "Title".into(),
+                subtitle: None,
+                widgets: Vec::new(),
+                submit_label: None,
+                cancel_label: None,
+            }),
+        };
+        for id in ["test.z", "test.a"] {
+            let mut plugin = LoadedPlugin::new(
+                None,
+                iris_api::PluginManifest {
+                    id: id.into(),
+                    permissions: vec![Permission::UiModal],
+                    ..Default::default()
+                },
+                PluginSource::Builtin,
+                true,
+                Runtime::Declarative,
+            );
+            let _ = apply_plugin_commands(&mut plugin, &manager.vault, None, vec![make_modal()]);
+            manager.plugins.insert(id.into(), plugin);
+        }
+        assert_eq!(manager.active_modal().map(|(id, _)| id), Some("test.z"));
+        assert!(manager.dismiss_modal("test.z").modal);
+        assert_eq!(manager.active_modal().map(|(id, _)| id), Some("test.a"));
+    }
+
+    #[test]
+    fn command_quotas_preserve_last_accepted_plugin_state_and_slots() {
+        let mut plugin = LoadedPlugin::new(
+            None,
+            iris_api::PluginManifest {
+                permissions: vec![Permission::MediaSource, Permission::UiModal],
+                ..Default::default()
+            },
+            PluginSource::Builtin,
+            true,
+            Runtime::Declarative,
+        );
+        let source = SourceDescriptor {
+            id: "valid".into(),
+            name: "Source".into(),
+            ..Default::default()
+        };
+        let (forward, dirty) = apply_plugin_commands(
+            &mut plugin,
+            &CredentialVault::in_memory(),
+            None,
+            vec![
+                HostCommand::SetState {
+                    key: "pref".into(),
+                    value: Some("keep".into()),
+                },
+                HostCommand::SetState {
+                    key: "pref".into(),
+                    value: Some("x".repeat(512 * 1024)),
+                },
+                HostCommand::SetSources {
+                    sources: vec![source.clone()],
+                },
+                HostCommand::SetSources {
+                    sources: vec![source.clone(), source],
+                },
+                HostCommand::RefreshSource {
+                    source_id: "no-such-source".into(),
+                },
+                HostCommand::OpenModal {
+                    modal: Box::new(PluginModal {
+                        id: "too-many".into(),
+                        title: "Title".into(),
+                        subtitle: None,
+                        widgets: vec![iris_api::Widget::Divider; 257],
+                        submit_label: None,
+                        cancel_label: None,
+                    }),
+                },
+            ],
+        );
+        assert_eq!(plugin.state.get("pref").map(String::as_str), Some("keep"));
+        assert_eq!(plugin.effective_sources().len(), 1);
+        assert!(forward.is_empty() && dirty.sources && !dirty.modal && plugin.modal.is_none());
+    }
 
     #[test]
     fn visible_overlays_share_one_expanded_frame_budget() {

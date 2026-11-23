@@ -4,7 +4,7 @@
 use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use gpui::{
     Context, CursorStyle, InteractiveElement, IntoElement, KeyContext, MouseButton, MouseDownEvent,
@@ -14,7 +14,7 @@ use gpui::{
 use iris_core::geometry::ImageView;
 use iris_core::input::{self, InputContext, PointerCommand, PointerInput};
 use iris_core::library::Kind;
-use iris_core::player::{Command, MediaStats, Session};
+use iris_core::player::{MediaStats, Session};
 use iris_core::settings::{Side, VideoWheel};
 
 use super::IrisWindow;
@@ -33,6 +33,7 @@ pub(super) struct Viewport {
     pub(super) image: ImageView,
     pub(super) drag_origin: Option<Point<Pixels>>,
     pub(super) pending_win_drag_origin: Option<Point<Pixels>>,
+    pub(super) pending_click_origin: Option<Point<Pixels>>,
     pub(super) load_generation: u64,
     pub(super) pending_path: Option<PathBuf>,
     pub(super) pending_subtitles: super::events::PendingSubtitles,
@@ -41,6 +42,7 @@ pub(super) struct Viewport {
     pub(super) cached_stats: Option<MediaStats>,
     pub(super) last_stats_refresh: Instant,
     pub(super) announce_audio: bool,
+    pub(super) announce_volume: Option<Instant>,
     pub(super) announce_sub: bool,
 }
 
@@ -54,6 +56,7 @@ impl Viewport {
             drag_origin: None,
             pending_win_drag_origin: None,
             load_generation: 0,
+            pending_click_origin: None,
             pending_path: None,
             pending_subtitles: Default::default(),
             loading_visible: false,
@@ -61,6 +64,7 @@ impl Viewport {
             cached_stats: None,
             last_stats_refresh: now,
             announce_audio: false,
+            announce_volume: None,
             announce_sub: false,
         }
     }
@@ -85,12 +89,22 @@ impl Drop for Viewport {
 impl IrisWindow {
     pub(super) fn image_geometry(&self) -> ([f64; 2], [f64; 2]) {
         let rect = self.active().rect.get().map(|r| r.0).unwrap_or([0.; 4]);
-        let st = self.active().session.state();
-        let (mut w, mut h) = st.video_size;
-        if st.rotation.rem_euclid(180) == 90 {
-            std::mem::swap(&mut w, &mut h);
+        let (w, h) = self.active().session.display_size();
+        ([rect[2], rect[3]], [w as f64, h as f64])
+    }
+
+    pub(super) fn image_geometry_ready(&self) -> bool {
+        let (viewport, media) = self.image_geometry();
+        viewport[0] > 0. && viewport[1] > 0. && media[0] > 0. && media[1] > 0.
+    }
+
+    fn image_can_pan(&self) -> bool {
+        let (viewport, media) = self.image_geometry();
+        if !self.image_geometry_ready() {
+            return false;
         }
-        ([rect[2], rect[3]], [w.max(1) as f64, h.max(1) as f64])
+        let [width, height] = self.active().image.displayed(viewport, media);
+        width > viewport[0] + 0.5 || height > viewport[1] + 0.5
     }
 
     pub(super) fn apply_image_view(&mut self, cx: &mut Context<Self>) {
@@ -107,6 +121,9 @@ impl IrisWindow {
         point: Option<Point<Pixels>>,
         cx: &mut Context<Self>,
     ) {
+        if !self.image_geometry_ready() {
+            return;
+        }
         let (viewport, media) = self.image_geometry();
         let rect = self.active().rect.get().map(|r| r.0).unwrap_or([0.; 4]);
         let pt = point
@@ -124,7 +141,7 @@ impl IrisWindow {
     pub(super) fn input_context(&self) -> InputContext {
         InputContext {
             media: self.active().session.kind(),
-            zoomed: self.active().image.zoomed(),
+            zoomed: self.image_can_pan(),
             overlay: self.overlays.has_blocking() || self.plugins.active_modal().is_some(),
             video_wheel_volume: self.settings.video_wheel == VideoWheel::Volume,
             single_click_pause: self.settings.single_click_pause,
@@ -136,7 +153,7 @@ impl IrisWindow {
         let session = &self.active().session;
         let kind = session.kind()?;
         let st = session.state();
-        let (w, h) = st.video_size;
+        let (w, h) = session.display_size();
         let mut parts = Vec::new();
         if st.is_live {
             parts.push("LIVE".into());
@@ -170,9 +187,10 @@ impl IrisWindow {
         let vp = self.active();
         let last_rect = vp.rect.clone();
         let video = vp.video.clone();
-        // macOS delivers a window-exit event even when the app stays active on this display.
-        let on_exit = (crate::platform::IS_MACOS && fullscreen).then(|| {
-            cx.listener(|this, _: &gpui::MouseExitEvent, w, cx| this.on_window_pointer_exit(w, cx))
+        let on_move = cx.listener(Self::on_root_mouse_move);
+        let on_up = cx.listener(Self::on_root_mouse_up);
+        let on_exit = cx.listener(|this, _: &gpui::MouseExitEvent, window, cx| {
+            this.on_window_pointer_exit(window, cx);
         });
         let probe = canvas(
             move |bounds, _, _| {
@@ -182,7 +200,7 @@ impl IrisWindow {
                     f32::from(bounds.size.width) as f64,
                     f32::from(bounds.size.height) as f64,
                 ]);
-                if r.0[2] <= 0. || r.0[3] <= 0. || last_rect.get() == Some(r) {
+                if last_rect.get() == Some(r) {
                     return;
                 }
                 last_rect.set(Some(r));
@@ -192,13 +210,23 @@ impl IrisWindow {
                 }
             },
             move |_, _, window, _| {
-                if let Some(on_exit) = on_exit {
-                    window.on_mouse_event(move |event, phase, window, cx| {
-                        if phase.capture() {
-                            on_exit(event, window, cx);
-                        }
-                    });
-                }
+                // Scrims occlude sibling hitboxes and native drag release may be outside
+                // the client area. Both still belong to the window pointer state machine.
+                window.on_mouse_event(move |event, phase, window, cx| {
+                    if phase.capture() {
+                        on_move(event, window, cx);
+                    }
+                });
+                window.on_mouse_event(move |event: &gpui::MouseUpEvent, phase, window, cx| {
+                    if phase.capture() && event.button == MouseButton::Left {
+                        on_up(event, window, cx);
+                    }
+                });
+                window.on_mouse_event(move |event, phase, window, cx| {
+                    if phase.capture() {
+                        on_exit(event, window, cx);
+                    }
+                });
             },
         )
         .absolute()
@@ -209,7 +237,7 @@ impl IrisWindow {
         let floating_dock = fullscreen || self.effective_floating_dock();
         let dock_h = f32::from(t.dock_h);
         let has_media = session.current().is_some() || session.current_uri().is_some();
-        let is_photo_zoomed = kind == Some(Kind::Photo) && vp.image.zoomed();
+        let is_photo_zoomed = kind == Some(Kind::Photo) && self.image_can_pan();
         let panning = vp.drag_origin.is_some();
         let show_filmstrip = kind == Some(Kind::Photo)
             && self.settings.photo_filmstrip
@@ -289,10 +317,7 @@ impl IrisWindow {
                     Some(PointerCommand::VolumeBy(_)) => {
                         let delta = this.damped_volume_delta(ev);
                         if delta.abs() >= 0.5 {
-                            this.command(Command::VolumeBy(delta), cx);
-                            let next =
-                                (this.active().session.state().volume + delta).clamp(0., 100.);
-                            this.show_osd(format!("音量 · {next:.0}%"), cx);
+                            this.adjust_volume_by(delta, cx);
                         }
                         cx.stop_propagation();
                     }
@@ -318,6 +343,7 @@ impl IrisWindow {
                         let vp = this.active_mut();
                         vp.drag_origin = None;
                         vp.pending_win_drag_origin = None;
+                        vp.pending_click_origin = None;
                         platform::begin_window_drag(window);
                         cx.stop_propagation();
                         return;
@@ -326,6 +352,7 @@ impl IrisWindow {
                     if ev.click_count >= 2 {
                         this.chrome.scrub.click_seq += 1;
                         this.active_mut().pending_win_drag_origin = None;
+                        this.active_mut().pending_click_origin = None;
                         match input::resolve_pointer_input(PointerInput::DoubleClick, ctx) {
                             Some(PointerCommand::CloseOverlay) => this.close_overlays(cx),
                             Some(PointerCommand::ToggleFullscreen) => window.toggle_fullscreen(),
@@ -355,22 +382,7 @@ impl IrisWindow {
                     } else if let Some(PointerCommand::TogglePlayback) =
                         input::resolve_pointer_input(PointerInput::SingleClick, ctx)
                     {
-                        this.chrome.scrub.click_seq += 1;
-                        let seq = this.chrome.scrub.click_seq;
-                        cx.spawn(async move |this, cx| {
-                            cx.background_executor()
-                                .timer(Duration::from_millis(200))
-                                .await;
-                            let _ = this.update(cx, |this, cx| {
-                                if this.chrome.scrub.click_seq == seq {
-                                    let st = this.active().session.state();
-                                    let next_paused = !st.paused && !st.ended;
-                                    this.command(Command::TogglePlayback, cx);
-                                    this.show_osd(if next_paused { "暂停" } else { "播放" }, cx);
-                                }
-                            });
-                        })
-                        .detach();
+                        this.active_mut().pending_click_origin = Some(ev.position);
                     }
                 }),
             )

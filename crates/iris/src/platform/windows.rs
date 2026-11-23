@@ -1,8 +1,9 @@
 //! Windows native window, sleep prevention, WIC thumbnail, GDI capture, and
 //! same-user named pipe helpers.
 
-use std::os::windows::ffi::OsStrExt;
-use std::path::Path;
+use std::ffi::OsString;
+use std::os::windows::ffi::{OsStrExt, OsStringExt};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use futures::channel::mpsc::{UnboundedReceiver, unbounded};
@@ -34,19 +35,39 @@ use windows::Win32::{
         },
     },
     UI::{
-        Input::KeyboardAndMouse::{GetAsyncKeyState, ReleaseCapture, VK_LBUTTON},
+        Input::KeyboardAndMouse::{GetAsyncKeyState, ReleaseCapture, VK_LBUTTON, VK_RBUTTON},
         WindowsAndMessaging::*,
     },
 };
 use windows::core::{HSTRING, Interface, PCWSTR, Result as WinResult, factory};
 
-use super::{MediaKey, NowPlaying, PinchEvent, apply_exif_orientation};
+use super::{MediaKey, NowPlaying, PinchEvent, apply_exif_orientation, valid_thumbnail_source};
 
 fn hwnd(window: &gpui::Window) -> Option<HWND> {
     match HasWindowHandle::window_handle(window).ok()?.as_raw() {
         RawWindowHandle::Win32(h) => Some(HWND(h.hwnd.get() as *mut _)),
         _ => None,
     }
+}
+
+pub(super) fn known_screenshot_dir() -> Option<PathBuf> {
+    use windows::Win32::{
+        Foundation::HANDLE,
+        System::Com::CoTaskMemFree,
+        UI::Shell::{FOLDERID_Desktop, FOLDERID_Pictures, KF_FLAG_DEFAULT, SHGetKnownFolderPath},
+    };
+
+    [FOLDERID_Pictures, FOLDERID_Desktop]
+        .into_iter()
+        .find_map(|id| unsafe {
+            let name = SHGetKnownFolderPath(&id, KF_FLAG_DEFAULT, HANDLE::default()).ok()?;
+            if name.is_null() {
+                return None;
+            }
+            let path = PathBuf::from(OsString::from_wide(name.as_wide()));
+            CoTaskMemFree(Some(name.0.cast()));
+            path.is_dir().then_some(path)
+        })
 }
 
 pub(crate) fn hide_traffic_lights(_window: &gpui::Window) {}
@@ -305,7 +326,7 @@ pub(super) fn decode_thumbnail_wic(path: &Path, max_dim: u32) -> Option<Arc<Rend
             let source: IWICBitmapSource = frame.cast().ok()?;
             let (mut sw, mut sh) = (0u32, 0u32);
             source.GetSize(&mut sw, &mut sh).ok()?;
-            if sw == 0 || sh == 0 {
+            if !valid_thumbnail_source(sw.into(), sh.into()) {
                 return None;
             }
             let long = sw.max(sh);
@@ -318,6 +339,22 @@ pub(super) fn decode_thumbnail_wic(path: &Path, max_dim: u32) -> Option<Arc<Rend
             } else {
                 (sw, sh)
             };
+            // Prefer a bounded embedded thumbnail when it has enough pixels
+            // for the request and preserves the source aspect ratio.
+            let (source, sw, sh) = frame
+                .GetThumbnail()
+                .ok()
+                .and_then(|thumbnail| {
+                    let (mut w, mut h) = (0u32, 0u32);
+                    thumbnail.GetSize(&mut w, &mut h).ok()?;
+                    if !valid_thumbnail_source(w.into(), h.into()) || w < dw || h < dh {
+                        return None;
+                    }
+                    let ratio_error = (i64::from(w) * i64::from(sh) - i64::from(h) * i64::from(sw))
+                        .unsigned_abs();
+                    (ratio_error <= u64::from(long)).then_some((thumbnail, w, h))
+                })
+                .unwrap_or((source, sw, sh));
             let scaled: IWICBitmapSource = if (dw, dh) != (sw, sh) {
                 let scaler = factory.CreateBitmapScaler().ok()?;
                 scaler
@@ -383,9 +420,14 @@ pub(crate) fn synth_mouse(
 pub(crate) fn begin_window_drag(window: &gpui::Window) {
     if let Some(hwnd) = hwnd(window) {
         unsafe {
-            // Only invoke `SC_DRAGMOVE` (`0xF012`) while the physical left mouse button is
-            // held down; otherwise `DefWindowProcW` enters modal keyboard-move mode.
-            if (GetAsyncKeyState(i32::from(VK_LBUTTON.0)) as u16 & 0x8000) == 0 {
+            // GetAsyncKeyState reports physical button state. Respect the
+            // primary-button mapping to avoid entering keyboard-move mode.
+            let primary = if GetSystemMetrics(SM_SWAPBUTTON) == 0 {
+                VK_LBUTTON
+            } else {
+                VK_RBUTTON
+            };
+            if (GetAsyncKeyState(i32::from(primary.0)) as u16 & 0x8000) == 0 {
                 return;
             }
             let _ = ReleaseCapture();
@@ -506,8 +548,10 @@ pub(crate) mod pipe {
     use windows_sys::Win32::Security::{
         GetTokenInformation, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER, TokenUser,
     };
+    #[cfg(any(debug_assertions, feature = "devtools"))]
+    use windows_sys::Win32::Storage::FileSystem::PIPE_ACCESS_INBOUND;
     use windows_sys::Win32::Storage::FileSystem::{
-        FILE_FLAG_FIRST_PIPE_INSTANCE, PIPE_ACCESS_INBOUND,
+        FILE_FLAG_FIRST_PIPE_INSTANCE, PIPE_ACCESS_DUPLEX,
     };
     use windows_sys::Win32::System::Pipes::{
         CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT,
@@ -573,7 +617,16 @@ pub(crate) mod pipe {
     /// Creates the first and only instance of an inbound, local-only byte pipe
     /// whose protected DACL grants access to the current token's user alone.
     /// `name` is NUL-terminated UTF-16.
+    #[cfg(any(debug_assertions, feature = "devtools"))]
     pub(crate) fn create_inbound(name: &[u16], in_buffer: u32) -> io::Result<File> {
+        create(name, PIPE_ACCESS_INBOUND, 0, in_buffer)
+    }
+
+    pub(crate) fn create_duplex(name: &[u16], in_buffer: u32) -> io::Result<File> {
+        create(name, PIPE_ACCESS_DUPLEX, 4096, in_buffer)
+    }
+
+    fn create(name: &[u16], access: u32, out_buffer: u32, in_buffer: u32) -> io::Result<File> {
         debug_assert_eq!(name.last(), Some(&0));
         let sid = current_user_sid()?;
         let sddl: Vec<u16> = format!("D:P(A;;GA;;;{sid})")
@@ -599,10 +652,10 @@ pub(crate) mod pipe {
             };
             let pipe = CreateNamedPipeW(
                 name.as_ptr(),
-                PIPE_ACCESS_INBOUND | FILE_FLAG_FIRST_PIPE_INSTANCE,
+                access | FILE_FLAG_FIRST_PIPE_INSTANCE,
                 PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
                 1,
-                0,
+                out_buffer,
                 in_buffer,
                 0,
                 &security,

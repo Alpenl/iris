@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use gpui::Context;
 use iris_api::HostEvent;
 use iris_core::library::{self, Kind, ScanResult};
-use iris_core::player::{self, Command, SessionEvent, TrackKind};
+use iris_core::player::{self, Command, SessionEvent, SessionUpdate, TrackKind};
 use iris_core::settings::{OnEof, PhotoDefault};
 
 use super::IrisWindow;
@@ -43,6 +43,16 @@ impl PendingSubtitles {
             Vec::new()
         }
     }
+
+    pub(super) fn clear(&mut self) {
+        self.paths.clear();
+    }
+
+    pub(super) fn advance(&mut self, from: u64, to: u64) {
+        if self.generation == from {
+            self.generation = to;
+        }
+    }
 }
 
 fn split_open_paths(mut paths: Vec<PathBuf>) -> (Vec<PathBuf>, Vec<PathBuf>) {
@@ -54,7 +64,7 @@ fn split_open_paths(mut paths: Vec<PathBuf>) -> (Vec<PathBuf>, Vec<PathBuf>) {
 }
 
 impl IrisWindow {
-    pub(super) fn on_events(&mut self, batch: Vec<SessionEvent>, cx: &mut Context<Self>) {
+    pub(super) fn on_events(&mut self, batch: Vec<SessionUpdate>, cx: &mut Context<Self>) {
         let was_ended = self.active().session.state().ended;
         let mut need_notify = false;
         let mut saw_position: Option<f64> = None;
@@ -64,10 +74,14 @@ impl IrisWindow {
         let mut saw_ended_now = false;
         let mut saw_audio = false;
         let mut saw_sub = false;
+        let mut saw_volume = false;
+        let mut saw_cache_duration = false;
         let mut last_error: Option<i32> = None;
 
-        for ev in &batch {
-            self.active_mut().session.apply(ev);
+        for update in batch {
+            let Some(ev) = self.active_mut().session.apply_update(&update) else {
+                continue;
+            };
             match ev {
                 SessionEvent::Position(t) => saw_position = Some(*t),
                 SessionEvent::Duration(_) => {
@@ -87,10 +101,15 @@ impl IrisWindow {
                     saw_sub = true;
                     need_notify = true;
                 }
+                SessionEvent::Volume(_) => {
+                    saw_volume = true;
+                    need_notify = true;
+                }
                 SessionEvent::Loaded | SessionEvent::Reconfigured => {
                     saw_loaded_or_reconfig = true;
                     need_notify = true;
                 }
+                SessionEvent::CacheDuration(_) => saw_cache_duration = true,
                 SessionEvent::Error(code) => last_error = Some(*code),
                 _ => need_notify = true,
             }
@@ -98,7 +117,7 @@ impl IrisWindow {
         self.active_mut().session.flush_deferred();
         if saw_loaded_or_reconfig
             && self.active().session.state().loaded
-            && self.active().pending_path.is_none()
+            && !self.media_load_pending()
         {
             self.flush_pending_subtitles(cx);
         }
@@ -160,12 +179,42 @@ impl IrisWindow {
                 }
             }
         }
+        let (duration, paused, ended, cache_end) = {
+            let state = self.active().session.state();
+            let buffer = (!state.is_live && state.cache_duration > 0.)
+                .then_some(state.time_pos + state.cache_duration);
+            (state.duration, state.paused, state.ended, buffer)
+        };
+        if let (Some(position), Some(ratio)) = (saw_position, self.chrome.scrub.seek_preview_ratio)
+            && !self.chrome.scrub.seeking
+            && (position - f64::from(ratio) * duration).abs() <= 0.5
+        {
+            self.chrome.scrub.seek_preview_ratio = None;
+            self.chrome.scrub.seek_preview_timeout = None;
+            need_notify = true;
+        }
+        if saw_cache_duration && self.chrome_shown() && !paused && duration > 0. {
+            let width = self
+                .chrome
+                .probes
+                .progress_bounds
+                .get()
+                .map_or(800., |bounds| f64::from(f32::from(bounds.size.width)));
+            let ratio = cache_end.map_or(0., |end| (end / duration).clamp(0., 1.));
+            let cache_px = (ratio * width * self.chrome.last_scale).round() as i32;
+            if cache_px != self.chrome.last_render_cache_px
+                && self.chrome.last_cache_tick.elapsed() >= MIN_BAR_TICK_INTERVAL
+            {
+                self.chrome.last_render_cache_px = cache_px;
+                self.chrome.last_cache_tick = Instant::now();
+                need_notify = true;
+            }
+        }
 
-        let state = self.active().session.state();
         let force_now_playing = saw_pause_or_speed
             || saw_loaded_or_reconfig
-            || was_ended != state.ended
-            || (state.paused && (saw_position.is_some() || saw_duration));
+            || was_ended != ended
+            || (paused && (saw_position.is_some() || saw_duration));
         if force_now_playing || saw_position.is_some() || saw_duration {
             self.sync_now_playing(force_now_playing);
         }
@@ -177,7 +226,11 @@ impl IrisWindow {
             }
         }
 
-        if saw_ended_now && !was_ended && self.active().session.state().ended {
+        if saw_ended_now
+            && !was_ended
+            && !self.media_load_pending()
+            && self.active().session.state().ended
+        {
             self.save_progress_sync();
             if matches!(
                 self.active().session.kind(),
@@ -213,7 +266,23 @@ impl IrisWindow {
             need_notify = false;
         }
 
+        if saw_volume
+            && self
+                .active_mut()
+                .announce_volume
+                .take()
+                .is_some_and(|requested| requested.elapsed() < Duration::from_secs(1))
+        {
+            let volume = self.active().session.state().volume;
+            self.show_osd(format!("音量 · {volume:.0}%"), cx);
+            need_notify = false;
+        }
+
         if let Some(code) = last_error {
+            if !self.media_load_pending() {
+                self.active_mut().pending_subtitles.clear();
+            }
+            self.sync_now_playing(true);
             self.show_toast(
                 format!("{}（错误 {code}）", player::friendly_error(code)),
                 cx,
@@ -261,9 +330,16 @@ impl IrisWindow {
             let vp = self.active_mut();
             vp.pending_photo_actual = is_photo_actual;
             vp.cached_stats = None;
+            vp.pending_win_drag_origin = None;
+            vp.pending_click_origin = None;
         }
         self.chrome.last_render_sec = -1;
         self.chrome.last_render_bar_px = -1;
+        self.chrome.last_render_cache_px = -1;
+        self.chrome.scrub.seeking = false;
+        self.chrome.scrub.seek_preview_ratio = None;
+        self.chrome.scrub.seek_preview_timeout = None;
+        self.chrome.scrub.timeline_hover = false;
         self.rebuild_directory_rows();
         self.scroll_directory_to_current();
         self.ensure_filmstrip_thumbnails(cx);
@@ -285,11 +361,23 @@ impl IrisWindow {
         if subtitles.is_empty() {
             return;
         }
+        let pending = self.media_load_pending();
         let vp = self.active_mut();
         vp.pending_subtitles.add(vp.load_generation, subtitles);
-        if vp.pending_path.is_none() && (vp.session.state().loaded || vp.session.kind().is_none()) {
+        if !pending && (vp.session.state().loaded || vp.session.kind().is_none()) {
             self.flush_pending_subtitles(cx);
         }
+    }
+
+    pub(super) fn media_load_pending(&self) -> bool {
+        self.active().pending_path.is_some()
+            || self.catalog.remote_load.is_some()
+            || self.catalog.pending_source.as_ref().is_some_and(|request| {
+                matches!(
+                    request.operation,
+                    super::state::SourceOperation::Resolve { .. }
+                )
+            })
     }
 
     fn flush_pending_subtitles(&mut self, cx: &mut Context<Self>) {
@@ -330,12 +418,11 @@ impl IrisWindow {
         self.overlays.close_menus();
         self.catalog.active_source = ActiveSource::Local;
         self.catalog.active_stream_meta = None;
-        let safe_path = library::safe_resolve_path(path);
         let cached = {
             let session = &self.active().session;
             session
                 .folder()
-                .filter(|folder| safe_path.parent() == Some(*folder))
+                .filter(|folder| path.parent() == Some(*folder))
                 .map(|folder| {
                     (
                         folder.to_path_buf(),
@@ -349,7 +436,7 @@ impl IrisWindow {
         let generation = {
             let vp = self.active_mut();
             vp.load_generation += 1;
-            vp.pending_path = Some(safe_path);
+            vp.pending_path = Some(path.to_path_buf());
             vp.loading_visible = false;
             vp.load_generation
         };
@@ -400,6 +487,7 @@ impl IrisWindow {
                     }
                     Err(e) => {
                         this.active_mut().pending_subtitles.paths.clear();
+                        this.sync_now_playing(true);
                         this.show_toast(format!("无法打开 · {e}"), cx);
                     }
                 }
@@ -419,7 +507,7 @@ impl IrisWindow {
         let generation = {
             let vp = self.active_mut();
             vp.load_generation += 1;
-            vp.pending_path = paths.first().map(|p| library::safe_resolve_path(p));
+            vp.pending_path = paths.first().cloned();
             vp.loading_visible = false;
             vp.load_generation
         };
@@ -460,6 +548,7 @@ impl IrisWindow {
                         this.show_toast(format!("已加入播放队列 · {count} 个文件"), cx);
                     }
                     Err(e) => {
+                        this.sync_now_playing(true);
                         this.active_mut().pending_subtitles.paths.clear();
                         this.show_toast(format!("无法打开 · {e}"), cx);
                     }
@@ -473,18 +562,15 @@ impl IrisWindow {
 
     pub(super) fn ensure_filmstrip_thumbnails(&mut self, cx: &mut Context<Self>) {
         if self.active().session.kind() != Some(Kind::Photo) || !self.settings.photo_filmstrip {
+            self.catalog.thumbs.enqueue_window(Vec::new());
             return;
         }
         let photos = &self.catalog.photo_paths;
         if photos.len() < 2 {
+            self.catalog.thumbs.enqueue_window(Vec::new());
             return;
         }
-        let cur_ix = self
-            .active()
-            .session
-            .current()
-            .and_then(|p| photos.iter().position(|x| x == p))
-            .unwrap_or(0);
+        let cur_ix = self.catalog.filmstrip_index;
         let mut prioritized = Vec::with_capacity(13);
         prioritized.push(photos[cur_ix].clone());
         for d in 1..=6usize {
@@ -508,12 +594,11 @@ impl IrisWindow {
             cx.spawn(async move |this, cx| {
                 let decoded = task.await;
                 let _ = this.update(cx, |this, cx| {
-                    let keep = this.catalog.thumbs.generation() == batch_gen || decoded.is_some();
-                    this.catalog
-                        .thumbs
-                        .finish(path, if keep { decoded } else { None });
+                    let changed = this.catalog.thumbs.finish(batch_gen, path, decoded);
                     this.pump_thumbnail_queue(cx);
-                    cx.notify();
+                    if changed && this.chrome_shown() && this.settings.photo_filmstrip {
+                        cx.notify();
+                    }
                 });
             })
             .detach();
@@ -530,7 +615,7 @@ impl IrisWindow {
         };
         let session = &self.viewports[0].session;
         let media = match session.kind() {
-            Some(kind @ (Kind::Video | Kind::Audio)) => {
+            Some(kind @ (Kind::Video | Kind::Audio)) if session.state().loaded => {
                 let title = session
                     .current_title()
                     .map(std::borrow::Cow::Borrowed)
@@ -577,5 +662,9 @@ mod tests {
         );
         pending.add(3, vec!["superseded.srt".into()]);
         assert!(pending.take(4).is_empty());
+
+        pending.add(5, vec!["while-resolving.srt".into()]);
+        pending.advance(5, 6);
+        assert_eq!(pending.take(6), [PathBuf::from("while-resolving.srt")]);
     }
 }

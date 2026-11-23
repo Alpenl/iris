@@ -34,16 +34,16 @@ use std::time::{Duration, Instant};
 use futures::StreamExt;
 use gpui::{
     Context, CursorStyle, ExternalPaths, FocusHandle, InteractiveElement, IntoElement, KeyContext,
-    MouseButton, ParentElement, Point, Render, Styled, Subscription, Task, Window, div,
-    prelude::FluentBuilder, px,
+    ParentElement, Point, Render, Styled, Subscription, Task, Window, div, prelude::FluentBuilder,
+    px,
 };
 use iris_core::catalog::PlayQueue;
 use iris_core::input::{self, PointerCommand, PointerInput};
 use iris_core::keymap::Keymap;
 use iris_core::library::Kind;
-use iris_core::player::{Command, Session};
+use iris_core::player::{Command, MAX_SPEED, MIN_SPEED, Session};
 use iris_core::plugin::PluginManager;
-use iris_core::preset::{PresetManager, PresetRuntime};
+use iris_core::preset::{PresetManager, PresetRuntime, SidebarMode};
 use iris_core::settings::{Settings, Side};
 use iris_core::store::Store;
 use iris_core::vfs::LocationStore;
@@ -153,7 +153,7 @@ impl IrisWindow {
         let text_inputs = TextInputHub::new(cx);
         focus.focus(window);
 
-        let mut rx = session.events();
+        let mut rx = session.events().expect("new session event receiver");
         let events = cx.spawn(async move |this, cx| {
             while let Some(first) = rx.next().await {
                 let mut batch = vec![first];
@@ -319,12 +319,8 @@ impl IrisWindow {
         for (pid, cmd_id) in init_plugin_cmds {
             this.invoke_plugin_command(&pid, &cmd_id, window, cx);
         }
-        if this
-            .text_inputs
-            .sync_plugin_modal(this.plugins.active_modal())
-        {
-            this.text_inputs.form_focus.focus(window);
-        }
+        this.overlays.plugin_modal_focus_pending = this.plugins.active_modal().is_some();
+        this.sync_plugin_modal_focus(window);
         this.sync_theme_tokens(cx);
         this.rebuild_directory_rows();
         this.active().session.apply_settings(&this.settings);
@@ -373,13 +369,17 @@ impl IrisWindow {
         self.save_progress_sync();
         let (vol, spd) = {
             let st = self.active().session.state();
-            (st.volume.clamp(0., 100.), st.speed.clamp(0.25, 4.))
+            (
+                st.volume.clamp(0., 100.),
+                st.speed.clamp(MIN_SPEED, MAX_SPEED),
+            )
         };
         self.settings.volume = Some(vol);
         if self.settings.remember_speed {
             self.settings.speed = Some(spd);
         }
         if self.settings.remember_window_size
+            && self.chrome.pending_window_size.is_none()
             && let Some((w, h)) = self.chrome.last_window_size
         {
             self.settings.window_width = Some(w);
@@ -401,6 +401,40 @@ impl Render for IrisWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.chrome.render_count += 1;
         self.sync_fullscreen(window, cx);
+        self.sync_plugin_modal_focus(window);
+        self.scan_visible_favorites(cx);
+        let modal_visible = self.plugins.active_modal().is_some();
+        let files_visible = self.sidebar_is_visible()
+            && self.catalog.sidebar_mode == SidebarMode::Files
+            && !modal_visible
+            && !self.overlays.has_menu_or_modal();
+        let sidebar_forms_visible =
+            self.sidebar_is_visible() && self.catalog.sidebar_mode == SidebarMode::Plugins;
+        let form_visible = self
+            .text_inputs
+            .active_form_key
+            .as_deref()
+            .is_some_and(|key| {
+                if key.starts_with("modal:") {
+                    modal_visible
+                } else if key.starts_with("sb:") {
+                    sidebar_forms_visible && !modal_visible && !self.overlays.has_menu_or_modal()
+                } else {
+                    self.overlays.dialog.is_some() && !modal_visible
+                }
+            });
+        let recorder_focused = self.text_inputs.recorder_focus.is_focused(window);
+        let recording = self.overlays.is_recording(recorder_focused);
+        if !recording {
+            self.overlays.recording_shortcut = None;
+        }
+        if (!files_visible && self.text_inputs.search_focus.is_focused(window))
+            || (!self.overlays.palette_open && self.text_inputs.palette_focus.is_focused(window))
+            || (!form_visible && self.text_inputs.form_focus.is_focused(window))
+            || (!recording && recorder_focused)
+        {
+            self.focus.focus(window);
+        }
         let t = ThemeTokens::of(cx);
         let fullscreen = self.chrome.fullscreen;
         let hide_tb = self.effective_hide_titlebar();
@@ -415,8 +449,7 @@ impl Render for IrisWindow {
         }
         if self.active().pending_photo_actual
             && self.active().session.kind() == Some(Kind::Photo)
-            && self.active().session.state().video_size.0 > 0
-            && self.active().rect.get().is_some()
+            && self.image_geometry_ready()
         {
             self.active_mut().pending_photo_actual = false;
             let (viewport, media) = self.image_geometry();
@@ -448,14 +481,14 @@ impl Render for IrisWindow {
         self.active_mut().session.subtitle_inset(inset, height);
 
         let mut root_ctx = KeyContext::default();
-        root_ctx.add("Workspace");
-        if self.overlays.is_text_input_active(
-            &self.text_inputs,
-            self.text_inputs.search_focus.is_focused(window),
-            self.text_inputs.palette_focus.is_focused(window),
-            self.text_inputs.form_focus.is_focused(window),
-        ) {
+        if recording {
+            root_ctx.add("ShortcutRecorder");
             root_ctx.add("TextInput");
+        } else {
+            root_ctx.add("Workspace");
+            if self.text_inputs.is_any_focused(window) {
+                root_ctx.add("TextInput");
+            }
         }
 
         let show_overlay_tb = !fullscreen
@@ -466,12 +499,10 @@ impl Render for IrisWindow {
             .id("root")
             .relative()
             .key_context(root_ctx)
-            .capture_any_mouse_up(cx.listener(|this, _, window, _| {
-                if !this.text_inputs.is_any_focused(window) {
-                    this.focus.focus(window);
-                }
-            }))
             .on_any_mouse_down(cx.listener(|this, _, window, _| {
+                if this.overlays.recording_shortcut.is_some() {
+                    return;
+                }
                 this.text_inputs.active_form_key = None;
                 this.focus.focus(window);
             }))
@@ -485,8 +516,6 @@ impl Render for IrisWindow {
             .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| {
                 this.open_paths(paths.paths().to_vec(), cx);
             }))
-            .on_mouse_move(cx.listener(Self::on_root_mouse_move))
-            .on_mouse_up(MouseButton::Left, cx.listener(Self::on_root_mouse_up))
             .when(self.chrome.resizing_dir.is_some(), |d| {
                 d.cursor(CursorStyle::ResizeLeftRight)
             })
@@ -515,16 +544,6 @@ impl Render for IrisWindow {
                     row.child(player).children(sidebar)
                 }
             })
-            .when(show_overlay_tb, |d| {
-                d.child(
-                    div()
-                        .absolute()
-                        .top_0()
-                        .left_0()
-                        .right_0()
-                        .child(self.render_titlebar(true, cx)),
-                )
-            })
             .when(self.overlays.settings_open, |d| {
                 d.child(self.render_settings_modal(window, cx))
             })
@@ -535,6 +554,17 @@ impl Render for IrisWindow {
             .children(self.render_plugin_modal(window, cx))
             .when_some(self.overlays.context_menu.clone(), |d, menu| {
                 d.child(self.render_context_menu(&menu, window, cx))
+            })
+            .when(show_overlay_tb, |d| {
+                d.child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .right_0()
+                        .occlude()
+                        .child(self.render_titlebar(true, cx)),
+                )
             })
     }
 }

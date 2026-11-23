@@ -123,9 +123,17 @@ def parse_toggle(val: str | None, current: bool) -> bool:
     return not current
 
 
+def finite_number(value: Any, fallback: float) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return fallback
+    return parsed if math.isfinite(parsed) else fallback
+
+
 def fmt_smpte(seconds: float) -> str:
     """Formats playback time as SMPTE-style `HH:MM:SS.d`."""
-    clamped = max(0.0, float(seconds))
+    clamped = max(0.0, finite_number(seconds, 0.0))
     whole = int(clamped)
     tenths = int((clamped - whole) * 10.0) % 10
     h, rem = divmod(whole, 3600)
@@ -421,19 +429,16 @@ class CinemaUiPlugin:
         saved_tag = str(state.get("hud_tag") or "").strip()
         if saved_tag:
             self.hud_tag = saved_tag[:24]
-        try:
-            if "hud_opacity" in state:
-                self.hud_opacity = max(30.0, min(100.0, float(state["hud_opacity"])))
-        except (TypeError, ValueError):
-            pass
+        opacity = finite_number(state.get("hud_opacity"), self.hud_opacity)
+        self.hud_opacity = max(30.0, min(100.0, opacity))
 
     def update_from_snapshot(self, snap: dict[str, Any]) -> None:
         if not snap:
             return
-        self.position = float(snap.get("position") or 0.0)
-        self.duration = float(snap.get("duration") or 0.0)
+        self.position = finite_number(snap.get("position"), 0.0)
+        self.duration = finite_number(snap.get("duration"), 0.0)
         self.paused = bool(snap.get("paused", True))
-        self.speed = float(snap.get("speed") or 1.0)
+        self.speed = finite_number(snap.get("speed"), 1.0)
         self.title = str(snap.get("title") or "")
 
     def apply_skin(self, target_id: str) -> list[dict[str, Any]]:
@@ -500,11 +505,8 @@ class CinemaUiPlugin:
             return cmds
 
         if act in ("set_hud_opacity", "hud-opacity-slider"):
-            try:
-                val = float(value or self.hud_opacity)
-            except (TypeError, ValueError):
-                return []
-            self.hud_opacity = max(30.0, min(100.0, round(val)))
+            val = finite_number(value, self.hud_opacity)
+            self.hud_opacity = round(max(30.0, min(100.0, val)))
             self.last_hud_bucket = (int(self.position * 10.0), self.paused)
             return [
                 {
@@ -567,8 +569,8 @@ class CinemaUiPlugin:
 
         if kind == "tick":
             was_paused = self.paused
-            self.position = float(ev.get("position") or 0.0)
-            self.duration = float(ev.get("duration") or 0.0)
+            self.position = finite_number(ev.get("position"), 0.0)
+            self.duration = finite_number(ev.get("duration"), 0.0)
             self.paused = bool(ev.get("paused", True))
             if not self.hud_enabled:
                 return []

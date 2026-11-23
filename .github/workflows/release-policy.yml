@@ -19,26 +19,20 @@ jobs:
         run: |
           set -euo pipefail
           python - <<'PY'
-          import ast, json, pathlib, re
+          import ast, pathlib, runpy, json
           root = pathlib.Path('scripts/release')
           for path in root.glob('*.py'):
-              ast.parse(path.read_text(), filename=str(path))
-          lock = json.loads((root / 'sources.lock.json').read_text())
-          for name, source in lock['sources'].items():
-              assert re.fullmatch('[a-f0-9]{40}', source['revision']), name
-              assert re.fullmatch('[a-f0-9]{64}', source['sha256']), name
-              assert source['url'].endswith('/' + source['revision']), name
-              assert not re.search(r'(?<!L)GPL|nonfree', source['license'], re.I), name
-          for key in ('windows_toolchain', 'linux_windows_toolchain'):
-              assert re.fullmatch('[a-f0-9]{64}', lock[key]['sha256'])
+              ast.parse(path.read_text(encoding='utf-8'), filename=str(path))
+          recipe = runpy.run_path(str(root / 'build-media.py'))
+          recipe['validate_lock'](json.loads((root / 'sources.lock.json').read_text(encoding='utf-8')))
           assert pathlib.Path('LICENSE-MIT').is_file()
           assert pathlib.Path('LICENSE-APACHE').is_file()
           PY
-      - name: Enforce Rust license allowlist
+      - name: Check Rust advisories, licenses, bans and sources
         shell: bash
         run: |
           set -euo pipefail
           rustup toolchain install 1.100.0 --profile minimal
           rustup default 1.100.0
-          cargo install cargo-deny --version 0.18.3 --locked
-          cargo deny --locked check licenses bans sources
+          cargo install cargo-deny --version 0.22.0 --locked
+          cargo deny --locked check advisories licenses bans sources

@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::fs_util;
 use crate::library::{SortBy, SortOrder};
+use crate::player::{MAX_SPEED, MIN_SPEED};
 
 pub const DEFAULT_DIRECTORY_WIDTH: f32 = 288.;
 pub const MIN_DIRECTORY_WIDTH: f32 = 220.;
@@ -261,7 +262,7 @@ impl Settings {
                     s.speed = v
                         .parse::<f64>()
                         .ok()
-                        .filter(|v| v.is_finite() && (0.1..=8.).contains(v));
+                        .filter(|v| v.is_finite() && (MIN_SPEED..=MAX_SPEED).contains(v));
                 }
                 ("remember_speed", v) => {
                     if let Some(b) = parse_bool(v) {
@@ -337,12 +338,8 @@ impl Settings {
                     }
                 }
                 ("disabled_plugins", v) => {
-                    s.disabled_plugins = v
-                        .split(',')
-                        .map(str::trim)
-                        .filter(|id| !id.is_empty())
-                        .map(String::from)
-                        .collect();
+                    s.disabled_plugins =
+                        v.split(',').filter_map(list_id).map(String::from).collect();
                 }
                 ("theme_id", v) => {
                     let clean = sanitize_line_value(v);
@@ -372,12 +369,8 @@ impl Settings {
                     }
                 }
                 ("hidden_dock_buttons", v) => {
-                    s.hidden_dock_buttons = v
-                        .split(',')
-                        .map(str::trim)
-                        .filter(|id| !id.is_empty())
-                        .map(String::from)
-                        .collect();
+                    s.hidden_dock_buttons =
+                        v.split(',').filter_map(list_id).map(String::from).collect();
                 }
                 ("audio_device", v) => {
                     let clean = sanitize_line_value(v);
@@ -459,7 +452,7 @@ impl Settings {
         if let Some(v) = self.speed
             && v.is_finite()
         {
-            text.push_str(&format!("speed = {:.2}\n", v.clamp(0.1, 8.)));
+            text.push_str(&format!("speed = {:.2}\n", v.clamp(MIN_SPEED, MAX_SPEED)));
         }
         text.push_str(&format!("remember_speed = {}\n", self.remember_speed));
         text.push_str(&format!("on_eof = {on_eof}\n"));
@@ -493,12 +486,7 @@ impl Settings {
         text.push_str(&format!("screenshot_subs = {}\n", self.screenshot_subs));
         text.push_str(&format!("always_on_top = {}\n", self.always_on_top));
         text.push_str(&format!("photo_filmstrip = {}\n", self.photo_filmstrip));
-        if !self.disabled_plugins.is_empty() {
-            text.push_str(&format!(
-                "disabled_plugins = {}\n",
-                self.disabled_plugins.join(",")
-            ));
-        }
+        write_id_list(&mut text, "disabled_plugins", &self.disabled_plugins);
         let theme_id = sanitize_line_value(&self.theme_id);
         text.push_str(&format!(
             "theme_id = {}\n",
@@ -523,12 +511,7 @@ impl Settings {
             self.show_titlebar_meta
         ));
         text.push_str(&format!("compact_controls = {}\n", self.compact_controls));
-        if !self.hidden_dock_buttons.is_empty() {
-            text.push_str(&format!(
-                "hidden_dock_buttons = {}\n",
-                self.hidden_dock_buttons.join(",")
-            ));
-        }
+        write_id_list(&mut text, "hidden_dock_buttons", &self.hidden_dock_buttons);
         let audio_device = sanitize_line_value(&self.audio_device);
         text.push_str(&format!(
             "audio_device = {}\n",
@@ -540,6 +523,28 @@ impl Settings {
         ));
 
         fs_util::atomic_write(path, &text)
+    }
+}
+
+fn list_id(id: &str) -> Option<&str> {
+    if id.contains(',') || id.chars().any(char::is_control) {
+        return None;
+    }
+    let id = id.trim();
+    (!id.is_empty()).then_some(id)
+}
+
+fn write_id_list(text: &mut String, key: &str, ids: &[String]) {
+    let mut ids = ids.iter().filter_map(|id| list_id(id));
+    if let Some(first) = ids.next() {
+        text.push_str(key);
+        text.push_str(" = ");
+        text.push_str(first);
+        for id in ids {
+            text.push(',');
+            text.push_str(id);
+        }
+        text.push('\n');
     }
 }
 
@@ -641,6 +646,33 @@ mod tests {
             r#"["right","loop","auto_safe","zh_hant","volume","actual"]"#
         );
 
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn list_entries_cannot_create_new_ids_or_settings() {
+        let dir =
+            std::env::temp_dir().join(format!("iris-settings-list-test-{}", std::process::id()));
+        let file = dir.join("settings.conf");
+        let settings = Settings {
+            disabled_plugins: vec![
+                "good.id".into(),
+                "one,two".into(),
+                "bad\nvolume = 17".into(),
+            ],
+            hidden_dock_buttons: vec![
+                "loop".into(),
+                "screenshot,share".into(),
+                "x\r\nalways_on_top = true".into(),
+            ],
+            ..Settings::default()
+        };
+        settings.save_to(&file).unwrap();
+        let loaded = Settings::load_from(&file);
+        assert_eq!(loaded.disabled_plugins, ["good.id"]);
+        assert_eq!(loaded.hidden_dock_buttons, ["loop"]);
+        assert_eq!(loaded.volume, settings.volume);
+        assert_eq!(loaded.always_on_top, settings.always_on_top);
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

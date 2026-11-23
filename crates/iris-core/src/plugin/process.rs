@@ -2,6 +2,8 @@
 
 use std::cell::Cell;
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
 use std::path::Path;
 #[cfg(unix)]
 use std::process::{Child, Stdio};
@@ -23,9 +25,10 @@ use windows::Child;
 /// Maximum JSON line accepted from an external plugin (2 MiB, fits large `ProvideSourcePage` payloads).
 pub(super) const MAX_LINE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_STDIN_QUEUE: usize = 64;
-const MAX_STDOUT_QUEUE: usize = 256;
+const MAX_STDOUT_QUEUE: usize = 8;
 pub(super) const MAX_DRAIN_PER_POLL: usize = 256;
 const SHUTDOWN_GRACE: Duration = Duration::from_millis(150);
+const STATUS_INTERVAL: Duration = Duration::from_millis(15);
 const MAX_STDERR_LINES: usize = 100;
 const MAX_STDERR_LINE_BYTES: usize = 4 * 1024;
 
@@ -91,7 +94,12 @@ pub(super) fn read_bounded_lines(
     let mut discarding = false;
     loop {
         let available = match reader.fill_buf() {
-            Ok([]) => break,
+            Ok([]) => {
+                if !discarding && !buf.is_empty() {
+                    on_line(&buf);
+                }
+                break;
+            }
             Ok(b) => b,
             Err(e) if e.kind() == ErrorKind::Interrupted => continue,
             Err(_) => break,
@@ -123,16 +131,19 @@ pub(super) fn read_bounded_lines(
 }
 
 pub(super) struct ExternalProcess {
-    child: Child,
+    stop_tx: Option<mpsc::Sender<()>>,
+    stopped: Receiver<()>,
+    exit_rx: Receiver<(Instant, String)>,
+    exit: Option<(Instant, String)>,
+    wake: Option<WakeSignal>,
     stdin_tx: Option<SyncSender<(Arc<String>, bool)>>,
     tick_pending: Arc<AtomicBool>,
     rx: Receiver<Vec<HostCommand>>,
     disconnected: bool,
-    stop_deadline: Option<Instant>,
 }
 
 #[cfg(unix)]
-fn child_status(child: &mut Child) -> std::io::Result<Option<ExitStatus>> {
+fn child_status(child: &Child) -> std::io::Result<Option<ExitStatus>> {
     use std::os::unix::process::ExitStatusExt;
     // Keep the leader waitable until the group has been signalled. Reaping it early
     // could let the OS recycle its process-group ID before shutdown.
@@ -161,7 +172,7 @@ fn child_status(child: &mut Child) -> std::io::Result<Option<ExitStatus>> {
 }
 
 #[cfg(windows)]
-fn child_status(child: &mut Child) -> std::io::Result<Option<ExitStatus>> {
+fn child_status(child: &Child) -> std::io::Result<Option<ExitStatus>> {
     child.status()
 }
 
@@ -173,6 +184,142 @@ fn exit_reason(status: ExitStatus) -> String {
         );
     }
     format!("进程已退出 ({status})")
+}
+
+// Unix process groups are cooperative lifecycle management. If a helper leaves
+// the group while retaining a pipe, the host still needs to release its own I/O.
+#[cfg(unix)]
+struct CancellablePipe<T> {
+    pipe: T,
+    cancelled: Arc<AtomicBool>,
+}
+
+#[cfg(unix)]
+impl<T: AsRawFd> CancellablePipe<T> {
+    fn new(pipe: T, cancelled: &Arc<AtomicBool>) -> std::io::Result<Self> {
+        let fd = pipe.as_raw_fd();
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags == -1 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(Self {
+            pipe,
+            cancelled: Arc::clone(cancelled),
+        })
+    }
+
+    fn io(
+        &mut self,
+        events: libc::c_short,
+        mut f: impl FnMut(&mut T) -> std::io::Result<usize>,
+    ) -> std::io::Result<usize> {
+        let mut poll = libc::pollfd {
+            fd: self.pipe.as_raw_fd(),
+            events,
+            revents: 0,
+        };
+        while !self.cancelled.load(Ordering::Acquire) {
+            match f(&mut self.pipe) {
+                Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                    if unsafe { libc::poll(&mut poll, 1, STATUS_INTERVAL.as_millis() as i32) } < 0 {
+                        let e = std::io::Error::last_os_error();
+                        if e.kind() != ErrorKind::Interrupted {
+                            return Err(e);
+                        }
+                    }
+                }
+                result => return result,
+            }
+        }
+        Err(ErrorKind::BrokenPipe.into())
+    }
+}
+
+#[cfg(unix)]
+impl<T: Read + AsRawFd> Read for CancellablePipe<T> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.io(libc::POLLIN, |pipe| pipe.read(buf))
+    }
+}
+
+#[cfg(unix)]
+impl<T: Write + AsRawFd> Write for CancellablePipe<T> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.io(libc::POLLOUT, |pipe| pipe.write(buf))
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.pipe.flush()
+    }
+}
+
+fn terminate_group(child: &mut Child) {
+    #[cfg(unix)]
+    {
+        // Signal while the leader still owns its PID, before reaping it.
+        unsafe { libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL) };
+        let _ = child.kill();
+    }
+    #[cfg(windows)]
+    child.close_job();
+}
+
+fn supervise(
+    mut child: Child,
+    stop: Receiver<()>,
+    stopped: mpsc::Sender<()>,
+    exit: mpsc::Sender<(Instant, String)>,
+    pipe_closed: &AtomicBool,
+    #[cfg(unix)] cancelled: &AtomicBool,
+    wake: Option<WakeSignal>,
+) {
+    let mut shutdown_at = None;
+    let mut closed_at = None;
+    let reason = loop {
+        match child_status(&child) {
+            Ok(Some(status)) => break Some(exit_reason(status)),
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(e) => break Some(format!("进程状态异常: {e}")),
+            Ok(None) => {}
+        }
+        let now = Instant::now();
+        if shutdown_at.is_some_and(|when| now >= when) {
+            break None;
+        }
+        if pipe_closed.load(Ordering::Acquire)
+            && now >= *closed_at.get_or_insert(now + SHUTDOWN_GRACE)
+        {
+            break Some("插件通信通道已关闭".into());
+        }
+        if shutdown_at.is_some() {
+            std::thread::sleep(STATUS_INTERVAL);
+        } else if stop
+            .recv_timeout(STATUS_INTERVAL)
+            .is_err_and(|e| e == mpsc::RecvTimeoutError::Disconnected)
+        {
+            shutdown_at = Some(Instant::now() + SHUTDOWN_GRACE);
+        }
+    };
+    terminate_group(&mut child);
+    let _ = stopped.send(());
+    if let Some(reason) = reason {
+        let deadline = Instant::now() + SHUTDOWN_GRACE;
+        let _ = exit.send((deadline, reason));
+        if let Some(w) = &wake {
+            w.notify();
+        }
+        // An escaped helper may hold stdout open. Give the reader time to deliver
+        // queued output, then wake the UI so it can retire the dead leader anyway.
+        if let Some(w) = wake {
+            std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
+            w.notify();
+        }
+    }
+    #[cfg(unix)]
+    cancelled.store(true, Ordering::Release);
+    #[cfg(unix)]
+    let _ = child.wait();
 }
 
 impl ExternalProcess {
@@ -216,11 +363,12 @@ impl ExternalProcess {
             ProcessCommand::new(&canonical_entry)
         };
         cmd.args(&manifest.args).current_dir(&canonical_dir);
+        cmd.env_remove("IRIS_CONTROL");
         #[cfg(windows)]
         let (child, mut stdin, stdout, stderr) =
             windows::spawn(&cmd).map_err(|e| format!("plugin job launch failed: {e}"))?;
         #[cfg(unix)]
-        let (child, mut stdin, stdout, stderr) = {
+        let (child, stdin, stdout, stderr) = {
             use std::os::unix::process::CommandExt;
             let mut child = cmd
                 .stdin(Stdio::piped())
@@ -243,15 +391,62 @@ impl ExternalProcess {
             (child, stdin, stdout, stderr)
         };
 
+        let pipe_closed = Arc::new(AtomicBool::new(false));
+        let (child_tx, child_rx) = mpsc::channel();
+        let (stop_tx, stop_rx) = mpsc::channel();
+        let (stopped_tx, stopped) = mpsc::channel();
+        let (exit_tx, exit_rx) = mpsc::channel();
+        let supervisor_wake = wake.clone();
+        let supervisor_pipe = Arc::clone(&pipe_closed);
+        #[cfg(unix)]
+        let cancelled = Arc::new(AtomicBool::new(false));
+        #[cfg(unix)]
+        let supervisor_cancel = Arc::clone(&cancelled);
+        if let Err(e) = std::thread::Builder::new()
+            .name("iris-plugin-supervisor".into())
+            .spawn(move || {
+                if let Ok(child) = child_rx.recv() {
+                    supervise(
+                        child,
+                        stop_rx,
+                        stopped_tx,
+                        exit_tx,
+                        &supervisor_pipe,
+                        #[cfg(unix)]
+                        &supervisor_cancel,
+                        supervisor_wake,
+                    );
+                }
+            })
+        {
+            let mut child = child;
+            terminate_group(&mut child);
+            #[cfg(unix)]
+            let _ = child.try_wait();
+            return Err(format!("plugin supervisor thread failed: {e}"));
+        }
+        let _ = child_tx.send(child);
+        #[cfg(unix)]
+        let (mut stdin, stdout, stderr) = {
+            let error = |e| format!("cannot make plugin pipes cancellable: {e}");
+            (
+                CancellablePipe::new(stdin, &cancelled).map_err(error)?,
+                CancellablePipe::new(stdout, &cancelled).map_err(error)?,
+                CancellablePipe::new(stderr, &cancelled).map_err(error)?,
+            )
+        };
+
         let (stdin_tx, stdin_rx) = mpsc::sync_channel::<(Arc<String>, bool)>(MAX_STDIN_QUEUE);
         let tick_pending = Arc::new(AtomicBool::new(false));
         let writer_tick = Arc::clone(&tick_pending);
+        let writer_closed = Arc::clone(&pipe_closed);
         let pid_w = manifest.id.clone();
         let writer = std::thread::Builder::new()
             .name(format!("iris-plugin-w-{pid_w}"))
             .spawn(move || {
                 while let Ok((line, tick)) = stdin_rx.recv() {
                     if stdin.write_all(line.as_bytes()).is_err() || stdin.flush().is_err() {
+                        writer_closed.store(true, Ordering::Release);
                         return;
                     }
                     if tick {
@@ -301,19 +496,13 @@ impl ExternalProcess {
                                     }
                                     true
                                 });
-                                if commands.is_empty() { return true; }
-                                match tx.try_send(commands) {
-                                Ok(()) => {
+                                if !commands.is_empty() {
+                                    if tx.send(commands).is_err() {
+                                        return false;
+                                    }
                                     if let Some(w) = &wake_out {
                                         w.notify();
                                     }
-                                }
-                                Err(TrySendError::Full(_)) => {
-                                    if warnings.take() {
-                                        log::warn!("plugin {plugin_id} output queue full; dropping");
-                                    }
-                                }
-                                Err(TrySendError::Disconnected(_)) => return false,
                                 }
                             }
                             Ok(PluginMessage::Log { message }) if logs.take() => {
@@ -328,6 +517,7 @@ impl ExternalProcess {
                     || { if warnings.take() { log::warn!("plugin {plugin_id} exceeded max line ({MAX_LINE_BYTES} B)"); } },
                 );
                 drop(tx);
+                pipe_closed.store(true, Ordering::Release);
                 if let Some(w) = &wake_out {
                     w.notify();
                 }
@@ -360,12 +550,15 @@ impl ExternalProcess {
         };
 
         let process = Self {
-            child,
+            stop_tx: Some(stop_tx),
+            stopped,
+            exit_rx,
+            exit: None,
+            wake,
             stdin_tx: Some(stdin_tx),
             tick_pending,
             rx,
             disconnected: false,
-            stop_deadline: None,
         };
         writer
             .and(reader)
@@ -392,7 +585,8 @@ impl ExternalProcess {
                 Ok(())
             }
             Err(TrySendError::Full(_)) => Err("plugin stdin queue full (unresponsive)".into()),
-            Err(TrySendError::Disconnected(_)) => Err("plugin stdin closed".into()),
+            // The supervisor reports the actual exit status if the writer closes first.
+            Err(TrySendError::Disconnected(_)) => Ok(()),
         }
     }
 
@@ -405,9 +599,13 @@ impl ExternalProcess {
 
     pub(super) fn drain(&mut self) -> (Vec<HostCommand>, Option<String>) {
         let mut cmds = Vec::new();
-        for _ in 0..MAX_DRAIN_PER_POLL {
+        let mut drained = 0;
+        for _ in 0..MAX_STDOUT_QUEUE {
             match self.rx.try_recv() {
-                Ok(commands) => cmds.extend(commands),
+                Ok(commands) => {
+                    cmds.extend(commands);
+                    drained += 1;
+                }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     self.disconnected = true;
@@ -415,55 +613,63 @@ impl ExternalProcess {
                 }
             }
         }
-        let exited = self
-            .disconnected
-            .then(|| match child_status(&mut self.child) {
-                Ok(Some(status)) => exit_reason(status),
-                Ok(None) => "输出通道已关闭".into(),
-                Err(e) => format!("进程状态异常: {e}"),
-            });
+        if self.exit.is_none() {
+            self.exit = self.exit_rx.try_recv().ok();
+        }
+        let exited = if drained == MAX_STDOUT_QUEUE {
+            if let Some(w) = &self.wake {
+                w.notify();
+            }
+            None
+        } else if self.disconnected
+            || self
+                .exit
+                .as_ref()
+                .is_some_and(|(deadline, _)| Instant::now() >= *deadline)
+        {
+            self.exit.take().map(|(_, reason)| reason)
+        } else {
+            None
+        };
         (cmds, exited)
     }
 
-    pub(super) fn request_shutdown(&mut self) -> Instant {
+    pub(super) fn request_shutdown(&mut self) {
         drop(self.stdin_tx.take());
-        *self
-            .stop_deadline
-            .get_or_insert_with(|| Instant::now() + SHUTDOWN_GRACE)
+        drop(self.stop_tx.take());
     }
 
-    fn stop(&mut self) {
-        let deadline = self.request_shutdown();
-        loop {
-            match child_status(&mut self.child) {
-                Ok(Some(_)) => break,
-                Ok(None) if Instant::now() < deadline => {
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-                _ => break,
-            }
-        }
-        // Signal the whole group/job even if the plugin itself exited cooperatively.
-        #[cfg(unix)]
-        {
-            unsafe { libc::kill(-(self.child.id() as libc::pid_t), libc::SIGKILL) };
-            let _ = self.child.kill();
-            let _ = self.child.wait();
-        }
-        #[cfg(windows)]
-        self.child.close_job_and_wait();
+    pub(super) fn wait_for_termination(&self, deadline: Instant) {
+        let _ = self
+            .stopped
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()));
     }
 }
 
 impl Drop for ExternalProcess {
     fn drop(&mut self) {
-        self.stop();
+        self.request_shutdown();
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bounded_line_reader_preserves_the_final_unterminated_line() {
+        let mut lines = Vec::new();
+        read_bounded_lines(
+            &b"first\nlast"[..],
+            8,
+            |line| {
+                lines.push(line.to_vec());
+                true
+            },
+            || panic!("valid lines must fit"),
+        );
+        assert_eq!(lines, [b"first\n".to_vec(), b"last".to_vec()]);
+    }
 
     #[test]
     fn log_allowance_stays_exhausted() {

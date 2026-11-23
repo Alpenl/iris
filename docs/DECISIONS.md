@@ -32,7 +32,7 @@
 | 2.9 | 目录按自然顺序排序（`ep2` 在 `ep10` 前），手写比较器、不加依赖，并支持按修改时间与文件大小升降序切换。 | 已完成（`library.rs`，含单元测试）|
 | 2.10 | 运行日志统一走 `log`，GUI 发布版写入系统应用日志目录，单次启动最多 4 MiB。 | 已完成（`logging.rs`）；控制协议回复仍写 stderr |
 | 2.11 | 调试控制使用跨平台本地流：macOS Unix socket，Windows 同用户命名管道。 | 已完成；普通 release 忽略 `IRIS_CONTROL`，测试需 `devtools` |
-| 2.12 | `deny.toml` 限制 Rust 依赖许可证；C 依赖由源码构建和打包清单约束。 | 已实现；CI `Release recipe policy` 持续门禁 |
+| 2.12 | `deny.toml` 检查 RustSec 公告、许可证和依赖来源。C 依赖由锁定的 HTTPS 源码、SPDX 许可表和发布清单约束。 | CI `Release recipe policy` 持续检查 |
 
 ## 3. 五个“单向门”
 
@@ -69,7 +69,7 @@
 | 4.5 | 拆出 `iris-core`（无头内核）；UI 只发语义命令，不定义假想 `MediaBackend`。 | 已完成 |
 | 4.6 | 成熟播放器细节打磨：可调宽虚拟目录、搜索与排序、子目录导航、设置面板、60fps 跟手进度条与章节标记、连续音量条、音频支持、字幕自动加载与偏移、画面比例/旋转/翻转/截图、防休眠、窗口置顶、独立轻量 OSD、右键菜单、媒体信息与 EXIF、照片缩略图底条、macOS 捏合缩放与媒体键。 | 已完成（2026-11-22，CI 双端通过） |
 | 4.7 | 落地统一控制面与矢量叠加面插件运行时：`iris-api` 无头协议 crate（`PROTOCOL_VERSION = 1`）、`PluginManager` 与外部 stdio 子进程运行时、内置官方插件与外部参考插件。 | 已完成（2026-11-22） |
-| 4.8 | 中期方向校准、工作区预设重塑与全远程协议插件化收口：确立“本体方向 C 一致 + 插件高自由度 + 远程协议 100% 插件化”（详见 `DISCUSSIONS.md`）；`mpv_command_node_async` 结构化安全流直通淘汰本地 `StreamGateway` 代理（放行插件 `127.0.0.1` 桥接端口并拦截外部 `30x` 回环跳转）；官方 WebDAV 收敛为标准内置插件 `iris.webdav`（`builtin.*`/`ext.*` Keychain 物理分桶，移除明文 fallback）；`1B+` 稀疏工作区预设（`settings.conf` 保护纯净个人基线 + `PresetRevert` 自动回退）；统一三元 `MediaUri`、`CatalogItem`、独立 `PlayQueue` 与单表 `Store`；提取 `ui/kit/` 公共原语并将全仓超千行文件全部重构压入 650/1000 行工程硬门禁内。 | 已完成（2026-11-22） |
+| 4.8 | 中期方向校准、工作区预设重塑与全远程协议插件化收口（见 `DISCUSSIONS.md`）。HTTP(S) 播放通过会话专属 `PlaybackRelay`，内部仍用结构化 libmpv 命令。WebDAV 按标准插件协议实现，凭据按作用域存入系统安全凭据库。工作区预设保护个人基线，统一 `MediaUri`、`CatalogItem`、`PlayQueue` 和 `Store`。生产代码行数由 `check-project.py` 按 650 行提示、850 行上限检查。 | 已完成 |
 
 ## 5. 许可：路线 B
 
@@ -82,8 +82,8 @@
 | 5.3 | **不用 mpv 官方的 LGPL 预编译包**：官方 LGPL 包启用了 Chromaprint 并配 GPL 的 FFTW3，必须自建并关掉 Chromaprint。 | 已定 |
 | 5.4 | Homebrew 的 libmpv 是 GPL 构建，**只能开发时用**，不能拿去分发。 | 已定 |
 | 5.5 | 只能动态链接：macOS 放 `Iris.app/Contents/Frameworks/*.dylib`，Windows 放主程序同级 `*.dll`。绝不静态链进 `iris`。 | 已遵守 |
-| 5.6 | 每个二进制分发附带所用 C 库对应源码、构建脚本、配置、校验值及许可证；保留动态库替换权。 | 构建和打包脚本强制产出 |
-| 5.7 | `deny.toml` 看守 Rust 依赖的许可证。 | 已完成，CI 持续门禁 |
+| 5.6 | 每个二进制分发附带所用 C 库对应源码、构建脚本、配置、校验值及许可证。源码可作为下载附件随同发行，安装程序和 ZIP 共用该附件。保留动态库替换权。 | 构建和打包脚本强制产出 |
+| 5.7 | `deny.toml` 检查 Rust 依赖的安全公告、许可证、依赖选型和来源。 | CI 持续检查 |
 | 5.8 | 维护两套平台的 LGPL 构建流水线是**持续成本**，要计入里程碑。 | 已记录 |
 | 5.9 | 宽松协议本身**不保证**“只有我能出商业版”：是否需要 CLA 或版权归属安排仍待决。 | 待决 |
 

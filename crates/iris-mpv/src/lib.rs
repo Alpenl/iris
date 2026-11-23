@@ -7,6 +7,7 @@
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::fmt;
 use std::ptr;
+use std::sync::Mutex;
 
 pub mod render;
 pub(crate) mod sys;
@@ -116,10 +117,11 @@ pub enum Event {
         level: String,
         text: String,
     },
-    StartFile,
+    StartFile(i64),
     EndFile {
         reason: EndReason,
         error: i32,
+        playlist_entry_id: i64,
     },
     FileLoaded,
     VideoReconfig,
@@ -131,13 +133,19 @@ pub enum Event {
         name: String,
         value: Value,
     },
+    QueueOverflow,
+    Hook {
+        userdata: u64,
+        id: u64,
+    },
     Other(i32),
 }
 
-/// An mpv client handle. The client API is thread-safe, so this is `Send + Sync`;
-/// only [`Mpv::wait_event`] must be called from one thread at a time.
+/// An mpv client handle. The client API is thread-safe. [`Mpv::wait_event`]
+/// additionally serializes access to the handle's borrowed event storage.
 pub struct Mpv {
     handle: *mut sys::mpv_handle,
+    wait_lock: Mutex<()>,
 }
 
 // SAFETY: libmpv documents `mpv_handle` as thread-safe across threads.
@@ -156,7 +164,10 @@ impl Mpv {
                 context: "mpv_create".into(),
             });
         }
-        Ok(Self { handle })
+        Ok(Self {
+            handle,
+            wait_lock: Mutex::new(()),
+        })
     }
 
     pub(crate) fn raw(&self) -> *mut sys::mpv_handle {
@@ -219,16 +230,15 @@ impl Mpv {
         )
     }
 
-    /// Executes an asynchronous `loadfile` command via `mpv_command_node_async`
-    /// (`MPV_FORMAT_NODE_MAP`), passing per-file options as structured key-value
-    /// entries (supporting repeated keys such as `"http-header-fields-append"`
-    /// and `"sub-files-append"` without string-escaping or injection hazards).
+    /// Queues playback with structured per-file options and returns the new
+    /// playlist entry ID. Only the command is synchronous; opening media remains
+    /// asynchronous in the player core.
     pub fn loadfile_with_options(
         &self,
         url: &str,
         flags: &str,
         options: &[(&str, &str)],
-    ) -> Result<()> {
+    ) -> Result<i64> {
         let opt_num = c_int::try_from(options.len()).map_err(|_| Error {
             code: sys::MPV_ERROR_INVALID_PARAMETER,
             context: "loadfile_with_options: too many options".into(),
@@ -312,12 +322,24 @@ impl Mpv {
             format: sys::MPV_FORMAT_NODE_MAP,
         };
 
-        // SAFETY: `self.handle` is valid, and `root_node` plus all referenced `mpv_node_list`s,
-        // `Vec` buffers, and `CString`s stay alive and unmoved until `mpv_command_node_async` returns.
+        let mut result = sys::mpv_node {
+            u: sys::mpv_node_u { int64: 0 },
+            format: sys::MPV_FORMAT_NONE,
+        };
+        // SAFETY: The option tree stays alive through the command. mpv fills
+        // the result node on success and transfers ownership to this caller.
         check(
-            unsafe { sys::mpv_command_node_async(self.handle, 0, &raw mut root_node) },
+            unsafe { sys::mpv_command_node(self.handle, &raw mut root_node, &raw mut result) },
             || "loadfile_with_options".into(),
-        )
+        )?;
+        // SAFETY: A successful command returned a valid result node.
+        let id = unsafe { load_entry_id(&result) };
+        // SAFETY: The result and its contents are freed exactly once here.
+        unsafe { sys::mpv_free_node_contents(&raw mut result) };
+        id.ok_or_else(|| Error {
+            code: sys::MPV_ERROR_PROPERTY_UNAVAILABLE,
+            context: "loadfile did not return a playlist entry ID".into(),
+        })
     }
 
     pub fn set_property_string(&self, name: &str, value: &str) -> Result<()> {
@@ -399,8 +421,32 @@ impl Mpv {
         )
     }
 
+    pub fn add_hook(&self, userdata: u64, name: &str) -> Result<()> {
+        with_cstr(name, |n| {
+            // SAFETY: mpv copies the C hook name while it is valid.
+            check(
+                unsafe { sys::mpv_hook_add(self.handle, userdata, n, 0) },
+                || format!("add_hook {name}"),
+            )
+        })
+    }
+
+    pub fn continue_hook(&self, id: u64) -> Result<()> {
+        // SAFETY: mpv validates the ID and borrows the live handle.
+        check(unsafe { sys::mpv_hook_continue(self.handle, id) }, || {
+            "continue_hook".into()
+        })
+    }
+
+    /// Interrupts a current or subsequent wait on this handle.
+    pub fn wakeup(&self) {
+        // SAFETY: The handle is live and mpv_wakeup is thread-safe.
+        unsafe { sys::mpv_wakeup(self.handle) }
+    }
+
     /// Waits for the next event. `timeout < 0` waits forever. Returns `None` on timeout.
     pub fn wait_event(&self, timeout: f64) -> Option<Event> {
+        let _wait = self.wait_lock.lock().unwrap_or_else(|e| e.into_inner());
         // SAFETY: `mpv_wait_event` always returns a non-null `mpv_event` pointer valid
         // until the next `mpv_wait_event` call on this handle.
         let ev = unsafe { &*sys::mpv_wait_event(self.handle, timeout) };
@@ -419,7 +465,11 @@ impl Mpv {
                     }
                 }
             }
-            sys::MPV_EVENT_START_FILE => Event::StartFile,
+            sys::MPV_EVENT_START_FILE => {
+                // SAFETY: START_FILE carries an mpv_event_start_file.
+                let data = unsafe { &*ev.data.cast::<sys::mpv_event_start_file>() };
+                Event::StartFile(data.playlist_entry_id)
+            }
             sys::MPV_EVENT_END_FILE => {
                 // SAFETY: For `MPV_EVENT_END_FILE`, `ev.data` points to `mpv_event_end_file`.
                 let e = unsafe { &*(ev.data as *const sys::mpv_event_end_file) };
@@ -434,6 +484,7 @@ impl Mpv {
                 Event::EndFile {
                     reason,
                     error: e.error,
+                    playlist_entry_id: e.playlist_entry_id,
                 }
             }
             sys::MPV_EVENT_FILE_LOADED => Event::FileLoaded,
@@ -468,9 +519,38 @@ impl Mpv {
                     value,
                 }
             }
+            sys::MPV_EVENT_QUEUE_OVERFLOW => Event::QueueOverflow,
+            sys::MPV_EVENT_HOOK => {
+                // SAFETY: HOOK carries an mpv_event_hook.
+                let data = unsafe { &*ev.data.cast::<sys::mpv_event_hook>() };
+                Event::Hook {
+                    userdata: ev.reply_userdata,
+                    id: data.id,
+                }
+            }
             other => Event::Other(other),
         })
     }
+}
+
+/// # Safety
+/// `result` must be a valid mpv node returned by a successful command.
+unsafe fn load_entry_id(result: &sys::mpv_node) -> Option<i64> {
+    if result.format != sys::MPV_FORMAT_NODE_MAP {
+        return None;
+    }
+    // SAFETY: A node map owns a valid list, arrays of `num` keys/values, and C strings.
+    unsafe {
+        let list = &*result.u.list;
+        for i in 0..list.num as usize {
+            let key = CStr::from_ptr(*list.keys.add(i));
+            let value = &*list.values.add(i);
+            if key.to_bytes() == b"playlist_entry_id" && value.format == sys::MPV_FORMAT_INT64 {
+                return Some(value.u.int64);
+            }
+        }
+    }
+    None
 }
 
 /// Converts a nullable C string pointer from an mpv event into an owned `String`.

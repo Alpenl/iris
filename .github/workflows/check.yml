@@ -21,10 +21,11 @@ jobs:
       - run: brew install mpv
       - run: python3 scripts/check-project.py
       - run: cargo fmt --all -- --check
-      - run: cargo test --locked --workspace
+      - run: cargo test --locked --workspace --future-incompat-report
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - run: cargo clippy --locked --workspace --all-targets --release -- -D warnings
       - run: cargo clippy --locked --workspace --all-targets --features iris/devtools -- -D warnings
+      - run: python3 scripts/check-project.py --future-incompat-report target/.future-incompat-report.json
   windows-media:
     uses: ./.github/workflows/media-sdk.yml
     with:
@@ -57,7 +58,8 @@ jobs:
           "MPV_LIB_DIR=$env:RUNNER_TEMP\media-sdk\prefix\lib" >> $env:GITHUB_ENV
           "$env:RUNNER_TEMP\media-sdk\prefix\bin" >> $env:GITHUB_PATH
       - run: python scripts/check-project.py
-      - run: cargo test --locked --workspace
+      - run: cargo test --locked --workspace --future-incompat-report
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - run: cargo clippy --locked --workspace --all-targets --release -- -D warnings
       - run: cargo clippy --locked --workspace --all-targets --features iris/devtools -- -D warnings
+      - run: python scripts/check-project.py --future-incompat-report target/.future-incompat-report.json

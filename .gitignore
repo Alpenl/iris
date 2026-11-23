@@ -29,3 +29,8 @@ venv/
 *.ilk
 *.exp
 iris-stderr.log
+
+# Code-signing material
+*.pfx
+*.p12
+*.keychain*

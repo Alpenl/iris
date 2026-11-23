@@ -7,7 +7,7 @@ use gpui::{Context, ScrollStrategy};
 use iris_core::catalog::{
     CatalogItem, CatalogItemKind, MediaFilter, filter_catalog_items, sort_catalog_items_with_order,
 };
-use iris_core::library::{self, FolderEntry, Kind, ScanResult};
+use iris_core::library::{self, FolderEntry, Kind};
 use iris_core::media_uri::MediaUri;
 
 use super::super::IrisWindow;
@@ -70,7 +70,7 @@ impl IrisWindow {
                 .filter(|s| !s.is_empty());
             self.browse_plugin_source(&pid, &sid, fid, None, q, cx);
         } else {
-            self.rebuild_directory_rows();
+            self.filter_directory_rows();
             cx.notify();
         }
     }
@@ -92,70 +92,105 @@ impl IrisWindow {
     }
 
     pub(in crate::ui) fn rebuild_directory_rows(&mut self) {
-        let favs = self.store.favorites();
-        self.catalog.favorite_count = favs.len();
+        let favorites = self.store.favorites();
+        self.catalog.favorite_count = favorites.len();
+        if self.catalog.favorite_uris != favorites {
+            self.catalog.favorite_uris = favorites;
+            self.catalog.favorite_items.clear();
+            self.catalog.favorite_scan = None;
+        }
+
+        let mut source_items: Vec<_> = match &self.catalog.active_source {
+            ActiveSource::Local => {
+                let session = &self.active().session;
+                session
+                    .subfolders()
+                    .iter()
+                    .map(CatalogItem::from_local_folder)
+                    .chain(session.entries().iter().map(CatalogItem::from_local_entry))
+                    .collect()
+            }
+            ActiveSource::Plugin(view) => view
+                .entries
+                .iter()
+                .map(|entry| {
+                    CatalogItem::from_source_entry(&view.plugin_id, &view.source_id, entry)
+                })
+                .collect(),
+        };
+        sort_catalog_items_with_order(
+            &mut source_items,
+            self.settings.sort_by,
+            self.settings.sort_order,
+        );
+
+        let (mut videos, mut audio, mut photos) = (0, 0, 0);
+        let current = self.active().session.current();
+        let mut current_index = 0;
+        let mut photo_paths = Vec::new();
+        for item in &source_items {
+            match item.media_kind() {
+                Some(Kind::Video) => videos += 1,
+                Some(Kind::Audio) => audio += 1,
+                Some(Kind::Photo) => {
+                    photos += 1;
+                    if let Some(path) = item.uri.as_local_path() {
+                        if current == Some(path) {
+                            current_index = photo_paths.len();
+                        }
+                        photo_paths.push(path.to_path_buf());
+                    }
+                }
+                None => {}
+            }
+        }
+        self.catalog.video_count = videos;
+        self.catalog.audio_count = audio;
+        self.catalog.photo_count = photos;
+        self.catalog.filmstrip_index = current_index;
+        self.catalog.photo_paths = photo_paths;
+        self.catalog.sorted_source_items = source_items;
+        self.filter_directory_rows();
+    }
+
+    pub(in crate::ui) fn scan_visible_favorites(&mut self, cx: &mut Context<Self>) {
+        if !self.sidebar_is_visible()
+            || self.catalog.sidebar_mode != iris_core::preset::SidebarMode::Files
+            || self.catalog.filter != MediaFilter::FavoritesOnly
+            || self.catalog.favorite_scan.is_some()
+            || self.catalog.favorite_uris.is_empty()
+        {
+            return;
+        }
+        let uris = self.catalog.favorite_uris.clone();
+        let scan = cx
+            .background_executor()
+            .spawn(async move { uris.into_iter().map(fav_uri_to_catalog_item).collect() });
+        self.catalog.favorite_scan = Some(cx.spawn(async move |this, cx| {
+            let items = scan.await;
+            let _ = this.update(cx, |this, cx| {
+                this.catalog.favorite_items = items;
+                if this.catalog.filter == MediaFilter::FavoritesOnly {
+                    this.filter_directory_rows();
+                    cx.notify();
+                }
+            });
+        }));
+    }
+
+    pub(in crate::ui) fn filter_directory_rows(&mut self) {
         let query = if self.text_inputs.search_open {
             self.text_inputs.search_input.text()
         } else {
             ""
         };
-
-        let raw_items: Vec<CatalogItem> = if self.catalog.filter == MediaFilter::FavoritesOnly {
-            favs.into_iter().map(fav_uri_to_catalog_item).collect()
+        let raw_items = if self.catalog.filter == MediaFilter::FavoritesOnly {
+            &self.catalog.favorite_items
         } else {
-            match &self.catalog.active_source {
-                ActiveSource::Local => {
-                    let session = &self.active().session;
-                    let mut all = CatalogItem::from_scan_result(&ScanResult {
-                        entries: session.entries().to_vec(),
-                        subfolders: session.subfolders().to_vec(),
-                    });
-                    sort_catalog_items_with_order(
-                        &mut all,
-                        self.settings.sort_by,
-                        self.settings.sort_order,
-                    );
-                    self.catalog.video_audio_count = all
-                        .iter()
-                        .filter(|i| matches!(i.media_kind(), Some(Kind::Video | Kind::Audio)))
-                        .count();
-                    self.catalog.photo_count = all
-                        .iter()
-                        .filter(|i| i.media_kind() == Some(Kind::Photo))
-                        .count();
-                    self.catalog.photo_paths = all
-                        .iter()
-                        .filter(|i| i.media_kind() == Some(Kind::Photo))
-                        .filter_map(|i| i.uri.as_local_path().map(Path::to_path_buf))
-                        .collect();
-                    all
-                }
-                ActiveSource::Plugin(ps) => {
-                    let mut all: Vec<CatalogItem> = ps
-                        .entries
-                        .iter()
-                        .map(|e| CatalogItem::from_source_entry(&ps.plugin_id, &ps.source_id, e))
-                        .collect();
-                    sort_catalog_items_with_order(
-                        &mut all,
-                        self.settings.sort_by,
-                        self.settings.sort_order,
-                    );
-                    self.catalog.video_audio_count = all
-                        .iter()
-                        .filter(|i| matches!(i.media_kind(), Some(Kind::Video | Kind::Audio)))
-                        .count();
-                    self.catalog.photo_count = all
-                        .iter()
-                        .filter(|i| i.media_kind() == Some(Kind::Photo))
-                        .count();
-                    self.catalog.photo_paths.clear();
-                    all
-                }
-            }
+            &self.catalog.sorted_source_items
         };
 
-        let filtered = filter_catalog_items(&raw_items, query, self.catalog.filter, |u| {
+        let filtered = filter_catalog_items(raw_items, query, self.catalog.filter, |u| {
             self.store.is_favorite(u)
         });
         let mut rows = Vec::with_capacity(filtered.len() + 2);

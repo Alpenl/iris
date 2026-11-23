@@ -66,7 +66,7 @@ fn sparse_photo(data: &[u8]) -> (Photo, Vec<(u64, usize)>) {
     )
     .unwrap();
     let format = detect_photo_format(&r.windows[0].1, None).unwrap();
-    let photo = finish_header(run_probe(&mut r, format));
+    let photo = finish_header(run_probe(&mut r, format), format);
     (photo, reads)
 }
 
@@ -174,7 +174,8 @@ fn heif_image(idat: bool) -> Vec<u8> {
     }
     let mut meta = vec![0; 4];
     meta.extend(atom(b"pitm", &[0, 0, 0, 0, 0, 3]));
-    let mut iinf = vec![0, 0, 0, 0, 0, 2];
+    let mut iinf = vec![0, 0, 0, 0, 0, 3];
+    iinf.extend(atom(b"infe", &[2, 0]));
     for id in [6, 7] {
         let mut info = vec![2, 0, 0, 0, 0, id, 0, 0];
         info.extend(b"Exif\0");
@@ -188,8 +189,9 @@ fn heif_image(idat: bool) -> Vec<u8> {
     let mut ipco = atom(b"ispe", &[0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 2]);
     ipco.extend(atom(b"ispe", &[0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 2, 0]));
     ipco.extend(atom(b"irot", &[3]));
+    ipco.extend(atom(b"imir", &[0]));
     let mut iprp = atom(b"ipco", &ipco);
-    iprp.extend(atom(b"ipma", &[0, 0, 0, 0, 0, 0, 0, 1, 0, 3, 2, 2, 3]));
+    iprp.extend(atom(b"ipma", &[0, 0, 0, 0, 0, 0, 0, 1, 0, 3, 3, 2, 3, 4]));
     meta.extend(atom(b"iprp", &iprp));
     meta.extend(atom(b"iloc", &loc));
     if idat {
@@ -206,7 +208,8 @@ fn heif_primary_properties_and_split_exif_extents_from_mdat_and_idat() {
         let (photo, reads) = sparse_photo(&bytes);
         assert_eq!(photo, probe_bytes(&bytes, None));
         assert_eq!(photo.size, Some((768, 512)));
-        assert_eq!(photo.rotate_cw, 90);
+        assert_eq!(photo.rotate_cw, 270);
+        assert_eq!(photo.mirror, Some(crate::photo::Mirror::Vertical));
         assert_eq!(photo.exif.unwrap().camera.as_deref(), Some("ABC"));
         assert!(reads.iter().map(|r| r.1).sum::<usize>() < bytes.len() / 2);
     }
@@ -392,6 +395,46 @@ fn heif_prefix_keeps_complete_primary_properties() {
     let data = heif_image(true);
     let photo = probe_bytes(&data[..PREFIX], None);
     assert_eq!(photo.size, Some((768, 512)));
-    assert_eq!(photo.rotate_cw, 90);
+    assert_eq!(photo.rotate_cw, 270);
     assert!(photo.exif.is_none());
+}
+
+#[test]
+fn sparse_reads_short_contiguous_replies() {
+    let bytes = b"abcdefghi";
+    let cancel = HttpCancel::default();
+    let mut reader = Sparse::open(
+        |start, size| {
+            let start = start as usize;
+            let end = (start + size.min(3)).min(bytes.len());
+            Ok((bytes[start..end].to_vec(), Some(bytes.len() as u64)))
+        },
+        &cancel,
+    )
+    .unwrap();
+    let mut found = Vec::new();
+    reader.read_to_end(&mut found).unwrap();
+    assert_eq!(found, bytes);
+}
+
+#[test]
+fn jpeg_fill_bytes_do_not_count_as_markers() {
+    let mut data = vec![0xff, 0xd8];
+    data.extend(std::iter::repeat_n(0xff, 5000));
+    data.extend([0xc0, 0, 7, 8, 0, 9, 0, 16, 0xff, 0xd9]);
+    assert_eq!(probe_bytes(&data, None).size, Some((16, 9)));
+}
+
+#[test]
+fn reads_long_exif_iso_value() {
+    let mut data = b"II*\0\x08\0\0\0\x01\0".to_vec();
+    data.extend(entry(0x8769, 4, 1, 26));
+    data.extend([0; 4]);
+    data.extend(1u16.to_le_bytes());
+    data.extend(entry(0x8827, 4, 1, 102_400));
+    data.extend([0; 4]);
+    assert_eq!(
+        probe_bytes(&data, None).exif.and_then(|exif| exif.iso),
+        Some(102_400)
+    );
 }

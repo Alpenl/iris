@@ -7,11 +7,12 @@ brew install mpv                 # 开发用的 libmpv（GPL 构建，不能拿�
 cargo build --release --features devtools  # 性能/控制测试专用，不能作为发行包
 cargo test --locked --workspace            # 单元、协议与端到端回归
 python3 scripts/check-project.py           # 仓库约束：递归 UI/mpv 隔离、iris-core 与 iris-api 依赖门禁、devtools 默认特性门禁、单文件 650/850 行预算、SVG 图标与插件清单校验
-cargo deny check licenses        # 依赖许可证检查，需要先 cargo install cargo-deny
+cargo deny --locked check         # RustSec、许可证、依赖选型和来源检查
 ```
 
-libmpv 不在 `/opt/homebrew/lib` 时用 `MPV_LIB_DIR` 指定。
-Windows 需将自建 SDK 的 `prefix/lib` 设为 `MPV_LIB_DIR` 并将 `prefix/bin` 加入 `PATH`。Windows 与 macOS 的 PR 检查均执行 `cargo test --locked --workspace`。
+libmpv 可通过 `MPV_LIB_DIR` 指定。Windows x64 MSVC 默认查找工作区 `target/deps/mpv/mpv.lib`。验证自建 SDK 时，把 `prefix/lib` 设为 `MPV_LIB_DIR`，并将 `prefix/bin` 加入 `PATH`。Windows 与 macOS 的 PR 检查均执行 `cargo test --locked --workspace`。
+
+发行工作流在编译作业运行 `package.py --prepare-only`。签名作业在独立 runner 接收产物，导入签名凭据后运行 `package.py --resume --package-only`。用同一输出目录和参数可继续已完成准备的打包任务。默认将许可和对应源码作为发行附件；本地流程可通过 `--mode local` 运行。
 
 ## 测试素材
 
@@ -25,7 +26,7 @@ Windows 需将自建 SDK 的 `prefix/lib` 设为 `MPV_LIB_DIR` 并将 `prefix/bi
 
 ## 照片实测脚本
 
-`scripts/photo-harness.py` 启动一个**独立的** Iris 测试实例（私有 Unix socket／Windows 命名管道，独立 `IRIS_SETTINGS`），不会连接用户已有窗口。它会把窗口调成 1440×900，然后用 `open` / `get` / `state` / `snap` / `key` 跑测试。不要在运行中操作这个测试窗口，否则输入会改变测试状态。
+`scripts/photo-harness.py` 启动独立的 Iris 测试实例，使用私有 Unix socket 或 Windows 命名管道，并通过 `IRIS_SETTINGS`、`IRIS_LOG_DIR` 隔离设置和日志。它把窗口调成 1440×900，通过 `open` / `get` / `state` / `snap` / `key` 驱动测试。运行中不要操作测试窗口。
 
 ```bash
 cargo build --release --features devtools
@@ -43,11 +44,21 @@ python3 scripts/icc-report.py out/
 
 ## 调试控制管道
 
-见 README 的“调试控制管道”一节，命令在 `crates/iris/src/debug.rs` 和 `crates/iris/src/ui.rs`。
+用法见 `scripts/control-client.py --help`。宿主入口在 `crates/iris/src/debug.rs`，窗口命令处理在 `crates/iris/src/ui/debug_cmd.rs`。
 
 **驱动别人正在用的窗口之前，先发 `state` 看当前状态**：用户可能正在用那个测试窗口，合成的点击和按键会打断他。能用独立实例（如上面的实测脚本）就不要驱动用户的窗口。
 
 ## 实测结果
+
+### 对抗式代码审查回归（Windows x64）
+
+- 使用自建 LGPL libmpv 运行 `cargo test --locked --workspace --future-incompat-report`，157 项通过，包括认证 HLS 原生播放、HTTP 截断处理、插件进程与 IPC 背压、凭据和历史记录迁移、预设回退及单实例确认。
+- `cargo clippy --locked --workspace --all-targets -- -D warnings`、`cargo fmt --all -- --check`、`python scripts/check-project.py` 和 cargo-deny 0.22.0 的四项检查通过。GPUI 0.2.2 的传递依赖 `proc-macro-error2 2.0.1` 仍有上游未来不兼容警告。
+- Windows 实窗验证了 D3D11VA 播放和暂停、置顶、恢复外观快捷键、通过第二实例打开 EXIF 方向 6 照片，以及转发时主实例日志保留。视频和照片截图位于 `target/audit-evidence/`。发行构建的 `--help`、`--version` 和非法选项退出码也通过实测。
+- 模拟 `DXGI_ERROR_DEVICE_REMOVED` 后，实窗的 D3D11VA 播放从 `0.60 s` 继续推进到 `1.63 s`，并抓取了恢复后的可见画面。
+- Windows 无签名安装包和 ZIP 已生成，两次打包续跑的 `SHA256SUMS` 一致，清单中的 SHA-256 逐件校验通过。许可包和对应源码分别归档。产物在 `target/audit-final-release/`。安装测试检测到本机已有 Iris 注册信息后退出。
+- Windows CI 原先已运行工作区和 UI 契约测试，插件指南原先已列出 `OverlayNode` 配额。仓库中的 shell 脚本已有 LF，现用 `.gitattributes` 让签出时也保留 LF。
+- TCP 建连支持取消。系统 DNS 调用在后台完成，同一主机合并请求，最多同时保留 8 项。Unix 插件负责自行脱离进程组的辅助进程，Windows 使用 Job 回收。macOS 原生窗口、媒体键和 Keychain 变更需要 macOS 实机验证。
 
 ### 0.0.1 审计修复回归（Windows x64，2026-11-23）
 

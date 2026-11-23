@@ -280,6 +280,9 @@ impl QueueItem {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlayQueue {
     items: Vec<QueueItem>,
+    /// Insertion point left by the most recent removal, for a still-playing item.
+    #[serde(skip)]
+    removed: Option<(MediaUri, usize)>,
 }
 
 impl PlayQueue {
@@ -339,36 +342,40 @@ impl PlayQueue {
 
     /// Replaces the entire queue with media items from `catalog_items`.
     pub fn replace_from_catalog(&mut self, catalog_items: &[CatalogItem]) {
-        self.items.clear();
+        self.clear();
         self.extend_catalog(catalog_items);
     }
 
     /// Replaces the entire queue from local [`Entry`] items.
     pub fn replace_from_entries(&mut self, entries: &[Entry]) {
-        self.items.clear();
+        self.clear();
         self.extend(entries.iter().map(QueueItem::from_local_entry));
     }
 
     /// Removes the item matching `uri`. Returns `true` if removed.
     pub fn remove(&mut self, uri: &MediaUri) -> bool {
-        if let Some(ix) = self.position_of(uri) {
-            self.items.remove(ix);
-            true
-        } else {
-            false
-        }
+        self.position_of(uri)
+            .and_then(|ix| self.remove_at(ix))
+            .is_some()
     }
 
     pub fn remove_at(&mut self, index: usize) -> Option<QueueItem> {
-        (index < self.items.len()).then(|| self.items.remove(index))
+        if index >= self.items.len() {
+            return None;
+        }
+        let item = self.items.remove(index);
+        self.removed = Some((item.uri.clone(), index));
+        Some(item)
     }
 
     pub fn clear(&mut self) {
         self.items.clear();
+        self.removed = None;
     }
 
     pub fn dedup(&mut self) {
         dedup_suffix(&mut self.items, 0, |item| &item.uri);
+        self.removed = None;
     }
 
     pub fn sort_by_title(&mut self, ascending: bool) {
@@ -376,27 +383,35 @@ impl PlayQueue {
             let ord = natural_cmp(&a.title, &b.title);
             if ascending { ord } else { ord.reverse() }
         });
+        self.removed = None;
     }
 
-    /// Steps `delta` items relative to `current` (`-1` = previous, `+1` = next).
-    /// Wraps around at queue boundaries when `wrap` is `true`.
+    /// Steps relative to the current item or to the gap left by its removal.
+    /// With no known position, starts from the first (next) or last (previous) item.
     pub fn step(&self, current: &MediaUri, delta: isize, wrap: bool) -> Option<&QueueItem> {
-        if self.items.is_empty() {
+        let len = self.items.len();
+        if len == 0 {
             return None;
         }
-        let ix = self.position_of(current)?;
-        if delta == 0 {
-            return self.items.get(ix);
-        }
-        let target = ix as isize + delta;
-        let len = self.items.len() as isize;
-        if wrap {
-            Some(&self.items[target.rem_euclid(len) as usize])
-        } else if target >= 0 && target < len {
-            Some(&self.items[target as usize])
+        let (index, offset) = if let Some(index) = self.position_of(current) {
+            (index, delta)
+        } else if delta == 0 {
+            return None;
+        } else if let Some((uri, index)) = &self.removed
+            && uri == current
+        {
+            (*index, delta - isize::from(delta > 0))
+        } else if delta < 0 {
+            return self.items.last();
         } else {
-            None
-        }
+            return self.items.first();
+        };
+        let target = if wrap {
+            (index + offset.rem_euclid(len as isize) as usize) % len
+        } else {
+            index.checked_add_signed(offset)?
+        };
+        self.items.get(target)
     }
 }
 
@@ -529,6 +544,14 @@ mod tests {
 
         assert!(q.remove(&http_uri));
         assert_eq!(q.len(), 2);
+        assert_eq!(
+            q.step(&http_uri, 1, false).map(|q| &q.uri),
+            Some(&local_uri)
+        );
+        assert_eq!(
+            q.step(&http_uri, -1, false).map(|q| &q.uri),
+            Some(&cloud_uri)
+        );
         q.clear();
         assert!(q.is_empty());
     }

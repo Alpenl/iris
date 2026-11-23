@@ -5,6 +5,7 @@ import json
 import re
 import subprocess
 from pathlib import Path
+import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -12,6 +13,27 @@ PROD_WARN_LINES = 650
 PROD_HARD_MAX_LINES = 850
 SRC_TOTAL_HARD_MAX_LINES = 1000
 TEST_FILE_HARD_MAX_LINES = 1000
+
+def check_future_incompatibilities(report):
+    if not report.is_file():
+        return
+    data = json.loads(report.read_text(encoding="utf-8"))
+    if data["version"] != 0:
+        raise RuntimeError(f"Unknown Cargo future incompatibility report format: {report}")
+    for entry in data["reports"]:
+        for package, warning in entry["per_package"].items():
+            warning = re.sub(r"\x1b\[[0-9;]*m", "", warning)
+            # GPUI 0.2.2 pulls in stacksafe-macro 0.1.4. Its proc-macro-error2
+            # dependency has no released fix for rust-lang/rust#127909.
+            if (package != "proc-macro-error2@2.0.1"
+                    or re.findall(r"(?m)^> warning\[([^]]+)\]: ([^\r\n]+)", warning)
+                    != [("E0365", "extern crate `proc_macro` is private and cannot be re-exported")]):
+                raise RuntimeError(f"Unexpected Cargo future incompatibility in {package}:\n{warning}")
+
+
+if len(sys.argv) == 3 and sys.argv[1] == "--future-incompat-report":
+    check_future_incompatibilities(Path(sys.argv[2]))
+    sys.exit(0)
 
 
 def strip_line_comments(rust_src: str) -> str:
@@ -93,6 +115,11 @@ for gated_file in (
         f"{gated_file.relative_to(ROOT)} missing devtools cfg gate"
     )
 
+vault = ROOT / "crates/iris-core/src/vault.rs"
+guard = r'#\[cfg\(any\(debug_assertions, feature = "devtools"\)\)\]'
+assert re.search(guard + r'\s+if let Some\(p\) = std::env::var_os\("IRIS_TEST_VAULT"\)',
+                 vault.read_text(encoding="utf-8")), "IRIS_TEST_VAULT must be gated out of production builds"
+
 for name, pkg in pkgs.items():
     manifest_text = Path(pkg["manifest_path"]).read_text(encoding="utf-8")
     assert re.search(r"(?m)^\[lints\]\s+workspace\s*=\s*true\b", manifest_text), (
@@ -160,6 +187,9 @@ tc_text = (ROOT / "rust-toolchain.toml").read_text(encoding="utf-8")
 tc_match = re.search(r'(?m)^channel\s*=\s*"([^"]+)"', tc_text)
 assert tc_match, "rust-toolchain.toml missing channel"
 expected_channel = tc_match.group(1)
+assert all(p["rust_version"] in (expected_channel, expected_channel.removesuffix(".0")) for p in pkgs.values()), (
+    "Workspace package rust-version must match the pinned toolchain"
+)
 for wf in sorted((ROOT / ".github/workflows").glob("*.yml")):
     wf_text = wf.read_text(encoding="utf-8")
     for match in re.findall(r"rustup toolchain install ([0-9.]+)", wf_text):

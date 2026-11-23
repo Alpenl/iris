@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Build Iris against the verified media SDK and package without system media fallbacks.
 
-Use --mode local for explicitly unsigned distributions. --mode release requires
-platform signing credentials (and macOS notarization); incomplete credentials fail.
+Use --mode local for unsigned distributions. For a signed release, run
+--prepare-only before provisioning signing credentials. Run --resume
+--package-only with the same inputs after provisioning credentials.
 Windows requires MSVC, the Windows SDK, and Inno Setup 6 (ISCC in PATH).
-Rust license compliance requires cargo-deny and an existing Cargo.lock.
+Rust compliance requires cargo-deny 0.22.0 and the workspace Cargo.lock.
 """
 import argparse
 import hashlib
@@ -29,6 +30,20 @@ _spec = spec_from_file_location("media_recipe", Path(__file__).with_name("build-
 _media = module_from_spec(_spec)
 _spec.loader.exec_module(_media)
 run = _media.run
+
+SIGNING_ENV = ("IRIS_WINDOWS_PFX", "IRIS_WINDOWS_PFX_PASSWORD", "IRIS_TIMESTAMP_URL",
+               "IRIS_MAC_SIGN_IDENTITY", "IRIS_NOTARY_PROFILE", "IRIS_NOTARY_KEYCHAIN")
+
+# Versions verified to ship an SPDX declaration without a standalone notice file.
+# Keep the corresponding checked Cargo.toml in their notice directory.
+METADATA_LICENSES = frozenset("""
+block@0.1.6 convert_case@0.4.0 dtor@0.0.6 dtor-proc-macro@0.0.5 dwrote@0.11.5 gloo-timers@0.3.0
+hexf-parse@0.2.1 leak@0.1.2 leaky-cow@0.1.1 lyon@1.0.19 lyon_algorithms@1.0.22 lyon_geom@1.0.20
+lyon_path@1.0.19 lyon_tessellation@1.0.23 mac@0.1.1 malloc_buf@0.0.6 naga@25.0.1 pathfinder_geometry@0.5.1
+pathfinder_simd@0.5.6 profiling@1.0.18 profiling-procmacros@1.0.18 r-efi@5.3.0 r-efi@6.0.0 seahash@4.1.0
+simd_helpers@0.1.0 stacksafe@0.1.4 stacksafe-macro@0.1.4 svg_fmt@0.4.5 taffy@0.9.0 winapi-i686-pc-windows-gnu@0.4.0
+winapi-x86_64-pc-windows-gnu@0.4.0 zune-inflate@0.2.54
+""".split())
 
 
 def sha(path):
@@ -82,41 +97,65 @@ def verify_vendor_archive(path):
 
 
 def imports_pe(path):
-    """Read both ordinary and delay-load PE imports; never execute target code."""
+    """Read PE32+ imports using only ranges backed by file data."""
     data = path.read_bytes()
+
+    def malformed():
+        raise RuntimeError(f"Malformed Windows x64 PE: {path}")
+
+    if len(data) < 64 or data[:2] != b"MZ":
+        malformed()
     pe = struct.unpack_from("<I", data, 0x3c)[0]
-    if data[pe:pe+4] != b"PE\0\0":
-        raise RuntimeError(f"Not a PE binary: {path}")
+    if pe + 24 > len(data) or data[pe:pe + 4] != b"PE\0\0":
+        malformed()
     machine, count = struct.unpack_from("<HH", data, pe + 4)
-    if machine != 0x8664:
-        raise RuntimeError(f"Not Windows x64: {path}")
     size = struct.unpack_from("<H", data, pe + 20)[0]
     optional = pe + 24
+    table = optional + size
+    if machine != 0x8664 or size < 112 or table + count * 40 > len(data):
+        malformed()
     if struct.unpack_from("<H", data, optional)[0] != 0x20b:
-        raise RuntimeError("PE32+ expected")
-    sections = [struct.unpack_from("<IIII", data, optional + size + i*40 + 8) for i in range(count)]
-    def offset(rva):
+        malformed()
+    directory_count = struct.unpack_from("<I", data, optional + 108)[0]
+    if directory_count > (size - 112) // 8:
+        malformed()
+    sections = [struct.unpack_from("<IIII", data, table + i * 40 + 8) for i in range(count)]
+
+    def file_span(rva, length):
         for virtual_size, virtual_address, raw_size, raw_offset in sections:
-            if virtual_address <= rva < virtual_address + max(virtual_size, raw_size):
-                return raw_offset + rva - virtual_address
-        raise RuntimeError(f"PE RVA out of range in {path}")
-    def string(rva):
-        start = offset(rva)
-        return data[start:data.index(0, start)].decode("ascii")
+            delta = rva - virtual_address
+            if 0 <= delta < max(virtual_size, raw_size):
+                limit = min(raw_offset + raw_size, len(data))
+                start = raw_offset + delta
+                if not raw_offset or start + length > limit:
+                    malformed()
+                return start, limit
+        malformed()
+
     names = []
     for index, width in ((1, 20), (13, 32)):
-        rva, length = struct.unpack_from("<II", data, optional + 112 + index*8)
-        if not rva:
+        if index >= directory_count:
             continue
-        start = offset(rva)
-        for pos in range(start, start + length, width):
-            descriptor = data[pos:pos+width]
-            if not any(descriptor):
+        rva, length = struct.unpack_from("<II", data, optional + 112 + index * 8)
+        if not rva and not length:
+            continue
+        if not rva or length < width:
+            malformed()
+        start, _ = file_span(rva, length)
+        for pos in range(start, start + length - width + 1, width):
+            values = struct.unpack_from("<" + "I" * (width // 4), data, pos)
+            if not any(values):
                 break
-            values = struct.unpack("<" + "I"*(width//4), descriptor)
             if index == 13 and not values[0] & 1:
                 raise RuntimeError("Unsupported VA-based delay import")
-            names.append(string(values[3] if index == 1 else values[1]))
+            name_rva = values[3] if index == 1 else values[1]
+            name_start, end = file_span(name_rva, 1)
+            nul = data.find(b"\0", name_start, end)
+            if nul <= name_start or not data[name_start:nul].isascii():
+                malformed()
+            names.append(data[name_start:nul].decode("ascii"))
+        else:
+            malformed()
     return names
 
 
@@ -200,10 +239,6 @@ def rust_notices(destination, env, checkpoint, state):
         if not (destination / "rust-license-manifest.json").is_file():
             raise RuntimeError("Completed Rust notices artifact missing")
         return
-    if not state.get("license_gate"):
-        run(["cargo", "deny", "--locked", "check", "licenses"], ROOT, env)
-        state["license_gate"] = True
-        save_checkpoint(checkpoint, state)
     vendor = destination / "rust-vendor"
     if not state.get("vendor"):
         vendored = subprocess.run(["cargo", "vendor", "--locked", "--versioned-dirs", str(vendor)],
@@ -244,15 +279,29 @@ def rust_notices(destination, env, checkpoint, state):
                 files.append(str(file.relative_to(directory)))
         if package["license_file"]:
             custom = Path(package["license_file"])
-            original = Path(package["manifest_path"]).parent / custom
-            target = notices / directory.name / custom.name
-            if not target.exists():
-                if not original.is_file():
-                    raise RuntimeError("Declared license file missing: " + str(original))
+            if custom.is_absolute() or ".." in custom.parts:
+                raise RuntimeError(f"Declared license must be within the vendored crate: {directory}: {custom}")
+            original = directory / custom
+            if custom.as_posix() not in checksums["files"] or not original.is_file():
+                raise RuntimeError(f"Declared license missing from verified vendor files: {original}")
+            if str(custom) not in files:
+                target = notices / directory.name / custom
                 target.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(original, target)
                 files.append(str(custom))
-        entries.append({"name": package["name"], "version": package["version"], "license": package["license"], "license_file": package["license_file"], "notices": files})
+        upstream_notice = bool(files)
+        if not files:
+            crate = f"{package['name']}@{package['version']}"
+            if crate not in METADATA_LICENSES or not package["license"]:
+                raise RuntimeError(f"No upstream license notice in vendored crate: {crate}")
+            # Preserve the actual published declaration when this version contains no notice file.
+            target = notices / directory.name / "Cargo.toml"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(directory / "Cargo.toml", target)
+            files.append("Cargo.toml")
+        entries.append({"name": package["name"], "version": package["version"], "license": package["license"],
+                        "license_file": package["license_file"], "notices": sorted(files),
+                        "notice_basis": "upstream-files" if upstream_notice else "published-SPDX-declaration"})
     (destination / "rust-license-manifest.json").write_text(json.dumps(entries, indent=2) + "\n")
     for name in ("LICENSE-MIT", "LICENSE-APACHE"):
         shutil.copy2(ROOT / name, destination / name)
@@ -273,6 +322,145 @@ def application_source(destination):
         shutil.copy2(ROOT / name, destination / name)
 
 
+def tree_hashes(folder):
+    return {p.relative_to(folder).as_posix(): sha(p) for p in sorted(folder.rglob("*")) if p.is_file()}
+
+
+def completed_file(state, file):
+    digest = state.get("distributions", {}).get(file.name)
+    if digest and (not file.is_file() or sha(file) != digest):
+        raise RuntimeError(f"Completed distribution changed or disappeared: {file}")
+    return bool(digest)
+
+
+def record_file(state, checkpoint, file):
+    state.setdefault("distributions", {})[file.name] = sha(file)
+    save_checkpoint(checkpoint, state)
+
+
+def reuse_rust(prior, state, notices, archive_dir):
+    previous = json.loads((prior / "package-checkpoint.json").read_text())
+    for name, digest in state["identity"]["application"].items():
+        if name.endswith("Cargo.toml") or name in ("Cargo.lock", "deny.toml", "scripts/release/package.py"):
+            if previous["identity"]["application"].get(name) != digest:
+                raise RuntimeError("Rust dependency or policy inputs changed; cannot reuse Rust artifacts")
+    unsigned = prior / "unsigned"
+    if not previous.get("prepared") or tree_hashes(unsigned) != previous["prepared"]:
+        raise RuntimeError("Prior Rust artifacts lack a valid preparation checkpoint")
+    archive = unsigned / "source/rust-corresponding-source.tar.gz"
+    verify_vendor_archive(archive)
+    shutil.copy2(archive, archive_dir / archive.name)
+    old_notices = unsigned / "compliance"
+    for name in ("rust-license-manifest.json", "cargo-vendor-config.toml", "LICENSE-MIT", "LICENSE-APACHE"):
+        shutil.copy2(old_notices / name, notices / name)
+    shutil.copytree(old_notices / "rust-licenses", notices / "rust-licenses", dirs_exist_ok=True)
+    state.update(rust_notices=True, rust_source=sha(archive))
+
+
+def stage_payload(payload, built, windows, version):
+    if windows:
+        payload.mkdir(parents=True)
+        executable = payload / "iris.exe"
+        frameworks = payload
+    else:
+        contents = payload / "Contents"
+        (contents / "MacOS").mkdir(parents=True)
+        frameworks = contents / "Frameworks"
+        frameworks.mkdir()
+        executable = contents / "MacOS/iris"
+        with (contents / "Info.plist").open("wb") as file:
+            plistlib.dump({"CFBundleExecutable": "iris", "CFBundleIdentifier": "io.github.alpenl.iris",
+                           "CFBundleName": "Iris", "CFBundlePackageType": "APPL", "CFBundleShortVersionString": version,
+                           "CFBundleVersion": version, "LSMinimumSystemVersion": "11.0", "NSHighResolutionCapable": True,
+                           "LSApplicationCategoryType": "public.app-category.video",
+                           "CFBundleDocumentTypes": [{"CFBundleTypeName": "Media", "CFBundleTypeRole": "Viewer",
+                               "LSHandlerRank": "Alternate", "LSItemContentTypes": ["public.movie", "public.audio", "public.image"]}]}, file)
+    shutil.copy2(built, executable)
+    return executable, frameworks
+
+
+def notarize(submission, target, evidence):
+    profile = ["--keychain-profile", os.environ["IRIS_NOTARY_PROFILE"]]
+    if os.environ.get("IRIS_NOTARY_KEYCHAIN"):
+        profile += ["--keychain", os.environ["IRIS_NOTARY_KEYCHAIN"]]
+    result = json.loads(run(["xcrun", "notarytool", "submit", submission, *profile, "--wait", "--output-format", "json"]))
+    evidence.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
+    if result.get("status") != "Accepted":
+        raise RuntimeError(f"Apple notarization did not accept {target}")
+    run(["xcrun", "stapler", "staple", target])
+    run(["xcrun", "stapler", "validate", target])
+
+
+def sign_payload(payload, executable, frameworks, notices, graph, target, mode, version, windows, output):
+    release = mode == "release"
+    record = {"mode": mode, "signing": "unsigned-local", "notarization": "not-requested",
+              "target": target, "version": version, "native_dependencies": graph}
+    if windows and release:
+        for file in [executable, *sorted(frameworks.glob("*.dll"))]:
+            run(["pwsh", "-NoProfile", "-File", Path(__file__).with_name("sign-windows.ps1"), "-File", file])
+        record["signing"] = "authenticode-verified"
+    if not windows:
+        signing = ["--timestamp", "--options", "runtime"] if release else []
+        identity = os.environ["IRIS_MAC_SIGN_IDENTITY"] if release else "-"
+        for file in sorted(frameworks.glob("*.dylib")):
+            run(["codesign", "--force", "--sign", identity, *signing, file])
+            run(["codesign", "--verify", "--strict", file])
+        record["signing"] = "developer-id-hardened-runtime" if release else "ad-hoc-local-not-developer-id"
+        if release:
+            # The sealed resource records the release requirement. The external manifest records the outcome.
+            record["notarization"] = "required; see accompanying build manifest for result"
+    (notices / "package-manifest.json").write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
+    if not windows:
+        run(["codesign", "--force", "--sign", identity, *signing, payload])
+        run(["codesign", "--verify", "--deep", "--strict", payload])
+        if release:
+            details = run(["codesign", "--display", "--verbose=4", payload])
+            if "Authority=Developer ID Application:" not in details or "runtime" not in details:
+                raise RuntimeError("Developer ID hardened runtime verification failed")
+            submission = output / "notary-submission.zip"
+            submission.unlink(missing_ok=True)
+            run(["ditto", "-c", "-k", "--keepParent", payload, submission])
+            notarize(submission, payload, output / "notary-result.json")
+            run(["spctl", "--assess", "--type", "execute", "--verbose=2", payload])
+            submission.unlink()
+            record["notarization"] = "accepted-and-stapled"
+    return record
+
+
+def build_installer(payload, output, artifact, version, release):
+    iscc = shutil.which("ISCC")
+    if not iscc:
+        installed = Path(os.environ["LOCALAPPDATA"]) / "Programs/Inno Setup 6/ISCC.exe"
+        if not installed.is_file():
+            raise RuntimeError("Inno Setup compiler required; run scripts/release/install-inno.ps1")
+        iscc = installed
+    args = [iscc, "/DAppVersion=" + version, "/DPayload=" + str(payload), "/DArtifact=" + artifact,
+            "/DOutput=" + str(output), "/DLicenseFile=" + str(ROOT / "LICENSE-MIT")]
+    if release:
+        # Use a clean cache so ISCC cannot reuse an uninstaller signed by some previous release.
+        cache = output / "signed-uninstaller"
+        if cache.exists():
+            shutil.rmtree(cache)
+        cache.mkdir()
+        script = str(Path(__file__).with_name("sign-windows.ps1")).replace("$", "$$")
+        args += ["/DSignedRelease", "/DSignedUninstallerDir=" + str(cache),
+                 f"/Siris=pwsh.exe -NoProfile -File $q{script}$q -File $f"]
+    run([*args, Path(__file__).with_name("windows-installer.iss")])
+    if release:
+        run(["signtool", "verify", "/pa", "/all", output / (artifact + "-setup.exe")])
+
+
+def media_source(compliance, manifest):
+    lock = json.loads(_media.LOCK.read_text(encoding="utf-8"))
+    _media.validate_lock(lock)
+    sdk_lock = json.loads((compliance / _media.LOCK.name).read_text(encoding="utf-8"))
+    if sdk_lock != lock or any(lock["sources"].get(name) != pin for name, pin in manifest["sources"].items()):
+        raise RuntimeError("Media SDK sources differ from the current verified source lock")
+    if not {"ffmpeg", "mpv"} <= manifest["sources"].keys():
+        raise RuntimeError("Media SDK manifest omits runtime source pins")
+    return compliance / "corresponding-source.tar.gz"
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--sdk", type=Path, required=True)
@@ -280,16 +468,19 @@ def main():
     parser.add_argument("--version", required=True, help="Must match the authorized 0.0.x workspace version")
     parser.add_argument("--mode", choices=["local", "release"], required=True)
     parser.add_argument("--resume", action="store_true", help="Resume only when application and SDK inputs are unchanged")
-    parser.add_argument("--adopt-completed-vendor", action="store_true",
-                        help="Migrate a pre-checkpoint run known to have completed build/license/vendor; requires --resume")
+    phases = parser.add_mutually_exclusive_group()
+    phases.add_argument("--prepare-only", action="store_true", help="Compile and collect unsigned release inputs without signing credentials")
+    phases.add_argument("--package-only", action="store_true", help="Package completed preparation without invoking Cargo; requires --resume")
     parser.add_argument("--reuse-rust", type=Path, help="Reuse verified Rust source/license artifacts from a prior package output")
     parser.add_argument(
         "--source-mode",
         choices=["embedded", "sidecar"],
-        default="embedded",
-        help="embedded (default) bundles corresponding source tarballs inside compliance/; sidecar emits them alongside the package",
+        default="sidecar",
+        help="sidecar (default) ships source archives alongside the installers; embedded includes them in compliance/"
     )
     args = parser.parse_args()
+    if args.mode == "release" and not (args.prepare_only or args.package_only):
+        parser.error("Release requires --prepare-only followed by --resume --package-only")
     with (ROOT / "Cargo.toml").open("rb") as file:
         workspace_version = tomllib.load(file)["workspace"]["package"]["version"]
     if not re.fullmatch(r"0\.0\.(0|[1-9][0-9]*)", args.version) or args.version != workspace_version:
@@ -297,26 +488,28 @@ def main():
     sdk, output = args.sdk.resolve(), args.output.resolve()
     compliance = sdk / "compliance"
     manifest = json.loads((compliance / "build-manifest.json").read_text())
+    media_archive = media_source(compliance, manifest)
+    media_digest = sha(media_archive)
     prefix = sdk / "prefix"
     windows = manifest["target"] == "windows-x86_64"
-    if windows != (os.name == "nt"):
+    if (windows and os.name != "nt") or (not windows and sys.platform != "darwin"):
         parser.error("Package on the target OS (Windows MSVC or native macOS)")
     if output.exists() and not args.resume:
         parser.error("Use a fresh output directory or --resume")
-    if args.adopt_completed_vendor and not args.resume:
-        parser.error("--adopt-completed-vendor requires --resume")
     checkpoint = output / "package-checkpoint.json"
     identity = {"application": application_inputs(), "sdk_manifest": sha(compliance / "build-manifest.json"),
                 "mode": args.mode, "version": args.version, "target": manifest["target"]}
-    if args.source_mode != "embedded":
-        identity["source_mode"] = args.source_mode
+    identity["source_mode"] = args.source_mode
+    identity["media_source"] = media_digest
     state = {"identity": identity}
     if checkpoint.exists():
         state = json.loads(checkpoint.read_text())
         if state["identity"] != identity:
             parser.error("Application, SDK, mode or version changed; refusing stale package resume")
-    elif args.resume and not args.adopt_completed_vendor:
-        parser.error("No checkpoint exists; legacy successful vendor stage needs explicit --adopt-completed-vendor")
+    elif args.resume:
+        parser.error("No package checkpoint exists")
+    if args.package_only and not (state.get("prepared") and state.get("build") and state.get("license_gate")):
+        parser.error("--package-only requires --resume and completed preparation")
     # Verify the entire SDK before compiling, including import libraries and headers.
     for relative, digest in manifest["files"].items():
         file = prefix / relative
@@ -327,21 +520,21 @@ def main():
     for key, value in (("gpl", False), ("libmpv", True), ("cplayer", False)):
         if manifest["mpv"].get(key) != value:
             raise RuntimeError("mpv manifest license gate rejected")
-    if args.mode == "release":
-        required = ["IRIS_WINDOWS_PFX", "IRIS_WINDOWS_PFX_PASSWORD", "IRIS_TIMESTAMP_URL"] if windows else ["IRIS_MAC_SIGN_IDENTITY", "IRIS_NOTARY_PROFILE"]
-        for name in required:
-            if not os.environ.get(name):
-                raise RuntimeError("Signed release requires " + name)
     output.mkdir(parents=True, exist_ok=args.resume)
     if not args.resume:
         save_checkpoint(checkpoint, state)
-    if not (output / "media-runtime-verification.json").is_file():
-        verification_env = os.environ.copy()
+    runtime_evidence = output / "media-runtime-verification.json"
+    if not state.get("runtime_verification") and not args.package_only:
+        verification_env = {key: value for key, value in os.environ.items() if key not in SIGNING_ENV}
         if not windows:
             verification_env["DYLD_LIBRARY_PATH"] = str(prefix / "lib")
         verification = run([sys.executable, Path(__file__).with_name("verify-media.py"), "--sdk", sdk], env=verification_env)
-        (output / "media-runtime-verification.json").write_text(verification)
-    env = os.environ.copy()
+        runtime_evidence.write_text(verification, encoding="utf-8")
+        state["runtime_verification"] = sha(runtime_evidence)
+        save_checkpoint(checkpoint, state)
+    elif not runtime_evidence.is_file() or sha(runtime_evidence) != state.get("runtime_verification"):
+        raise RuntimeError("Completed media runtime verification changed or disappeared")
+    env = {key: value for key, value in os.environ.items() if key not in SIGNING_ENV}
     env["MPV_LIB_DIR"] = str(prefix / "lib")
     env["PKG_CONFIG_PATH"] = str(prefix / "lib/pkgconfig")
     target = {"windows-x86_64": "x86_64-pc-windows-msvc", "macos-arm64": "aarch64-apple-darwin", "macos-x86_64": "x86_64-apple-darwin"}[manifest["target"]]
@@ -353,181 +546,145 @@ def main():
         env["RUSTFLAGS"] = "-C link-arg=-Wl,-headerpad_max_install_names"
     cargo_target = Path(env.get("CARGO_TARGET_DIR", str(output / "cargo-target"))).resolve()
     env["CARGO_TARGET_DIR"] = str(cargo_target)
-    built = cargo_target / target / "release" / ("iris.exe" if windows else "iris")
-    if args.adopt_completed_vendor:
-        prior_notices = output / ("stage/Iris/compliance" if windows else "stage/Iris.app/Contents/Resources/compliance")
-        config = prior_notices / "cargo-vendor-config.toml"
-        if not built.is_file() or not config.is_file() or not (prior_notices / "rust-vendor").is_dir():
-            parser.error("Legacy build/vendor artifacts are incomplete")
-        # Older runs did not record hashes: reject any input newer than their actual build.
-        if any((ROOT / name).stat().st_mtime_ns > built.stat().st_mtime_ns for name in identity["application"]):
-            parser.error("Application/license inputs changed after legacy build; refusing adoption")
-        staged = output / ("stage/Iris/iris.exe" if windows else "stage/Iris.app/Contents/MacOS/iris")
-        if not staged.is_file() or sha(staged) != sha(built):
-            parser.error("Legacy staged executable differs from successful build")
-        state.update(build=sha(built), license_gate=True, vendor=True)
-        save_checkpoint(checkpoint, state)
+    built = output / "unsigned" / ("iris.exe" if windows else "iris")
     if not state.get("build"):
         run(["cargo", "build", "--locked", "--release", "--target", target, "-p", "iris"], ROOT, env)
+        built.parent.mkdir(exist_ok=True)
+        shutil.copy2(cargo_target / target / "release" / built.name, built)
         state["build"] = sha(built)
         save_checkpoint(checkpoint, state)
     elif not built.is_file() or sha(built) != state["build"]:
-        raise RuntimeError("Completed application build artifact changed or disappeared")
-    stage = output / "stage"
-    stage.mkdir(exist_ok=args.resume)
-    if windows:
-        payload = stage / "Iris"
-        payload.mkdir(exist_ok=args.resume)
-        executable = payload / "iris.exe"
-        frameworks = payload
-    else:
-        payload = stage / "Iris.app"
-        contents = payload / "Contents"
-        (contents / "MacOS").mkdir(parents=True, exist_ok=args.resume)
-        frameworks = contents / "Frameworks"
-        frameworks.mkdir(exist_ok=args.resume)
-        executable = contents / "MacOS/iris"
-        with (contents / "Info.plist").open("wb") as file:
-            plistlib.dump({"CFBundleExecutable": "iris", "CFBundleIdentifier": "io.github.alpenl.iris",
-                          "CFBundleName": "Iris", "CFBundlePackageType": "APPL", "CFBundleShortVersionString": args.version,
-                          "CFBundleVersion": args.version, "LSMinimumSystemVersion": "11.0", "NSHighResolutionCapable": True,
-                          "LSApplicationCategoryType": "public.app-category.video",
-                          "CFBundleDocumentTypes": [{"CFBundleTypeName": "Media", "CFBundleTypeRole": "Viewer",
-                              "LSHandlerRank": "Alternate", "LSItemContentTypes": ["public.movie", "public.audio", "public.image"]}]}, file)
-    if not executable.exists():
-        shutil.copy2(built, executable)
-    elif sha(executable) != state["build"]:
-        raise RuntimeError("Staged executable changed; refusing resume")
-    notices = payload / "compliance" if windows else payload / "Contents/Resources/compliance"
-    shutil.copytree(compliance, notices, dirs_exist_ok=True, ignore=shutil.ignore_patterns(".DS_Store"))
-    if args.source_mode == "sidecar":
-        (notices / "corresponding-source.tar.gz").unlink(missing_ok=True)
-    # Fonts and SVG icons are compiled into the binary via include_bytes!;
-    # ship only their OFL license notices to avoid duplicating embedded assets.
-    font_licenses = notices / "font-licenses"
-    font_licenses.mkdir(exist_ok=True)
-    for ofl in sorted((ROOT / "Resources/Fonts").glob("*-OFL.txt")):
-        shutil.copy2(ofl, font_licenses / ofl.name)
-    archive_dir = notices if args.source_mode == "embedded" else output
-    if args.reuse_rust and not state.get("rust_notices"):
-        prior = args.reuse_rust.resolve()
-        previous = json.loads((prior / "package-checkpoint.json").read_text())
-        for name, digest in identity["application"].items():
-            if name.endswith("Cargo.toml") or name in ("Cargo.lock", "deny.toml"):
-                if previous["identity"]["application"].get(name) != digest:
-                    parser.error("Rust dependency/license inputs changed; cannot reuse Rust artifacts")
-        old_notices = prior / ("stage/Iris/compliance" if windows else "stage/Iris.app/Contents/Resources/compliance")
-        archive = old_notices / "rust-corresponding-source.tar.gz"
-        if not archive.is_file():
-            archive = prior / "rust-corresponding-source.tar.gz"
-        if not previous.get("rust_notices") or not archive.is_file() or sha(archive) != previous.get("rust_source"):
-            parser.error("Prior Rust source artifacts lack a valid completion checkpoint")
-        verify_vendor_archive(archive)
-        shutil.copy2(archive, archive_dir / "rust-corresponding-source.tar.gz")
-        for name in ("rust-license-manifest.json", "cargo-vendor-config.toml"):
-            shutil.copy2(old_notices / name, notices / name)
-        shutil.copytree(old_notices / "rust-licenses", notices / "rust-licenses", dirs_exist_ok=True)
-        state.update(rust_notices=True, rust_source=sha(archive))
-        save_checkpoint(checkpoint, state)
-    rust_notices(notices, env, checkpoint, state)
-    if not state.get("iris_source"):
-        application_source(notices)
-    for directory, archive, flag in (("rust-vendor", "rust-corresponding-source.tar.gz", "rust_source"),
-                                     ("iris-source", "iris-corresponding-source.tar.gz", "iris_source")):
-        target_archive = archive_dir / archive
-        if not state.get(flag):
-            _media.source_archive(notices / directory, target_archive, manifest["source_date_epoch"])
-            state[flag] = sha(target_archive)
+        raise RuntimeError("Completed unsigned application changed or disappeared")
+    prepared = output / "unsigned"
+    notices = prepared / "compliance"
+    archive_dir = prepared / "source"
+    if not state.get("prepared"):
+        notices.mkdir(exist_ok=True)
+        archive_dir.mkdir(exist_ok=True)
+        shutil.copytree(compliance, notices, dirs_exist_ok=True,
+                        ignore=shutil.ignore_patterns(".DS_Store", "corresponding-source.tar.gz"))
+        font_licenses = notices / "font-licenses"
+        font_licenses.mkdir(exist_ok=True)
+        for ofl in sorted((ROOT / "Resources/Fonts").glob("*-OFL.txt")):
+            shutil.copy2(ofl, font_licenses / ofl.name)
+        if not state.get("license_gate"):
+            run(["cargo", "deny", "--locked", "check", "advisories", "licenses", "bans", "sources"], ROOT, env)
+            state["license_gate"] = True
             save_checkpoint(checkpoint, state)
-        elif not target_archive.is_file() or sha(target_archive) != state[flag]:
-            raise RuntimeError("Completed corresponding source archive changed: " + archive)
-        if (notices / directory).exists():
-            shutil.rmtree(notices / directory)
-    graph = windows_dependencies(executable, prefix, manifest, frameworks) if windows else mac_dependencies(executable, prefix, manifest, frameworks, manifest["target"].removeprefix("macos-"))
-    state = {"mode": args.mode, "signing": "unsigned-local", "notarization": "not-requested", "target": target, "version": args.version, "native_dependencies": graph}
-    if windows and args.mode == "release":
-        for file in [executable, *sorted(frameworks.glob("*.dll"))]:
-            run(["pwsh", "-NoProfile", "-File", Path(__file__).with_name("sign-windows.ps1"), "-File", file])
-        state["signing"] = "authenticode-verified"
-    if not windows:
-        identity = os.environ["IRIS_MAC_SIGN_IDENTITY"] if args.mode == "release" else "-"
-        for file in sorted(frameworks.glob("*.dylib")):
-            run(["codesign", "--force", "--sign", identity, *( ["--timestamp", "--options", "runtime"] if args.mode == "release" else []), file])
-            run(["codesign", "--verify", "--strict", file])
-        state["signing"] = "developer-id-hardened-runtime" if args.mode == "release" else "ad-hoc-local-not-developer-id"
-    # Manifest must exist before signing the app; do not mutate signed resources afterward.
-    (notices / "package-manifest.json").write_text(json.dumps(state, indent=2) + "\n")
-    artifact = "Iris-" + args.version + "-" + manifest["target"] + "-" + args.mode
-    if windows:
-        iss = Path(__file__).with_name("windows-installer.iss")
-        iscc = shutil.which("ISCC")
-        if not iscc:
-            installed = Path(os.environ["LOCALAPPDATA"]) / "Programs/Inno Setup 6/ISCC.exe"
-            if not installed.is_file():
-                raise RuntimeError("Inno Setup compiler required; run scripts/release/install-inno.ps1")
-            iscc = str(installed)
-        installer = output / (artifact + "-setup.exe")
-        completed = json.loads(checkpoint.read_text())
-        if completed.get("installer"):
-            if not installer.is_file() or sha(installer) != completed["installer"]:
-                raise RuntimeError("Completed installer changed or disappeared")
-        else:
-            run([iscc, "/DAppVersion=" + args.version, "/DPayload=" + str(payload), "/DArtifact=" + artifact,
-                 "/DOutput=" + str(output), "/DLicenseFile=" + str(ROOT / "LICENSE-MIT"), iss])
-            completed["installer"] = sha(installer)
-            save_checkpoint(checkpoint, completed)
-        if args.mode == "release":
-            run(["pwsh", "-NoProfile", "-File", Path(__file__).with_name("sign-windows.ps1"), "-File", installer])
-        with zipfile.ZipFile(output / (artifact + ".zip"), "w", zipfile.ZIP_DEFLATED, strict_timestamps=False) as zip:
-            for file in sorted(payload.rglob("*")):
-                if file.is_file():
-                    zip.write(file, file.relative_to(stage))
+        if args.reuse_rust and not state.get("rust_notices"):
+            reuse_rust(args.reuse_rust.resolve(), state, notices, archive_dir)
+            save_checkpoint(checkpoint, state)
+        rust_notices(notices, env, checkpoint, state)
+        if not state.get("iris_source"):
+            application_source(notices)
+        for directory, archive, flag in (("rust-vendor", "rust-corresponding-source.tar.gz", "rust_source"),
+                                         ("iris-source", "iris-corresponding-source.tar.gz", "iris_source")):
+            target_archive = archive_dir / archive
+            if not state.get(flag):
+                _media.source_archive(notices / directory, target_archive, manifest["source_date_epoch"])
+                state[flag] = sha(target_archive)
+                save_checkpoint(checkpoint, state)
+            elif not target_archive.is_file() or sha(target_archive) != state[flag]:
+                raise RuntimeError("Completed corresponding source archive changed: " + archive)
+            if (notices / directory).exists():
+                shutil.rmtree(notices / directory)
+        state["prepared"] = tree_hashes(prepared)
+        save_checkpoint(checkpoint, state)
+    elif tree_hashes(prepared) != state["prepared"]:
+        raise RuntimeError("Completed unsigned package inputs changed or disappeared")
+    if args.prepare_only:
+        return
+
+    release = args.mode == "release"
+    if release:
+        required = SIGNING_ENV[:3] if windows else SIGNING_ENV[3:5]
+        for name in required:
+            if not os.environ.get(name):
+                raise RuntimeError("Signed release requires " + name)
+    artifact = f"Iris-{args.version}-{manifest['target']}-{args.mode}"
+    stage = output / "stage"
+    payload = stage / ("Iris" if windows else "Iris.app")
+    packaged_notices = payload / ("compliance" if windows else "Contents/Resources/compliance")
+    sources = {file.name: file for file in sorted(archive_dir.glob("*.tar.gz"))}
+    sources[media_archive.name] = media_archive
+    source_names = {name: f"{artifact}.{name}" for name in sources}
+    if state.get("payload"):
+        if tree_hashes(stage) != state["payload"]:
+            raise RuntimeError("Completed signed package payload changed or disappeared")
+        package = state["manifest"]
+        if not windows:
+            run(["codesign", "--verify", "--deep", "--strict", payload])
+            if release:
+                run(["xcrun", "stapler", "validate", payload])
     else:
-        identity = os.environ["IRIS_MAC_SIGN_IDENTITY"] if args.mode == "release" else "-"
-        run(["codesign", "--force", "--sign", identity, *(["--timestamp", "--options", "runtime"] if args.mode == "release" else []), payload])
-        run(["codesign", "--verify", "--deep", "--strict", payload])
-        if args.mode == "release":
-            details = run(["codesign", "--display", "--verbose=4", payload])
-            if "Authority=Developer ID Application:" not in details or "runtime" not in details:
-                raise RuntimeError("Developer ID hardened runtime verification failed")
-            submission = output / "notary-submission.zip"
-            run(["ditto", "-c", "-k", "--keepParent", payload, submission])
-            result = json.loads(run(["xcrun", "notarytool", "submit", submission, "--keychain-profile", os.environ["IRIS_NOTARY_PROFILE"], "--wait", "--output-format", "json"]))
-            (output / "notary-result.json").write_text(json.dumps(result, indent=2))
-            if result.get("status") != "Accepted":
-                raise RuntimeError("Apple notarization did not accept this application")
-            run(["xcrun", "stapler", "staple", payload])
-            run(["xcrun", "stapler", "validate", payload])
-            run(["spctl", "--assess", "--type", "execute", "--verbose=2", payload])
-            state["notarization"] = "accepted-and-stapled"
-            submission.unlink()
-        run(["ditto", "-c", "-k", "--sequesterRsrc", "--keepParent", payload, output / (artifact + ".zip")])
-        run(["hdiutil", "create", "-volname", "Iris", "-srcfolder", stage, "-ov", "-format", "UDZO", output / (artifact + ".dmg")])
-        if args.mode == "release":
-            run(["codesign", "--sign", os.environ["IRIS_MAC_SIGN_IDENTITY"], "--timestamp", output / (artifact + ".dmg")])
-            result = json.loads(run(["xcrun", "notarytool", "submit", output / (artifact + ".dmg"), "--keychain-profile", os.environ["IRIS_NOTARY_PROFILE"], "--wait", "--output-format", "json"]))
-            (output / "notary-dmg-result.json").write_text(json.dumps(result, indent=2))
-            if result.get("status") != "Accepted":
-                raise RuntimeError("Apple notarization did not accept the distribution disk image")
-            run(["xcrun", "stapler", "staple", output / (artifact + ".dmg")])
-            run(["xcrun", "stapler", "validate", output / (artifact + ".dmg")])
-    # Sidecars accompany every distribution, including the installable package.
-    for suffix in (".zip", "-setup.exe" if windows else ".dmg"):
-        binary = output / (artifact + suffix)
-        if not binary.is_file():
-            raise RuntimeError("Expected distribution missing: " + str(binary))
-        shutil.copy2(compliance / "corresponding-source.tar.gz", output / (binary.name + ".corresponding-source.tar.gz"))
-        if args.source_mode == "sidecar":
-            for extra in ("rust-corresponding-source.tar.gz", "iris-corresponding-source.tar.gz"):
-                shutil.copy2(output / extra, output / (binary.name + "." + extra))
-        bundle = {**state, "binary_sha256": sha(binary), "media_build": manifest}
+        if stage.exists():
+            shutil.rmtree(stage)
+        executable, frameworks = stage_payload(payload, built, windows, args.version)
+        shutil.copytree(notices, packaged_notices)
+        if args.source_mode == "embedded":
+            for name, file in sources.items():
+                shutil.copy2(file, packaged_notices / name)
+        else:
+            (packaged_notices / "CORRESPONDING-SOURCE.txt").write_text(
+                "Download these exact source archives alongside the Iris distribution:\n"
+                + "".join(f"{sha(sources[name])}  {filename}\n" for name, filename in sorted(source_names.items())),
+                encoding="utf-8",
+            )
+        graph = windows_dependencies(executable, prefix, manifest, frameworks) if windows else mac_dependencies(
+            executable, prefix, manifest, frameworks, manifest["target"].removeprefix("macos-"))
+        package = sign_payload(payload, executable, frameworks, packaged_notices, graph,
+                               target, args.mode, args.version, windows, output)
+        state.update(payload=tree_hashes(stage), manifest=package)
+        save_checkpoint(checkpoint, state)
+    zip_path = output / (artifact + ".zip")
+    if not completed_file(state, zip_path):
+        zip_path.unlink(missing_ok=True)
+        if windows:
+            with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED, strict_timestamps=False) as archive:
+                for file in sorted(payload.rglob("*")):
+                    if file.is_file():
+                        archive.write(file, file.relative_to(stage))
+        else:
+            run(["ditto", "-c", "-k", "--sequesterRsrc", "--keepParent", payload, zip_path])
+        record_file(state, checkpoint, zip_path)
+
+    setup = output / (artifact + ("-setup.exe" if windows else ".dmg"))
+    if not completed_file(state, setup):
+        setup.unlink(missing_ok=True)
+        if windows:
+            build_installer(payload, output, artifact, args.version, release)
+        else:
+            run(["hdiutil", "create", "-volname", "Iris", "-srcfolder", stage, "-ov", "-format", "UDZO", setup])
+            if release:
+                run(["codesign", "--sign", os.environ["IRIS_MAC_SIGN_IDENTITY"], "--timestamp", setup])
+                run(["codesign", "--verify", "--strict", setup])
+                notarize(setup, setup, output / "notary-dmg-result.json")
+        record_file(state, checkpoint, setup)
+    elif release:
+        if windows:
+            run(["signtool", "verify", "/pa", "/all", setup])
+        else:
+            run(["codesign", "--verify", "--strict", setup])
+            run(["xcrun", "stapler", "validate", setup])
+
+    if args.source_mode == "sidecar":
+        for name, file in sources.items():
+            shutil.copy2(file, output / source_names[name])
+    licenses = output / (artifact + ".licenses.tar.gz")
+    if not completed_file(state, licenses):
+        with tarfile.open(licenses, "w:gz") as archive:
+            archive.add(packaged_notices, arcname="compliance",
+                        filter=lambda entry: None if entry.name.removeprefix("compliance/") in sources else entry)
+        record_file(state, checkpoint, licenses)
+    for binary in (zip_path, setup):
+        bundle = {**package, "binary_sha256": state["distributions"][binary.name], "media_build": manifest,
+                  "corresponding_source": source_names if args.source_mode == "sidecar" else "embedded"}
+        if release and not windows and binary == setup:
+            bundle["disk_image_notarization"] = "accepted-and-stapled"
         (output / (binary.name + ".build-manifest.json")).write_text(json.dumps(bundle, indent=2) + "\n")
-        with tarfile.open(output / (binary.name + ".licenses.tar.gz"), "w:gz") as tar:
-            tar.add(notices, arcname="compliance")
     distributed = sorted(p for p in output.glob(artifact + "*") if p.is_file())
-    (output / "SHA256SUMS").write_text("".join(sha(p) + "  " + p.name + "\n" for p in distributed))
-    # Keep Cargo's incremental cache, especially when supplied by the caller.
-    print("Packaged:", output, "signing:", state["signing"], "notarization:", state["notarization"])
+    (output / "SHA256SUMS").write_text("".join(f"{sha(p)}  {p.name}\n" for p in distributed))
+    print("Packaged:", output, "signing:", package["signing"], "notarization:", package["notarization"])
 
 
 if __name__ == "__main__":

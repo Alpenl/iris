@@ -202,12 +202,9 @@ pub(in crate::ui) fn thin_scrollbar(
 ) -> Option<Div> {
     let state = handle.0.borrow();
     let max_y = f32::from(state.base_handle.max_offset().height);
-    let off_y = (-f32::from(state.base_handle.offset().y)).clamp(0., max_y.max(0.));
+    let offset = f32::from(state.base_handle.offset().y);
     let view_h = f32::from(state.base_handle.bounds().size.height);
-    (max_y > 1. && view_h > 20.).then(|| {
-        let total = view_h + max_y;
-        let thumb_h = (view_h * (view_h / total)).clamp(24., view_h * 0.8);
-        let top = (off_y / max_y) * (view_h - thumb_h);
+    scrollbar_geometry(view_h, max_y, offset).map(|(top, thumb_h)| {
         div()
             .absolute()
             .right(px(2.))
@@ -217,4 +214,36 @@ pub(in crate::ui) fn thin_scrollbar(
             .rounded(t.radius_sm)
             .bg(t.line_strong)
     })
+}
+
+fn scrollbar_geometry(view_h: f32, max_y: f32, offset: f32) -> Option<(f32, f32)> {
+    if !view_h.is_finite()
+        || !max_y.is_finite()
+        || !offset.is_finite()
+        || max_y <= 1.
+        || view_h <= 20.
+    {
+        return None;
+    }
+    let max_thumb = view_h * 0.8;
+    let thumb_h = (view_h * (view_h / (view_h + max_y))).clamp(24.0_f32.min(max_thumb), max_thumb);
+    let top = (-offset).clamp(0., max_y) / max_y * (view_h - thumb_h);
+    Some((top, thumb_h))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::scrollbar_geometry;
+
+    #[test]
+    fn short_scroll_tracks_fit_the_thumb_at_both_ends() {
+        for view in [20.1, 24., 29.9, 30., 120.] {
+            let (top, height) = scrollbar_geometry(view, 100., 0.).unwrap();
+            assert_eq!(top, 0.);
+            assert!(height > 0. && height <= view * 0.8);
+            let (bottom, _) = scrollbar_geometry(view, 100., -100.).unwrap();
+            assert!(bottom + height <= view);
+        }
+        assert!(scrollbar_geometry(f32::NAN, 100., 0.).is_none());
+    }
 }

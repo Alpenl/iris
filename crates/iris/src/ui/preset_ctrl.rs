@@ -5,7 +5,7 @@ use gpui::{Context, Window, px, size};
 use iris_api::{HostEvent, Permission};
 use iris_core::library::{SortBy, SortOrder};
 use iris_core::player::Command;
-use iris_core::preset::{PresetCaptureScope, PresetManager, SidebarMode};
+use iris_core::preset::{PresetCaptureScope, PresetLayout, PresetManager, SidebarMode};
 
 use super::IrisWindow;
 use super::chrome::DirectoryPopup;
@@ -70,6 +70,9 @@ impl IrisWindow {
     /// Guardrail #3: One-click safety escape that disables `UiTheme` plugins, clears
     /// frameless/chrome overrides, and restores the default Graphite theme.
     pub(super) fn reset_appearance(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.overlays.close_all();
+        self.text_inputs.active_form_key = None;
+        self.focus.focus(window);
         let theme_plugin_ids: Vec<String> = self
             .plugins
             .list()
@@ -87,6 +90,12 @@ impl IrisWindow {
                 .set_enabled_with_snapshot(&pid, false, snap.clone());
             self.apply_poll_report(report, Some(window), cx);
         }
+        while let Some((plugin, _)) = self.plugins.active_modal() {
+            let plugin = plugin.to_owned();
+            self.plugins.dismiss_modal(&plugin);
+        }
+        self.overlays.plugin_modal_focus_pending = true;
+        self.sync_plugin_modal_focus(window);
         self.settings.theme_id = "graphite".into();
         self.settings.floating_dock = false;
         self.settings.compact_controls = false;
@@ -111,6 +120,20 @@ impl IrisWindow {
         cx.notify();
     }
 
+    fn current_preset_layout(&self, window: &Window) -> PresetLayout {
+        let size = window.viewport_size();
+        PresetLayout {
+            sidebar_mode: self.catalog.sidebar_mode,
+            window_size: self.chrome.pending_window_size.or_else(|| {
+                if window.is_fullscreen() || window.is_maximized() {
+                    self.chrome.last_window_size
+                } else {
+                    Some((f32::from(size.width), f32::from(size.height)))
+                }
+            }),
+        }
+    }
+
     pub(super) fn activate_preset(
         &mut self,
         id: &str,
@@ -126,9 +149,10 @@ impl IrisWindow {
             .get(id)
             .map_or_else(|| "默认工作区".into(), |p| p.name.clone());
         let prev_disabled = self.settings.disabled_plugins.clone();
+        let layout = self.current_preset_layout(window);
         let trans = self
             .preset_rt
-            .switch_preset(&self.presets, id, &mut self.settings);
+            .switch_preset(&self.presets, id, &mut self.settings, layout);
 
         for (pid, cmd_id) in trans.on_exit_commands {
             let snap = self.plugin_snapshot();
@@ -167,10 +191,13 @@ impl IrisWindow {
             self.catalog.sidebar_mode = mode;
         }
         platform::set_always_on_top(window, self.settings.always_on_top);
-        if !self.chrome.fullscreen
-            && let Some((w, h)) = trans.window_size
-        {
-            window.resize(size(px(w.clamp(480., 7680.)), px(h.clamp(300., 4320.))));
+        if let Some((w, h)) = trans.window_size {
+            if window.is_fullscreen() {
+                self.chrome.pending_window_size = Some((w, h));
+            } else {
+                window.resize(size(px(w), px(h)));
+                self.chrome.last_window_size = Some((w, h));
+            }
         }
         if let Some(sp) = trans.speed {
             self.command(Command::SetSpeed(sp), cx);
@@ -181,9 +208,7 @@ impl IrisWindow {
 
         self.active().session.apply_settings(&self.settings);
         self.sync_theme_tokens(cx);
-        if self.settings.photo_filmstrip {
-            self.ensure_filmstrip_thumbnails(cx);
-        }
+        self.ensure_filmstrip_thumbnails(cx);
         self.overlays.popover = None;
         self.show_toast(format!("已切换预设 · {preset_name}"), cx);
     }
@@ -193,7 +218,7 @@ impl IrisWindow {
         name: String,
         description: String,
         scope: PresetCaptureScope,
-        window: &Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let vp = window.viewport_size();
@@ -210,6 +235,7 @@ impl IrisWindow {
             description.trim().to_string(),
             scope,
             &self.settings,
+            self.preset_rt.baseline(),
             self.catalog.sidebar_mode,
             win_sz,
             st.speed,
@@ -217,9 +243,7 @@ impl IrisWindow {
         );
         let label = preset.name.clone();
         let saved_id = self.presets.save_custom(preset);
-        let _ = self
-            .preset_rt
-            .switch_preset(&self.presets, &saved_id, &mut self.settings);
+        self.activate_preset(&saved_id, window, cx);
         self.show_toast(format!("已保存预设 · {label}"), cx);
     }
 
@@ -238,6 +262,7 @@ impl IrisWindow {
             id,
             scope,
             &self.settings,
+            self.preset_rt.baseline(),
             self.catalog.sidebar_mode,
             win_sz,
             st.speed,
@@ -262,6 +287,7 @@ impl IrisWindow {
         self.settings.sort_order = next_ord;
         self.persist_user_settings();
         self.rebuild_directory_rows();
+        self.ensure_filmstrip_thumbnails(cx);
         let by_str = match next_by {
             SortBy::Name => "名称",
             SortBy::Modified => "修改时间",

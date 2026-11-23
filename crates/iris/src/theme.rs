@@ -19,7 +19,7 @@ const ROW_H: f32 = 28.;
 pub(crate) const BUTTON: f32 = 28.;
 
 const DEFAULT_CORNER_RADIUS: f32 = 0.0;
-const MIN_CONTRAST_LUMINANCE_DIFF: f32 = 0.12;
+const MIN_TEXT_CONTRAST: f32 = 4.5;
 const HIGH_CONTRAST_LIGHT: u32 = 0xF2F4F8FF;
 const HIGH_CONTRAST_DARK: u32 = 0x111317FF;
 
@@ -218,33 +218,97 @@ impl ThemeTokens {
             apply_metric_override(&mut radius, spec.corner_radius, 0.0, 14.0);
         }
 
-        let window_bg = rgba(p.window_bg);
-        let panel = rgba(p.panel);
-        let mut text = rgba(p.text);
-
         if plugin_override.is_some() {
-            let lum_text = relative_luminance(text);
-            let lum_panel = relative_luminance(panel);
-            let lum_win = relative_luminance(window_bg);
-            if (lum_text - lum_panel).abs() < MIN_CONTRAST_LUMINANCE_DIFF
-                || (lum_text - lum_win).abs() < MIN_CONTRAST_LUMINANCE_DIFF
-            {
-                text = if (lum_panel + lum_win) * 0.5 < 0.5 {
-                    rgba(HIGH_CONTRAST_LIGHT)
+            p.window_bg |= 0xFF;
+            // Pick a common foreground polarity. Independently accepting a black panel and
+            // white window can leave no usable foreground shared by the two surfaces.
+            let window = rgba(p.window_bg);
+            let preferred =
+                if contrast(rgba(0xFFFFFFFF), window) >= contrast(rgba(0x000000FF), window) {
+                    HIGH_CONTRAST_LIGHT
                 } else {
-                    rgba(HIGH_CONTRAST_DARK)
+                    HIGH_CONTRAST_DARK
                 };
+            let extreme = if preferred == HIGH_CONTRAST_LIGHT {
+                0xFFFFFFFF
+            } else {
+                0x000000FF
+            };
+            for surface in [&mut p.panel, &mut p.hover, &mut p.selected] {
+                *surface |= 0xFF;
+                if contrast(rgba(extreme), rgba(*surface)) < MIN_TEXT_CONTRAST {
+                    *surface = p.window_bg;
+                }
+            }
+            // The overlay can sit over arbitrary media, so test the worst case for the
+            // fallback foreground as well as checking each foreground over both extremes.
+            let mut overlay = rgba(p.overlay);
+            let black = rgba(0x000000FF);
+            let white = rgba(0xFFFFFFFF);
+            if overlay.a < 0.9
+                || [black, white]
+                    .map(|bg| composite(overlay, bg))
+                    .into_iter()
+                    .any(|bg| contrast(rgba(extreme), bg) < MIN_TEXT_CONTRAST)
+            {
+                p.overlay = p.window_bg;
+                overlay = window;
+            }
+            let surfaces = [
+                window,
+                rgba(p.panel),
+                rgba(p.hover),
+                rgba(p.selected),
+                composite(overlay, black),
+                composite(overlay, white),
+            ];
+            let curated = ThemePalette::for_id(base_id);
+            for (slot, fallback) in [
+                (&mut p.text, curated.text),
+                (&mut p.text_muted, curated.text_muted),
+                (&mut p.text_dim, curated.text_dim),
+                (&mut p.text_faint, curated.text_faint),
+                (&mut p.accent, curated.accent),
+            ] {
+                *slot = [*slot, fallback, preferred, extreme]
+                    .into_iter()
+                    .find(|&value| {
+                        let foreground = rgba(value);
+                        foreground.a >= 0.9
+                            && surfaces
+                                .iter()
+                                .all(|&bg| contrast(foreground, bg) >= MIN_TEXT_CONTRAST)
+                    })
+                    .unwrap_or(extreme);
+            }
+            for (slot, fallback, minimum) in [
+                (&mut p.line, curated.line, 1.2),
+                (&mut p.line_strong, curated.line_strong, 1.5),
+            ] {
+                *slot = [*slot, fallback, preferred, extreme]
+                    .into_iter()
+                    .find(|&value| {
+                        let outline = rgba(value);
+                        outline.a >= 0.9
+                            && [window, rgba(p.panel)]
+                                .into_iter()
+                                .all(|bg| contrast(outline, bg) >= minimum)
+                    })
+                    .unwrap_or(extreme);
+            }
+            if rgba(p.scrim).a < 0.35 {
+                p.scrim = curated.scrim;
             }
         }
 
         Self {
-            window_bg,
-            panel,
+            window_bg: rgba(p.window_bg),
+            panel: rgba(p.panel),
             hover: rgba(p.hover),
             selected: rgba(p.selected),
             line: rgba(p.line),
             line_strong: rgba(p.line_strong),
-            text,
+            text: rgba(p.text),
             text_muted: rgba(p.text_muted),
             text_dim: rgba(p.text_dim),
             text_faint: rgba(p.text_faint),
@@ -274,6 +338,22 @@ fn relative_luminance(color: Rgba) -> f32 {
     0.2126 * linearize_srgb(color.r)
         + 0.7152 * linearize_srgb(color.g)
         + 0.0722 * linearize_srgb(color.b)
+}
+
+fn composite(foreground: Rgba, background: Rgba) -> Rgba {
+    let a = foreground.a;
+    Rgba {
+        r: foreground.r * a + background.r * (1. - a),
+        g: foreground.g * a + background.g * (1. - a),
+        b: foreground.b * a + background.b * (1. - a),
+        a: 1.,
+    }
+}
+
+fn contrast(foreground: Rgba, background: Rgba) -> f32 {
+    let a = relative_luminance(composite(foreground, background));
+    let b = relative_luminance(background);
+    (a.max(b) + 0.05) / (a.min(b) + 0.05)
 }
 
 fn parse_hex_packed(s: &str) -> Option<u32> {
@@ -315,9 +395,8 @@ mod tests {
     use iris_api::UiThemeSpec;
 
     use super::{
-        BUILTIN_THEMES, DOCK_H, HIGH_CONTRAST_DARK, HIGH_CONTRAST_LIGHT,
-        MIN_CONTRAST_LUMINANCE_DIFF, OLED_PALETTE, ROW_H, TITLEBAR_H, ThemeTokens, parse_hex_rgba,
-        relative_luminance,
+        BUILTIN_THEMES, DOCK_H, MIN_TEXT_CONTRAST, OLED_PALETTE, ROW_H, TITLEBAR_H, ThemeTokens,
+        contrast, parse_hex_rgba,
     };
 
     #[test]
@@ -418,34 +497,41 @@ mod tests {
     }
 
     #[test]
-    fn enforces_luminance_contrast_floor_for_dark_and_light_collisions() {
-        let cases = [
-            // Dark-on-dark (< 0.12 luminance diff) -> corrected to HIGH_CONTRAST_LIGHT
-            ("#000000", "#050505", "#0A0A0A", rgba(HIGH_CONTRAST_LIGHT)),
-            ("#101012", "#151618", "#18191C", rgba(HIGH_CONTRAST_LIGHT)),
-            // Light-on-light (< 0.12 luminance diff) -> corrected to HIGH_CONTRAST_DARK
-            ("#FFFFFF", "#FFFFFF", "#F8F8F8", rgba(HIGH_CONTRAST_DARK)),
-            ("#F5F6F8", "#FFFFFF", "#EFEFEF", rgba(HIGH_CONTRAST_DARK)),
-            // Readable custom dark theme (>= 0.12 luminance diff) -> preserved verbatim
-            ("#0E0F11", "#15171A", "#D0E0FF", rgba(0xD0E0FFFF)),
-        ];
-        for (win_hex, panel_hex, text_hex, expected_text) in cases {
+    fn conflicting_or_transparent_theme_colors_preserve_text_contrast() {
+        for (window, panel) in [("#00000000", "#FFFFFF"), ("#FFFFFF00", "#000000")] {
             let spec = UiThemeSpec {
-                window_bg: Some(win_hex.into()),
-                panel: Some(panel_hex.into()),
-                text: Some(text_hex.into()),
+                window_bg: Some(window.into()),
+                panel: Some(panel.into()),
+                hover: Some(panel.into()),
+                selected: Some(panel.into()),
+                overlay: Some("#00000000".into()),
+                text: Some("#FFFFFF00".into()),
+                text_muted: Some("#00000000".into()),
+                text_dim: Some("#FFFFFF00".into()),
+                text_faint: Some("#FFFFFF00".into()),
+                accent: Some("#FFFFFF00".into()),
                 ..Default::default()
             };
             let resolved = ThemeTokens::resolve("graphite", Some(&spec));
-            assert_eq!(resolved.text, expected_text, "failed case {text_hex}");
-            assert!(
-                (relative_luminance(resolved.text) - relative_luminance(resolved.panel)).abs()
-                    >= MIN_CONTRAST_LUMINANCE_DIFF
-            );
-            assert!(
-                (relative_luminance(resolved.text) - relative_luminance(resolved.window_bg)).abs()
-                    >= MIN_CONTRAST_LUMINANCE_DIFF
-            );
+            assert_eq!(resolved.window_bg.a, 1.);
+            for fg in [
+                resolved.text,
+                resolved.text_muted,
+                resolved.text_dim,
+                resolved.text_faint,
+                resolved.accent,
+            ] {
+                assert!(fg.a >= 0.9);
+                for bg in [
+                    resolved.window_bg,
+                    resolved.panel,
+                    resolved.hover,
+                    resolved.selected,
+                    resolved.overlay,
+                ] {
+                    assert!(contrast(fg, bg) >= MIN_TEXT_CONTRAST);
+                }
+            }
         }
     }
 }

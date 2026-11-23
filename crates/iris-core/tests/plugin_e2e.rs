@@ -20,6 +20,9 @@ use iris_core::plugin::{
 use iris_core::settings::Settings;
 use iris_core::vault::CredentialVault;
 
+#[path = "plugin_e2e/process.rs"]
+mod process;
+
 static TEST_SEQ: AtomicU64 = AtomicU64::new(0);
 
 struct TestEnv {
@@ -373,6 +376,12 @@ fn dirty_slots_value_equality_and_fullscreen_zero_hz_guard() {
         false
     ));
     assert!(status_only.should_notify_ui(true, true, false));
+    let sidebar_only = DirtySlots {
+        sidebar: true,
+        ..Default::default()
+    };
+    assert!(!sidebar_only.should_notify_ui(false, true, false));
+    assert!(sidebar_only.should_notify_ui(false, true, true));
     assert!(
         DirtySlots {
             overlay: true,
@@ -475,177 +484,6 @@ with open('events.jsonl', 'w', encoding='utf-8') as output:
     }
 }
 
-const TREE_PLUGIN: &str = r#"import json, os, pathlib, subprocess, sys
-child = r'''
-import os, pathlib, time
-with open('child.lock', 'w+b') as f:
-    if os.name == 'nt':
-        import msvcrt
-        msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
-    else:
-        import fcntl
-        fcntl.flock(f, fcntl.LOCK_EX)
-    pathlib.Path('ready').touch()
-    time.sleep(20)
-'''
-helper = None
-for raw in sys.stdin:
-    event = json.loads(raw)['payload']['event']
-    if event == 'init':
-        helper = subprocess.Popen([sys.executable, '-c', child], stdin=subprocess.DEVNULL)
-    elif event == 'shutdown':
-        pathlib.Path('shutdown').touch()
-if not pathlib.Path('shutdown').exists() and os.name != 'nt':
-    helper.terminate()
-    helper.wait()
-pathlib.Path('eof').touch()
-"#;
-
-fn install_tree_plugin(env: &TestEnv) -> PathBuf {
-    let name = "acme.tree";
-    write_ext_plugin(
-        &env.ext_dir,
-        name,
-        &manifest_with(name, Some("main.py"), vec![]),
-        TREE_PLUGIN,
-    );
-    env.ext_dir.join(name)
-}
-
-fn wait_for_file(path: &Path) -> bool {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while !path.is_file() && Instant::now() < deadline {
-        thread::sleep(Duration::from_millis(10));
-    }
-    path.is_file()
-}
-
-fn assert_helper_released_lock(dir: &Path) {
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(dir.join("child.lock"))
-        .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(3);
-    while file.try_lock().is_err() {
-        assert!(
-            Instant::now() < deadline,
-            "plugin helper retained its file lock"
-        );
-        thread::sleep(Duration::from_millis(10));
-    }
-}
-
-#[test]
-fn normal_quit_delivers_shutdown_then_eof_and_cleans_up_descendants() {
-    assert!(python_available());
-    let env = TestEnv::new("normal-quit");
-    let dir = install_tree_plugin(&env);
-    let mut mgr = env.manager(&[]);
-    assert!(wait_for_file(&dir.join("ready")));
-    mgr.shutdown();
-    assert!(dir.join("shutdown").is_file() && dir.join("eof").is_file());
-    assert_helper_released_lock(&dir);
-    mgr.shutdown();
-}
-
-#[test]
-fn abrupt_plugin_host_exit() {
-    const FIXTURE: &str = "IRIS_E2E_CHILD_PLUGIN_DIR";
-    if let Some(dir) = std::env::var_os(FIXTURE) {
-        let _mgr = PluginManager::with_dirs_and_vault(
-            Some(Path::new(&dir)),
-            None,
-            &[],
-            CredentialVault::in_memory(),
-        );
-        thread::sleep(Duration::from_secs(20));
-        return;
-    }
-    assert!(python_available());
-    let env = TestEnv::new("abrupt-quit");
-    let dir = install_tree_plugin(&env);
-    let mut host = ProcessCommand::new(std::env::current_exe().unwrap())
-        .args(["--exact", "abrupt_plugin_host_exit"])
-        .env(FIXTURE, &env.ext_dir)
-        .spawn()
-        .unwrap();
-    let ready = wait_for_file(&dir.join("ready"));
-    host.kill().unwrap();
-    host.wait().unwrap();
-    assert!(ready, "plugin helper did not start");
-    #[cfg(unix)]
-    assert!(
-        wait_for_file(&dir.join("eof")),
-        "plugin must receive EOF when the host disappears"
-    );
-    assert_helper_released_lock(&dir);
-}
-
-#[test]
-fn external_stderr_250_lines_and_large_json_line_never_crash_or_drop() {
-    if !python_available() {
-        return;
-    }
-    let env = TestEnv::new("stderr-250");
-    let chatty_py = r#"import json, sys
-for raw in sys.stdin:
-    ev = json.loads(raw).get("payload", {})
-    if ev.get("event") == "init":
-        for i in range(250):
-            sys.stderr.write(f"diag {i} " + "x" * 120 + "\n")
-        sys.stderr.flush()
-    elif ev.get("event") == "command" and ev.get("id") == "ping":
-        for i in range(150):
-            sys.stderr.write(f"ping {i}\n")
-        sys.stderr.flush()
-        entries = [{"id": f"e{i}", "name": f"Item {i}.mp4", "kind": "video", "variants": []} for i in range(1200)]
-        page = {"source_id": "s", "folder_id": None, "parent_id": None, "title": "Big", "entries": entries, "next_page": None, "authenticated": True, "auth_hint": None}
-        cmds = [{"command": "set_status", "badge": {"id": "ok", "text": "ALIVE-400", "accent": True}}, {"command": "provide_source_page", "request_id": "big", "page": page}]
-        cmds.insert(0, {"command": "set_overlay", "nodes": [{"kind": "grid", "rows": 3, "cols": 3}] * 65})
-        sys.stdout.write(json.dumps({"type": "commands", "commands": cmds}) + "\n")
-        sys.stdout.flush()
-    elif ev.get("event") == "shutdown":
-        break
-"#;
-    let chatty_m = manifest_with(
-        "acme.chatty",
-        Some("main.py"),
-        vec![
-            Permission::ReadState,
-            Permission::UiStatus,
-            Permission::UiOverlay,
-            Permission::MediaSource,
-        ],
-    );
-    write_ext_plugin(&env.ext_dir, "chatty", &chatty_m, chatty_py);
-    write_ext_plugin(
-        &env.ext_dir,
-        "stall",
-        &manifest_with("acme.stall", Some("stall.py"), vec![Permission::ReadState]),
-        "import time\ntime.sleep(10)\n",
-    );
-
-    let mut mgr = env.manager(&[]);
-    let started = Instant::now();
-    for _ in 0..500 {
-        let _ = mgr.broadcast(&HostEvent::Tick {
-            position: 1.0,
-            duration: 60.0,
-            paused: false,
-        });
-    }
-    assert!(started.elapsed() < Duration::from_millis(250));
-
-    let _ = mgr.send_to("acme.chatty", cmd_ev("ping", PlaybackSnapshot::default()));
-    let rep = poll_until(&mut mgr, |m, r| {
-        !m.status_badges().is_empty()
-            && r.commands.iter().any(|(_, c)| matches!(c, HostCommand::ProvideSourcePage { page, .. } if page.entries.len() == 1200))
-    });
-    assert!(!rep.commands.is_empty() && mgr.status_badges()[0].1.text == "ALIVE-400");
-    assert!(!mgr.overlay_nodes().any(|(id, _)| id == "acme.chatty"));
-}
-
 #[test]
 fn external_example_plugins_end_to_end_never_silently_skips_errors() {
     if !python_available() {
@@ -739,6 +577,21 @@ fn external_example_plugins_end_to_end_never_silently_skips_errors() {
     thread::sleep(Duration::from_millis(120));
     assert!(!mgr.poll().dirty.overlay);
 
+    let browse = |request_id: &str| HostEvent::SourceBrowse {
+        request_id: request_id.into(),
+        source_id: "demo-drive".into(),
+        folder_id: None,
+        page: None,
+        query: None,
+    };
+    let mut prompt = mgr.send_to("example.cloud-media-demo", browse("before-login"));
+    prompt.merge(poll_until(&mut mgr, |_, report| report.commands.iter().any(|(_, cmd)| {
+        matches!(cmd, HostCommand::ProvideSourcePage { request_id, page } if request_id == "before-login" && !page.authenticated)
+    })));
+    assert!(prompt.commands.iter().any(|(_, cmd)| {
+        matches!(cmd, HostCommand::ProvideSourcePage { request_id, page } if request_id == "before-login" && !page.authenticated)
+    }));
+
     let _ = mgr.send_to(
         "example.cloud-media-demo",
         cmd_ev("login", PlaybackSnapshot::default()),
@@ -746,17 +599,25 @@ fn external_example_plugins_end_to_end_never_silently_skips_errors() {
     poll_until(&mut mgr, |m, _| m.active_modal().is_some());
     assert_eq!(mgr.active_modal().unwrap().0, "example.cloud-media-demo");
 
-    let _ = mgr.send_to(
+    let mut logged_in = mgr.send_to(
         "example.cloud-media-demo",
         submit_ev("cloud-login", &[("api_token", "tok-test"), ("cdn", "cn")]),
     );
-    poll_until(&mut mgr, |m, _| {
+    logged_in.merge(poll_until(&mut mgr, |m, report| {
         m.active_modal().is_none()
+            && report.commands.iter().any(|(_, cmd)| matches!(cmd, HostCommand::RefreshSource { source_id } if source_id == "demo-drive"))
             && env
                 .vault
                 .get_secret("ext.example.cloud-media-demo", "api_token")
                 .is_some()
-    });
+    }));
+    assert!(logged_in.commands.iter().any(|(_, cmd)| matches!(cmd, HostCommand::RefreshSource { source_id } if source_id == "demo-drive")));
+    assert!(
+        !logged_in
+            .commands
+            .iter()
+            .any(|(_, cmd)| matches!(cmd, HostCommand::ProvideSourcePage { .. }))
+    );
     assert!(mgr.active_modal().is_none());
     assert_eq!(
         env.vault
@@ -764,6 +625,13 @@ fn external_example_plugins_end_to_end_never_silently_skips_errors() {
             .as_deref(),
         Some("tok-test")
     );
+    let mut refreshed = mgr.send_to("example.cloud-media-demo", browse("after-login"));
+    refreshed.merge(poll_until(&mut mgr, |_, report| report.commands.iter().any(|(_, cmd)| {
+        matches!(cmd, HostCommand::ProvideSourcePage { request_id, page } if request_id == "after-login" && page.authenticated && !page.entries.is_empty())
+    })));
+    assert!(refreshed.commands.iter().any(|(_, cmd)| {
+        matches!(cmd, HostCommand::ProvideSourcePage { request_id, page } if request_id == "after-login" && page.authenticated && !page.entries.is_empty())
+    }));
 
     mgr.reload(&[]);
     let res_ev = HostEvent::SourceResolve {
@@ -790,54 +658,56 @@ fn builtin_webdav_plugin_modal_async_browse_mtime_and_subtitle_resolve_e2e() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let srv = thread::spawn(move || {
-        let (mut sock, _) = listener.accept().unwrap();
-        let mut req_bytes = Vec::with_capacity(1024);
-        let mut buf = [0u8; 4096];
-        loop {
-            let n = sock.read(&mut buf).unwrap();
-            if n == 0 {
-                break;
-            }
-            req_bytes.extend_from_slice(&buf[..n]);
-            if let Some(hdr_end) = req_bytes
-                .windows(4)
-                .position(|w| w == b"\r\n\r\n")
-                .map(|i| i + 4)
-            {
-                let hdr_str = String::from_utf8_lossy(&req_bytes[..hdr_end]);
-                let cl = hdr_str
-                    .lines()
-                    .find_map(|l| {
-                        let (k, v) = l.split_once(':')?;
-                        k.trim()
-                            .eq_ignore_ascii_case("content-length")
-                            .then(|| v.trim().parse::<usize>().ok())
-                            .flatten()
-                    })
-                    .unwrap_or(0);
-                if req_bytes.len() >= hdr_end + cl {
+        for _ in 0..2 {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut req_bytes = Vec::with_capacity(1024);
+            let mut buf = [0u8; 4096];
+            loop {
+                let n = sock.read(&mut buf).unwrap();
+                if n == 0 {
                     break;
                 }
+                req_bytes.extend_from_slice(&buf[..n]);
+                if let Some(hdr_end) = req_bytes
+                    .windows(4)
+                    .position(|w| w == b"\r\n\r\n")
+                    .map(|i| i + 4)
+                {
+                    let hdr_str = String::from_utf8_lossy(&req_bytes[..hdr_end]);
+                    let cl = hdr_str
+                        .lines()
+                        .find_map(|l| {
+                            let (k, v) = l.split_once(':')?;
+                            k.trim()
+                                .eq_ignore_ascii_case("content-length")
+                                .then(|| v.trim().parse::<usize>().ok())
+                                .flatten()
+                        })
+                        .unwrap_or(0);
+                    if req_bytes.len() >= hdr_end + cl {
+                        break;
+                    }
+                }
             }
-        }
-        let req = String::from_utf8_lossy(&req_bytes);
-        assert!(req.starts_with("PROPFIND /dav/Anime/ HTTP/1.1\r\n"));
-        assert!(
-            req.to_ascii_lowercase()
-                .contains("authorization: basic ywxpy2u6cznjcjn0")
-        );
-        let xml = r#"<?xml version="1.0" encoding="utf-8"?><D:multistatus xmlns:D="DAV:">
+            let req = String::from_utf8_lossy(&req_bytes);
+            assert!(req.starts_with("PROPFIND /dav/Anime/ HTTP/1.1\r\n"));
+            assert!(
+                req.to_ascii_lowercase()
+                    .contains("authorization: basic ywxpy2u6cznjcjn0")
+            );
+            let xml = r#"<?xml version="1.0" encoding="utf-8"?><D:multistatus xmlns:D="DAV:">
             <D:response><D:href>/dav/Anime/</D:href><D:propstat><D:prop><D:resourcetype><D:collection/></D:resourcetype></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>
             <D:response><D:href>/dav/Anime/Season%202/</D:href><D:propstat><D:prop><D:resourcetype><D:collection/></D:resourcetype></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>
             <D:response><D:href>/dav/Anime/ep01.mkv</D:href><D:propstat><D:prop><D:resourcetype/><D:getcontentlength>10485760</D:getcontentlength><D:getlastmodified>Wed, 21 Oct 2015 07:28:00 GMT</D:getlastmodified></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>
             <D:response><D:href>/dav/Anime/ep01.zh-Hans.ass</D:href><D:propstat><D:prop><D:resourcetype/></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>
         </D:multistatus>"#;
-        let resp = format!(
-            "HTTP/1.1 207 Multi-Status\r\nContent-Type: application/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{xml}",
-            xml.len()
-        );
-        sock.write_all(resp.as_bytes()).unwrap();
-        let _ = sock.shutdown(std::net::Shutdown::Write);
+            let resp = format!(
+                "HTTP/1.1 207 Multi-Status\r\nContent-Type: application/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{xml}",
+                xml.len()
+            );
+            sock.write_all(resp.as_bytes()).unwrap();
+            let _ = sock.shutdown(std::net::Shutdown::Write);
+        }
     });
 
     let env = TestEnv::new("webdav-e2e");
@@ -902,6 +772,21 @@ fn builtin_webdav_plugin_modal_async_browse_mtime_and_subtitle_resolve_e2e() {
             .unwrap()
             .contains("s3cr3t")
     );
+
+    let resolve_direct = HostEvent::SourceResolve {
+        request_id: "direct".into(),
+        source_id: source_id.clone(),
+        folder_id: None,
+        entry_id: "/Anime/ep01.mkv".into(),
+        variant: None,
+    };
+    let mut direct = mgr.send_to("iris.webdav", resolve_direct);
+    direct.merge(poll_until(&mut mgr, |_, report| {
+        !report.commands.is_empty()
+    }));
+    assert!(direct.commands.iter().any(|(_, cmd)| {
+        matches!(cmd, HostCommand::ResolveStream { request_id: Some(id), stream } if id == "direct" && stream.subtitles.len() == 1)
+    }));
 
     let browse_ev = HostEvent::SourceBrowse {
         request_id: "b-1".into(),
@@ -981,4 +866,53 @@ fn builtin_webdav_plugin_modal_async_browse_mtime_and_subtitle_resolve_e2e() {
             .get_secret("builtin.iris.webdav", &format!("secret.{source_id}")),
         None
     );
+}
+
+#[test]
+fn legacy_webdav_credentials_move_to_the_vault_before_exposure() {
+    let env = TestEnv::new("webdav-migration");
+    std::fs::create_dir_all(&env.state_dir).unwrap();
+    let path = env.state_dir.join("iris.webdav.json");
+    let old = serde_json::json!([
+        {"id":"secure","name":"Secure","endpoint":"https://alice:p%40ss@nas.example/dav?token=old"},
+        {"id":"plain","name":"Plain","endpoint":"http://alice:discard@nas.example/dav"}
+    ]);
+    std::fs::write(
+        &path,
+        serde_json::json!({"servers":old.to_string()}).to_string(),
+    )
+    .unwrap();
+    let mut mgr = env.manager(&[]);
+    let saved = std::fs::read_to_string(&path).unwrap();
+    assert!(saved.contains("https://nas.example/dav"));
+    for secret in ["p%40ss", "p@ss", "token=old", "discard", "@nas"] {
+        assert!(!saved.contains(secret));
+        assert!(mgr.media_sources().iter().all(|(_, _, source)| {
+            !source
+                .subtitle
+                .as_deref()
+                .unwrap_or_default()
+                .contains(secret)
+        }));
+    }
+    assert_eq!(
+        env.vault
+            .get_secret("builtin.iris.webdav", "secret.secure")
+            .as_deref(),
+        Some("p@ss")
+    );
+    let rejected = mgr.send_to(
+        "iris.webdav",
+        HostEvent::SourceResolve {
+            request_id: "r".into(),
+            source_id: "plain".into(),
+            folder_id: None,
+            entry_id: "/file.mp3".into(),
+            variant: None,
+        },
+    );
+    assert!(matches!(
+        &rejected.commands[0].1,
+        HostCommand::SourceError { .. }
+    ));
 }
