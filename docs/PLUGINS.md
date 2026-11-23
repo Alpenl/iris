@@ -1,180 +1,212 @@
-# Iris 插件系统与开发指南
+# Iris 插件系统与开发指南（`iris-api` 协议 `protocol: 1`）
 
-Iris 的插件系统严格遵循**“控制面 + 矢量叠加面”**边界：
+Iris 的插件架构从第一性原理出发，围绕四根支柱构建单一、正交的控制面协议（`PROTOCOL_VERSION = 1`）：
 
-- **绝不经手实时像素数据**：解码、色彩管理与渲染管线由内核独占，插件不会拖慢帧率或破坏色彩准确性。
-- **宿主掌控视觉语法**：插件不能绘制任意自定义 UI，而是向宿主规定的 4 个结构化容器填入数据，由 Iris 按方向 C 样式统一渲染。
-- **最小权限与进程隔离**：外部插件以独立子进程运行，经 JSON-lines stdio 与宿主通信；所有动作都是强类型语义命令，受清单权限严格过滤，无法注入任何 mpv 原始选项或命令行。
+1. **全远程协议插件化（`Permission::MediaSource`）**：本地内核仅提供通用网络传输与安全底座，所有远程协议（WebDAV、NAS、S3、Alist、媒体服、直播与各类网盘）100% 通过统一的 `MediaSource` 插件接入（支持动态注册多服务器实例 `SetSources`、连接增删改 `SourceManage`、目录层级、远程关键词搜索、分页加载、多清晰度/线路切换、外挂字幕与扫码/Token 登录）。远程流经宿主校验协议安全后通过 `mpv_command_node_async`（单文件 `http-header-fields-append`）结构化直交 `libmpv` 原生网络栈（零命令行拼接注入风险，完整保留 HTTP Keep-Alive、Range 拖拽与 HLS 分片；同时允许插件返回 `http://127.0.0.1:<port>=1024..` 本地回环流以支撑 SMBv3/SFTP/私有加密分片桥接）；远程图片按需拉取前 256 KiB 文件头完成 Display P3 / Adobe RGB 色彩管理与 EXIF/HEIC 方向校正。
+2. **高自由度参数化工作台与统一声明式控件树（`UiTheme` / `UiToolbar` / `UiSidebar` / `UiModal` / `UiStatus` / `UiOverlay`）**：本体默认保持方向 C 视觉一致，但不限制插件自由度——UI 插件可动态接管全套主题配色令牌（`#RRGGBB[AA]`）、圆角与栏高尺度、无边框影院窗口（`hide_titlebar`，宿主自动提供顶缘叠层唤醒标题栏、视口拖拽与最低对比度逃生护栏）、悬浮控制栏（`floating_dock`）与底栏常驻按钮显隐；侧栏面板（`SidebarPanel`）与非破坏性异步校验弹窗（`PluginModal`）共用同一套 13 种声明式 `Widget` 控件；视口层通过归一化 `OverlayNode` 绘制边框/填充卡片、辅助线、时间码/字幕文本、频谱柱状条与可点击 HUD 按钮。
+3. **原子握手、状态持久化与分桶加密凭据库（`SetState` / `SetSecret`）**：非敏感偏好键值（`state`）由宿主自动落盘，敏感密码/令牌（`secrets`，单条上限 2048B）按 `builtin.<id>` / `ext.<id>` 物理隔离存入系统凭据库（macOS Keychain / Windows Credential Manager，失败显式报错，绝不降级明文文件），并在插件启动时通过单次原子 `Init` 事件连同当前播放快照一并注入。
+4. **像素与安全严格隔离**：解码、色彩空间转换与原生交换链由内核独占，插件绝不经手实时像素数据，且通过 `DirtySlots` 值相等脏检测守住全屏隐藏控制栏下的 `0 Hz` 空转防线。
 
-协议定义位于独立的无头 crate [`crates/iris-api`](../crates/iris-api/src/lib.rs)，宿主运行时与内置插件位于 [`crates/iris-core/src/plugin/`](../crates/iris-core/src/plugin/mod.rs)。
-
----
-
-## 1. 内置官方插件
-
-Iris 内置了两个基于同一套 `iris-api` 协议实现的官方插件，可在 **设置 → 插件** 中随时启停：
-
-1. **构图辅助线（`iris.guides`）**
-   - 权限：`read_state`、`ui_overlay`、`ui_status`、`ui_sidebar`、`notifications`
-   - 能力：在视口矢量叠层绘制三分线（3×3）、黄金分割线、中心十字、2.39:1 电影画幅参考框与 90%/80% 安全区；通过命令面板（`⌘P` / `Ctrl+P`）、侧栏插件视图或底栏状态徽章切换。
-2. **A-B 循环与标记（`iris.ab-loop`）**
-   - 权限：`read_state`、`control_playback`、`ui_sidebar`、`ui_status`、`notifications`
-   - 能力：设置视频 A/B 点实现区间自动循环，并在当前文件添加多个时间点书签，点击侧栏标记直接精确跳转。
+协议定义位于无头 crate [`crates/iris-api`](../crates/iris-api/src/lib.rs)，宿主运行时与内置插件位于 [`crates/iris-core/src/plugin/`](../crates/iris-core/src/plugin/mod.rs)，系统凭据库位于 [`crates/iris-core/src/vault.rs`](../crates/iris-core/src/vault.rs)。
 
 ---
 
-## 2. 外部插件安装与目录
+## 1. 内置官方插件与外部参考插件
 
-将插件文件夹放入应用数据目录的 `plugins/` 下（每个子目录包含一个 `plugin.json`），然后在 **设置 → 插件** 点击「重新扫描」即可生效：
+### 内置官方插件（编译进内核，`iris.*` 保留命名空间，可在「设置 → 插件」启停）
+1. **WebDAV 远程存储（`iris.webdav`）**：100% 遵循标准 `iris-api` 协议实现的官方免挂载 WebDAV 插件（零内核特权），支持添加/编辑/移除多台 NAS 服务器、Basic/Bearer 认证（密码存系统凭据库）、后台工作线程非阻塞 `PROPFIND`（经 `PluginResponder` 异步回推，解析 RFC 1123 修改时间）、同目录外挂字幕自动挂载与广色域原图直看。
+2. **构图辅助线（`iris.guides`）**：三分线（3×3）、黄金分割线、中心十字、2.39:1 电影画幅框与 90%/80% 安全区；可被「审片与选片」工作区预设联动开启并在退出预设时自动关闭。
+3. **A-B 循环与标记（`iris.ab-loop`）**：视频/音频 A-B 区间循环与时间点书签（同时支持本地与远程插件流 `MediaUri`）。
+
+### 外部进程参考插件（位于 `examples/plugins/`）
+1. **云盘与视频源参考插件（[`examples/plugins/cloud-media-demo/`](../examples/plugins/cloud-media-demo/)）**
+   - 完整演示网盘 / 视频源插件形态：扫码二维码 + Token 登录弹窗（`ui_modal`）、加密凭据存取（`set_secret` + `init.secrets`）、目录树浏览、关键词搜索、清晰度切换（1080P / 720P）以及带自定义请求头的流解析（`resolve_stream`）。
+2. **Cinema UI 自由定制参考插件（[`examples/plugins/cinema-ui/`](../examples/plugins/cinema-ui/)）**
+   - 完整演示高自由度 UI 插件形态：注册底栏快捷按钮（`ui_toolbar`）、实时热切换多套皮肤、无标题栏无边框窗口（`hide_titlebar`）与悬浮控制栏布局（`ui_theme`）、视口可交互 SMPTE 时间码与动态频谱 HUD（`ui_overlay`），以及含滑块、输入框、开关、选择器的交互式侧栏。
+3. **观影计时统计（[`examples/plugins/watch-stats/`](../examples/plugins/watch-stats/)）**
+   - 轻量级 `read_state` + `ui_sidebar` + `ui_status` + `set_state` 外部进程插件示例。
+
+---
+
+## 2. 外部插件目录与零进程声明式主题插件
+
+将插件目录放入应用数据目录的 `plugins/<插件目录>/plugin.json`，在 **设置 → 插件** 点击「重新扫描」即可加载：
 
 - **macOS**：`~/Library/Application Support/Iris/plugins/<插件目录>/plugin.json`
 - **Windows**：`%APPDATA%\Iris\plugins\<插件目录>\plugin.json`
-- **测试覆盖**：设置环境变量 `IRIS_PLUGINS=/自定义路径` 可隔离扫描目录。
+- **测试隔离**：环境变量 `IRIS_PLUGINS=/自定义路径`
 
-仓库自带一个开箱即用的外部插件示例：[examples/plugins/watch-stats/](../examples/plugins/watch-stats/)（Python 3，记录本次会话累计观看时长并在底栏与侧栏展示）。
+> **纯声明式 UI 主题插件（零子进程开销）**：仅需定制配色、圆角、栏高或无边框/悬浮控制栏骨架时，在 `plugin.json` 中声明 `"permissions": ["ui_theme"]` 并直接填写 `"theme": { ... }` 与 `"chrome": { ... }`，无需提供 `"entry"` 可执行脚本，宿主直接以零进程开销挂载生效。
 
 ---
 
-## 3. 清单规范（`plugin.json`）
+## 3. 权限模型（`Permission`）
+
+`SetState`（插件私有非敏感配置持久化）为基础能力，无需额外权限；其余命令与事件均受 `plugin.json` 权限白名单严格门控：
+
+| 权限名 | 说明 | 允许接收的事件 / 发送的命令 |
+|---|---|---|
+| `read_state` | 读取播放快照与播放进度 | 接收 `init.snapshot`、`media_opened`、`state_changed`、`tick`（含 `uri`、`title`、`is_live`、`buffering`） |
+| `control_playback` | 控制传输、倍速、音量与收藏 | `toggle_playback`、`seek_relative`、`seek_absolute`、`set_speed`、`set_volume`、`toggle_mute`、`open_next`、`open_previous`、`toggle_favorite` |
+| `ui_sidebar` | 交互式侧栏面板 | `set_sidebar`（`SidebarPanel` → `SidebarSection` → 统一 `Widget` 列表） |
+| `ui_status` | 底栏状态槽紧凑徽章 | `set_status`（`StatusBadge`） |
+| `ui_overlay` | 视口归一化矢量与 HUD 叠层 | `set_overlay`（`nodes: Vec<OverlayNode>`，空数组即清空叠层） |
+| `ui_toolbar` | 底栏自定义工具按钮 | `set_toolbar`（`buttons: Vec<ToolbarButton>`） |
+| `ui_modal` | 交互式配置、OAuth 与扫码弹窗 | `open_modal`、`close_modal`（`PluginModal`，与侧栏共用统一 `Widget` 列表） |
+| `ui_theme` | 动态主题令牌与窗口/底栏结构定制 | 清单静态声明或运行时发送 `set_theme`（`UiThemeSpec` + `ChromeLayoutSpec`） |
+| `media_source` | 虚拟数据源与加密凭据（自动隐含 `secrets`） | 清单声明 `sources` 或 `source_provider`；接收 `source_browse`、`source_resolve`、`source_manage`；发送 `set_sources`、`provide_source_page`、`resolve_stream`、`source_error`、`set_secret` |
+| `secrets` | 独立使用系统加密凭据库 | 接收 `init.secrets`；发送 `set_secret`（无需声明 `sources`） |
+| `notifications` | 顶部轻提示 | `show_toast` |
+
+---
+
+## 4. 消息线协议（JSON-lines over stdio）
+
+外部插件进程从 `stdin` 按行读取 `HostMessage`，向 `stdout` 按行输出 `PluginMessage`（单行上限 **2 MiB**，支撑大目录分页返回；外部插件禁止使用保留前缀 `iris.*`）：
+
+### 4.1 宿主 → 插件事件（`HostEvent`）
+
+1. **原子启动握手（`init`）**：一次性注入协议版本、持久化非敏感 `state`、解密后的 `secrets`（需 `secrets` 或 `media_source` 权限）与当前播放快照：
+   ```json
+   {
+     "type": "event",
+     "payload": {
+       "event": "init",
+       "protocol": 1,
+       "host_version": "0.1.0",
+       "state": { "skin": "neon" },
+       "secrets": { "access_token": "tok_xxx" },
+       "snapshot": { "uri": null, "title": null, "kind": null, "position": 0.0, "duration": 0.0, "paused": true, "volume": 100.0, "muted": false, "speed": 1.0, "favorite": false, "chapter": -1, "is_live": false, "buffering": false }
+     }
+   }
+   ```
+2. **播放生命周期**：`media_opened { snapshot }`、`state_changed { snapshot }`、`tick { position, duration, paused }`。
+3. **命令与统一控件交互**：
+   - 命令面板或快捷键触发：`{"event": "command", "id": "login", "snapshot": { ... }}`
+   - 任意侧栏 / 底栏按钮 / 状态徽章 / 视口 HUD / 滑块 / 输入框 / 开关 / 选择器触发统一 `action` 事件（`input`、`select`、`toggle`、`slider` 通过 `value` 携带新值，纯按钮点击 `value` 为 `null`）：
+     ```json
+     {"event": "action", "id": "set_opacity", "value": "0.85", "snapshot": { ... }}
+     ```
+4. **非破坏性弹窗交互**：用户点击确认时宿主保持弹窗开启（保留已输入内容）并发送 `modal_submit { id, values }`，插件校验成功后显式发送 `close_modal` 关闭弹窗（校验失败仅发 `show_toast` 或更新同 `id` 弹窗即可原地提示）；用户按 `Esc` 或取消时宿主强制立即关窗并发送 `modal_cancel { id }`。
+5. **虚拟数据源请求与多实例管理**：`source_browse { request_id, source_id, folder_id, page, query }`、`source_resolve { request_id, source_id, entry_id, folder_id, variant }`、`source_manage { source_id, action: "configure" | "remove" }`（配合 `set_sources { sources }` 动态增删改多个服务器实例）。
+6. **退出清理**：`shutdown`。
+
+### 4.2 统一声明式控件 `Widget`（侧栏与弹窗同构复用）
+
+`SidebarSection.widgets` 与 `PluginModal.widgets` 完全共用以下 13 种 `Widget`（`"kind"` 标签）：
+
+- `label`：`{ text, muted, mono }`
+- `stat`：`{ label, value, accent }`
+- `progress`：`{ label, ratio }`
+- `slider`：`{ id, label, value, min, max, step, unit, action_id }`（带 `-` / 数值单位 / `+` 步进器与进度轨）
+- `button`：`{ label, action_id, icon, accent }`（`icon` 支持内置 SVG 名称，如 `"play"`、`"globe"`、`"sliders"`、`"layers"` 等）
+- `button_group`：`{ buttons: [{ label, action_id, icon, accent }, ...] }`
+- `input`：`{ id, label, value, placeholder, secret, action_id }`（支持中英文 IME 与剪贴板；侧栏中回车或点「提交」触发 `action`；弹窗中随 `modal_submit.values` 一并提交）
+- `toggle`：`{ id, label, checked, action_id }`
+- `select`：`{ id, label, selected, options: [{ value, label }], action_id }`
+- `list_item`：`{ id, title, subtitle, badge, active, action_id }`
+- `qr_code`：`{ label, data, matrix, hint }`（高清点阵二维码渲染 + 一键复制内容）
+- `link`：`{ label, url, button_text }`
+- `divider`：分隔线
+
+### 4.3 视口叠层节点 `OverlayNode` 与统一色彩 `Color`
+
+所有颜色字段统一使用 `Color`：语义令牌 `"white"`、`"muted"`、`"dim"`、`"dark"`、`"accent"`，或十六进制 `"#RRGGBB"` / `"#RRGGBBAA"`。`OverlayNode` 支持 7 种归一化（`0.0..=1.0`）节点：
+
+- `box`：`{ x, y, w, h, fill, border, border_width, radius, opacity }`
+- `line`：`{ x1, y1, x2, y2, color, width, opacity }`
+- `grid`：`{ cols, rows, color, opacity }`
+- `crosshair`：`{ x, y, size, color, opacity }`
+- `text`：`{ x, y, text, size, color, bg, mono, align, opacity }`（`align` 支持 `"left"` | `"center"` | `"right"`）
+- `bars`：`{ x, y, w, h, values, color, opacity }`
+- `button`：`{ id, x, y, label, icon, accent, action_id }`（宿主精确路由回所属插件，点击不抢视口键盘焦点）
+
+---
+
+## 5. 网盘 / 视频源插件与无边框影院 UI 示例
+
+### 5.1 `plugin.json` 与 `resolve_stream`（`StreamSpec`）
 
 ```json
 {
-  "id": "example.watch-stats",
-  "name": "观影计时统计",
+  "id": "acme.cloud-drive",
+  "name": "示例网盘插件",
   "version": "0.1.0",
-  "author": "Iris Examples",
-  "description": "记录本次会话实际播放时长。",
   "protocol": 1,
   "entry": "main.py",
-  "args": [],
-  "permissions": [
-    "read_state",
-    "ui_sidebar",
-    "ui_status",
-    "notifications"
-  ],
+  "permissions": ["media_source", "ui_modal", "notifications"],
   "commands": [
+    { "id": "login", "title": "网盘：扫码或 Token 登录" }
+  ],
+  "sources": [
     {
-      "id": "reset",
-      "title": "统计：重置本次观影计时",
-      "subtitle": "将当前会话累计播放时长归零",
-      "shortcut_hint": null
+      "id": "my-drive",
+      "name": "我的云盘",
+      "subtitle": "支持原画视频流与广色域照片直看",
+      "supports_search": true,
+      "requires_auth": true,
+      "auth_command_id": "login"
     }
   ]
 }
 ```
 
-### 字段校验与安全约束
-
-- `id`：1–64 字符，仅允许 ASCII 字母、数字、`.`、`-`、`_`。
-- `protocol`：当前必须为 `1`。
-- `entry`：相对于插件目录的可执行文件或 `.py` 脚本；**禁止**绝对路径和 `..` 路径穿越（以 `.py` 结尾时宿主自动使用 `python3 -u` / `python -u` 启动）。
-- Windows 上子进程自动附带 `CREATE_NO_WINDOW`，不闪黑框；标准输出单行限制 **64 KiB**，单次轮询最多读取 256 条消息。
-
----
-
-## 4. 权限模型（`Permission`）
-
-插件发出的每条 `HostCommand` 都会被宿主按清单 `permissions` 校验，未声明的命令直接拦截并记录警告日志：
-
-| 权限名 | 说明 | 允许的命令 / 事件 |
-|---|---|---|
-| `read_state` | 读取播放快照与时间推进 | 接收 `file_opened`、`state_changed`、`position_tick` |
-| `control_playback` | 控制播放与收藏 | `toggle_playback`、`seek_relative`、`seek_absolute`、`set_speed`、`set_volume`、`toggle_mute`、`open_next`、`open_previous`、`toggle_favorite` |
-| `ui_sidebar` | 侧栏插件面板槽位 | `set_sidebar` |
-| `ui_status` | 底栏紧凑状态徽章槽位 | `set_status` |
-| `ui_overlay` | 视口归一化矢量叠层槽位 | `set_overlay`、`clear_overlay` |
-| `notifications` | 顶部轻提示 | `show_toast` |
-
----
-
-## 5. 通信协议（JSON-lines stdio v1）
-
-所有消息均为 **UTF-8 单行 JSON**，以 `\n` 分隔（`stdin` 收宿主事件，`stdout` 发插件命令，务必每次写入后 `flush`）。
-
-### 宿主 → 插件（`HostMessage`）
-
-```json
-{"type":"event","payload":{"event":"init","protocol":1,"host_version":"0.1.0"}}
-{"type":"event","payload":{"event":"file_opened","snapshot":{"path":"/path/a.mp4","file_name":"a.mp4","kind":"video","position":0.0,"duration":120.0,"paused":false,"volume":100.0,"muted":false,"speed":1.0,"favorite":false,"chapter":-1}}}
-{"type":"event","payload":{"event":"position_tick","position":12.4,"duration":120.0,"paused":false}}
-{"type":"event","payload":{"event":"command_invoked","command_id":"reset","snapshot":{...}}}
-{"type":"event","payload":{"event":"action_invoked","action_id":"reset","snapshot":{...}}}
-{"type":"event","payload":{"event":"shutdown"}}
-```
-
-### 插件 → 宿主（`PluginMessage`）
-
-```json
-{"type":"commands","commands":[{"command":"show_toast","message":"已执行"}]}
-{"type":"log","message":"diagnostic info"}
-```
-
----
-
-## 6. 四类宿主界面槽位
-
-### 6.1 视口矢量叠层（`set_overlay` / `clear_overlay`）
-
-坐标全部为相对于视口宽高的归一化比例 `0.0..=1.0`，配色仅限宿主视觉规范 `white` / `accent` / `dim` / `dark`，绘制在画面上方且不拦截鼠标和滚轮事件：
+解析播放地址（响应 `source_resolve` 时附带 `request_id`，主动推流时 `request_id` 可省略为 `null`）：
 
 ```json
 {
-  "command": "set_overlay",
-  "shapes": [
-    {"shape": "grid", "cols": 3, "rows": 3, "color": "white", "opacity": 0.45},
-    {"shape": "rect", "x": 0.05, "y": 0.05, "w": 0.9, "h": 0.9, "color": "accent", "opacity": 0.7, "stroke": 1.0},
-    {"shape": "line", "x1": 0.5, "y1": 0.0, "x2": 0.5, "y2": 1.0, "color": "dim", "opacity": 0.5, "thickness": 1.0},
-    {"shape": "crosshair", "x": 0.5, "y": 0.5, "size": 0.08, "color": "accent", "opacity": 0.85},
-    {"shape": "label", "x": 0.02, "y": 0.02, "text": "2.39:1", "color": "accent"}
+  "type": "commands",
+  "commands": [
+    {
+      "command": "resolve_stream",
+      "request_id": "resolve-1",
+      "stream": {
+        "source_id": "my-drive",
+        "entry_id": "item-42",
+        "url": "https://cdn.example.com/media/42.mkv",
+        "headers": {
+          "Authorization": "Bearer tok_xxx",
+          "User-Agent": "MyDriveClient/1.0"
+        },
+        "title": "01-样片.mkv",
+        "kind": "video",
+        "is_live": false,
+        "variants": [
+          { "id": "4k", "label": "4K 原画" },
+          { "id": "1080p", "label": "1080P" }
+        ],
+        "active_variant": "4k",
+        "subtitles": []
+      }
+    }
   ]
 }
 ```
 
-### 6.2 底栏状态徽章（`set_status`）
-
-传 `item: null` 清除徽章；带 `action_id` 时可点击并回调 `action_invoked`：
+### 5.2 动态主题与无边框影院窗口（`set_theme`）
 
 ```json
 {
-  "command": "set_status",
-  "item": {
-    "id": "watch-timer",
-    "text": "已看 04:12",
-    "tooltip": "点击重置",
-    "accent": false,
-    "action_id": "reset"
-  }
-}
-```
-
-### 6.3 侧栏插件面板（`set_sidebar`）
-
-在目录侧栏右上角点击插件图标（方块网格）可切换至插件面板视图，支持 `text`、`key_value`、`progress`、`button`、`button_row` 五种结构化条目：
-
-```json
-{
-  "command": "set_sidebar",
-  "panel": {
-    "title": "示例面板",
-    "sections": [
-      {
-        "heading": "概览",
-        "items": [
-          {"kind": "key_value", "key": "状态", "value": "运行中", "accent": true},
-          {"kind": "progress", "label": "进度", "ratio": 0.65},
-          {"kind": "button", "label": "执行动作", "action_id": "run", "accent": false},
-          {"kind": "button_row", "buttons": [
-            {"label": "A", "action_id": "a", "accent": true},
-            {"label": "B", "action_id": "b", "accent": false}
-          ]}
-        ]
+  "type": "commands",
+  "commands": [
+    {
+      "command": "set_theme",
+      "theme": {
+        "name": "Borderless Cinema",
+        "window_bg": "#050608",
+        "panel": "#0D1017",
+        "accent": "#00E5FF",
+        "corner_radius": 6.0,
+        "dock_height": 44.0
+      },
+      "chrome": {
+        "hide_titlebar": true,
+        "floating_dock": true,
+        "show_titlebar_meta": false,
+        "compact_controls": false,
+        "hidden_dock_buttons": ["loop", "screenshot"]
       }
-    ]
-  }
+    }
+  ]
 }
 ```
-
-### 6.4 命令面板（`commands`）
-
-清单中声明的每条 `commands` 会自动注册到 **命令面板（`⌘P` / `Ctrl+P` / `⌘⇧P`）**，支持按标题、说明或插件名实时过滤；用户选中后宿主发送 `command_invoked`。

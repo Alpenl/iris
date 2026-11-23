@@ -5,8 +5,8 @@
 ```bash
 brew install mpv                 # 开发用的 libmpv（GPL 构建，不能拿去分发）
 cargo build --release --features devtools  # 性能/控制测试专用，不能作为发行包
-cargo test --locked --workspace            # 44 项单元/集成测试：协议、插件权限/崩溃与外部 stdio 握手、排序、照片/ICC 畸形头防御、几何、输入策略、字幕安全区、设置、记录、IME 与缩略图 LRU 缓存
-python3 scripts/check-project.py           # 仓库约束：UI 不碰 mpv、iris-core 与 iris-api 无头隔离、devtools 门、锁定元数据
+cargo test --locked --workspace            # 71 项单元/端到端测试：协议与多源权限、插件隔离/异步校验与外部 stdio 握手、内置 iris.webdav、稀疏预设与基线保护、!TextInput 打字防火墙、照片/ICC 单遍解析、UI 契约与 ThemeTokens 安全兜底
+python3 scripts/check-project.py           # 仓库约束：递归 UI/mpv 隔离、iris-core 与 iris-api 依赖门禁、devtools 默认特性门禁、单文件 650/850 行预算、SVG 图标与插件清单校验
 cargo deny check licenses        # 依赖许可证检查，需要先 cargo install cargo-deny
 ```
 
