@@ -3,7 +3,7 @@
   "name": "观影计时统计",
   "version": "0.1.0",
   "author": "Iris Examples",
-  "description": "外部进程插件示例：记录本次会话实际播放时长，在底栏与侧栏展示统计并注册命令面板动作。",
+  "description": "外部进程插件示例：记录累计实际播放时长并跨会话持久化，在底栏与侧栏展示统计并注册命令面板动作。",
   "protocol": 1,
   "entry": "main.py",
   "permissions": [
@@ -15,8 +15,8 @@
   "commands": [
     {
       "id": "reset",
-      "title": "统计：重置本次观影计时",
-      "subtitle": "将当前会话累计播放时长归零"
+      "title": "统计：重置观影计时",
+      "subtitle": "将累计播放时长归零"
     }
   ]
 }

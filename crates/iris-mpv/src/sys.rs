@@ -1,6 +1,6 @@
 //! Raw declarations from mpv/client.h, mpv/render.h and mpv/render_gl.h
 //! (client API 2.x, checked against mpv 0.42 headers).
-#![allow(non_camel_case_types)]
+#![allow(non_camel_case_types, dead_code)]
 
 use std::ffi::{c_char, c_int, c_void};
 
@@ -22,6 +22,33 @@ pub const MPV_FORMAT_FLAG: mpv_format = 3;
 pub const MPV_FORMAT_INT64: mpv_format = 4;
 pub const MPV_FORMAT_DOUBLE: mpv_format = 5;
 pub const MPV_FORMAT_NODE: mpv_format = 6;
+pub const MPV_FORMAT_NODE_ARRAY: mpv_format = 7;
+pub const MPV_FORMAT_NODE_MAP: mpv_format = 8;
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub union mpv_node_u {
+    pub string: *mut c_char,
+    pub flag: c_int,
+    pub int64: i64,
+    pub double_: f64,
+    pub list: *mut mpv_node_list,
+    pub ba: *mut c_void,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct mpv_node {
+    pub u: mpv_node_u,
+    pub format: mpv_format,
+}
+
+#[repr(C)]
+pub struct mpv_node_list {
+    pub num: c_int,
+    pub values: *mut mpv_node,
+    pub keys: *mut *mut c_char,
+}
 
 pub type mpv_event_id = c_int;
 pub const MPV_EVENT_NONE: mpv_event_id = 0;
@@ -43,6 +70,7 @@ pub const MPV_END_FILE_REASON_ERROR: c_int = 4;
 pub const MPV_END_FILE_REASON_REDIRECT: c_int = 5;
 
 pub const MPV_ERROR_NOMEM: c_int = -2;
+pub const MPV_ERROR_INVALID_PARAMETER: c_int = -4;
 pub const MPV_ERROR_PROPERTY_UNAVAILABLE: c_int = -10;
 
 #[repr(C)]
@@ -141,11 +169,22 @@ unsafe extern "C" {
         data: *const c_char,
     ) -> c_int;
     pub fn mpv_command(ctx: *mut mpv_handle, args: *mut *const c_char) -> c_int;
+    pub fn mpv_command_node(
+        ctx: *mut mpv_handle,
+        args: *mut mpv_node,
+        result: *mut mpv_node,
+    ) -> c_int;
     pub fn mpv_command_async(
         ctx: *mut mpv_handle,
         reply_userdata: u64,
         args: *mut *const c_char,
     ) -> c_int;
+    pub fn mpv_command_node_async(
+        ctx: *mut mpv_handle,
+        reply_userdata: u64,
+        args: *mut mpv_node,
+    ) -> c_int;
+    pub fn mpv_free_node_contents(node: *mut mpv_node);
     pub fn mpv_set_property_string(
         ctx: *mut mpv_handle,
         name: *const c_char,

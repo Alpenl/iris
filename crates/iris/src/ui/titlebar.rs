@@ -1,54 +1,156 @@
-//! Windowed title bar: platform-conventional window buttons (left on macOS,
-//! right on Windows), drag area with current path, media info, and pin toggle.
+//! Windowed and frameless-overlay title bar: platform window buttons, drag area,
+//! media info, workspace preset pill with `· 已微调` baseline badge, and pin toggle.
+
 use gpui::{
     Context, FontWeight, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
-    ParentElement, StatefulInteractiveElement, Styled, div, prelude::FluentBuilder, px,
+    ParentElement, StatefulInteractiveElement, Styled, canvas, div, prelude::FluentBuilder, px,
 };
 
-use super::widgets::{icon, tip};
-use super::*;
+use super::IrisWindow;
+use super::actions::ToggleAlwaysOnTop;
+use super::kit::{icon, tip};
+use super::state::PopoverKind;
 use crate::assets::Icon;
+use crate::platform;
+use crate::theme::{FONT_MONO, ThemeTokens};
 
 impl IrisWindow {
-    pub(super) fn render_titlebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(super) fn render_titlebar(
+        &self,
+        overlay_mode: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let t = ThemeTokens::of(cx);
         let session = &self.active().session;
         let file = session
-            .current
-            .as_ref()
+            .current()
             .and_then(|p| p.file_name())
-            .map(|n| n.to_string_lossy().into_owned());
-        let folder = session
-            .folder
-            .as_ref()
-            .and_then(|f| f.file_name())
             .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "未打开".into());
+            .or_else(|| session.current_title().map(str::to_string));
+        let remote_badge = !self.catalog.active_source.is_local();
+        let folder = if remote_badge {
+            self.catalog
+                .active_source
+                .display_badge()
+                .unwrap_or_else(|| "远程数据源".into())
+        } else {
+            session
+                .folder()
+                .and_then(|f| f.file_name())
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| {
+                    if session.current_uri().is_some() {
+                        "远程媒体".into()
+                    } else {
+                        "未打开".into()
+                    }
+                })
+        };
         let pinned = self.settings.always_on_top;
 
+        let preset_open = self.overlays.popover == Some(PopoverKind::Presets);
+        let non_default =
+            !self.settings.active_preset.is_empty() && self.settings.active_preset != "default";
+        let preset_modified = self.preset_rt.is_modified(&self.settings);
+        let preset_hi = preset_open || non_default;
+        let base_name = self
+            .presets
+            .get(&self.settings.active_preset)
+            .map_or("默认工作区", |p| p.name.as_str());
+        let preset_label = if preset_modified {
+            format!("{base_name} · 已微调")
+        } else {
+            base_name.to_string()
+        };
+        let preset_slot = self.chrome.probes.anchor_presets.clone();
+
         let win_btn = |id: &'static str, glyph: Icon, label: &'static str, accent_hover: bool| {
-            let group_name = id;
             div()
                 .id(id)
-                .group(group_name)
+                .group(id)
                 .size(px(22.))
                 .flex_none()
                 .flex()
                 .items_center()
                 .justify_center()
+                .rounded(t.radius_md)
                 .border_1()
-                .border_color(line())
+                .border_color(t.line)
                 .cursor_pointer()
                 .tooltip(tip(label, None))
                 .when(accent_hover, |d| {
-                    d.hover(|s| s.bg(accent()).border_color(accent()))
+                    d.hover(|s| s.bg(t.accent).border_color(t.accent))
                 })
                 .when(!accent_hover, |d| {
-                    d.hover(|s| s.bg(hover()).border_color(line_strong()))
+                    d.hover(|s| s.bg(t.hover).border_color(t.line_strong))
                 })
-                .child(
-                    icon(glyph, 11., text_dim()).group_hover(group_name, |s| s.text_color(text())),
-                )
+                .child(icon(glyph, 11., t.text_dim).group_hover(id, move |s| s.text_color(t.text)))
         };
+
+        let preset_pill = div()
+            .relative()
+            .flex_none()
+            .child(
+                div()
+                    .id((
+                        "win-preset",
+                        usize::from(preset_open) * 2 + usize::from(non_default),
+                    ))
+                    .group("win-preset")
+                    .h(px(22.))
+                    .px(px(7.))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .gap(px(5.))
+                    .rounded(t.radius_md)
+                    .border_1()
+                    .border_color(if preset_open {
+                        t.accent
+                    } else if non_default {
+                        t.line_strong
+                    } else {
+                        t.line
+                    })
+                    .when(preset_open, |d| d.bg(t.selected))
+                    .when(!preset_open, |d| {
+                        d.bg(t.panel)
+                            .hover(|s| s.bg(t.hover).border_color(t.line_strong))
+                    })
+                    .cursor_pointer()
+                    .tooltip(tip(
+                        "工作区预设 · 点击切换或保存当前布局",
+                        self.key_hint("cycle_preset"),
+                    ))
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.toggle_popover(PopoverKind::Presets, cx);
+                    }))
+                    .child(
+                        icon(
+                            Icon::Layers,
+                            12.,
+                            if preset_hi { t.accent } else { t.text_dim },
+                        )
+                        .group_hover("win-preset", move |s| {
+                            s.text_color(if preset_hi { t.accent } else { t.text })
+                        }),
+                    )
+                    .child(
+                        div()
+                            .max_w(px(148.))
+                            .truncate()
+                            .text_size(px(11.))
+                            .text_color(if preset_hi { t.text } else { t.text_muted })
+                            .group_hover("win-preset", move |s| s.text_color(t.text))
+                            .child(preset_label),
+                    ),
+            )
+            .child(
+                canvas(move |b, _, _| preset_slot.set(Some(b)), |_, _, _, _| {})
+                    .absolute()
+                    .size_full(),
+            );
 
         let pin_btn = div()
             .id(("win-pin", usize::from(pinned)))
@@ -58,11 +160,12 @@ impl IrisWindow {
             .flex()
             .items_center()
             .justify_center()
+            .rounded(t.radius_md)
             .border_1()
-            .border_color(if pinned { accent() } else { line() })
-            .when(pinned, |d| d.bg(selected()))
+            .border_color(if pinned { t.accent } else { t.line })
+            .when(pinned, |d| d.bg(t.selected))
             .when(!pinned, |d| {
-                d.hover(|s| s.bg(hover()).border_color(line_strong()))
+                d.hover(|s| s.bg(t.hover).border_color(t.line_strong))
             })
             .cursor_pointer()
             .tooltip(tip(
@@ -71,16 +174,16 @@ impl IrisWindow {
                 } else {
                     "窗口置顶"
                 },
-                Some("T"),
+                self.key_hint("toggle_always_on_top"),
             ))
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_click(
                 cx.listener(|this, _, w, cx| this.toggle_always_on_top(&ToggleAlwaysOnTop, w, cx)),
             )
             .child(
-                icon(Icon::Pin, 12., if pinned { accent() } else { text_dim() })
-                    .group_hover("win-pin", |s| {
-                        s.text_color(if pinned { accent() } else { text() })
+                icon(Icon::Pin, 12., if pinned { t.accent } else { t.text_dim })
+                    .group_hover("win-pin", move |s| {
+                        s.text_color(if pinned { t.accent } else { t.text })
                     }),
             );
 
@@ -124,6 +227,11 @@ impl IrisWindow {
                 )
         };
 
+        let meta_info = self
+            .effective_show_titlebar_meta()
+            .then(|| self.media_info())
+            .flatten();
+
         let drag_area = div()
             .id("drag")
             .flex_1()
@@ -132,7 +240,7 @@ impl IrisWindow {
             .flex()
             .items_center()
             .gap(px(10.))
-            .pl(px(if cfg!(target_os = "macos") { 12. } else { 14. }))
+            .pl(px(if platform::IS_MACOS { 12. } else { 14. }))
             .pr(px(10.))
             .on_mouse_down(MouseButton::Left, |ev: &MouseDownEvent, window, _| {
                 if ev.click_count >= 2 {
@@ -148,53 +256,60 @@ impl IrisWindow {
                     .text_size(px(13.))
                     .child("IRIS"),
             )
-            .child(div().flex_none().w(px(1.)).h(px(14.)).bg(line()))
+            .child(div().flex_none().w(px(1.)).h(px(14.)).bg(t.line))
             .child(
                 div()
                     .flex_1()
                     .min_w(px(0.))
                     .flex()
+                    .items_center()
                     .gap(px(6.))
                     .font_family(FONT_MONO)
                     .text_size(px(11.))
-                    .child(div().flex_none().text_color(text_dim()).child(folder))
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_color(if remote_badge { t.accent } else { t.text_dim })
+                            .child(folder),
+                    )
                     .when_some(file, |d, file| {
-                        d.child(div().flex_none().text_color(text_faint()).child("/"))
+                        d.child(div().flex_none().text_color(t.text_faint).child("/"))
                             .child(
                                 div()
                                     .min_w(px(0.))
                                     .truncate()
-                                    .text_color(text())
+                                    .text_color(t.text)
                                     .child(file),
                             )
                     }),
             )
-            .when_some(self.media_info(), |d, info| {
+            .when_some(meta_info, |d, info| {
                 d.child(
                     div()
                         .flex_none()
                         .font_family(FONT_MONO)
                         .text_size(px(11.))
-                        .text_color(text_dim())
+                        .text_color(t.text_dim)
                         .child(info),
                 )
             })
+            .child(preset_pill)
             .child(pin_btn);
 
         let bar = div()
-            .h(px(TITLEBAR_H))
+            .h(t.titlebar_h)
             .w_full()
             .flex_none()
             .flex()
             .items_center()
-            .bg(window_bg())
+            .bg(if overlay_mode { t.overlay } else { t.window_bg })
             .border_b_1()
-            .border_color(line())
+            .border_color(t.line)
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|_, _, _, cx| cx.stop_propagation()),
             );
-        if cfg!(target_os = "macos") {
+        if platform::IS_MACOS {
             bar.child(mac_buttons()).child(drag_area)
         } else {
             bar.child(drag_area).child(win_buttons())

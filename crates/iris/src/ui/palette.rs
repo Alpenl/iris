@@ -1,18 +1,41 @@
-//! Direction C Command Palette (`⌘P` / `Ctrl+P` / `⌘⇧P`): unifies built-in
-//! player commands and all commands contributed by enabled plugins.
-use gpui::{
-    ClipboardItem, Context, ElementInputHandler, InteractiveElement, IntoElement, KeyContext,
-    KeyDownEvent, MouseButton, ParentElement, StatefulInteractiveElement, Styled, Window, canvas,
-    div, prelude::FluentBuilder, px,
-};
+//! Command Palette (`⌘P` / `Ctrl+P` / `⌘⇧P`): aggregates core commands,
+//! `ResetAppearance`, workspace presets, themes, dynamic `source_providers()` &
+//! `media_sources()`, pinned bookmarks, and plugin commands using `kit::text_field`.
 
-use super::widgets::icon;
-use super::*;
+use gpui::{
+    Context, InteractiveElement, IntoElement, MouseButton, ParentElement,
+    StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder, px,
+};
+use iris_core::keymap;
+use iris_core::preset::{PresetCaptureScope, SidebarMode};
+use iris_core::vfs::PinnedBookmark;
+
+use super::IrisWindow;
+use super::actions::{
+    CycleAspect, CyclePreset, OpenFile, RefreshDirectory, RotateCw, TakeScreenshot,
+    ToggleDirectory, ToggleInfo, ToggleLoop, ToggleMute, TogglePause, ToggleSearch,
+};
+use super::kit::badge_pill;
+use super::kit::text_field::{TextFieldKind, TextFieldSpec};
+use super::state::{BuiltinDialog, SettingsTab};
 use crate::assets::Icon;
+use crate::platform::IS_MACOS;
+use crate::theme::{BUILTIN_THEMES, FONT_MONO, ThemeTokens};
 
 #[derive(Clone, Debug)]
-pub(super) enum PaletteTarget {
+enum PaletteTarget {
     Host(&'static str),
+    ResetAppearance,
+    Preset(String),
+    SavePreset,
+    Theme(&'static str),
+    OpenUrl,
+    BrowsePluginSource {
+        plugin_id: String,
+        source_id: String,
+    },
+    Bookmark(PinnedBookmark),
+    PinLocation,
     Plugin {
         plugin_id: String,
         command_id: String,
@@ -20,198 +43,355 @@ pub(super) enum PaletteTarget {
 }
 
 #[derive(Clone, Debug)]
-pub(super) struct PaletteEntry {
-    pub title: String,
-    pub subtitle: Option<String>,
-    pub badge: String,
-    pub shortcut: Option<String>,
-    pub target: PaletteTarget,
+struct PaletteEntry {
+    title: String,
+    subtitle: Option<String>,
+    badge: String,
+    shortcut: Option<String>,
+    target: PaletteTarget,
 }
 
 impl IrisWindow {
-    pub(super) fn palette_entries(&self) -> Vec<PaletteEntry> {
-        let cmd_prefix = if cfg!(target_os = "macos") {
-            "⌘"
-        } else {
-            "Ctrl+"
-        };
+    fn palette_entries(&self) -> Vec<PaletteEntry> {
+        let live_key = |id: &str| self.key_hint(id).map(|s| s.to_string());
+
         let mut entries = vec![
             PaletteEntry {
                 title: "打开文件或文件夹…".into(),
                 subtitle: None,
                 badge: "内核".into(),
-                shortcut: Some(format!("{cmd_prefix}O")),
+                shortcut: live_key("open_file"),
                 target: PaletteTarget::Host("open"),
+            },
+            PaletteEntry {
+                title: "打开网络流 / 远程媒体地址…".into(),
+                subtitle: Some("原生直连播放 HTTP / HTTPS 视频、HLS 或远程照片".into()),
+                badge: "网络".into(),
+                shortcut: live_key("open_url"),
+                target: PaletteTarget::OpenUrl,
+            },
+            PaletteEntry {
+                title: "恢复默认外观（清除无边框与插件主题覆盖）".into(),
+                subtitle: Some("一键停用异常外观插件、恢复标题栏与默认石墨配色".into()),
+                badge: "安全".into(),
+                shortcut: None,
+                target: PaletteTarget::ResetAppearance,
             },
             PaletteEntry {
                 title: "播放 / 暂停".into(),
                 subtitle: None,
                 badge: "内核".into(),
-                shortcut: Some("Space".into()),
+                shortcut: live_key("toggle_pause"),
                 target: PaletteTarget::Host("toggle_pause"),
             },
             PaletteEntry {
                 title: "静音 / 取消静音".into(),
                 subtitle: None,
                 badge: "内核".into(),
-                shortcut: Some("M".into()),
+                shortcut: live_key("toggle_mute"),
                 target: PaletteTarget::Host("toggle_mute"),
             },
             PaletteEntry {
                 title: "切换单曲循环".into(),
                 subtitle: None,
                 badge: "内核".into(),
-                shortcut: Some("L".into()),
+                shortcut: live_key("toggle_loop"),
                 target: PaletteTarget::Host("toggle_loop"),
             },
             PaletteEntry {
                 title: "切换画面比例 / 铺满裁剪".into(),
                 subtitle: None,
                 badge: "内核".into(),
-                shortcut: Some("C".into()),
+                shortcut: live_key("cycle_aspect"),
                 target: PaletteTarget::Host("cycle_aspect"),
             },
             PaletteEntry {
                 title: "顺时针旋转 90°".into(),
                 subtitle: None,
                 badge: "内核".into(),
-                shortcut: Some("R".into()),
+                shortcut: live_key("rotate_cw"),
                 target: PaletteTarget::Host("rotate_cw"),
-            },
-            PaletteEntry {
-                title: "水平镜像翻转".into(),
-                subtitle: None,
-                badge: "内核".into(),
-                shortcut: Some("H".into()),
-                target: PaletteTarget::Host("hflip"),
             },
             PaletteEntry {
                 title: "保存当前帧截图".into(),
                 subtitle: None,
                 badge: "内核".into(),
-                shortcut: Some(format!("{cmd_prefix}S")),
+                shortcut: live_key("take_screenshot"),
                 target: PaletteTarget::Host("screenshot"),
             },
             PaletteEntry {
                 title: "媒体详情与统计".into(),
                 subtitle: None,
                 badge: "内核".into(),
-                shortcut: Some("I".into()),
+                shortcut: live_key("toggle_info"),
                 target: PaletteTarget::Host("info"),
             },
             PaletteEntry {
-                title: "切换窗口置顶".into(),
-                subtitle: None,
-                badge: "内核".into(),
-                shortcut: Some("T".into()),
-                target: PaletteTarget::Host("always_on_top"),
-            },
-            PaletteEntry {
-                title: "切换目录 / 插件侧栏视图".into(),
-                subtitle: Some("在文件目录与插件面板之间切换".into()),
-                badge: "内核".into(),
+                title: "切换侧栏视图（目录 / 数据源 / 队列 / 插件）".into(),
+                subtitle: Some(format!(
+                    "当前侧栏视图：{}",
+                    self.catalog.sidebar_mode.label()
+                )),
+                badge: "工作区".into(),
                 shortcut: None,
                 target: PaletteTarget::Host("toggle_sidebar_mode"),
+            },
+            PaletteEntry {
+                title: "展开 / 收起侧栏面板".into(),
+                subtitle: None,
+                badge: "工作区".into(),
+                shortcut: live_key("toggle_directory"),
+                target: PaletteTarget::Host("toggle_directory"),
             },
             PaletteEntry {
                 title: "搜索目录".into(),
                 subtitle: None,
                 badge: "内核".into(),
-                shortcut: Some(format!("{cmd_prefix}F")),
+                shortcut: live_key("toggle_search"),
                 target: PaletteTarget::Host("search"),
             },
             PaletteEntry {
                 title: "刷新目录".into(),
                 subtitle: None,
                 badge: "内核".into(),
-                shortcut: Some(format!("{cmd_prefix}R")),
+                shortcut: live_key("refresh_directory"),
                 target: PaletteTarget::Host("refresh"),
+            },
+            PaletteEntry {
+                title: "循环切换下一个工作区预设".into(),
+                subtitle: None,
+                badge: "预设".into(),
+                shortcut: live_key("cycle_preset"),
+                target: PaletteTarget::Host("cycle_preset"),
+            },
+            PaletteEntry {
+                title: "预设：将当前状态保存为新预设…".into(),
+                subtitle: Some("保存当前窗口布局、主题、播放策略与插件组合".into()),
+                badge: "预设".into(),
+                shortcut: None,
+                target: PaletteTarget::SavePreset,
+            },
+            PaletteEntry {
+                title: "书签：固定当前目录到常驻书签".into(),
+                subtitle: None,
+                badge: "书签".into(),
+                shortcut: None,
+                target: PaletteTarget::PinLocation,
             },
             PaletteEntry {
                 title: "打开设置…".into(),
                 subtitle: None,
                 badge: "内核".into(),
-                shortcut: Some(format!("{cmd_prefix},")),
+                shortcut: live_key("open_settings"),
                 target: PaletteTarget::Host("settings"),
             },
             PaletteEntry {
+                title: "管理快捷键方案与按键录制…".into(),
+                subtitle: None,
+                badge: "设置".into(),
+                shortcut: None,
+                target: PaletteTarget::Host("shortcuts"),
+            },
+            PaletteEntry {
                 title: "管理插件…".into(),
-                subtitle: Some("启用、禁用或重新扫描外部插件".into()),
+                subtitle: None,
                 badge: "插件".into(),
                 shortcut: None,
                 target: PaletteTarget::Host("plugins"),
             },
         ];
 
-        for (plugin_id, plugin_name, spec) in self.plugins.commands() {
+        for (pid, spec) in self.plugins.source_providers() {
             entries.push(PaletteEntry {
-                title: spec.title.clone(),
-                subtitle: spec.subtitle.clone(),
-                badge: plugin_name.to_string(),
-                shortcut: spec.shortcut_hint.clone(),
+                title: format!("数据源：添加{}…", spec.label),
+                subtitle: None,
+                badge: "数据源".into(),
+                shortcut: None,
                 target: PaletteTarget::Plugin {
-                    plugin_id: plugin_id.to_string(),
-                    command_id: spec.id.clone(),
+                    plugin_id: pid,
+                    command_id: spec.add_command_id,
                 },
             });
         }
 
-        let q = self.palette_input.text().trim().to_ascii_lowercase();
+        for preset in self.presets.list() {
+            let cur = if self.settings.active_preset == preset.id {
+                " [当前]"
+            } else {
+                ""
+            };
+            entries.push(PaletteEntry {
+                title: format!("预设：切换到 {}{cur}", preset.name),
+                subtitle: (!preset.description.is_empty()).then(|| preset.description.clone()),
+                badge: "预设".into(),
+                shortcut: live_key(&format!("preset:{}", preset.id)),
+                target: PaletteTarget::Preset(preset.id.clone()),
+            });
+        }
+
+        for th in BUILTIN_THEMES {
+            let cur = if self.settings.theme_id.eq_ignore_ascii_case(th.id) {
+                " [当前]"
+            } else {
+                ""
+            };
+            entries.push(PaletteEntry {
+                title: format!("主题：切换到 {}{cur}", th.name),
+                subtitle: Some(th.description.into()),
+                badge: "主题".into(),
+                shortcut: None,
+                target: PaletteTarget::Theme(th.id),
+            });
+        }
+
+        for (pid, pname, src) in self.plugins.media_sources() {
+            entries.push(PaletteEntry {
+                title: format!("数据源：浏览 {} · {}", pname, src.name),
+                subtitle: src.subtitle.clone(),
+                badge: pname.to_string(),
+                shortcut: None,
+                target: PaletteTarget::BrowsePluginSource {
+                    plugin_id: pid.to_string(),
+                    source_id: src.id.clone(),
+                },
+            });
+        }
+
+        for bm in &self.locations.bookmarks {
+            entries.push(PaletteEntry {
+                title: format!("书签：打开 {}", bm.name),
+                subtitle: Some(bm.uri.to_uri_string()),
+                badge: "书签".into(),
+                shortcut: None,
+                target: PaletteTarget::Bookmark(bm.clone()),
+            });
+        }
+
+        for (pid, pname, cmd) in self.plugins.commands() {
+            entries.push(PaletteEntry {
+                title: cmd.title.clone(),
+                subtitle: cmd.subtitle.clone(),
+                badge: pname.to_string(),
+                shortcut: live_key(&format!("plugin:{pid}:{}", cmd.id)).or_else(|| {
+                    cmd.shortcut_hint
+                        .as_deref()
+                        .map(|s| keymap::format_keystroke_display(s, IS_MACOS))
+                }),
+                target: PaletteTarget::Plugin {
+                    plugin_id: pid.to_string(),
+                    command_id: cmd.id.clone(),
+                },
+            });
+        }
+
+        let q = self.text_inputs.palette_input.text().trim().to_lowercase();
         if !q.is_empty() {
             entries.retain(|e| {
-                e.title.to_ascii_lowercase().contains(&q)
-                    || e.badge.to_ascii_lowercase().contains(&q)
+                e.title.to_lowercase().contains(&q)
+                    || e.badge.to_lowercase().contains(&q)
                     || e.subtitle
-                        .as_deref()
-                        .is_some_and(|s| s.to_ascii_lowercase().contains(&q))
+                        .as_ref()
+                        .is_some_and(|s| s.to_lowercase().contains(&q))
             });
         }
         entries
     }
 
-    pub(super) fn execute_palette_target(
+    pub(in crate::ui) fn move_palette_selection(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let len = self.palette_entries().len();
+        if len == 0 {
+            return;
+        }
+        let next = (self.overlays.palette_index as isize + delta).rem_euclid(len as isize) as usize;
+        self.overlays.palette_index = next;
+        self.overlays.palette_scroll.scroll_to_item(next);
+        cx.notify();
+    }
+
+    pub(in crate::ui) fn execute_palette_selected(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let entries = self.palette_entries();
+        if let Some(entry) = entries.get(self.overlays.palette_index).cloned() {
+            self.run_palette_target(entry.target, window, cx);
+        }
+    }
+
+    fn run_palette_target(
         &mut self,
         target: PaletteTarget,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         self.overlays.palette_open = false;
-        self.palette_input.clear();
-        self.palette_index = 0;
+        self.text_inputs.palette_input.clear();
         self.focus.focus(window);
+
         match target {
-            PaletteTarget::Host("open") => self.open_file(&OpenFile, window, cx),
-            PaletteTarget::Host("toggle_pause") => self.toggle_pause(&TogglePause, window, cx),
-            PaletteTarget::Host("toggle_mute") => self.toggle_mute(&ToggleMute, window, cx),
-            PaletteTarget::Host("toggle_loop") => self.toggle_loop(&ToggleLoop, window, cx),
-            PaletteTarget::Host("cycle_aspect") => self.cycle_aspect(&CycleAspect, window, cx),
-            PaletteTarget::Host("rotate_cw") => self.rotate_cw(&RotateCw, window, cx),
-            PaletteTarget::Host("hflip") => self.toggle_hflip(&ToggleHFlip, window, cx),
-            PaletteTarget::Host("screenshot") => self.take_screenshot(&TakeScreenshot, window, cx),
-            PaletteTarget::Host("info") => self.toggle_info(&ToggleInfo, window, cx),
-            PaletteTarget::Host("always_on_top") => {
-                self.toggle_always_on_top(&ToggleAlwaysOnTop, window, cx)
-            }
-            PaletteTarget::Host("toggle_sidebar_mode") => {
-                self.sidebar_plugins = !self.sidebar_plugins;
-                if !self.fullscreen {
-                    self.settings.directory_open = true;
-                } else {
-                    self.overlays.dir_popup = true;
+            PaletteTarget::Host(id) => match id {
+                "open" => self.open_file(&OpenFile, window, cx),
+                "toggle_pause" => self.toggle_pause(&TogglePause, window, cx),
+                "toggle_mute" => self.toggle_mute(&ToggleMute, window, cx),
+                "toggle_loop" => self.toggle_loop(&ToggleLoop, window, cx),
+                "cycle_aspect" => self.cycle_aspect(&CycleAspect, window, cx),
+                "rotate_cw" => self.rotate_cw(&RotateCw, window, cx),
+                "screenshot" => self.take_screenshot(&TakeScreenshot, window, cx),
+                "info" => self.toggle_info(&ToggleInfo, window, cx),
+                "toggle_sidebar_mode" => {
+                    let next = match self.catalog.sidebar_mode {
+                        SidebarMode::Files => SidebarMode::Sources,
+                        SidebarMode::Sources => SidebarMode::Queue,
+                        SidebarMode::Queue => SidebarMode::Plugins,
+                        SidebarMode::Plugins => SidebarMode::Files,
+                    };
+                    self.set_sidebar_mode(next, cx);
                 }
+                "toggle_directory" => self.toggle_directory(&ToggleDirectory, window, cx),
+                "search" => self.toggle_search(&ToggleSearch, window, cx),
+                "refresh" => self.refresh_directory(&RefreshDirectory, window, cx),
+                "cycle_preset" => self.cycle_preset_action(&CyclePreset, window, cx),
+                "settings" => {
+                    self.overlays.open_settings(None);
+                    cx.notify();
+                }
+                "shortcuts" => {
+                    self.overlays.open_settings(Some(SettingsTab::Shortcuts));
+                    cx.notify();
+                }
+                "plugins" => {
+                    self.overlays.open_settings(Some(SettingsTab::Plugins));
+                    cx.notify();
+                }
+                _ => {}
+            },
+            PaletteTarget::ResetAppearance => self.reset_appearance(window, cx),
+            PaletteTarget::Preset(id) => self.activate_preset(&id, window, cx),
+            PaletteTarget::SavePreset => self.open_builtin_dialog(
+                BuiltinDialog::SavePreset {
+                    scope: PresetCaptureScope::default(),
+                },
+                window,
+                cx,
+            ),
+            PaletteTarget::Theme(id) => {
+                self.settings.theme_id = id.to_string();
+                self.persist_user_settings();
+                self.sync_theme_tokens(cx);
                 cx.notify();
             }
-            PaletteTarget::Host("search") => self.toggle_search(&ToggleSearch, window, cx),
-            PaletteTarget::Host("refresh") => self.refresh_directory(&RefreshDirectory, window, cx),
-            PaletteTarget::Host("settings") => {
-                self.overlays.open_settings(None);
-                cx.notify();
+            PaletteTarget::OpenUrl => {
+                self.open_builtin_dialog(BuiltinDialog::OpenUrl, window, cx);
             }
-            PaletteTarget::Host("plugins") => {
-                self.overlays.open_settings(Some(SettingsTab::Plugins));
-                cx.notify();
+            PaletteTarget::BrowsePluginSource {
+                plugin_id,
+                source_id,
+            } => {
+                self.browse_plugin_source(&plugin_id, &source_id, None, None, None, cx);
             }
-            PaletteTarget::Host(_) => {}
+            PaletteTarget::Bookmark(bm) => self.open_bookmark(&bm, cx),
+            PaletteTarget::PinLocation => self.pin_current_location(cx),
             PaletteTarget::Plugin {
                 plugin_id,
                 command_id,
@@ -226,39 +406,27 @@ impl IrisWindow {
         window: &Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let vp = window.viewport_size();
-        let w = (f32::from(vp.width) - 32.).clamp(360., 520.);
+        let t = ThemeTokens::of(cx);
         let entries = self.palette_entries();
-        let count = entries.len();
-        let selected_ix = if count > 0 {
-            self.palette_index.min(count - 1)
-        } else {
-            0
-        };
-        let is_empty = self.palette_input.is_empty();
-        let display = if is_empty {
-            "输入命令或插件名称…".to_string()
-        } else {
-            self.palette_input.display_text(true)
-        };
-        let focus_ime = self.palette_focus.clone();
-        let entity_ime = cx.entity().clone();
+        let active_ix = self
+            .overlays
+            .palette_index
+            .min(entries.len().saturating_sub(1));
 
         div()
             .id("palette-backdrop")
             .absolute()
             .inset_0()
-            .pt(px(56.))
             .flex()
-            .items_start()
             .justify_center()
-            .bg(scrim())
+            .pt(px(64.))
+            .bg(t.scrim)
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(|this, _, window, cx| {
+                cx.listener(|this, _, w, cx| {
                     this.overlays.palette_open = false;
-                    this.palette_input.clear();
-                    this.focus.focus(window);
+                    this.text_inputs.palette_input.clear();
+                    this.focus.focus(w);
                     cx.stop_propagation();
                     cx.notify();
                 }),
@@ -267,240 +435,75 @@ impl IrisWindow {
             .child(
                 div()
                     .id("palette-box")
-                    .w(px(w))
+                    .w(px(540.))
                     .max_h(px(420.))
                     .flex()
                     .flex_col()
-                    .bg(panel())
+                    .rounded(t.radius_lg)
+                    .overflow_hidden()
+                    .bg(t.panel)
                     .border_1()
-                    .border_color(line_strong())
-                    .track_focus(&self.palette_focus)
-                    .key_context({
-                        let mut ctx = KeyContext::default();
-                        ctx.add("CommandPalette");
-                        ctx.add("TextInput");
-                        ctx
-                    })
+                    .border_color(t.line_strong)
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
-                        if this.palette_input.marked_range.is_some() {
-                            // Active IME composition: let the OS input method handle editing/confirm/cancel keys.
-                            return;
-                        }
-                        let mods = ev.keystroke.modifiers;
-                        if mods.secondary() && !mods.alt {
-                            match ev.keystroke.key.as_str() {
-                                "a" => {
-                                    this.palette_input.select_all();
-                                    cx.stop_propagation();
-                                    cx.notify();
-                                    return;
-                                }
-                                "c" => {
-                                    let sel = this.palette_input.selected_text();
-                                    let to_copy = if sel.is_empty() {
-                                        this.palette_input.text()
-                                    } else {
-                                        sel
-                                    };
-                                    if !to_copy.is_empty() {
-                                        cx.write_to_clipboard(ClipboardItem::new_string(
-                                            to_copy.to_string(),
-                                        ));
-                                    }
-                                    cx.stop_propagation();
-                                    return;
-                                }
-                                "x" => {
-                                    let sel = this.palette_input.selected_text().to_string();
-                                    if !sel.is_empty() {
-                                        cx.write_to_clipboard(ClipboardItem::new_string(sel));
-                                        this.palette_input.backspace();
-                                        this.palette_index = 0;
-                                        this.palette_scroll.scroll_to_item(0);
-                                        cx.notify();
-                                    }
-                                    cx.stop_propagation();
-                                    return;
-                                }
-                                "v" => {
-                                    if let Some(text) =
-                                        cx.read_from_clipboard().and_then(|c| c.text())
-                                    {
-                                        this.palette_input.insert_paste(&text);
-                                        this.palette_index = 0;
-                                        this.palette_scroll.scroll_to_item(0);
-                                        cx.notify();
-                                    }
-                                    cx.stop_propagation();
-                                    return;
-                                }
-                                _ => return,
-                            }
-                        }
-                        match ev.keystroke.key.as_str() {
-                            "escape" => {
-                                this.overlays.palette_open = false;
-                                this.palette_input.clear();
-                                this.focus.focus(window);
-                                cx.stop_propagation();
-                                cx.notify();
-                            }
-                            "up" => {
-                                let len = this.palette_entries().len();
-                                if len > 0 {
-                                    this.palette_index = if this.palette_index == 0 {
-                                        len - 1
-                                    } else {
-                                        this.palette_index - 1
-                                    };
-                                    this.palette_scroll.scroll_to_item(this.palette_index);
-                                }
-                                cx.stop_propagation();
-                                cx.notify();
-                            }
-                            "down" => {
-                                let len = this.palette_entries().len();
-                                if len > 0 {
-                                    this.palette_index = (this.palette_index + 1) % len;
-                                    this.palette_scroll.scroll_to_item(this.palette_index);
-                                }
-                                cx.stop_propagation();
-                                cx.notify();
-                            }
-                            "enter" => {
-                                let items = this.palette_entries();
-                                if !items.is_empty() {
-                                    let ix = this.palette_index.min(items.len() - 1);
-                                    let target = items[ix].target.clone();
-                                    this.execute_palette_target(target, window, cx);
-                                }
-                                cx.stop_propagation();
-                            }
-                            "backspace" => {
-                                this.palette_input.backspace();
-                                this.palette_index = 0;
-                                this.palette_scroll.scroll_to_item(0);
-                                cx.stop_propagation();
-                                cx.notify();
-                            }
-                            "delete" => {
-                                this.palette_input.delete_forward();
-                                this.palette_index = 0;
-                                this.palette_scroll.scroll_to_item(0);
-                                cx.stop_propagation();
-                                cx.notify();
-                            }
-                            "left" => {
-                                this.palette_input.move_left();
-                                cx.stop_propagation();
-                                cx.notify();
-                            }
-                            "right" => {
-                                this.palette_input.move_right();
-                                cx.stop_propagation();
-                                cx.notify();
-                            }
-                            "home" => {
-                                this.palette_input.move_home();
-                                cx.stop_propagation();
-                                cx.notify();
-                            }
-                            "end" => {
-                                this.palette_input.move_end();
-                                cx.stop_propagation();
-                                cx.notify();
-                            }
-                            _ => {
-                                // Leave printable keys unhandled so GPUI routes ASCII & IME
-                                // composition through `EntityInputHandler`.
-                            }
-                        }
-                    }))
                     .child(
                         div()
-                            .relative()
-                            .h(px(38.))
                             .flex_none()
-                            .px(px(12.))
+                            .h(px(40.))
+                            .px(px(6.))
                             .flex()
                             .items_center()
-                            .gap(px(8.))
-                            .bg(window_bg())
+                            .bg(t.window_bg)
                             .border_b_1()
-                            .border_color(line())
-                            .child(
-                                canvas(
-                                    |_, _, _| {},
-                                    move |bounds, _, window, cx| {
-                                        window.handle_input(
-                                            &focus_ime,
-                                            ElementInputHandler::new(bounds, entity_ime.clone()),
-                                            cx,
-                                        );
-                                    },
-                                )
-                                .absolute()
-                                .inset_0(),
-                            )
-                            .child(icon(Icon::Command, 14., accent()))
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w(px(0.))
-                                    .truncate()
-                                    .text_size(px(13.))
-                                    .text_color(if is_empty { text_faint() } else { text() })
-                                    .child(display),
-                            )
-                            .child(
-                                div()
-                                    .font_family(FONT_MONO)
-                                    .text_size(px(10.))
-                                    .text_color(text_faint())
-                                    .child("↑↓ · Enter · Esc"),
-                            ),
+                            .border_color(t.line)
+                            .child(self.render_text_field(
+                                TextFieldSpec {
+                                    id: "palette-search".into(),
+                                    kind: TextFieldKind::Palette,
+                                    placeholder: "输入命令、工作区预设、数据源或插件动作…".into(),
+                                    height: px(34.),
+                                    leading_icon: Some(Icon::Command),
+                                    borderless: true,
+                                },
+                                Some(window),
+                                cx,
+                            )),
                     )
                     .child(
                         div()
                             .id("palette-list")
                             .flex_1()
                             .min_h(px(0.))
-                            .max_h(px(360.))
                             .overflow_y_scroll()
-                            .track_scroll(&self.palette_scroll)
-                            .py(px(4.))
+                            .track_scroll(&self.overlays.palette_scroll)
+                            .p(px(6.))
                             .flex()
                             .flex_col()
                             .when(entries.is_empty(), |d| {
                                 d.child(
                                     div()
-                                        .px(px(12.))
-                                        .py(px(12.))
+                                        .p(px(14.))
                                         .text_size(px(12.))
-                                        .text_color(text_faint())
+                                        .text_color(t.text_faint)
                                         .child("没有匹配的命令"),
                                 )
                             })
-                            .children(entries.into_iter().enumerate().map(|(i, item)| {
-                                let active = i == selected_ix;
-                                let target = item.target;
+                            .children(entries.into_iter().enumerate().map(|(ix, entry)| {
+                                let selected = ix == active_ix;
+                                let target = entry.target;
                                 div()
-                                    .id(("pal-row", i))
-                                    .px(px(12.))
+                                    .id(("pal-row", ix))
+                                    .px(px(10.))
                                     .py(px(7.))
                                     .flex()
                                     .items_center()
                                     .justify_between()
                                     .gap(px(10.))
+                                    .rounded(t.radius_sm)
                                     .cursor_pointer()
-                                    .when(active, |d| d.bg(selected()).text_color(text()))
-                                    .when(!active, |d| {
-                                        d.text_color(text_muted())
-                                            .hover(|s| s.bg(hover()).text_color(text()))
-                                    })
-                                    .on_click(cx.listener(move |this, _, window, cx| {
-                                        this.execute_palette_target(target.clone(), window, cx);
+                                    .when(selected, |d| d.bg(t.selected))
+                                    .when(!selected, |d| d.hover(|s| s.bg(t.hover)))
+                                    .on_click(cx.listener(move |this, _, w, cx| {
+                                        this.run_palette_target(target.clone(), w, cx);
                                     }))
                                     .child(
                                         div()
@@ -508,19 +511,20 @@ impl IrisWindow {
                                             .min_w(px(0.))
                                             .flex()
                                             .flex_col()
-                                            .gap(px(1.))
+                                            .gap(px(2.))
                                             .child(
                                                 div()
-                                                    .text_size(px(12.))
                                                     .truncate()
-                                                    .child(item.title),
+                                                    .text_size(px(12.))
+                                                    .text_color(t.text)
+                                                    .child(entry.title),
                                             )
-                                            .when_some(item.subtitle, |d, sub| {
+                                            .when_some(entry.subtitle, |d, sub| {
                                                 d.child(
                                                     div()
-                                                        .text_size(px(10.))
-                                                        .text_color(text_faint())
                                                         .truncate()
+                                                        .text_size(px(10.))
+                                                        .text_color(t.text_dim)
                                                         .child(sub),
                                                 )
                                             }),
@@ -531,23 +535,13 @@ impl IrisWindow {
                                             .flex()
                                             .items_center()
                                             .gap(px(6.))
-                                            .child(
-                                                div()
-                                                    .px(px(5.))
-                                                    .py(px(1.))
-                                                    .bg(window_bg())
-                                                    .border_1()
-                                                    .border_color(line())
-                                                    .text_size(px(10.))
-                                                    .text_color(text_dim())
-                                                    .child(item.badge),
-                                            )
-                                            .when_some(item.shortcut, |d, key| {
+                                            .child(badge_pill(entry.badge, selected, t))
+                                            .when_some(entry.shortcut, |d, key| {
                                                 d.child(
                                                     div()
                                                         .font_family(FONT_MONO)
                                                         .text_size(px(10.))
-                                                        .text_color(text_faint())
+                                                        .text_color(t.text_dim)
                                                         .child(key),
                                                 )
                                             }),

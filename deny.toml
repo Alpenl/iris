@@ -35,3 +35,15 @@ confidence-threshold = 0.9
 [licenses.private]
 # Workspace crates are unpublished; their MIT/Apache notices ship with the app.
 ignore = true
+
+[bans]
+multiple-versions = "allow"
+deny = [
+    { name = "bindgen" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

@@ -1,13 +1,16 @@
 //! Media details & playback stats inspector overlay (`I` / `⌘I`).
+
 use gpui::{
     Context, InteractiveElement, IntoElement, MouseButton, ParentElement,
     StatefulInteractiveElement, Styled, div, px,
 };
+use iris_core::library::{Kind, format_size};
+use iris_core::settings::Side;
 
-use super::widgets::{icon_button, tip};
-use super::*;
+use super::IrisWindow;
+use super::kit::{icon_button, tip};
 use crate::assets::Icon;
-use crate::library::format_size;
+use crate::theme::{FLOAT_GAP, FONT_MONO, ThemeTokens};
 
 impl IrisWindow {
     pub(super) fn render_info_overlay(
@@ -15,8 +18,8 @@ impl IrisWindow {
         fullscreen: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        // Use cached stats refreshed on load/open and at 1 Hz (never sync-poll mpv in render()).
-        let stats = self.cached_stats.clone().unwrap_or_default();
+        let t = ThemeTokens::of(cx);
+        let stats = self.active().cached_stats.clone().unwrap_or_default();
         let kind = self.active().session.kind();
         let mut rows: Vec<(&'static str, String)> = Vec::new();
 
@@ -40,14 +43,10 @@ impl IrisWindow {
                 if !stats.pixel_format.is_empty() {
                     rows.push(("像素格式", stats.pixel_format));
                 }
-                if let Some(fps) = stats.video_fps
-                    && fps > 0.
-                {
+                if let Some(fps) = stats.video_fps.filter(|v| *v > 0.) {
                     rows.push(("帧率", format!("{fps:.2} fps")));
                 }
-                if let Some(br) = stats.video_bitrate
-                    && br > 0.
-                {
+                if let Some(br) = stats.video_bitrate.filter(|v| *v > 0.) {
                     rows.push(("视频码率", format!("{:.2} Mbps", br / 1_000_000.)));
                 }
                 rows.push((
@@ -66,14 +65,12 @@ impl IrisWindow {
                     if !stats.audio_channels.is_empty() {
                         audio.push_str(&format!(" · {}", stats.audio_channels));
                     }
-                    if let Some(sr) = stats.audio_sample_rate
-                        && sr > 0
-                    {
+                    if let Some(sr) = stats.audio_sample_rate.filter(|v| *v > 0) {
                         audio.push_str(&format!(" · {:.1} kHz", sr as f64 / 1000.));
                     }
                     rows.push(("音频", audio));
                 }
-                let chapters = self.active().session.state.chapters.len();
+                let chapters = self.active().session.state().chapters.len();
                 if chapters > 0 {
                     rows.push(("章节", format!("{chapters} 个")));
                 }
@@ -85,14 +82,10 @@ impl IrisWindow {
                 if !stats.audio_channels.is_empty() {
                     rows.push(("声道", stats.audio_channels));
                 }
-                if let Some(sr) = stats.audio_sample_rate
-                    && sr > 0
-                {
+                if let Some(sr) = stats.audio_sample_rate.filter(|v| *v > 0) {
                     rows.push(("采样率", format!("{:.1} kHz", sr as f64 / 1000.)));
                 }
-                if let Some(br) = stats.audio_bitrate
-                    && br > 0.
-                {
+                if let Some(br) = stats.audio_bitrate.filter(|v| *v > 0.) {
                     rows.push(("码率", format!("{:.0} kbps", br / 1000.)));
                 }
             }
@@ -142,9 +135,11 @@ impl IrisWindow {
                 .max_w(px(330.))
                 .flex()
                 .flex_col()
-                .bg(overlay())
+                .rounded(t.radius_lg)
+                .overflow_hidden()
+                .bg(t.overlay)
                 .border_1()
-                .border_color(line_strong())
+                .border_color(t.line_strong)
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
                 .child(
@@ -155,18 +150,23 @@ impl IrisWindow {
                         .items_center()
                         .justify_between()
                         .border_b_1()
-                        .border_color(line())
+                        .border_color(t.line)
                         .child(
                             div()
                                 .flex()
                                 .items_center()
                                 .gap(px(8.))
-                                .child(div().size(px(6.)).bg(accent()))
-                                .child(div().text_size(px(12.)).child("媒体详情")),
+                                .child(div().size(px(6.)).bg(t.accent))
+                                .child(
+                                    div()
+                                        .text_size(px(12.))
+                                        .text_color(t.text)
+                                        .child("媒体详情"),
+                                ),
                         )
                         .child(
-                            icon_button("info-close", Icon::Close, false)
-                                .tooltip(tip("关闭详情", Some("I / Esc")))
+                            icon_button("info-close", Icon::Close, false, t)
+                                .tooltip(tip("关闭详情", self.key_hint("toggle_info")))
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.overlays.info_open = false;
                                     cx.notify();
@@ -181,19 +181,18 @@ impl IrisWindow {
                             .justify_between()
                             .gap(px(12.))
                             .text_size(px(11.))
-                            .child(div().flex_none().text_color(text_dim()).child(k))
+                            .child(div().flex_none().text_color(t.text_dim).child(k))
                             .child(
                                 div()
                                     .min_w(px(0.))
                                     .truncate()
                                     .font_family(FONT_MONO)
-                                    .text_color(text())
+                                    .text_color(t.text)
                                     .child(v),
                             )
                     }),
                 ));
 
-        // In fullscreen, anchor opposite the directory popup so the two never overlap.
         let place_left = if fullscreen {
             self.settings.directory_side == Side::Right
         } else {

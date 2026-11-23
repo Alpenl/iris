@@ -1,14 +1,14 @@
 //! Built-in official plugins compiled into Iris.
 //! They use the exact same [`BuiltinPlugin`] control-plane & vector-overlay
-//! protocol as external stdio plugins.
+//! protocol (`PROTOCOL_VERSION = 1`) as external stdio plugins.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use iris_api::{
-    ActionButton, BuiltinPlugin, CommandSpec, HostCommand, HostEvent, MediaKind, OverlayColor,
-    OverlayShape, PROTOCOL_VERSION, Permission, PlaybackSnapshot, PluginManifest, SidebarItem,
-    SidebarPanel, SidebarSection, StatusItem,
+    BuiltinPlugin, ButtonSpec, Color, CommandSpec, HostCommand, HostEvent, MediaKind, OverlayNode,
+    PROTOCOL_VERSION, Permission, PlaybackSnapshot, PluginManifest, SidebarPanel, SidebarSection,
+    StatusBadge, TextAlign, Widget,
 };
 
 use crate::player::format_time;
@@ -17,7 +17,7 @@ use crate::player::format_time;
 // Built-in Official Plugin 1: Composition & Safe-Area Vector Guides
 // ============================================================================
 
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum GuideMode {
     #[default]
     Off,
@@ -29,6 +29,29 @@ enum GuideMode {
 }
 
 impl GuideMode {
+    fn as_key(self) -> &'static str {
+        match self {
+            GuideMode::Off => "off",
+            GuideMode::RuleOfThirds => "thirds",
+            GuideMode::GoldenRatio => "golden",
+            GuideMode::Crosshair => "cross",
+            GuideMode::Cinema239 => "cinema",
+            GuideMode::ActionSafe => "safe",
+        }
+    }
+
+    fn from_key(s: &str) -> Option<Self> {
+        match s {
+            "off" => Some(GuideMode::Off),
+            "thirds" => Some(GuideMode::RuleOfThirds),
+            "golden" => Some(GuideMode::GoldenRatio),
+            "cross" => Some(GuideMode::Crosshair),
+            "cinema" => Some(GuideMode::Cinema239),
+            "safe" => Some(GuideMode::ActionSafe),
+            _ => None,
+        }
+    }
+
     fn next(self) -> Self {
         match self {
             GuideMode::Off => GuideMode::RuleOfThirds,
@@ -51,104 +74,120 @@ impl GuideMode {
         }
     }
 
-    fn shapes(self) -> Vec<OverlayShape> {
+    fn nodes(self) -> Vec<OverlayNode> {
         match self {
             GuideMode::Off => Vec::new(),
-            GuideMode::RuleOfThirds => vec![OverlayShape::Grid {
+            GuideMode::RuleOfThirds => vec![OverlayNode::Grid {
                 cols: 3,
                 rows: 3,
-                color: OverlayColor::White,
+                color: Color::White,
                 opacity: 0.45,
             }],
             GuideMode::GoldenRatio => vec![
-                OverlayShape::Line {
+                OverlayNode::Line {
                     x1: 0.382,
-                    y1: 0.,
+                    y1: 0.0,
                     x2: 0.382,
-                    y2: 1.,
-                    color: OverlayColor::Accent,
+                    y2: 1.0,
+                    color: Color::Accent,
+                    width: 1.0,
                     opacity: 0.55,
-                    thickness: 1.,
                 },
-                OverlayShape::Line {
+                OverlayNode::Line {
                     x1: 0.618,
-                    y1: 0.,
+                    y1: 0.0,
                     x2: 0.618,
-                    y2: 1.,
-                    color: OverlayColor::Accent,
+                    y2: 1.0,
+                    color: Color::Accent,
+                    width: 1.0,
                     opacity: 0.55,
-                    thickness: 1.,
                 },
-                OverlayShape::Line {
-                    x1: 0.,
+                OverlayNode::Line {
+                    x1: 0.0,
                     y1: 0.382,
-                    x2: 1.,
+                    x2: 1.0,
                     y2: 0.382,
-                    color: OverlayColor::Accent,
+                    color: Color::Accent,
+                    width: 1.0,
                     opacity: 0.55,
-                    thickness: 1.,
                 },
-                OverlayShape::Line {
-                    x1: 0.,
+                OverlayNode::Line {
+                    x1: 0.0,
                     y1: 0.618,
-                    x2: 1.,
+                    x2: 1.0,
                     y2: 0.618,
-                    color: OverlayColor::Accent,
+                    color: Color::Accent,
+                    width: 1.0,
                     opacity: 0.55,
-                    thickness: 1.,
                 },
             ],
-            GuideMode::Crosshair => vec![OverlayShape::Crosshair {
+            GuideMode::Crosshair => vec![OverlayNode::Crosshair {
                 x: 0.5,
                 y: 0.5,
                 size: 0.08,
-                color: OverlayColor::Accent,
+                color: Color::Accent,
                 opacity: 0.85,
             }],
             GuideMode::Cinema239 => {
                 // 2.39:1 frame centered inside a 16:9 viewport (~12.8% matte top/bottom).
                 vec![
-                    OverlayShape::Rect {
+                    OverlayNode::Box {
                         x: 0.0,
                         y: 0.128,
                         w: 1.0,
                         h: 0.744,
-                        color: OverlayColor::Accent,
+                        fill: None,
+                        border: Some(Color::Accent),
+                        border_width: 1.0,
+                        radius: 0.0,
                         opacity: 0.75,
-                        stroke: 1.0,
                     },
-                    OverlayShape::Label {
+                    OverlayNode::Text {
                         x: 0.015,
                         y: 0.14,
                         text: "2.39:1 SCOPE".into(),
-                        color: OverlayColor::Accent,
+                        size: 11.0,
+                        color: Color::Accent,
+                        bg: Some(Color::Dark),
+                        mono: true,
+                        align: TextAlign::Left,
+                        opacity: 0.9,
                     },
                 ]
             }
             GuideMode::ActionSafe => vec![
-                OverlayShape::Rect {
+                OverlayNode::Box {
                     x: 0.05,
                     y: 0.05,
                     w: 0.90,
                     h: 0.90,
-                    color: OverlayColor::White,
+                    fill: None,
+                    border: Some(Color::White),
+                    border_width: 1.0,
+                    radius: 0.0,
                     opacity: 0.5,
-                    stroke: 1.0,
                 },
-                OverlayShape::Rect {
+                OverlayNode::Box {
                     x: 0.10,
                     y: 0.10,
                     w: 0.80,
                     h: 0.80,
-                    color: OverlayColor::Dim,
+                    fill: None,
+                    border: Some(Color::Dim),
+                    border_width: 1.0,
+                    radius: 0.0,
                     opacity: 0.45,
-                    stroke: 1.0,
                 },
-                OverlayShape::Label {
+                OverlayNode::Text {
                     x: 0.06,
                     y: 0.06,
                     text: "SAFE 90% / 80%".into(),
-                    color: OverlayColor::White,
+                    size: 11.0,
+                    color: Color::White,
+                    bg: Some(Color::Dark),
+                    mono: true,
+                    align: TextAlign::Left,
+                    opacity: 0.9,
                 },
             ],
         }
@@ -161,78 +200,88 @@ pub(super) struct GuidesPlugin {
 }
 
 impl GuidesPlugin {
-    fn sync_ui(&self, announce: bool) -> Vec<HostCommand> {
+    fn sync_ui(&self, persist_and_announce: bool) -> Vec<HostCommand> {
         let mut cmds = Vec::new();
-        let shapes = self.mode.shapes();
-        if shapes.is_empty() {
-            cmds.push(HostCommand::ClearOverlay);
-            cmds.push(HostCommand::SetStatus { item: None });
+        let nodes = self.mode.nodes();
+        if nodes.is_empty() {
+            cmds.push(HostCommand::SetOverlay { nodes: Vec::new() });
+            cmds.push(HostCommand::SetStatus { badge: None });
         } else {
-            cmds.push(HostCommand::SetOverlay { shapes });
+            cmds.push(HostCommand::SetOverlay { nodes });
             cmds.push(HostCommand::SetStatus {
-                item: Some(StatusItem {
+                badge: Some(Box::new(StatusBadge {
                     id: "guide-badge".into(),
                     text: self.mode.label().into(),
                     tooltip: Some("构图辅助线 · 点击切换".into()),
                     accent: true,
                     action_id: Some("cycle".into()),
-                }),
+                })),
             });
         }
         cmds.push(HostCommand::SetSidebar {
-            panel: Some(SidebarPanel {
+            panel: Some(Box::new(SidebarPanel {
                 title: "构图辅助线".into(),
                 sections: vec![SidebarSection {
                     heading: "矢量参考线（仅叠加，不改像素）".into(),
-                    items: vec![
-                        SidebarItem::KeyValue {
-                            key: "当前模式".into(),
+                    widgets: vec![
+                        Widget::Stat {
+                            label: "当前模式".into(),
                             value: self.mode.label().into(),
                             accent: self.mode != GuideMode::Off,
                         },
-                        SidebarItem::ButtonRow {
+                        Widget::ButtonGroup {
                             buttons: vec![
-                                ActionButton {
+                                ButtonSpec {
                                     label: "关闭".into(),
                                     action_id: "off".into(),
+                                    icon: None,
                                     accent: self.mode == GuideMode::Off,
                                 },
-                                ActionButton {
+                                ButtonSpec {
                                     label: "三分线".into(),
                                     action_id: "thirds".into(),
+                                    icon: None,
                                     accent: self.mode == GuideMode::RuleOfThirds,
                                 },
-                                ActionButton {
+                                ButtonSpec {
                                     label: "黄金分割".into(),
                                     action_id: "golden".into(),
+                                    icon: None,
                                     accent: self.mode == GuideMode::GoldenRatio,
                                 },
                             ],
                         },
-                        SidebarItem::ButtonRow {
+                        Widget::ButtonGroup {
                             buttons: vec![
-                                ActionButton {
+                                ButtonSpec {
                                     label: "十字".into(),
                                     action_id: "cross".into(),
+                                    icon: None,
                                     accent: self.mode == GuideMode::Crosshair,
                                 },
-                                ActionButton {
+                                ButtonSpec {
                                     label: "2.39:1".into(),
                                     action_id: "cinema".into(),
+                                    icon: None,
                                     accent: self.mode == GuideMode::Cinema239,
                                 },
-                                ActionButton {
+                                ButtonSpec {
                                     label: "安全区".into(),
                                     action_id: "safe".into(),
+                                    icon: None,
                                     accent: self.mode == GuideMode::ActionSafe,
                                 },
                             ],
                         },
                     ],
                 }],
-            }),
+            })),
         });
-        if announce {
+        if persist_and_announce {
+            cmds.push(HostCommand::SetState {
+                key: "mode".into(),
+                value: (self.mode != GuideMode::Off).then(|| self.mode.as_key().into()),
+            });
             cmds.push(HostCommand::ShowToast {
                 message: format!("构图辅助线 · {}", self.mode.label()),
             });
@@ -243,13 +292,10 @@ impl GuidesPlugin {
     fn apply_action(&mut self, action: &str) -> Vec<HostCommand> {
         self.mode = match action {
             "cycle" => self.mode.next(),
-            "thirds" => GuideMode::RuleOfThirds,
-            "golden" => GuideMode::GoldenRatio,
-            "cross" => GuideMode::Crosshair,
-            "cinema" => GuideMode::Cinema239,
-            "safe" => GuideMode::ActionSafe,
-            "off" => GuideMode::Off,
-            _ => return Vec::new(),
+            other => match GuideMode::from_key(other) {
+                Some(m) => m,
+                None => return Vec::new(),
+            },
         };
         self.sync_ui(true)
     }
@@ -307,14 +353,20 @@ impl BuiltinPlugin for GuidesPlugin {
                     shortcut_hint: None,
                 },
             ],
+            ..Default::default()
         }
     }
 
     fn handle_event(&mut self, event: &HostEvent) -> Vec<HostCommand> {
         match event {
-            HostEvent::Init { .. } => self.sync_ui(false),
-            HostEvent::CommandInvoked { command_id, .. } => self.apply_action(command_id),
-            HostEvent::ActionInvoked { action_id, .. } => self.apply_action(action_id),
+            HostEvent::Init { state, .. } => {
+                self.mode = state
+                    .get("mode")
+                    .and_then(|s| GuideMode::from_key(s))
+                    .unwrap_or_default();
+                self.sync_ui(false)
+            }
+            HostEvent::Command { id, .. } | HostEvent::Action { id, .. } => self.apply_action(id),
             _ => Vec::new(),
         }
     }
@@ -330,7 +382,7 @@ const LOOP_SEEK_COOLDOWN: Duration = Duration::from_millis(400);
 
 #[derive(Default)]
 pub(super) struct AbLoopPlugin {
-    current_path: Option<String>,
+    current_uri: Option<String>,
     point_a: Option<f64>,
     point_b: Option<f64>,
     markers: BTreeMap<String, Vec<f64>>,
@@ -340,53 +392,56 @@ pub(super) struct AbLoopPlugin {
 impl AbLoopPlugin {
     fn sync_ui(&self) -> Vec<HostCommand> {
         let mut cmds = Vec::new();
-        let status = match (self.point_a, self.point_b) {
-            (Some(a), Some(b)) => Some(StatusItem {
+        let badge = match (self.point_a, self.point_b) {
+            (Some(a), Some(b)) => Some(Box::new(StatusBadge {
                 id: "ab-status".into(),
                 text: format!("A-B {}–{}", format_time(a), format_time(b)),
                 tooltip: Some("A-B 区间循环中 · 点击清除".into()),
                 accent: true,
                 action_id: Some("clear".into()),
-            }),
-            (Some(a), None) => Some(StatusItem {
+            })),
+            (Some(a), None) => Some(Box::new(StatusBadge {
                 id: "ab-status".into(),
                 text: format!("A {}–?", format_time(a)),
                 tooltip: Some("已设置起点 A · 点击清除".into()),
                 accent: false,
                 action_id: Some("clear".into()),
-            }),
+            })),
             _ => None,
         };
-        cmds.push(HostCommand::SetStatus { item: status });
+        cmds.push(HostCommand::SetStatus { badge });
 
         let mut sections = vec![SidebarSection {
             heading: "A-B 区间循环".into(),
-            items: vec![
-                SidebarItem::KeyValue {
-                    key: "起点 A".into(),
+            widgets: vec![
+                Widget::Stat {
+                    label: "起点 A".into(),
                     value: self.point_a.map_or("未设置".into(), format_time),
                     accent: self.point_a.is_some(),
                 },
-                SidebarItem::KeyValue {
-                    key: "终点 B".into(),
+                Widget::Stat {
+                    label: "终点 B".into(),
                     value: self.point_b.map_or("未设置".into(), format_time),
                     accent: self.point_b.is_some(),
                 },
-                SidebarItem::ButtonRow {
+                Widget::ButtonGroup {
                     buttons: vec![
-                        ActionButton {
+                        ButtonSpec {
                             label: "设起点 A".into(),
                             action_id: "set_a".into(),
+                            icon: None,
                             accent: false,
                         },
-                        ActionButton {
+                        ButtonSpec {
                             label: "设终点 B".into(),
                             action_id: "set_b".into(),
+                            icon: None,
                             accent: false,
                         },
-                        ActionButton {
+                        ButtonSpec {
                             label: "清除".into(),
                             action_id: "clear".into(),
+                            icon: None,
                             accent: false,
                         },
                     ],
@@ -394,32 +449,34 @@ impl AbLoopPlugin {
             ],
         }];
 
-        let mut marker_items = vec![SidebarItem::Button {
+        let mut marker_widgets = vec![Widget::Button {
             label: "+ 在当前时间添加标记".into(),
             action_id: "add_marker".into(),
+            icon: None,
             accent: false,
         }];
-        if let Some(path) = &self.current_path
-            && let Some(list) = self.markers.get(path)
+        if let Some(uri) = &self.current_uri
+            && let Some(list) = self.markers.get(uri)
         {
             for (i, &t) in list.iter().enumerate() {
-                marker_items.push(SidebarItem::Button {
+                marker_widgets.push(Widget::Button {
                     label: format!("#{}  {}", i + 1, format_time(t)),
                     action_id: format!("jump:{t:.3}"),
+                    icon: None,
                     accent: false,
                 });
             }
         }
         sections.push(SidebarSection {
             heading: "时间点标记".into(),
-            items: marker_items,
+            widgets: marker_widgets,
         });
 
         cmds.push(HostCommand::SetSidebar {
-            panel: Some(SidebarPanel {
+            panel: Some(Box::new(SidebarPanel {
                 title: "A-B 循环与标记".into(),
                 sections,
-            }),
+            })),
         });
         cmds
     }
@@ -430,24 +487,25 @@ impl AbLoopPlugin {
 
     fn run_action(&mut self, action: &str, snapshot: &PlaybackSnapshot) -> Vec<HostCommand> {
         let mut cmds = Vec::new();
-        if let Some(ts) = action.strip_prefix("jump:")
-            && let Ok(sec) = ts.parse::<f64>()
+        if let Some(sec) = action
+            .strip_prefix("jump:")
+            .and_then(|s| s.parse::<f64>().ok())
         {
-            cmds.push(HostCommand::SeekAbsolute { seconds: sec });
-            cmds.push(HostCommand::ShowToast {
-                message: format!("跳转标记 · {}", format_time(sec)),
-            });
-            return cmds;
+            return vec![
+                HostCommand::SeekAbsolute { seconds: sec },
+                HostCommand::ShowToast {
+                    message: format!("跳转标记 · {}", format_time(sec)),
+                },
+            ];
         }
         if matches!(action, "set_a" | "set_b" | "add_marker") && !Self::is_timed_media(snapshot) {
-            cmds.push(HostCommand::ShowToast {
+            return vec![HostCommand::ShowToast {
                 message: "A-B 循环与时间标记仅支持视频或音频".into(),
-            });
-            return cmds;
+            }];
         }
         match action {
             "set_a" => {
-                self.point_a = Some(snapshot.position.max(0.));
+                self.point_a = Some(snapshot.position.max(0.0));
                 self.last_loop_seek = None;
                 if let Some(b) = self.point_b
                     && b <= snapshot.position
@@ -460,7 +518,7 @@ impl AbLoopPlugin {
                 });
             }
             "set_b" => {
-                let pos = snapshot.position.max(0.);
+                let pos = snapshot.position.max(0.0);
                 match self.point_a {
                     Some(a) if pos > a + 0.2 => {
                         self.point_b = Some(pos);
@@ -478,24 +536,22 @@ impl AbLoopPlugin {
                 }
             }
             "clear" => {
-                self.point_a = None;
-                self.point_b = None;
-                self.last_loop_seek = None;
+                (self.point_a, self.point_b, self.last_loop_seek) = (None, None, None);
                 cmds.extend(self.sync_ui());
                 cmds.push(HostCommand::ShowToast {
                     message: "已清除 A-B 循环".into(),
                 });
             }
             "add_marker" => {
-                if let Some(path) = snapshot.path.clone() {
-                    let list = self.markers.entry(path).or_default();
-                    let t = snapshot.position.max(0.);
+                if let Some(uri) = snapshot.uri.clone().or_else(|| self.current_uri.clone()) {
+                    self.current_uri.get_or_insert_with(|| uri.clone());
+                    let list = self.markers.entry(uri).or_default();
+                    let t = snapshot.position.max(0.0);
                     list.push(t);
                     list.sort_by(f64::total_cmp);
                     cmds.extend(self.sync_ui());
-                    cmds.push(HostCommand::ShowToast {
-                        message: format!("已添加时间标记 · {}", format_time(t)),
-                    });
+                    let msg = format!("已添加时间标记 · {}", format_time(t));
+                    cmds.push(HostCommand::ShowToast { message: msg });
                 }
             }
             _ => {}
@@ -523,46 +579,50 @@ impl BuiltinPlugin for AbLoopPlugin {
                 Permission::UiStatus,
                 Permission::Notifications,
             ],
-            commands: vec![
-                CommandSpec {
-                    id: "set_a".into(),
-                    title: "A-B 循环：设置起点 A".into(),
-                    subtitle: Some("以当前播放时间作为循环起点".into()),
-                    shortcut_hint: None,
-                },
-                CommandSpec {
-                    id: "set_b".into(),
-                    title: "A-B 循环：设置终点 B".into(),
-                    subtitle: Some("到达 B 点后自动跳回 A 点".into()),
-                    shortcut_hint: None,
-                },
-                CommandSpec {
-                    id: "clear".into(),
-                    title: "A-B 循环：清除区间".into(),
-                    subtitle: None,
-                    shortcut_hint: None,
-                },
-                CommandSpec {
-                    id: "add_marker".into(),
-                    title: "标记：在当前时间添加书签".into(),
-                    subtitle: Some("在侧栏插件面板点击即可跳转".into()),
-                    shortcut_hint: None,
-                },
-            ],
+            commands: [
+                (
+                    "set_a",
+                    "A-B 循环：设置起点 A",
+                    Some("以当前播放时间作为循环起点"),
+                ),
+                (
+                    "set_b",
+                    "A-B 循环：设置终点 B",
+                    Some("到达 B 点后自动跳回 A 点"),
+                ),
+                ("clear", "A-B 循环：清除区间", None),
+                (
+                    "add_marker",
+                    "标记：在当前时间添加书签",
+                    Some("在侧栏插件面板点击即可跳转"),
+                ),
+            ]
+            .into_iter()
+            .map(|(id, title, subtitle)| CommandSpec {
+                id: id.into(),
+                title: title.into(),
+                subtitle: subtitle.map(Into::into),
+                shortcut_hint: None,
+            })
+            .collect(),
+            ..Default::default()
         }
     }
 
     fn handle_event(&mut self, event: &HostEvent) -> Vec<HostCommand> {
         match event {
-            HostEvent::Init { .. } => self.sync_ui(),
-            HostEvent::FileOpened { snapshot } => {
-                self.current_path = snapshot.path.clone();
+            HostEvent::Init { snapshot, .. } => {
+                self.current_uri = snapshot.uri.clone();
+                self.sync_ui()
+            }
+            HostEvent::MediaOpened { snapshot } => {
+                self.current_uri = snapshot.uri.clone();
                 self.point_a = None;
                 self.point_b = None;
                 self.last_loop_seek = None;
                 self.sync_ui()
             }
-            HostEvent::PositionTick {
+            HostEvent::Tick {
                 position, paused, ..
             } => {
                 if !paused
@@ -579,14 +639,9 @@ impl BuiltinPlugin for AbLoopPlugin {
                 }
                 Vec::new()
             }
-            HostEvent::CommandInvoked {
-                command_id,
-                snapshot,
-            } => self.run_action(command_id, snapshot),
-            HostEvent::ActionInvoked {
-                action_id,
-                snapshot,
-            } => self.run_action(action_id, snapshot),
+            HostEvent::Command { id, snapshot } | HostEvent::Action { id, snapshot, .. } => {
+                self.run_action(id, snapshot)
+            }
             _ => Vec::new(),
         }
     }

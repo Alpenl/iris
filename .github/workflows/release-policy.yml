@@ -1,9 +1,9 @@
 name: Release recipe policy
 on:
   pull_request:
-    paths: ['scripts/release/**', '.github/workflows/release-*.yml', 'LICENSE-*', 'Cargo.toml', 'Cargo.lock', 'deny.toml']
+    paths: ['scripts/release/**', '.github/workflows/release-*.yml', 'LICENSE-*', 'Cargo.toml', 'Cargo.lock', 'crates/**/Cargo.toml', 'deny.toml']
   push:
-    paths: ['scripts/release/**', '.github/workflows/release-*.yml', 'LICENSE-*', 'Cargo.toml', 'Cargo.lock', 'deny.toml']
+    paths: ['scripts/release/**', '.github/workflows/release-*.yml', 'LICENSE-*', 'Cargo.toml', 'Cargo.lock', 'crates/**/Cargo.toml', 'deny.toml']
 permissions:
   contents: read
 jobs:
@@ -41,4 +41,4 @@ jobs:
           rustup toolchain install 1.100.0 --profile minimal
           rustup default 1.100.0
           cargo install cargo-deny --version 0.18.3 --locked
-          cargo deny --locked check licenses
+          cargo deny --locked check licenses bans sources

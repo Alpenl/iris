@@ -7,20 +7,13 @@
 //! `mpv <command...>`, or `quit`. Replies remain on Iris's stderr.
 //! Ordinary release builds ignore `IRIS_CONTROL` entirely.
 
-use futures::channel::mpsc::UnboundedReceiver;
-
-pub fn control_channel() -> Option<UnboundedReceiver<String>> {
-    #[cfg(all(
-        any(debug_assertions, feature = "devtools"),
-        any(target_os = "macos", target_os = "windows")
-    ))]
+#[cfg(any(debug_assertions, feature = "devtools"))]
+pub(crate) fn control_channel() -> Option<futures::channel::mpsc::UnboundedReceiver<String>> {
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     {
         enabled::control_channel()
     }
-    #[cfg(not(all(
-        any(debug_assertions, feature = "devtools"),
-        any(target_os = "macos", target_os = "windows")
-    )))]
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         None
     }
@@ -35,7 +28,7 @@ mod enabled {
     use std::io::{self, BufRead, BufReader, Read};
     use std::time::Duration;
 
-    const MAX_LINE: usize = 16 * 1024;
+    pub(super) const MAX_LINE: usize = 16 * 1024;
     const MAX_PENDING: usize = 256;
 
     pub(super) fn control_channel() -> Option<UnboundedReceiver<String>> {
@@ -65,7 +58,7 @@ mod enabled {
 
     // fill_buf bounds allocation even when a peer never sends a newline. Backpressure
     // bounds the otherwise-unbounded UI channel; only this thread owns its sender.
-    fn forward(reader: impl Read, tx: &UnboundedSender<String>) -> io::Result<()> {
+    pub(super) fn forward(reader: impl Read, tx: &UnboundedSender<String>) -> io::Result<()> {
         let mut reader = BufReader::new(reader);
         let mut bytes = Vec::new();
         loop {
@@ -128,7 +121,6 @@ mod enabled {
 
         impl Listener {
             pub(super) fn bind(path: &OsStr) -> io::Result<Self> {
-                // Never unlink an existing endpoint: it may belong to another instance.
                 let socket = UnixListener::bind(path)?;
                 let metadata = std::fs::symlink_metadata(path)?;
                 let listener = Self {
@@ -156,7 +148,6 @@ mod enabled {
                     // SAFETY: stream owns a live socket and both output pointers are valid.
                     let result =
                         unsafe { libc::getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) };
-                    // Checking the peer also closes the bind-to-chmod permission window.
                     if result != 0 || uid != unsafe { libc::geteuid() } {
                         log::warn!("rejecting control connection from a different or unknown user");
                         continue;
@@ -213,7 +204,6 @@ mod enabled {
 
             pub(super) fn run(mut self, tx: UnboundedSender<String>) {
                 while !tx.is_closed() {
-                    // Blocking accept/read prevent a disconnected client from hot-spinning.
                     let connected =
                         unsafe { ConnectNamedPipe(self.0.as_raw_handle(), std::ptr::null_mut()) };
                     if connected == 0 {
@@ -232,6 +222,45 @@ mod enabled {
                     }
                 }
             }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::io::Cursor;
+
+        #[test]
+        fn forward_trims_skips_blank_and_drops_incomplete_tail() {
+            let (tx, mut rx) = unbounded();
+            let payload = b"  state \n\n\t\r\n  key space \r\nincomplete_tail";
+            forward(Cursor::new(payload), &tx).unwrap();
+
+            let mut received = Vec::new();
+            while let Ok(msg) = rx.try_recv() {
+                received.push(msg);
+            }
+            assert_eq!(received, vec!["state", "key space"]);
+        }
+
+        #[test]
+        fn forward_enforces_16kib_line_cap_and_rejects_bad_utf8() {
+            let (tx, mut rx) = unbounded();
+            let mut exact = vec![b'a'; MAX_LINE - 1];
+            exact.push(b'\n');
+            forward(Cursor::new(exact), &tx).unwrap();
+            assert_eq!(rx.try_recv().unwrap().len(), MAX_LINE - 1);
+
+            let mut too_long = vec![b'x'; MAX_LINE];
+            too_long.push(b'\n');
+            let err = forward(Cursor::new(too_long), &tx).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+
+            let err_utf8 = forward(Cursor::new(b"\xFF\xFE\n"), &tx).unwrap_err();
+            assert_eq!(err_utf8.kind(), io::ErrorKind::InvalidData);
+
+            drop(rx);
+            forward(Cursor::new(b"quit\n"), &tx).unwrap();
         }
     }
 }

@@ -9,7 +9,7 @@ use futures::channel::mpsc::UnboundedReceiver;
 use gpui::RenderImage;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use windows::Win32::{
-    Foundation::{GENERIC_READ, HWND, LPARAM, RECT, WPARAM},
+    Foundation::{GENERIC_READ, HWND, LPARAM, WPARAM},
     Graphics::{
         Gdi::*,
         Imaging::{
@@ -38,9 +38,9 @@ fn hwnd(window: &gpui::Window) -> Option<HWND> {
     }
 }
 
-pub fn hide_traffic_lights(_window: &gpui::Window) {}
+pub(crate) fn hide_traffic_lights(_window: &gpui::Window) {}
 
-pub fn set_always_on_top(window: &gpui::Window, on: bool) {
+pub(crate) fn set_always_on_top(window: &gpui::Window, on: bool) {
     if let Some(hwnd) = hwnd(window) {
         let after = if on { HWND_TOPMOST } else { HWND_NOTOPMOST };
         unsafe {
@@ -58,15 +58,15 @@ pub fn set_always_on_top(window: &gpui::Window, on: bool) {
 }
 
 #[derive(Default)]
-pub struct SleepPreventer {
+pub(crate) struct SleepPreventer {
     active: bool,
 }
 
 impl SleepPreventer {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self { active: false }
     }
-    pub fn set_active(&mut self, active: bool) {
+    pub(crate) fn set_active(&mut self, active: bool) {
         if active == self.active {
             return;
         }
@@ -88,19 +88,19 @@ impl Drop for SleepPreventer {
     }
 }
 
-pub struct PinchMonitor;
+pub(crate) struct PinchMonitor;
 impl PinchMonitor {
-    pub fn attach(_window: &gpui::Window) -> Option<(Self, UnboundedReceiver<PinchEvent>)> {
+    pub(crate) fn attach(_window: &gpui::Window) -> Option<(Self, UnboundedReceiver<PinchEvent>)> {
         None
     }
 }
 
-pub struct MediaKeyBridge;
+pub(crate) struct MediaKeyBridge;
 impl MediaKeyBridge {
-    pub fn attach() -> Option<(Self, UnboundedReceiver<MediaKey>)> {
+    pub(crate) fn attach() -> Option<(Self, UnboundedReceiver<MediaKey>)> {
         None
     }
-    pub fn update_now_playing(
+    pub(crate) fn update_now_playing(
         &self,
         _title: Option<&str>,
         _duration: f64,
@@ -186,7 +186,8 @@ pub(super) fn decode_thumbnail_wic(path: &Path, max_dim: u32) -> Option<Arc<Rend
     }
 }
 
-pub fn synth_mouse(
+#[cfg(any(debug_assertions, feature = "devtools"))]
+pub(crate) fn synth_mouse(
     window: &gpui::Window,
     click: bool,
     x: f64,
@@ -206,7 +207,7 @@ pub fn synth_mouse(
     }))
 }
 
-pub fn begin_window_drag(window: &gpui::Window) {
+pub(crate) fn begin_window_drag(window: &gpui::Window) {
     if let Some(hwnd) = hwnd(window) {
         unsafe {
             let _ = ReleaseCapture();
@@ -223,7 +224,9 @@ pub fn begin_window_drag(window: &gpui::Window) {
 /// Captures the visible desktop rectangle of this window, including both
 /// DComp targets. The window must be unobscured and on-screen; unlike GDI
 /// window capture this also sees NOREDIRECTIONBITMAP composition surfaces.
-pub fn snapshot_window(window: &gpui::Window, path: &Path) -> anyhow::Result<()> {
+#[cfg(any(debug_assertions, feature = "devtools"))]
+pub(crate) fn snapshot_window(window: &gpui::Window, path: &Path) -> anyhow::Result<()> {
+    use windows::Win32::Foundation::RECT;
     let hwnd = hwnd(window).ok_or_else(|| anyhow::anyhow!("missing HWND"))?;
     unsafe {
         let mut rect = RECT::default();
@@ -299,7 +302,7 @@ pub fn snapshot_window(window: &gpui::Window, path: &Path) -> anyhow::Result<()>
 
 /// Same-user named pipes for the debug control channel and the
 /// single-instance file handoff.
-pub mod pipe {
+pub(crate) mod pipe {
     use std::ffi::c_void;
     use std::fs::File;
     use std::io;
@@ -332,7 +335,7 @@ pub mod pipe {
     }
 
     /// The current process token's user SID in string form (`S-1-5-...`).
-    pub fn current_user_sid() -> io::Result<String> {
+    pub(crate) fn current_user_sid() -> io::Result<String> {
         unsafe {
             let mut token = std::ptr::null_mut();
             if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
@@ -379,7 +382,7 @@ pub mod pipe {
     /// Creates the first and only instance of an inbound, local-only byte pipe
     /// whose protected DACL grants access to the current token's user alone.
     /// `name` is NUL-terminated UTF-16.
-    pub fn create_inbound(name: &[u16], in_buffer: u32) -> io::Result<File> {
+    pub(crate) fn create_inbound(name: &[u16], in_buffer: u32) -> io::Result<File> {
         debug_assert_eq!(name.last(), Some(&0));
         let sid = current_user_sid()?;
         let sddl: Vec<u16> = format!("D:P(A;;GA;;;{sid})")

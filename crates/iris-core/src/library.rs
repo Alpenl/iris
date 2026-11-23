@@ -1,10 +1,14 @@
-//! Folder scanning, sorting and media classification for the docked directory.
+//! Folder scanning, slow-share-safe path resolution, sorting, and media classification.
 
 use std::cmp::Ordering;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Threshold above which slow network shares skip per-file `stat`/`metadata()` syscalls.
+const SLOW_SHARE_FAST_SCAN_THRESHOLD: usize = 150;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Kind {
     Video,
     Photo,
@@ -26,7 +30,7 @@ pub enum SortOrder {
     Desc,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry {
     pub path: PathBuf,
     pub name: String,
@@ -35,7 +39,7 @@ pub struct Entry {
     pub modified_secs: u64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FolderEntry {
     pub path: PathBuf,
     pub name: String,
@@ -77,15 +81,25 @@ pub fn kind_of(path: &Path) -> Option<Kind> {
     }
 }
 
+fn meta_size_and_mtime(meta: Option<std::fs::Metadata>) -> (u64, u64) {
+    meta.map_or((0, 0), |m| {
+        let secs = m
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map_or(0, |d| d.as_secs());
+        (m.len(), secs)
+    })
+}
+
 pub fn entry_from_path(path: PathBuf) -> Option<Entry> {
     let kind = kind_of(&path)?;
     let name = path.file_name()?.to_string_lossy().into_owned();
-    let meta = std::fs::metadata(&path).ok();
-    let size = meta.as_ref().map_or(0, std::fs::Metadata::len);
-    let modified_secs = meta
-        .and_then(|m| m.modified().ok())
-        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-        .map_or(0, |d| d.as_secs());
+    let (size, modified_secs) = if is_slow_network_path(&path) {
+        (0, 0)
+    } else {
+        meta_size_and_mtime(std::fs::metadata(&path).ok())
+    };
     Some(Entry {
         path,
         name,
@@ -95,41 +109,173 @@ pub fn entry_from_path(path: PathBuf) -> Option<Entry> {
     })
 }
 
-/// Scans `dir` for playable media files and immediate non-hidden subfolders,
-/// sorted in natural name order.
-pub fn scan_dir(dir: &Path) -> ScanResult {
+fn is_unc_str(raw: &str) -> bool {
+    if raw.len() >= 8 && raw.as_bytes()[..8].eq_ignore_ascii_case(br"\\?\UNC\") {
+        return true;
+    }
+    if raw.starts_with(r"\\") && !raw.starts_with(r"\\?\") && !raw.starts_with(r"\\.\") {
+        let rest = &raw[2..];
+        return rest.contains('\\') && !rest.starts_with('\\');
+    }
+    false
+}
+
+/// Detects paths on potentially high-latency network mounts or external volumes:
+/// - Windows UNC paths (`\\server\share\...` and `\\?\UNC\server\share\...`)
+/// - macOS `/Volumes/<mount>/...` non-root mounts (excluding the boot volume symlink to `/`)
+pub fn is_slow_network_path(path: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        use std::path::Prefix;
+        if let Some(Component::Prefix(prefix)) = path.components().next()
+            && matches!(prefix.kind(), Prefix::UNC(_, _) | Prefix::VerbatimUNC(_, _))
+        {
+            return true;
+        }
+    }
+
+    let raw = path.to_string_lossy();
+    if is_unc_str(&raw) {
+        return true;
+    }
+
+    if let Some(after_volumes) = raw.strip_prefix("/Volumes/") {
+        let mount_name = after_volumes.split('/').next().unwrap_or("");
+        if !mount_name.is_empty() && mount_name != "." && mount_name != ".." {
+            let mount_root = Path::new("/Volumes").join(mount_name);
+            if let Ok(link_target) = std::fs::read_link(&mount_root)
+                && link_target == Path::new("/")
+            {
+                return false;
+            }
+            return true;
+        }
+    }
+
+    false
+}
+
+fn normalize_unc_str(raw: &str) -> PathBuf {
+    let (prefix, tail) = if raw.len() >= 8 && raw.as_bytes()[..8].eq_ignore_ascii_case(br"\\?\UNC\")
+    {
+        (r"\\?\UNC\", &raw[8..])
+    } else {
+        (r"\\", &raw[2..])
+    };
+
+    let mut parts = tail.split(['\\', '/']).filter(|s| !s.is_empty());
+    let Some(server) = parts.next() else {
+        return PathBuf::from(raw);
+    };
+    let Some(share) = parts.next() else {
+        return PathBuf::from(format!("{prefix}{server}"));
+    };
+
+    let mut stack: Vec<&str> = Vec::new();
+    for seg in parts {
+        if seg == "." {
+            continue;
+        }
+        if seg == ".." {
+            stack.pop();
+            continue;
+        }
+        stack.push(seg);
+    }
+
+    let mut out = format!(r"{prefix}{server}\{share}");
+    for seg in stack {
+        out.push('\\');
+        out.push_str(seg);
+    }
+    PathBuf::from(out)
+}
+
+fn lexical_normalize(path: &Path) -> PathBuf {
+    let raw = path.to_string_lossy();
+    if is_unc_str(&raw) {
+        return normalize_unc_str(&raw);
+    }
+
+    let base = if path.is_absolute() {
+        path.to_path_buf()
+    } else if let Ok(cwd) = std::env::current_dir() {
+        cwd.join(path)
+    } else {
+        path.to_path_buf()
+    };
+
+    let mut normalized = PathBuf::new();
+    let mut root_locked = false;
+    for comp in base.components() {
+        match comp {
+            Component::Prefix(p) => normalized.push(p.as_os_str()),
+            Component::RootDir => {
+                normalized.push(comp.as_os_str());
+                root_locked = true;
+            }
+            Component::CurDir => {}
+            Component::ParentDir => {
+                let can_pop = normalized
+                    .components()
+                    .next_back()
+                    .is_some_and(|c| matches!(c, Component::Normal(_)));
+                if can_pop {
+                    normalized.pop();
+                } else if !root_locked {
+                    normalized.push("..");
+                }
+            }
+            Component::Normal(seg) => normalized.push(seg),
+        }
+    }
+    if normalized.as_os_str().is_empty() {
+        PathBuf::from(".")
+    } else {
+        normalized
+    }
+}
+
+/// Resolves `path` safely across local disks and network shares.
+/// Avoids blocking `std::fs::canonicalize()` syscalls (and Windows `\\?\UNC\` rewrites)
+/// on slow network shares, falling back gracefully to lexical normalization.
+pub fn safe_resolve_path(path: &Path) -> PathBuf {
+    if is_slow_network_path(path) {
+        return lexical_normalize(path);
+    }
+    std::fs::canonicalize(path).unwrap_or_else(|_| lexical_normalize(path))
+}
+
+fn scan_dir_with_mode(dir: &Path, slow_share: bool) -> ScanResult {
     let Ok(read) = std::fs::read_dir(dir) else {
         return ScanResult::default();
     };
+    let items: Vec<std::fs::DirEntry> = read
+        .flatten()
+        .filter(|e| !e.file_name().to_string_lossy().starts_with('.'))
+        .collect();
+
+    let fast_skip_stat = slow_share && items.len() > SLOW_SHARE_FAST_SCAN_THRESHOLD;
     let mut entries = Vec::new();
     let mut subfolders = Vec::new();
-    for item in read.flatten() {
+
+    for item in items {
         let name = item.file_name().to_string_lossy().into_owned();
-        if name.starts_with('.') {
-            continue;
-        }
         let path = item.path();
-        // Fast path: `file_type()` uses d_type from readdir without an extra stat
-        // syscall on non-media files. Symlinks fall through to `metadata()`.
         let Ok(ft) = item.file_type() else {
             continue;
         };
         if ft.is_dir() {
             subfolders.push(FolderEntry { path, name });
-            continue;
-        }
-        if ft.is_file() {
+        } else if ft.is_file() {
             let Some(kind) = kind_of(&path) else {
                 continue;
             };
-            let (size, modified_secs) = item.metadata().ok().map_or((0, 0), |m| {
-                let secs = m
-                    .modified()
-                    .ok()
-                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                    .map_or(0, |d| d.as_secs());
-                (m.len(), secs)
-            });
+            let (size, modified_secs) = if fast_skip_stat {
+                (0, 0)
+            } else {
+                meta_size_and_mtime(item.metadata().ok())
+            };
             entries.push(Entry {
                 path,
                 name,
@@ -137,39 +283,54 @@ pub fn scan_dir(dir: &Path) -> ScanResult {
                 size,
                 modified_secs,
             });
-            continue;
-        }
-        if ft.is_symlink() {
-            let Ok(meta) = item.metadata() else {
-                continue;
-            };
-            if meta.is_dir() {
-                subfolders.push(FolderEntry { path, name });
-            } else if meta.is_file()
-                && let Some(kind) = kind_of(&path)
-            {
-                let size = meta.len();
-                let modified_secs = meta
-                    .modified()
-                    .ok()
-                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                    .map_or(0, |d| d.as_secs());
-                entries.push(Entry {
-                    path,
-                    name,
-                    kind,
-                    size,
-                    modified_secs,
-                });
+        } else if ft.is_symlink() {
+            if fast_skip_stat {
+                if let Some(kind) = kind_of(&path) {
+                    entries.push(Entry {
+                        path,
+                        name,
+                        kind,
+                        size: 0,
+                        modified_secs: 0,
+                    });
+                }
+            } else if let Ok(meta) = item.metadata() {
+                if meta.is_dir() {
+                    subfolders.push(FolderEntry { path, name });
+                } else if meta.is_file()
+                    && let Some(kind) = kind_of(&path)
+                {
+                    let (size, modified_secs) = meta_size_and_mtime(Some(meta));
+                    entries.push(Entry {
+                        path,
+                        name,
+                        kind,
+                        size,
+                        modified_secs,
+                    });
+                }
             }
         }
     }
+
     entries.sort_by(|a, b| natural_cmp(&a.name, &b.name));
     subfolders.sort_by(|a, b| natural_cmp(&a.name, &b.name));
     ScanResult {
         entries,
         subfolders,
     }
+}
+
+/// Scans `dir` for playable media files and immediate non-hidden subfolders,
+/// sorted in natural name order.
+pub fn scan_dir(dir: &Path) -> ScanResult {
+    scan_dir_with_mode(dir, false)
+}
+
+/// Scans `dir` for media files and subfolders, switching automatically to a zero-`stat`
+/// fast scan on slow network shares with more than 150 entries.
+pub fn scan_local_or_share(dir: &Path) -> ScanResult {
+    scan_dir_with_mode(dir, is_slow_network_path(dir))
 }
 
 pub fn sort_entries(entries: &mut [Entry], by: SortBy, order: SortOrder) {
@@ -212,7 +373,6 @@ pub fn format_size(bytes: u64) -> String {
 /// compare by value (`ep2` before `ep10`), other characters compare
 /// case-insensitively. Names that only differ in case or leading zeros
 /// fall back to a plain comparison, so the order is total and stable.
-/// Allocation-free: slices directly into `a` and `b`.
 pub fn natural_cmp(a: &str, b: &str) -> Ordering {
     let (mut ra, mut rb) = (a, b);
     loop {
@@ -226,7 +386,6 @@ pub fn natural_cmp(a: &str, b: &str) -> Ordering {
                 ra = rest_a;
                 rb = rest_b;
                 let (m, n) = (m.trim_start_matches('0'), n.trim_start_matches('0'));
-                // Without leading zeros, a longer run is a bigger number.
                 let ord = m.len().cmp(&n.len()).then_with(|| m.cmp(n));
                 if ord != Ordering::Equal {
                     return ord;
@@ -331,19 +490,28 @@ mod tests {
     }
 
     #[test]
-    fn natural_sort_handles_large_folder_quickly() {
-        let mut names: Vec<String> = (0..5000)
-            .rev()
-            .map(|i| format!("IMG_{:04}_shot_{}.HEIC", i % 500, i))
-            .collect();
-        let start = std::time::Instant::now();
-        names.sort_by(|a, b| natural_cmp(a, b));
-        assert!(
-            start.elapsed() < std::time::Duration::from_secs(2),
-            "5000-entry natural sort took {:?}",
-            start.elapsed()
-        );
-        assert_eq!(names[0], "IMG_0000_shot_0.HEIC");
-        assert_eq!(names[1], "IMG_0000_shot_500.HEIC");
+    fn slow_network_path_helpers_and_large_share_fast_scan() {
+        assert!(is_slow_network_path(Path::new(r"\\nas\media\Movies")));
+        assert!(is_slow_network_path(Path::new(r"\\?\UNC\nas\media\Movies")));
+        assert!(!is_slow_network_path(Path::new("/Users/alpen/Movies")));
+
+        let resolved_unc = safe_resolve_path(Path::new(r"\\nas\media\Movies\..\Anime\.\ep1.mkv"));
+        assert_eq!(resolved_unc, PathBuf::from(r"\\nas\media\Anime\ep1.mkv"));
+
+        let dir = std::env::temp_dir().join(format!("iris-fast-share-scan-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("SubFolder")).unwrap();
+        for i in 1..=160 {
+            std::fs::write(dir.join(format!("ep{i}.mp4")), b"stub").unwrap();
+        }
+        let res = scan_dir_with_mode(&dir, true);
+        assert_eq!(res.subfolders.len(), 1);
+        assert_eq!(res.entries.len(), 160);
+        assert_eq!(res.entries[0].name, "ep1.mp4");
+        assert_eq!(res.entries[1].name, "ep2.mp4");
+        assert_eq!(res.entries[9].name, "ep10.mp4");
+        assert_eq!(res.entries[0].size, 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

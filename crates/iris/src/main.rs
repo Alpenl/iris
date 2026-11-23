@@ -4,9 +4,6 @@
     windows_subsystem = "windows"
 )]
 
-// Headless modules live in iris-core; re-exported so `crate::player` etc. resolve.
-use iris_core::{geometry, input, library, logging, player, plugin, settings, store};
-
 mod assets;
 mod debug;
 mod instance;
@@ -15,13 +12,20 @@ mod theme;
 mod ui;
 mod video;
 
-use futures::StreamExt;
 use std::borrow::Cow;
 use std::path::PathBuf;
 
+use futures::StreamExt;
 use gpui::{
     App, AppContext as _, Application, Bounds, Menu, MenuItem, TitlebarOptions,
     WindowBackgroundAppearance, WindowBounds, WindowOptions, px, size,
+};
+use iris_core::{
+    keymap::Keymap,
+    logging,
+    player::Session,
+    preset::{PresetManager, PresetRuntime},
+    settings::Settings,
 };
 
 fn main() {
@@ -85,11 +89,12 @@ fn main() {
         ]) {
             log::error!("fonts: {e:#}");
         }
-        ui::bind_keys(cx);
+        let initial_keymap = Keymap::load();
+        ui::rebind_keys(cx, &initial_keymap);
         cx.set_menus(app_menus());
         cx.on_action(|_: &ui::Quit, cx| cx.quit());
 
-        let session = match player::Session::new() {
+        let session = match Session::new() {
             Ok(m) => m,
             Err(e) => {
                 log::error!("player initialization: {e:#}");
@@ -98,11 +103,24 @@ fn main() {
             }
         };
 
-        let settings = settings::Settings::load();
-        let (win_w, win_h) = if settings.remember_window_size {
+        let presets = PresetManager::load();
+        let loaded_settings = Settings::load();
+        let (active_settings, preset_rt, init_plugin_cmds) =
+            PresetRuntime::restore_on_startup(&presets, loaded_settings);
+        cx.set_global(theme::ThemeTokens::resolve(&active_settings.theme_id, None));
+
+        let use_saved_size =
+            active_settings.remember_window_size || active_settings.active_preset != "default";
+        let (win_w, win_h) = if use_saved_size {
             (
-                settings.window_width.unwrap_or(1440.).clamp(480., 7680.),
-                settings.window_height.unwrap_or(900.).clamp(300., 4320.),
+                active_settings
+                    .window_width
+                    .unwrap_or(1440.)
+                    .clamp(480., 7680.),
+                active_settings
+                    .window_height
+                    .unwrap_or(900.)
+                    .clamp(300., 4320.),
             )
         } else {
             (1440., 900.)
@@ -125,7 +143,19 @@ fn main() {
             ..Default::default()
         };
         let window = match cx.open_window(options, move |window, cx| {
-            cx.new(|cx| ui::IrisWindow::new(session, settings, initial, window, cx))
+            cx.new(|cx| {
+                ui::IrisWindow::new(
+                    session,
+                    active_settings,
+                    presets,
+                    preset_rt,
+                    init_plugin_cmds,
+                    initial_keymap,
+                    initial,
+                    window,
+                    cx,
+                )
+            })
         }) {
             Ok(window) => window,
             Err(e) => {
@@ -164,6 +194,8 @@ fn app_menus() -> Vec<Menu> {
             name: "Iris".into(),
             items: vec![
                 MenuItem::action("设置…", ui::OpenSettings),
+                MenuItem::action("切换工作区预设", ui::CyclePreset),
+                MenuItem::action("恢复默认外观", ui::ResetAppearance),
                 MenuItem::separator(),
                 MenuItem::action("退出 Iris", ui::Quit),
             ],
@@ -171,7 +203,9 @@ fn app_menus() -> Vec<Menu> {
         Menu {
             name: "文件".into(),
             items: vec![
-                MenuItem::action("打开…", ui::OpenFile),
+                MenuItem::action("打开本地文件…", ui::OpenFile),
+                MenuItem::action("打开网络流 / 远程地址…", ui::OpenStreamUrl),
+                MenuItem::separator(),
                 MenuItem::action("搜索目录", ui::ToggleSearch),
                 MenuItem::action("刷新目录", ui::RefreshDirectory),
                 MenuItem::separator(),
@@ -196,8 +230,10 @@ fn app_menus() -> Vec<Menu> {
             name: "视图".into(),
             items: vec![
                 MenuItem::action("命令面板…", ui::OpenCommandPalette),
+                MenuItem::action("切换工作区预设", ui::CyclePreset),
+                MenuItem::action("恢复默认外观", ui::ResetAppearance),
                 MenuItem::separator(),
-                MenuItem::action("展开 / 收起目录", ui::ToggleDirectory),
+                MenuItem::action("展开 / 收起侧栏", ui::ToggleDirectory),
                 MenuItem::action("媒体详情", ui::ToggleInfo),
                 MenuItem::action("窗口置顶", ui::ToggleAlwaysOnTop),
                 MenuItem::action("切换画面比例", ui::CycleAspect),

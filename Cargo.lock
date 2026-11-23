@@ -2493,13 +2493,24 @@ name = "iris-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
  "env_logger",
  "futures",
+ "httparse",
  "iris-api",
  "iris-mpv",
  "log",
  "miniz_oxide 0.8.9",
+ "percent-encoding",
+ "roxmltree",
+ "rustls",
+ "rustls-native-certs",
+ "rustls-pki-types",
+ "security-framework",
+ "serde",
  "serde_json",
+ "url",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

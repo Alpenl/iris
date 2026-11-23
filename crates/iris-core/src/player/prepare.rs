@@ -1,0 +1,348 @@
+//! Off-UI-thread folder scanning and photo header preparation (`safe_resolve_path` + `scan_local_or_share`).
+
+use std::path::{Path, PathBuf};
+
+use anyhow::Result;
+
+use crate::library::{self, Entry, FolderEntry, Kind, ScanResult};
+use crate::photo::{self, Photo};
+
+/// A folder scan and photo probe done off the UI thread, ready to load.
+pub struct Prepared {
+    pub(super) folder: PathBuf,
+    pub(super) entries: Vec<Entry>,
+    pub(super) subfolders: Vec<FolderEntry>,
+    pub(super) target: Option<PathBuf>,
+    pub(super) kind: Option<Kind>,
+    pub(super) photo: Option<Photo>,
+}
+
+impl Prepared {
+    /// The file that will load, if any; records are keyed by this path.
+    pub fn target(&self) -> Option<&Path> {
+        self.target.as_deref()
+    }
+
+    pub fn folder(&self) -> &Path {
+        &self.folder
+    }
+
+    pub fn entries(&self) -> &[Entry] {
+        &self.entries
+    }
+
+    pub fn subfolders(&self) -> &[FolderEntry] {
+        &self.subfolders
+    }
+
+    pub fn kind(&self) -> Option<Kind> {
+        self.kind
+    }
+}
+
+/// Resolves `path` to its folder listing and photo header metadata without blocking
+/// on slow network share `canonicalize` or full per-file `stat` scans.
+pub fn prepare(path: &Path, cached: Option<(PathBuf, ScanResult)>) -> Result<Prepared> {
+    let path = library::safe_resolve_path(path);
+    let meta = std::fs::metadata(&path)?;
+    let (folder, file) = if meta.is_dir() {
+        (path, None)
+    } else {
+        (
+            path.parent().unwrap_or(Path::new(".")).to_path_buf(),
+            Some(path),
+        )
+    };
+    let ScanResult {
+        entries,
+        subfolders,
+    } = match cached {
+        Some((dir, scan)) if dir == folder => scan,
+        _ => library::scan_local_or_share(&folder),
+    };
+    let (target, kind) = match file {
+        Some(file) => {
+            let kind = library::kind_of(&file);
+            (Some(file), kind)
+        }
+        None => entries
+            .first()
+            .map_or((None, None), |e| (Some(e.path.clone()), Some(e.kind))),
+    };
+    let photo = (kind == Some(Kind::Photo))
+        .then(|| target.as_deref().map(photo::probe))
+        .flatten();
+    Ok(Prepared {
+        folder,
+        entries,
+        subfolders,
+        target,
+        kind,
+        photo,
+    })
+}
+
+/// A multi-file drop queue prepared off the UI thread, ready to load.
+pub struct PreparedQueue {
+    pub(super) folder: PathBuf,
+    pub(super) entries: Vec<Entry>,
+    pub(super) photo: Option<Photo>,
+}
+
+impl PreparedQueue {
+    pub fn target(&self) -> Option<&Path> {
+        self.entries.first().map(|e| e.path.as_path())
+    }
+
+    pub fn entries(&self) -> &[Entry] {
+        &self.entries
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+/// Resolves a multi-file drop queue off the UI thread using slow-share-safe path resolution.
+pub fn prepare_queue(paths: Vec<PathBuf>) -> Option<PreparedQueue> {
+    let entries: Vec<Entry> = paths
+        .into_iter()
+        .map(|p| library::safe_resolve_path(&p))
+        .filter(|p| p.is_file())
+        .filter_map(library::entry_from_path)
+        .collect();
+    let first = entries.first()?;
+    let folder = first
+        .path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let photo = (first.kind == Kind::Photo).then(|| photo::probe(&first.path));
+    Some(PreparedQueue {
+        folder,
+        entries,
+        photo,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use iris_mpv::{Event, Format, Mpv, Value};
+
+    use super::*;
+    use crate::media_uri::MediaUri;
+    use crate::player::{
+        Command, RemoteMediaRequest, RemoteSubtitle, Session, SessionEvent, Track, TrackKind,
+        step_speed,
+    };
+    use crate::settings::Settings;
+
+    #[test]
+    fn prepare_targets_file_or_first_entry_and_reuses_listing() {
+        let dir = std::env::temp_dir().join(format!("iris-prepare-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in ["ep10.mp4", "ep2.mp4", "notes.txt"] {
+            std::fs::write(dir.join(name), b"").unwrap();
+        }
+        let folder = library::safe_resolve_path(&dir);
+
+        let opened = prepare(&dir, None).unwrap();
+        assert_eq!(opened.folder(), folder);
+        assert_eq!(opened.entries().len(), 2);
+        assert_eq!(opened.target(), Some(folder.join("ep2.mp4").as_path()));
+        assert_eq!(opened.kind(), Some(Kind::Video));
+
+        let cached = ScanResult {
+            entries: vec![opened.entries[1].clone()],
+            subfolders: Vec::new(),
+        };
+        let file = prepare(&dir.join("ep10.mp4"), Some((folder.clone(), cached))).unwrap();
+        assert_eq!(file.target(), Some(folder.join("ep10.mp4").as_path()));
+        assert_eq!(file.entries().len(), 1);
+
+        let other = prepare(
+            &dir.join("ep10.mp4"),
+            Some((PathBuf::from("/elsewhere"), ScanResult::default())),
+        )
+        .unwrap();
+        assert_eq!(other.entries().len(), 2);
+
+        assert!(prepare(&dir.join("missing.mp4"), None).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn speed_steps_and_subtitle_safe_area_update_backend() {
+        assert_eq!(step_speed(1.0, 1), 1.25);
+        assert_eq!(step_speed(1.0, -1), 0.75);
+        assert_eq!(step_speed(3.0, 1), 3.0);
+        assert_eq!(step_speed(0.25, -1), 0.25);
+
+        let mut session = Session::new().unwrap();
+        let _render = session.render_handle();
+        session
+            .mpv
+            .observe_property(100, "sub-margin-y-offset", Format::Int)
+            .unwrap();
+        let wait_for = |mpv: &Mpv, value| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while std::time::Instant::now() < deadline {
+                if let Some(Event::PropertyChange {
+                    id: 100,
+                    value: Value::Int(actual),
+                    ..
+                }) = mpv.wait_event(0.05)
+                    && actual == value
+                {
+                    return;
+                }
+            }
+            panic!("subtitle safe margin never became {value}");
+        };
+        session.subtitle_inset(132., 900.);
+        wait_for(&session.mpv, 106);
+        session.subtitle_inset(0., 900.);
+        wait_for(&session.mpv, 0);
+        session.shutdown();
+    }
+
+    #[test]
+    fn open_local_sets_canonical_file_uri_and_open_remote_guards_subtitle_auth_leak() {
+        let dir = std::env::temp_dir().join(format!("iris-session-uri-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let clip = dir.join("demo.mp4");
+        std::fs::write(&clip, b"stub").unwrap();
+
+        let mut session = Session::new().unwrap();
+        let prepared = prepare(&clip, None).unwrap();
+        let target_path = prepared.target().unwrap().to_path_buf();
+        session.open(prepared, 0.).unwrap();
+        assert_eq!(session.current(), Some(target_path.as_path()));
+        assert_eq!(
+            session.current_uri(),
+            Some(MediaUri::Local(target_path).to_uri_string().as_str())
+        );
+        assert!(session.current_uri().unwrap().starts_with("file:///"));
+
+        let bad_scheme = RemoteMediaRequest {
+            uri: MediaUri::HttpUrl("https://cdn.example.com/v.mp4".into()),
+            title: "Bad".into(),
+            playback_url: "lavfi://testsrc".into(),
+            headers: BTreeMap::new(),
+            kind: Kind::Video,
+            is_live: false,
+            photo: None,
+            subtitles: Vec::new(),
+        };
+        assert!(
+            session
+                .open_remote(bad_scheme, &Settings::default(), 0.)
+                .is_err()
+        );
+
+        let mut auth_headers = BTreeMap::new();
+        auth_headers.insert("Authorization".into(), "Bearer top-secret".into());
+        let cross_sub_leak = RemoteMediaRequest {
+            uri: MediaUri::Plugin {
+                plugin_id: "iris.webdav".into(),
+                source_id: "nas".into(),
+                entry_id: "/ep1.mkv".into(),
+            },
+            title: "EP1".into(),
+            playback_url: "https://nas.example.com/dav/ep1.mkv".into(),
+            headers: auth_headers.clone(),
+            kind: Kind::Video,
+            is_live: false,
+            photo: None,
+            subtitles: vec![RemoteSubtitle::Url(
+                "https://thirdparty-subs.example.org/ep1.ass".into(),
+            )],
+        };
+        assert!(
+            session
+                .open_remote(cross_sub_leak, &Settings::default(), 0.)
+                .is_err(),
+            "cross-origin subtitle URL must be rejected when Authorization header is set"
+        );
+
+        let safe_remote = RemoteMediaRequest {
+            uri: MediaUri::Plugin {
+                plugin_id: "iris.webdav".into(),
+                source_id: "nas".into(),
+                entry_id: "/ep1.mkv".into(),
+            },
+            title: "EP1".into(),
+            playback_url: "http://127.0.0.1:19999/dav/ep1.mkv".into(),
+            headers: auth_headers,
+            kind: Kind::Video,
+            is_live: false,
+            photo: None,
+            subtitles: vec![
+                RemoteSubtitle::Url("http://127.0.0.1:19999/dav/ep1.chs.ass".into()),
+                RemoteSubtitle::InlineText("1\n00:00:01,000 --> 00:00:02,000\nHi\n".into()),
+            ],
+        };
+        session
+            .open_remote(safe_remote, &Settings::default(), 12.5)
+            .unwrap();
+        assert_eq!(session.current(), None);
+        assert_eq!(session.current_title(), Some("EP1"));
+
+        session.state.tracks = vec![Track {
+            id: 1,
+            kind: TrackKind::Audio,
+            title: String::new(),
+            lang: "jpn".into(),
+            codec: "flac".into(),
+            selected: false,
+            external: false,
+        }];
+        session.apply(&SessionEvent::Audio("1".into()));
+        assert!(session.state().tracks[0].selected);
+        session
+            .execute(Command::SetVideoEq {
+                brightness: 150,
+                contrast: -150,
+                saturation: 10,
+                gamma: 0,
+            })
+            .unwrap();
+        assert_eq!(session.state().eq_brightness, 100);
+        assert_eq!(session.state().eq_contrast, -100);
+
+        session.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn loads_real_track_list_json_from_libmpv_if_test_media_present() {
+        let mkv =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../test-media/03-bars-scope-subs.mkv");
+        if !mkv.is_file() {
+            return;
+        }
+        let mut session = Session::new().unwrap();
+        let prepared = prepare(&mkv, None).unwrap();
+        session.open(prepared, 0.).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while std::time::Instant::now() < deadline && !session.state().loaded {
+            if let Some(ev) = session.mpv.wait_event(0.05)
+                && let Some(se) = SessionEvent::from_backend(ev)
+            {
+                session.apply(&se);
+            }
+        }
+        session.flush_deferred();
+        assert!(session.state().loaded);
+        assert!(!session.tracks_of(TrackKind::Sub).is_empty());
+        session.shutdown();
+    }
+}

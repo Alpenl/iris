@@ -7,3 +7,6 @@ license.workspace = true
 links = "mpv"
 
 [dependencies]
+
+[lints]
+workspace = true

@@ -3,53 +3,18 @@
 //! Windows `%APPDATA%\Iris\settings.conf`. `IRIS_SETTINGS` overrides the path.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 
+use serde::{Deserialize, Serialize};
+
+use crate::fs_util;
 use crate::library::{SortBy, SortOrder};
-
-static ATOMIC_SEQ: AtomicU64 = AtomicU64::new(0);
-
-/// Atomically writes `content` to `path` via a unique sibling `.tmp` file,
-/// cleaning up the temp file on failure and retrying briefly on Windows
-/// transient sharing locks.
-pub fn atomic_write(path: &Path, content: &str) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let seq = ATOMIC_SEQ.fetch_add(1, Ordering::Relaxed);
-    let tmp = path.with_extension(format!("{}.{}.tmp", std::process::id(), seq));
-    if let Err(e) = std::fs::write(&tmp, content) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e);
-    }
-    let mut last_err = None;
-    let attempts = if cfg!(windows) { 5 } else { 1 };
-    for attempt in 0..attempts {
-        match std::fs::rename(&tmp, path) {
-            Ok(()) => return Ok(()),
-            Err(e)
-                if cfg!(windows)
-                    && attempt + 1 < attempts
-                    && e.kind() == std::io::ErrorKind::PermissionDenied =>
-            {
-                last_err = Some(e);
-                std::thread::sleep(std::time::Duration::from_millis(10 * (attempt + 1) as u64));
-            }
-            Err(e) => {
-                let _ = std::fs::remove_file(&tmp);
-                return Err(e);
-            }
-        }
-    }
-    let _ = std::fs::remove_file(&tmp);
-    Err(last_err.unwrap_or_else(|| std::io::Error::other("atomic rename failed")))
-}
 
 pub const DEFAULT_DIRECTORY_WIDTH: f32 = 288.;
 pub const MIN_DIRECTORY_WIDTH: f32 = 220.;
 pub const MAX_DIRECTORY_WIDTH: f32 = 520.;
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Side {
     #[default]
     Left,
@@ -57,7 +22,8 @@ pub enum Side {
 }
 
 /// What happens when a video reaches its end.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum OnEof {
     /// Stay on the last frame (Space replays from start).
     #[default]
@@ -68,7 +34,8 @@ pub enum OnEof {
     Loop,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Hwdec {
     #[default]
     AutoSafe,
@@ -76,7 +43,7 @@ pub enum Hwdec {
 }
 
 impl Hwdec {
-    pub fn mpv_value(self) -> &'static str {
+    pub(crate) fn mpv_value(self) -> &'static str {
         match self {
             Hwdec::AutoSafe => "auto-safe",
             Hwdec::Off => "no",
@@ -84,7 +51,8 @@ impl Hwdec {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SubLang {
     #[default]
     ZhHans,
@@ -94,7 +62,7 @@ pub enum SubLang {
 }
 
 impl SubLang {
-    pub fn mpv_slang(self) -> &'static str {
+    pub(crate) fn mpv_slang(self) -> &'static str {
         match self {
             SubLang::ZhHans => "zh-Hans,zh-CN,chs,sc,zh,chi,zho,zh-Hant,zh-TW,cht,tc,en,eng",
             SubLang::ZhHant => "zh-Hant,zh-TW,cht,tc,zh,chi,zho,zh-Hans,zh-CN,chs,sc,en,eng",
@@ -104,14 +72,16 @@ impl SubLang {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum VideoWheel {
     #[default]
     Volume,
     None,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PhotoDefault {
     #[default]
     Fit,
@@ -164,6 +134,20 @@ pub struct Settings {
     pub photo_filmstrip: bool,
     /// Plugin IDs explicitly disabled by the user.
     pub disabled_plugins: Vec<String>,
+    /// Active UI color/chrome theme ID (built-in or plugin-provided).
+    pub theme_id: String,
+    /// Active workspace layout/scene preset ID.
+    pub active_preset: String,
+    /// Render the control bar as a floating dock even in windowed mode.
+    pub floating_dock: bool,
+    /// Show media resolution and codec metadata in the titlebar.
+    pub show_titlebar_meta: bool,
+    /// Prefer compact control bar density.
+    pub compact_controls: bool,
+    /// Built-in dock button IDs hidden from the control bar.
+    pub hidden_dock_buttons: Vec<String>,
+    /// Preferred audio output device name (`"auto"` by default).
+    pub audio_device: String,
 }
 
 impl Default for Settings {
@@ -195,6 +179,13 @@ impl Default for Settings {
             always_on_top: false,
             photo_filmstrip: true,
             disabled_plugins: Vec::new(),
+            theme_id: "graphite".into(),
+            active_preset: "default".into(),
+            floating_dock: false,
+            show_titlebar_meta: true,
+            compact_controls: false,
+            hidden_dock_buttons: Vec::new(),
+            audio_device: "auto".into(),
         }
     }
 }
@@ -203,21 +194,11 @@ pub fn path() -> Option<PathBuf> {
     if let Some(p) = std::env::var_os("IRIS_SETTINGS") {
         return Some(PathBuf::from(p));
     }
-    #[cfg(target_os = "macos")]
-    let dir =
-        std::env::var_os("HOME").map(|h| PathBuf::from(h).join("Library/Application Support/Iris"));
-    #[cfg(target_os = "windows")]
-    let dir = std::env::var_os("APPDATA").map(|a| PathBuf::from(a).join("Iris"));
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    let dir = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
-        .map(|d| d.join("iris"));
-    dir.map(|d| d.join("settings.conf"))
+    fs_util::data_dir().map(|d| d.join("settings.conf"))
 }
 
 pub fn data_dir() -> Option<PathBuf> {
-    path().and_then(|p| p.parent().map(Path::to_path_buf))
+    fs_util::data_dir()
 }
 
 impl Settings {
@@ -363,6 +344,47 @@ impl Settings {
                         .map(String::from)
                         .collect();
                 }
+                ("theme_id", v) => {
+                    let clean = sanitize_line_value(v);
+                    if !clean.is_empty() {
+                        s.theme_id = clean;
+                    }
+                }
+                ("active_preset", v) => {
+                    let clean = sanitize_line_value(v);
+                    if !clean.is_empty() {
+                        s.active_preset = clean;
+                    }
+                }
+                ("floating_dock", v) => {
+                    if let Some(b) = parse_bool(v) {
+                        s.floating_dock = b;
+                    }
+                }
+                ("show_titlebar_meta", v) => {
+                    if let Some(b) = parse_bool(v) {
+                        s.show_titlebar_meta = b;
+                    }
+                }
+                ("compact_controls", v) => {
+                    if let Some(b) = parse_bool(v) {
+                        s.compact_controls = b;
+                    }
+                }
+                ("hidden_dock_buttons", v) => {
+                    s.hidden_dock_buttons = v
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|id| !id.is_empty())
+                        .map(String::from)
+                        .collect();
+                }
+                ("audio_device", v) => {
+                    let clean = sanitize_line_value(v);
+                    if !clean.is_empty() {
+                        s.audio_device = clean;
+                    }
+                }
                 _ => {}
             }
         }
@@ -477,9 +499,56 @@ impl Settings {
                 self.disabled_plugins.join(",")
             ));
         }
+        let theme_id = sanitize_line_value(&self.theme_id);
+        text.push_str(&format!(
+            "theme_id = {}\n",
+            if theme_id.is_empty() {
+                "graphite"
+            } else {
+                &theme_id
+            }
+        ));
+        let active_preset = sanitize_line_value(&self.active_preset);
+        text.push_str(&format!(
+            "active_preset = {}\n",
+            if active_preset.is_empty() {
+                "default"
+            } else {
+                &active_preset
+            }
+        ));
+        text.push_str(&format!("floating_dock = {}\n", self.floating_dock));
+        text.push_str(&format!(
+            "show_titlebar_meta = {}\n",
+            self.show_titlebar_meta
+        ));
+        text.push_str(&format!("compact_controls = {}\n", self.compact_controls));
+        if !self.hidden_dock_buttons.is_empty() {
+            text.push_str(&format!(
+                "hidden_dock_buttons = {}\n",
+                self.hidden_dock_buttons.join(",")
+            ));
+        }
+        let audio_device = sanitize_line_value(&self.audio_device);
+        text.push_str(&format!(
+            "audio_device = {}\n",
+            if audio_device.is_empty() {
+                "auto"
+            } else {
+                &audio_device
+            }
+        ));
 
-        atomic_write(path, &text)
+        fs_util::atomic_write(path, &text)
     }
+}
+
+fn sanitize_line_value(v: &str) -> String {
+    v.chars()
+        .filter(|c| !c.is_control())
+        .collect::<String>()
+        .trim()
+        .to_string()
 }
 
 fn parse_bool(v: &str) -> Option<bool> {
@@ -527,6 +596,13 @@ mod tests {
             always_on_top: true,
             photo_filmstrip: false,
             disabled_plugins: vec!["foo".into(), "bar".into()],
+            theme_id: "oled".into(),
+            active_preset: "cinema".into(),
+            floating_dock: true,
+            show_titlebar_meta: false,
+            compact_controls: true,
+            hidden_dock_buttons: vec!["screenshot".into(), "loop".into()],
+            audio_device: "coreaudio/BuiltInSpeakerDevice".into(),
         };
         custom.save_to(&file).unwrap();
         let loaded = Settings::load_from(&file);
@@ -534,7 +610,7 @@ mod tests {
 
         std::fs::write(
             &file,
-            "directory_width = 9999\nfullscreen_hide_ms = 50\nsub_scale = NaN\nvolume = 180\n",
+            "directory_width = 9999\nfullscreen_hide_ms = 50\nsub_scale = NaN\nvolume = 180\ntheme_id =   \naudio_device = \n",
         )
         .unwrap();
         let clamped = Settings::load_from(&file);
@@ -542,6 +618,28 @@ mod tests {
         assert_eq!(clamped.fullscreen_hide_ms, 1000);
         assert_eq!(clamped.sub_scale, 1.0);
         assert_eq!(clamped.volume, None);
+        assert_eq!(clamped.theme_id, "graphite");
+        assert_eq!(clamped.active_preset, "default");
+        assert!(!clamped.floating_dock);
+        assert!(clamped.show_titlebar_meta);
+        assert!(!clamped.compact_controls);
+        assert!(clamped.hidden_dock_buttons.is_empty());
+        assert_eq!(clamped.audio_device, "auto");
+
+        // Verify serde snake_case serialization for preset-shared enums.
+        let json = serde_json::to_string(&(
+            Side::Right,
+            OnEof::Loop,
+            Hwdec::AutoSafe,
+            SubLang::ZhHant,
+            VideoWheel::Volume,
+            PhotoDefault::Actual,
+        ))
+        .unwrap();
+        assert_eq!(
+            json,
+            r#"["right","loop","auto_safe","zh_hant","volume","actual"]"#
+        );
 
         std::fs::remove_dir_all(dir).unwrap();
     }

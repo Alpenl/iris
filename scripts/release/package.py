@@ -36,7 +36,18 @@ def sha(path):
 
 
 def application_inputs():
-    files = [ROOT / name for name in ("Cargo.toml", "Cargo.lock", "deny.toml", "LICENSE-MIT", "LICENSE-APACHE")]
+    files = [
+        ROOT / name
+        for name in (
+            "Cargo.toml",
+            "Cargo.lock",
+            "deny.toml",
+            "rust-toolchain.toml",
+            "LICENSE-MIT",
+            "LICENSE-APACHE",
+        )
+        if (ROOT / name).is_file()
+    ]
     files += [
         p
         for directory in ("crates", "Resources")
@@ -249,18 +260,20 @@ def rust_notices(destination, env, checkpoint, state):
 
 
 def application_source(destination):
-    # Preserve the exact working-tree application source, not merely HEAD.
+    # Bundle only explicit application build inputs (never docs/, examples/, or web assets).
     app = destination / "iris-source"
-    for name in run(["git", "-c", "core.quotepath=false", "ls-files", "--cached", "--others", "--exclude-standard"], ROOT).splitlines():
-        file = ROOT / name
-        if file.is_file():
-            target = app / name
-            target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(file, target)
-    # Include current release recipes/licenses even before they are committed.
-    shutil.copytree(ROOT / "scripts/release", app / "scripts/release", dirs_exist_ok=True)
-    for name in ("LICENSE-MIT", "LICENSE-APACHE"):
-        shutil.copy2(ROOT / name, app / name)
+    app.mkdir(parents=True, exist_ok=True)
+    for rel in application_inputs():
+        file = ROOT / rel
+        target = app / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(file, target)
+    shutil.copytree(
+        ROOT / "scripts/release",
+        app / "scripts/release",
+        dirs_exist_ok=True,
+        ignore=shutil.ignore_patterns(".DS_Store", "__pycache__", "*.pyc"),
+    )
     for name in ("LICENSE-MIT", "LICENSE-APACHE"):
         shutil.copy2(ROOT / name, destination / name)
 

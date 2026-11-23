@@ -7,7 +7,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
-use iris_mpv::{Mpv, render::RenderContext, sys};
+use iris_mpv::render::{RenderContext, RenderHandle};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use windows::Win32::{
     Foundation::{HMODULE, HWND},
@@ -40,7 +40,7 @@ struct Layout {
     stopped: bool,
 }
 
-pub struct VideoSurface {
+pub(crate) struct VideoSurface {
     layout: Arc<Mutex<Layout>>,
     wake: mpsc::SyncSender<()>,
     worker: Option<JoinHandle<()>>,
@@ -49,7 +49,7 @@ pub struct VideoSurface {
 }
 
 impl VideoSurface {
-    pub fn attach(window: &gpui::Window, mpv: Arc<Mpv>) -> Result<Self> {
+    pub(crate) fn attach(window: &gpui::Window, mpv: RenderHandle) -> Result<Self> {
         let hwnd = match HasWindowHandle::window_handle(window)
             .map_err(|e| anyhow!("{e:?}"))?
             .as_raw()
@@ -59,8 +59,7 @@ impl VideoSurface {
         };
         // SDR output; use the monitor's ICC when one is installed. HDR/EDR is
         // intentionally not inferred from a 10-bit source or an HDR desktop.
-        mpv.set_property_string("target-prim", "bt.709")?;
-        mpv.set_property_string("target-trc", "srgb")?;
+        mpv.set_display_color_target("bt.709", "srgb")?;
         let initial_monitor = update_display_profile(HWND(hwnd as *mut _), &mpv)?;
         let render_mpv = mpv.clone();
         let scale = window.scale_factor() as f64;
@@ -170,11 +169,11 @@ impl VideoSurface {
         }
     }
 
-    pub fn request_redraw(&self) {
+    pub(crate) fn request_redraw(&self) {
         let _ = self.wake.try_send(());
     }
 
-    pub fn set_frame(&self, x: f64, y: f64, w: f64, h: f64) {
+    pub(crate) fn set_frame(&self, x: f64, y: f64, w: f64, h: f64) {
         let mut layout = self.layout.lock().unwrap();
         let rect = [x, y, w, h];
         if layout.rect == rect {
@@ -185,7 +184,7 @@ impl VideoSurface {
         self.request_redraw();
     }
 
-    pub fn set_scale(&mut self, scale: f64) {
+    pub(crate) fn set_scale(&mut self, scale: f64) {
         let scale_changed = self.scale.replace(scale) != scale;
         let poll_monitor = self.last_monitor_check.elapsed() >= MONITOR_POLL_INTERVAL;
         if !scale_changed && !poll_monitor {
@@ -203,7 +202,7 @@ impl VideoSurface {
         self.request_redraw();
     }
 
-    pub fn shutdown(&mut self) {
+    fn shutdown(&mut self) {
         if let Some(worker) = self.worker.take() {
             self.layout.lock().unwrap().stopped = true;
             self.request_redraw();
@@ -246,7 +245,7 @@ struct Renderer {
 }
 
 impl Renderer {
-    unsafe fn new(hwnd: HWND, mpv: Arc<Mpv>, wake: mpsc::SyncSender<()>) -> Result<Self> {
+    unsafe fn new(hwnd: HWND, mpv: RenderHandle, wake: mpsc::SyncSender<()>) -> Result<Self> {
         let (mut device, mut context) = (None, None);
         unsafe {
             D3D11CreateDevice(
@@ -314,7 +313,7 @@ impl Renderer {
             .layout
             .is_none_or(|prev| prev.rect != layout.rect || prev.scale != layout.scale);
         let update = self.render.update();
-        if !geometry_changed && update & sys::MPV_RENDER_UPDATE_FRAME == 0 {
+        if !geometry_changed && update & RenderContext::UPDATE_FRAME == 0 {
             return Ok(());
         }
         if layout.rect[2] <= 0. || layout.rect[3] <= 0. {
@@ -369,7 +368,7 @@ impl Drop for Renderer {
     }
 }
 
-fn update_display_profile(hwnd: HWND, mpv: &Mpv) -> Result<isize> {
+fn update_display_profile(hwnd: HWND, mpv: &RenderHandle) -> Result<isize> {
     use windows::Win32::Graphics::Gdi::*;
     use windows::Win32::UI::ColorSystem::GetICMProfileW;
     use windows::core::{PCWSTR, PWSTR};
@@ -397,10 +396,10 @@ fn update_display_profile(hwnd: HWND, mpv: &Mpv) -> Result<isize> {
                 .position(|c| *c == 0)
                 .unwrap_or(profile.len());
             let path = String::from_utf16(&profile[..end])?;
-            mpv.set_property_string("icc-profile", &path)?;
+            mpv.set_display_icc_profile(&path)?;
             log::info!("display ICC: {path}");
         } else {
-            mpv.set_property_string("icc-profile", "")?;
+            mpv.set_display_icc_profile("")?;
             log::info!("display has no ICC profile; using SDR sRGB output");
         }
         Ok(monitor.0 as isize)

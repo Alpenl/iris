@@ -1,9 +1,12 @@
-//! Path-keyed personal data, stored beside settings, never beside media.
-use std::{
-    collections::BTreeMap,
-    fmt::Write as _,
-    path::{Path, PathBuf},
-};
+//! Unified URI-keyed personal records and recent media list (`records.tsv`, `recent.tsv`).
+//! Stored in the application data directory, never beside media files.
+
+use std::collections::BTreeMap;
+use std::fmt::Write as _;
+use std::path::{Path, PathBuf};
+
+use crate::fs_util;
+use crate::media_uri::MediaUri;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Record {
@@ -13,122 +16,124 @@ pub struct Record {
 }
 
 const MAX_RECENT: usize = 20;
+const HEX: &[u8; 16] = b"0123456789abcdef";
 
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub struct Store {
-    pub records: BTreeMap<PathBuf, Record>,
-    pub recent: Vec<PathBuf>,
+    records: BTreeMap<String, Record>,
+    recent: Vec<MediaUri>,
     dirty: bool,
+    backing_dir: Option<PathBuf>,
 }
 
 impl Store {
     pub fn load() -> Self {
-        let Some(cfg) = crate::settings::path() else {
-            return Self::default();
-        };
-        let mut this = Self::read(&cfg.with_file_name("records.tsv"));
-        this.recent = Self::read_recent(&cfg.with_file_name("recent.tsv"));
-        this
-    }
-    fn read_recent(path: &Path) -> Vec<PathBuf> {
-        let Ok(text) = std::fs::read_to_string(path) else {
-            return Vec::new();
-        };
-        let mut out = Vec::new();
-        for line in text.lines() {
-            if let Some(p) = decode_path(line.trim())
-                && !out.contains(&p)
-            {
-                out.push(p);
-                if out.len() >= MAX_RECENT {
-                    break;
-                }
-            }
+        match fs_util::data_dir() {
+            Some(dir) => Self::load_from_dir(&dir),
+            None => Self::default(),
         }
-        out
     }
-    fn save_recent(&self) {
-        let Some(path) = crate::settings::path().map(|p| p.with_file_name("recent.tsv")) else {
+
+    pub fn load_from_dir(dir: &Path) -> Self {
+        let mut records = BTreeMap::new();
+        // Load legacy `uri_records.tsv` first so newer `records.tsv` entries win on collision.
+        Self::read_records_into(&dir.join("uri_records.tsv"), &mut records);
+        Self::read_records_into(&dir.join("records.tsv"), &mut records);
+
+        let mut recent = Vec::new();
+        Self::read_recent_into(&dir.join("recent.tsv"), &mut recent);
+        Self::read_recent_into(&dir.join("recent_uris.tsv"), &mut recent);
+
+        Self {
+            records,
+            recent,
+            dirty: false,
+            backing_dir: Some(dir.to_path_buf()),
+        }
+    }
+
+    fn target_dir(&self) -> Option<PathBuf> {
+        self.backing_dir.clone().or_else(fs_util::data_dir)
+    }
+
+    pub fn records(&self) -> &BTreeMap<String, Record> {
+        &self.records
+    }
+
+    pub fn recent(&self) -> &[MediaUri] {
+        &self.recent
+    }
+
+    pub fn favorites(&self) -> Vec<MediaUri> {
+        self.records
+            .iter()
+            .filter(|(_, r)| r.favorite)
+            .map(|(k, _)| MediaUri::parse(k))
+            .collect()
+    }
+
+    fn read_recent_into(path: &Path, out: &mut Vec<MediaUri>) {
+        let Ok(text) = std::fs::read_to_string(path) else {
             return;
         };
-        if let Err(e) = self.write_recent(&path) {
+        for line in text.lines() {
+            if out.len() >= MAX_RECENT {
+                break;
+            }
+            if let Some(uri) = decode_any_media_uri(line.trim())
+                && !out.contains(&uri)
+            {
+                out.push(uri);
+            }
+        }
+    }
+
+    fn read_records_into(path: &Path, out: &mut BTreeMap<String, Record>) {
+        let Ok(text) = std::fs::read_to_string(path) else {
+            return;
+        };
+        for line in text.lines() {
+            let fields: Vec<_> = line.split('\t').collect();
+            if fields.len() != 4 {
+                continue;
+            }
+            let (Some(uri), Ok(position), Ok(duration)) = (
+                decode_any_media_uri(fields[0]),
+                fields[2].parse::<f64>(),
+                fields[3].parse::<f64>(),
+            ) else {
+                continue;
+            };
+            if !position.is_finite() || !duration.is_finite() || position < 0. || duration < 0. {
+                continue;
+            }
+            out.insert(
+                uri.to_uri_string(),
+                Record {
+                    favorite: fields[1] == "1",
+                    position,
+                    duration,
+                },
+            );
+        }
+    }
+
+    fn save_recent(&self) {
+        let Some(dir) = self.target_dir() else { return };
+        let mut text = String::with_capacity(self.recent.len() * 64);
+        for u in self.recent.iter().take(MAX_RECENT) {
+            push_hex(u.to_uri_string().as_bytes(), &mut text);
+            text.push('\n');
+        }
+        if let Err(e) = fs_util::atomic_write(&dir.join("recent.tsv"), text.as_bytes()) {
             log::error!("saving recent list failed: {e}");
         }
     }
-    fn write_recent(&self, path: &Path) -> std::io::Result<()> {
-        let mut text = String::with_capacity(self.recent.len() * 64);
-        for p in self.recent.iter().take(MAX_RECENT) {
-            encode_path_into(p, &mut text);
-            text.push('\n');
-        }
-        crate::settings::atomic_write(path, &text)
-    }
-    pub fn push_recent(&mut self, path: &Path) {
-        let p = path.to_path_buf();
-        self.recent.retain(|x| x != &p);
-        self.recent.insert(0, p);
-        self.recent.truncate(MAX_RECENT);
-        self.save_recent();
-    }
-    pub fn clear_recent(&mut self) {
-        if self.recent.is_empty() {
-            return;
-        }
-        self.recent.clear();
-        self.save_recent();
-    }
-    pub fn reset_progress(&mut self, path: &Path) -> bool {
-        let Some(r) = self.records.get_mut(path) else {
-            return false;
-        };
-        if r.position <= 0. && r.duration <= 0. {
-            return false;
-        }
-        r.position = 0.;
-        r.duration = 0.;
-        if !r.favorite {
-            self.records.remove(path);
-        }
-        self.save();
-        true
-    }
-    fn read(path: &Path) -> Self {
-        let mut this = Self::default();
-        if let Ok(text) = std::fs::read_to_string(path) {
-            for line in text.lines() {
-                let fields: Vec<_> = line.split('\t').collect();
-                if fields.len() != 4 {
-                    continue;
-                }
-                let (Some(path), Ok(position), Ok(duration)) = (
-                    decode_path(fields[0]),
-                    fields[2].parse::<f64>(),
-                    fields[3].parse::<f64>(),
-                ) else {
-                    continue;
-                };
-                if !position.is_finite() || !duration.is_finite() || position < 0. || duration < 0.
-                {
-                    continue;
-                }
-                this.records.insert(
-                    path,
-                    Record {
-                        favorite: fields[1] == "1",
-                        position,
-                        duration,
-                    },
-                );
-            }
-        }
-        this
-    }
 
     pub fn save(&mut self) {
-        let Some(path) = crate::settings::path().map(|p| p.with_file_name("records.tsv")) else {
-            return;
-        };
-        if let Err(e) = self.write(&path) {
+        let Some(dir) = self.target_dir() else { return };
+        let text = self.format_records();
+        if let Err(e) = fs_util::atomic_write(&dir.join("records.tsv"), text.as_bytes()) {
             log::error!("saving records failed: {e}");
         } else {
             self.dirty = false;
@@ -139,28 +144,28 @@ impl Store {
         self.dirty
     }
 
-    /// Captures serialized records for off-UI-thread atomic saving, clearing the
-    /// dirty flag. Returns `None` if nothing changed since the last save.
+    /// Captures serialized records in memory for off-UI-thread atomic saving,
+    /// performing zero synchronous disk I/O on the calling thread.
     pub fn take_dirty_snapshot(&mut self) -> Option<(PathBuf, String)> {
         if !self.dirty {
             return None;
         }
-        let path = crate::settings::path().map(|p| p.with_file_name("records.tsv"))?;
+        let dir = self.target_dir()?;
         self.dirty = false;
-        Some((path, self.format_records()))
+        Some((dir.join("records.tsv"), self.format_records()))
     }
 
     /// Writes a previously captured snapshot to disk (safe to run on a worker thread).
     pub fn write_snapshot(path: &Path, text: &str) {
-        if let Err(e) = crate::settings::atomic_write(path, text) {
+        if let Err(e) = fs_util::atomic_write(path, text.as_bytes()) {
             log::error!("saving records failed: {e}");
         }
     }
 
     fn format_records(&self) -> String {
         let mut text = String::with_capacity(self.records.len() * 96);
-        for (p, r) in &self.records {
-            encode_path_into(p, &mut text);
+        for (k, r) in &self.records {
+            push_hex(k.as_bytes(), &mut text);
             let _ = writeln!(
                 text,
                 "\t{}\t{:.3}\t{:.3}",
@@ -172,45 +177,179 @@ impl Store {
         text
     }
 
-    fn write(&self, path: &Path) -> std::io::Result<()> {
-        let text = self.format_records();
-        crate::settings::atomic_write(path, &text)
+    pub fn push_recent(&mut self, uri: &MediaUri) {
+        self.recent.retain(|x| x != uri);
+        self.recent.insert(0, uri.clone());
+        self.recent.truncate(MAX_RECENT);
+        self.save_recent();
     }
 
-    pub fn favorite(&self, path: &Path) -> bool {
-        self.records.get(path).is_some_and(|r| r.favorite)
+    pub fn push_recent_path(&mut self, path: &Path) {
+        self.push_recent(&MediaUri::Local(path.to_path_buf()));
     }
-    pub fn toggle_favorite(&mut self, path: &Path) -> bool {
-        let r = self.records.entry(path.to_path_buf()).or_default();
+
+    pub fn clear_recent(&mut self) {
+        if !self.recent.is_empty() {
+            self.recent.clear();
+            self.save_recent();
+        }
+    }
+
+    pub fn is_favorite(&self, uri: &MediaUri) -> bool {
+        self.records
+            .get(&uri.to_uri_string())
+            .is_some_and(|r| r.favorite)
+    }
+
+    pub fn is_favorite_path(&self, path: &Path) -> bool {
+        self.is_favorite(&MediaUri::Local(path.to_path_buf()))
+    }
+
+    pub fn toggle_favorite(&mut self, uri: &MediaUri) -> bool {
+        let key = uri.to_uri_string();
+        let r = self.records.entry(key.clone()).or_default();
         r.favorite = !r.favorite;
-        let favorite = r.favorite;
-        if !favorite && r.position <= 0. && r.duration <= 0. {
-            self.records.remove(path);
+        let fav = r.favorite;
+        if !fav && r.position <= 0. && r.duration <= 0. {
+            self.records.remove(&key);
         }
         self.save();
-        favorite
+        fav
     }
-    pub fn remove_favorite(&mut self, path: &Path) -> bool {
-        if let Some(r) = self.records.get_mut(path)
+
+    pub fn toggle_favorite_path(&mut self, path: &Path) -> bool {
+        self.toggle_favorite(&MediaUri::Local(path.to_path_buf()))
+    }
+
+    pub fn remove_favorite(&mut self, uri: &MediaUri) -> bool {
+        let key = uri.to_uri_string();
+        if let Some(r) = self.records.get_mut(&key)
             && r.favorite
         {
             r.favorite = false;
             if r.position <= 0. && r.duration <= 0. {
-                self.records.remove(path);
+                self.records.remove(&key);
             }
             self.save();
             return true;
         }
         false
     }
-    pub fn progress_ratio(&self, path: &Path) -> Option<f32> {
-        let r = self.records.get(path)?;
+
+    pub fn remove_favorite_path(&mut self, path: &Path) -> bool {
+        self.remove_favorite(&MediaUri::Local(path.to_path_buf()))
+    }
+
+    pub fn progress_ratio(&self, uri: &MediaUri) -> Option<f32> {
+        let r = self.records.get(&uri.to_uri_string())?;
         if r.duration > 0. && r.position >= 5. && r.position < r.duration - 5. {
             Some((r.position / r.duration).clamp(0., 1.) as f32)
         } else {
             None
         }
     }
+
+    pub fn progress_ratio_uri(&self, uri: &MediaUri) -> Option<f32> {
+        self.progress_ratio(uri)
+    }
+
+    pub fn progress_ratio_path(&self, path: &Path) -> Option<f32> {
+        self.progress_ratio(&MediaUri::Local(path.to_path_buf()))
+    }
+
+    pub fn resume(&self, uri: &MediaUri) -> f64 {
+        self.records
+            .get(&uri.to_uri_string())
+            .filter(|r| r.position >= 5. && r.position < r.duration - 5.)
+            .map_or(0., |r| r.position)
+    }
+
+    pub fn resume_path(&self, path: &Path) -> f64 {
+        self.resume(&MediaUri::Local(path.to_path_buf()))
+    }
+
+    pub fn remember(&mut self, uri: &MediaUri, position: f64, duration: f64, eof: bool) -> bool {
+        if !position.is_finite() || !duration.is_finite() || duration <= 0. {
+            return false;
+        }
+        let key = uri.to_uri_string();
+        if key.is_empty() {
+            return false;
+        }
+        if eof {
+            let changed = match self.records.get_mut(&key) {
+                Some(r) if r.favorite => {
+                    let diff = r.position > 0. || (r.duration - duration).abs() > 0.01;
+                    r.position = 0.;
+                    r.duration = duration;
+                    diff
+                }
+                Some(_) => {
+                    self.records.remove(&key);
+                    true
+                }
+                None => false,
+            };
+            if changed {
+                self.dirty = true;
+            }
+            return changed;
+        }
+        let next_pos = position.max(0.);
+        if let Some(r) = self.records.get_mut(&key) {
+            if (r.position - next_pos).abs() < 0.25 && (r.duration - duration).abs() < 0.01 {
+                return false;
+            }
+            r.position = next_pos;
+            r.duration = duration;
+            self.dirty = true;
+            return true;
+        }
+        if next_pos < 5. || next_pos >= duration - 5. {
+            return false;
+        }
+        self.records.insert(
+            key,
+            Record {
+                favorite: false,
+                position: next_pos,
+                duration,
+            },
+        );
+        self.dirty = true;
+        true
+    }
+
+    pub fn remember_path(&mut self, path: &Path, position: f64, duration: f64, eof: bool) -> bool {
+        self.remember(
+            &MediaUri::Local(path.to_path_buf()),
+            position,
+            duration,
+            eof,
+        )
+    }
+
+    pub fn reset_progress(&mut self, uri: &MediaUri) -> bool {
+        let key = uri.to_uri_string();
+        let Some(r) = self.records.get_mut(&key) else {
+            return false;
+        };
+        if r.position <= 0. && r.duration <= 0. {
+            return false;
+        }
+        r.position = 0.;
+        r.duration = 0.;
+        if !r.favorite {
+            self.records.remove(&key);
+        }
+        self.save();
+        true
+    }
+
+    pub fn reset_progress_path(&mut self, path: &Path) -> bool {
+        self.reset_progress(&MediaUri::Local(path.to_path_buf()))
+    }
+
     pub fn clear_progress(&mut self) -> usize {
         let mut cleared = 0;
         self.records.retain(|_, r| {
@@ -226,63 +365,7 @@ impl Store {
         }
         cleared
     }
-    pub fn resume(&self, path: &Path) -> f64 {
-        self.records
-            .get(path)
-            .filter(|r| r.position >= 5. && r.position < r.duration - 5.)
-            .map_or(0., |r| r.position)
-    }
-    pub fn remember(&mut self, path: &Path, position: f64, duration: f64, eof: bool) -> bool {
-        if !position.is_finite() || !duration.is_finite() || duration <= 0. {
-            return false;
-        }
-        if eof {
-            let changed = match self.records.get_mut(path) {
-                Some(r) if r.favorite => {
-                    let diff = r.position > 0. || (r.duration - duration).abs() > 0.01;
-                    r.position = 0.;
-                    r.duration = duration;
-                    diff
-                }
-                Some(_) => {
-                    self.records.remove(path);
-                    true
-                }
-                None => false,
-            };
-            if changed {
-                self.dirty = true;
-            }
-            return changed;
-        }
-        let next_pos = position.max(0.);
-        if let Some(r) = self.records.get_mut(path) {
-            if (r.position - next_pos).abs() < 0.25 && (r.duration - duration).abs() < 0.01 {
-                return false;
-            }
-            r.position = next_pos;
-            r.duration = duration;
-            self.dirty = true;
-            return true;
-        }
-        // Avoid storing unresumable non-favorite positions near start/end.
-        if next_pos < 5. || next_pos >= duration - 5. {
-            return false;
-        }
-        self.records.insert(
-            path.to_path_buf(),
-            Record {
-                favorite: false,
-                position: next_pos,
-                duration,
-            },
-        );
-        self.dirty = true;
-        true
-    }
 }
-
-const HEX: &[u8; 16] = b"0123456789abcdef";
 
 fn push_hex(bytes: &[u8], out: &mut String) {
     out.reserve(bytes.len() * 2);
@@ -292,41 +375,33 @@ fn push_hex(bytes: &[u8], out: &mut String) {
     }
 }
 
-fn encode_path_into(path: &Path, out: &mut String) {
-    #[cfg(unix)]
+/// Decodes a hex-encoded canonical URI, legacy UTF-8 path/WebDAV URI, or legacy OS path.
+fn decode_any_media_uri(hex_text: &str) -> Option<MediaUri> {
+    if hex_text.is_empty()
+        || !hex_text.len().is_multiple_of(2)
+        || hex_text.len() > 262144
+        || !hex_text.is_ascii()
     {
-        use std::os::unix::ffi::OsStrExt;
-        push_hex(path.as_os_str().as_bytes(), out);
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::ffi::OsStrExt;
-        for unit in path.as_os_str().encode_wide() {
-            push_hex(&unit.to_le_bytes(), out);
-        }
-    }
-}
-
-#[cfg(test)]
-fn encode_path(path: &Path) -> String {
-    let mut out = String::new();
-    encode_path_into(path, &mut out);
-    out
-}
-
-fn decode_path(text: &str) -> Option<PathBuf> {
-    if !text.len().is_multiple_of(2) || text.len() > 262144 || !text.is_ascii() {
         return None;
     }
-    let bytes: Vec<u8> = (0..text.len())
+    let bytes: Vec<u8> = (0..hex_text.len())
         .step_by(2)
-        .map(|i| u8::from_str_radix(&text[i..i + 2], 16))
+        .map(|i| u8::from_str_radix(&hex_text[i..i + 2], 16))
         .collect::<Result<_, _>>()
         .ok()?;
+    if bytes.is_empty() {
+        return None;
+    }
+    if !bytes.contains(&0)
+        && let Ok(s) = std::str::from_utf8(&bytes)
+        && !s.is_empty()
+    {
+        return Some(MediaUri::parse(s));
+    }
     #[cfg(unix)]
     {
         use std::os::unix::ffi::OsStringExt;
-        Some(std::ffi::OsString::from_vec(bytes).into())
+        Some(MediaUri::Local(std::ffi::OsString::from_vec(bytes).into()))
     }
     #[cfg(windows)]
     {
@@ -340,115 +415,94 @@ fn decode_path(text: &str) -> Option<PathBuf> {
             .iter()
             .map(|b| u16::from_le_bytes(*b))
             .collect();
-        Some(std::ffi::OsString::from_wide(&units).into())
+        Some(MediaUri::Local(
+            std::ffi::OsString::from_wide(&units).into(),
+        ))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn paths_with_delimiters_roundtrip() {
-        let p = Path::new("/素材/hello\tworld\n100%.mp4");
-        assert_eq!(decode_path(&encode_path(p)).as_deref(), Some(p));
-        assert_eq!(decode_path("💡"), None);
-        assert_eq!(decode_path("zz"), None);
-    }
-    #[test]
-    fn records_survive_replacement_and_ignore_corrupt_rows() {
-        use std::io::Write;
-        let dir = std::env::temp_dir().join(format!("iris-records-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let file = dir.join("records.tsv");
-        let media = Path::new("/素材/a\tb.mp4");
-        let mut store = Store::default();
-        store.records.insert(
-            media.into(),
-            Record {
-                favorite: true,
-                position: 10.,
-                duration: 60.,
-            },
-        );
-        store.write(&file).unwrap();
-        store.remember(media, 25., 60., false);
-        store.write(&file).unwrap();
-        let mut damaged = std::fs::OpenOptions::new()
-            .append(true)
-            .open(&file)
-            .unwrap();
-        writeln!(damaged, "invalid\t1\tNaN\t60").unwrap();
-        drop(damaged);
-        let restored = Store::read(&file);
-        assert_eq!(restored.records.len(), 1);
-        assert_eq!(restored.resume(media), 25.);
-        assert!(restored.favorite(media));
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-    #[test]
-    fn resume_skips_completed_files_without_losing_favorites() {
-        let p = Path::new("test.mp4");
-        let mut s = Store::default();
-        s.records.insert(
-            p.into(),
-            Record {
-                favorite: true,
-                position: 30.,
-                duration: 60.,
-            },
-        );
-        assert_eq!(s.resume(p), 30.);
-        s.remember(p, 60., 60., true);
-        assert_eq!(s.resume(p), 0.);
-        assert!(s.favorite(p));
-    }
-    #[test]
-    fn progress_ratio_and_clear_progress_preserve_favorites() {
-        let fav = Path::new("fav.mp4");
-        let plain = Path::new("plain.mp4");
-        let mut s = Store::default();
-        s.records.insert(
-            fav.into(),
-            Record {
-                favorite: true,
-                position: 30.,
-                duration: 60.,
-            },
-        );
-        s.records.insert(
-            plain.into(),
-            Record {
-                favorite: false,
-                position: 15.,
-                duration: 60.,
-            },
-        );
-        assert_eq!(s.progress_ratio(fav), Some(0.5));
-        assert_eq!(s.progress_ratio(plain), Some(0.25));
-        // Clear progress keeps fav's star and removes non-favorite progress-only row.
-        assert_eq!(s.clear_progress(), 2);
-        assert!(s.favorite(fav));
-        assert_eq!(s.progress_ratio(fav), None);
-        assert!(!s.records.contains_key(plain));
+
+    fn hex_str(s: &str) -> String {
+        let mut out = String::new();
+        push_hex(s.as_bytes(), &mut out);
+        out
     }
 
     #[test]
-    fn remember_prunes_completed_non_favorites_and_tracks_dirty() {
-        let p = Path::new("clip.mp4");
-        let mut s = Store::default();
-        assert!(!s.is_dirty());
-        // Within first 5s: not resumable, should not create a dead entry.
-        assert!(!s.remember(p, 2.0, 60.0, false));
-        assert!(!s.records.contains_key(p));
-        assert!(!s.is_dirty());
-        // Resumable position creates entry and marks dirty.
-        assert!(s.remember(p, 15.0, 60.0, false));
-        assert!(s.is_dirty());
-        assert_eq!(s.resume(p), 15.0);
-        // Tiny sub-0.25s drift does not trigger another write.
-        assert!(!s.remember(p, 15.1, 60.0, false));
-        // Reaching EOF removes non-favorite entry cleanly.
-        assert!(s.remember(p, 60.0, 60.0, true));
-        assert!(!s.records.contains_key(p));
+    fn unified_store_roundtrips_and_migrates_legacy_path_and_webdav_tsvs() {
+        let dir = std::env::temp_dir().join(format!("iris-store-unified-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Seed legacy `records.tsv` (raw local path) + legacy `uri_records.tsv` (`webdav://` URI)
+        // + legacy `recent.tsv` + `recent_uris.tsv` + corrupt row.
+        let legacy_local = "/素材/hello\tworld\n100%.mp4";
+        let legacy_webdav = "webdav://home-nas/Movies/Sci%20Fi/ep1.mkv";
+        std::fs::write(
+            dir.join("records.tsv"),
+            format!(
+                "{}\t1\t25.000\t100.000\ninvalid\t1\tNaN\t60\n",
+                hex_str(legacy_local)
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("uri_records.tsv"),
+            format!("{}\t1\t30.000\t120.000\n", hex_str(legacy_webdav)),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("recent.tsv"),
+            format!("{}\n", hex_str(legacy_local)),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("recent_uris.tsv"),
+            format!("{}\n", hex_str(legacy_webdav)),
+        )
+        .unwrap();
+
+        let mut store = Store::load_from_dir(&dir);
+        assert!(store.is_favorite_path(Path::new(legacy_local)));
+        assert_eq!(store.resume_path(Path::new(legacy_local)), 25.0);
+
+        let upgraded_webdav = MediaUri::Plugin {
+            plugin_id: "iris.webdav".into(),
+            source_id: "home-nas".into(),
+            entry_id: "/Movies/Sci Fi/ep1.mkv".into(),
+        };
+        assert!(store.is_favorite(&upgraded_webdav));
+        assert_eq!(store.progress_ratio_uri(&upgraded_webdav), Some(0.25));
+        assert_eq!(store.recent().len(), 2);
+
+        // Remember new progress and flush purely via snapshot (no main-thread I/O).
+        let cloud_item = MediaUri::Plugin {
+            plugin_id: "acme.cloud".into(),
+            source_id: "drive".into(),
+            entry_id: "ep2".into(),
+        };
+        assert!(store.remember(&cloud_item, 15.0, 60.0, false));
+        assert!(store.is_dirty());
+        let (snap_path, snap_text) = store.take_dirty_snapshot().unwrap();
+        assert!(!store.is_dirty());
+        Store::write_snapshot(&snap_path, &snap_text);
+
+        // Remove legacy uri_records.tsv to prove single `records.tsv` holds everything now.
+        let _ = std::fs::remove_file(dir.join("uri_records.tsv"));
+        let mut reloaded = Store::load_from_dir(&dir);
+        assert!(reloaded.is_favorite(&upgraded_webdav));
+        assert_eq!(reloaded.resume(&cloud_item), 15.0);
+
+        // EOF prunes non-favorite progress while keeping favorites.
+        assert!(reloaded.remember(&cloud_item, 60.0, 60.0, true));
+        assert_eq!(reloaded.clear_progress(), 2);
+        assert!(reloaded.is_favorite(&upgraded_webdav));
+        assert_eq!(reloaded.resume(&upgraded_webdav), 0.0);
+        assert_eq!(reloaded.resume(&cloud_item), 0.0);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

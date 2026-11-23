@@ -15,6 +15,26 @@ use crate::{Error, Mpv, Result, check, sys};
 pub type GetProcAddress =
     unsafe extern "C" fn(ctx: *mut c_void, name: *const c_char) -> *mut c_void;
 
+/// Capability-restricted handle granting video surface workers access ONLY to
+/// render context creation and display color-space target properties.
+#[derive(Clone)]
+pub struct RenderHandle(Arc<Mpv>);
+
+impl RenderHandle {
+    pub fn new(mpv: Arc<Mpv>) -> Self {
+        Self(mpv)
+    }
+
+    pub fn set_display_color_target(&self, prim: &str, trc: &str) -> Result<()> {
+        self.0.set_property_string("target-prim", prim)?;
+        self.0.set_property_string("target-trc", trc)
+    }
+
+    pub fn set_display_icc_profile(&self, path: &str) -> Result<()> {
+        self.0.set_property_string("icc-profile", path)
+    }
+}
+
 type UpdateFn = Box<dyn Fn() + Send + Sync>;
 
 pub struct RenderContext {
@@ -23,15 +43,18 @@ pub struct RenderContext {
     _mpv: Arc<Mpv>,
 }
 
+// SAFETY: `mpv_render_context` may be moved between threads as long as render calls are serialized.
 unsafe impl Send for RenderContext {}
 
 impl RenderContext {
+    pub const UPDATE_FRAME: u64 = sys::MPV_RENDER_UPDATE_FRAME;
+
     /// Creates an OpenGL render context. The GL context must be current.
     ///
     /// # Safety
     /// `get_proc_address` must resolve GL symbols for the current context.
     pub unsafe fn new_gl(
-        mpv: Arc<Mpv>,
+        mpv: RenderHandle,
         get_proc_address: GetProcAddress,
         proc_ctx: *mut c_void,
     ) -> Result<Self> {
@@ -59,8 +82,10 @@ impl RenderContext {
             },
         ];
         let mut ctx = ptr::null_mut();
+        // SAFETY: `mpv.0` holds a live `mpv_handle`, `params` is `MPV_RENDER_PARAM_INVALID`-terminated,
+        // and the caller guarantees a current GL context matching `get_proc_address`.
         check(
-            unsafe { sys::mpv_render_context_create(&mut ctx, mpv.raw(), params.as_mut_ptr()) },
+            unsafe { sys::mpv_render_context_create(&mut ctx, mpv.0.raw(), params.as_mut_ptr()) },
             || "mpv_render_context_create(opengl)".into(),
         )?;
         if ctx.is_null() {
@@ -72,7 +97,7 @@ impl RenderContext {
         Ok(Self {
             ctx,
             update: None,
-            _mpv: mpv,
+            _mpv: mpv.0,
         })
     }
 
@@ -81,7 +106,7 @@ impl RenderContext {
     /// # Safety
     /// `device` must be a live ID3D11Device without SINGLETHREADED. Its immediate
     /// context must not be used concurrently with this render context.
-    pub unsafe fn new_d3d11(mpv: Arc<Mpv>, device: *mut c_void) -> Result<Self> {
+    pub unsafe fn new_d3d11(mpv: RenderHandle, device: *mut c_void) -> Result<Self> {
         let mut init = sys::mpv_d3d11_init_params { device };
         let mut advanced: c_int = 1;
         let mut params = [
@@ -103,8 +128,10 @@ impl RenderContext {
             },
         ];
         let mut ctx = ptr::null_mut();
+        // SAFETY: `mpv.0` holds a live `mpv_handle`, `params` is zero-terminated,
+        // and the caller guarantees `device` is a valid multi-thread-safe ID3D11Device.
         check(
-            unsafe { sys::mpv_render_context_create(&mut ctx, mpv.raw(), params.as_mut_ptr()) },
+            unsafe { sys::mpv_render_context_create(&mut ctx, mpv.0.raw(), params.as_mut_ptr()) },
             || "mpv_render_context_create(d3d11)".into(),
         )?;
         if ctx.is_null() {
@@ -116,7 +143,7 @@ impl RenderContext {
         Ok(Self {
             ctx,
             update: None,
-            _mpv: mpv,
+            _mpv: mpv.0,
         })
     }
 
@@ -140,6 +167,8 @@ impl RenderContext {
                 data: ptr::null_mut(),
             },
         ];
+        // SAFETY: `self.ctx` is valid, `params` is zero-terminated, and the caller
+        // guarantees `texture` is a valid D3D11 render target for the duration of the call.
         check(
             unsafe { sys::mpv_render_context_render(self.ctx, params.as_mut_ptr()) },
             || "mpv_render_context_render(d3d11)".into(),
@@ -150,17 +179,22 @@ impl RenderContext {
     /// It runs on an mpv thread: only signal from it, never call mpv.
     pub fn set_update_callback(&mut self, f: impl Fn() + Send + Sync + 'static) {
         unsafe extern "C" fn trampoline(data: *mut c_void) {
+            // SAFETY: `data` points to a heap-allocated `UpdateFn` kept alive in `self.update`
+            // until the callback is replaced or cleared in `Drop`.
             let f = unsafe { &*(data as *const UpdateFn) };
             f();
         }
         let boxed: Box<UpdateFn> = Box::new(Box::new(f));
         let data = &*boxed as *const UpdateFn as *mut c_void;
+        // SAFETY: `self.ctx` is valid and `boxed` has a stable heap address stored in `self.update`
+        // before any replacement or context teardown drops it.
         unsafe { sys::mpv_render_context_set_update_callback(self.ctx, Some(trampoline), data) };
         self.update = Some(boxed);
     }
 
     /// Returns `MPV_RENDER_UPDATE_*` flags. Call before deciding whether to render.
     pub fn update(&self) -> u64 {
+        // SAFETY: `self.ctx` is a valid `mpv_render_context`.
         unsafe { sys::mpv_render_context_update(self.ctx) }
     }
 
@@ -199,6 +233,7 @@ impl RenderContext {
                 data: ptr::null_mut(),
             },
         ];
+        // SAFETY: `self.ctx` is valid and `params` is `MPV_RENDER_PARAM_INVALID`-terminated.
         check(
             unsafe { sys::mpv_render_context_render(self.ctx, params.as_mut_ptr()) },
             || "mpv_render_context_render".into(),
@@ -207,6 +242,7 @@ impl RenderContext {
 
     /// Tells mpv a frame was presented (improves frame timing).
     pub fn report_swap(&self) {
+        // SAFETY: `self.ctx` is a valid `mpv_render_context`.
         unsafe { sys::mpv_render_context_report_swap(self.ctx) }
     }
 }
@@ -214,6 +250,8 @@ impl RenderContext {
 impl Drop for RenderContext {
     /// OpenGL callers must keep their GL context current when this runs.
     fn drop(&mut self) {
+        // SAFETY: Detaches the update callback before freeing `self.ctx`, while `_mpv`
+        // and `self.update` are still alive.
         unsafe {
             sys::mpv_render_context_set_update_callback(self.ctx, None, ptr::null_mut());
             sys::mpv_render_context_free(self.ctx);

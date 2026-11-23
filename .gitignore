@@ -1,6 +1,31 @@
 /target
 /out
-.DS_Store
 /test-media
+
+# OS metadata
+.DS_Store
+._*
+.AppleDouble
+.LSOverride
+Thumbs.db
+Desktop.ini
+
+# Editor & Python local environments
+.vscode/
+.idea/
+*.swp
+*~
 __pycache__/
 *.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+
+# Local debug endpoints & build artifacts
+*.fifo
+*.sock
+*.pdb
+*.ilk
+*.exp
+iris-stderr.log

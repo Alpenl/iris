@@ -3,7 +3,7 @@
 //! content view. GPUI's Metal layer is non-opaque and clears to transparent,
 //! so anything GPUI doesn't paint shows the video, and GPUI can draw on top.
 
-use std::ffi::{CString, c_char, c_int, c_void};
+use std::ffi::{c_char, c_int, c_void};
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, SyncSender};
@@ -13,8 +13,7 @@ use std::thread::JoinHandle;
 use anyhow::{Context as _, Result, anyhow};
 use cocoa::base::{NO, YES, id, nil};
 use cocoa::foundation::NSRect;
-use iris_mpv::Mpv;
-use iris_mpv::render::RenderContext;
+use iris_mpv::render::{RenderContext, RenderHandle};
 use objc::declare::ClassDecl;
 use objc::rc::autoreleasepool;
 use objc::runtime::{BOOL, Class, Object, Sel};
@@ -80,9 +79,11 @@ unsafe extern "C" {
 
 unsafe extern "C" fn gl_get_proc_address(_ctx: *mut c_void, name: *const c_char) -> *mut c_void {
     static HANDLE: OnceLock<usize> = OnceLock::new();
-    let handle = *HANDLE.get_or_init(|| {
-        let path = CString::new("/System/Library/Frameworks/OpenGL.framework/OpenGL").unwrap();
-        unsafe { dlopen(path.as_ptr(), RTLD_LAZY) as usize }
+    let handle = *HANDLE.get_or_init(|| unsafe {
+        dlopen(
+            c"/System/Library/Frameworks/OpenGL.framework/OpenGL".as_ptr(),
+            RTLD_LAZY,
+        ) as usize
     }) as *mut c_void;
     if handle.is_null() {
         ptr::null_mut()
@@ -131,7 +132,7 @@ impl Drop for LayerState {
 struct SendId(id);
 unsafe impl Send for SendId {}
 
-pub struct VideoSurface {
+pub(crate) struct VideoSurface {
     state: Arc<LayerState>,
     view: id,
     layer: id,
@@ -192,7 +193,7 @@ extern "C" fn can_draw(
         return NO;
     };
     let flags = render.update();
-    if force || resized || flags & iris_mpv::sys::MPV_RENDER_UPDATE_FRAME != 0 {
+    if force || resized || flags & RenderContext::UPDATE_FRAME != 0 {
         YES
     } else {
         NO
@@ -271,7 +272,7 @@ fn layer_class() -> &'static Class {
 impl VideoSurface {
     /// Creates the GL context and mpv render context, and inserts the video
     /// view under GPUI's view. Must run on the main thread.
-    pub fn attach(window: &gpui::Window, mpv: Arc<Mpv>) -> Result<Self> {
+    pub(crate) fn attach(window: &gpui::Window, mpv: RenderHandle) -> Result<Self> {
         let gpui_view: id = match HasWindowHandle::window_handle(window)
             .map_err(|e| anyhow!("{e:?}"))?
             .as_raw()
@@ -316,8 +317,7 @@ impl VideoSurface {
             // The layer is tagged Display P3 (below), so mpv must output
             // Display P3 with the sRGB curve. Core Animation then converts to
             // the screen, as it does for GPUI's layer.
-            mpv.set_property_string("target-prim", "display-p3")?;
-            mpv.set_property_string("target-trc", "srgb")?;
+            mpv.set_display_color_target("display-p3", "srgb")?;
 
             CGLSetCurrentContext(gl);
             let render_res = RenderContext::new_gl(mpv, gl_get_proc_address, ptr::null_mut())
@@ -386,7 +386,7 @@ impl VideoSurface {
     }
 
     /// Re-renders the current frame even if mpv has no new one.
-    pub fn request_redraw(&self) {
+    pub(crate) fn request_redraw(&self) {
         self.state.force.store(true, Ordering::Release);
         if let Some(tx) = &self.redraw_tx {
             let _ = tx.try_send(());
@@ -396,7 +396,7 @@ impl VideoSurface {
     /// Places the video view over the video area, given in GPUI window
     /// coordinates (logical points, top-left origin). mpv's OSD and subtitles
     /// then live inside this rect, letterbox bars included.
-    pub fn set_frame(&self, x: f64, y: f64, w: f64, h: f64) {
+    pub(crate) fn set_frame(&self, x: f64, y: f64, w: f64, h: f64) {
         unsafe {
             let superview: id = msg_send![self.view, superview];
             if superview == nil {
@@ -423,7 +423,7 @@ impl VideoSurface {
     }
 
     /// Keeps the layer at the window's backing scale (Retina vs. non-Retina screens).
-    pub fn set_scale(&mut self, scale: f64) {
+    pub(crate) fn set_scale(&mut self, scale: f64) {
         if (scale - self.scale).abs() > f64::EPSILON {
             self.scale = scale;
             unsafe {
@@ -435,7 +435,7 @@ impl VideoSurface {
 
     /// Stops mpv render callbacks, joins the video thread, detaches the layer's
     /// state pointer, and frees the render context with its GL context current.
-    pub fn shutdown(&mut self) {
+    fn shutdown(&mut self) {
         // 1. Free the render context first so mpv's update callback stops firing
         //    and releases its clone of `redraw_tx`.
         let render = self.state.render.lock().unwrap().take();

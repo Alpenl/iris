@@ -1,0 +1,36 @@
+{
+  "id": "example.cinema-ui",
+  "name": "影院 HUD 与百变主题工作台",
+  "version": "0.1.0",
+  "author": "Iris Examples",
+  "description": "官方界面定制参考插件：演示动态色彩/圆角/无边框悬浮控制栏皮肤切换、底栏自定义图标按钮、实时 SMPTE 时间码频谱 HUD 叠层与富交互侧栏面板。",
+  "protocol": 1,
+  "entry": "main.py",
+  "permissions": [
+    "read_state",
+    "control_playback",
+    "ui_theme",
+    "ui_toolbar",
+    "ui_overlay",
+    "ui_sidebar",
+    "ui_status",
+    "notifications"
+  ],
+  "commands": [
+    {
+      "id": "toggle_hud",
+      "title": "影院工作台：开关时间码与频谱 HUD",
+      "subtitle": "切换视口右上角实时 SMPTE 时间码、动态频谱柱与跳过片头按钮"
+    },
+    {
+      "id": "cycle_skin",
+      "title": "影院工作台：循环切换 UI 主题皮肤",
+      "subtitle": "在 默认还原 / 赛博霓虹 Neon / 暗房胶片 Amber / 极简悬浮窗 Minimal / 无边框悬浮窗 Frameless 之间切换"
+    },
+    {
+      "id": "reset_skin",
+      "title": "影院工作台：恢复默认外观与控制栏",
+      "subtitle": "清除插件动态主题与 Chrome 布局覆盖"
+    }
+  ]
+}

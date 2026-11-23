@@ -7,24 +7,44 @@ mod macos;
 mod windows;
 
 #[cfg(target_os = "macos")]
-pub use macos::*;
+pub(crate) use macos::{
+    MediaKeyBridge, PinchMonitor, SleepPreventer, begin_window_drag, hide_traffic_lights,
+    set_always_on_top,
+};
+#[cfg(any(debug_assertions, feature = "devtools"))]
+#[cfg(target_os = "macos")]
+pub(crate) use macos::{snapshot_window, synth_mouse};
 #[cfg(target_os = "windows")]
-pub use windows::*;
+pub(crate) use windows::{
+    MediaKeyBridge, PinchMonitor, SleepPreventer, begin_window_drag, hide_traffic_lights, pipe,
+    set_always_on_top,
+};
+#[cfg(any(debug_assertions, feature = "devtools"))]
+#[cfg(target_os = "windows")]
+pub(crate) use windows::{snapshot_window, synth_mouse};
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use gpui::RenderImage;
 
+pub(crate) const IS_MACOS: bool = cfg!(target_os = "macos");
+
+pub(crate) const REVEAL_IN_FILE_MANAGER_LABEL: &str = if IS_MACOS {
+    "在访达中显示"
+} else {
+    "在资源管理器中显示"
+};
+
 #[derive(Clone, Copy, Debug)]
-pub struct PinchEvent {
-    pub delta: f64,
-    pub position: [f64; 2],
+pub(crate) struct PinchEvent {
+    pub(crate) delta: f64,
+    pub(crate) position: [f64; 2],
 }
 
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum MediaKey {
+pub(crate) enum MediaKey {
     Play,
     Pause,
     Toggle,
@@ -33,7 +53,7 @@ pub enum MediaKey {
 }
 
 /// Default folder for saved screenshots (`Desktop` on macOS, `Pictures`/`Desktop` on Windows).
-pub fn default_screenshot_dir() -> PathBuf {
+pub(crate) fn default_screenshot_dir() -> PathBuf {
     #[cfg(target_os = "macos")]
     {
         if let Some(h) = std::env::var_os("HOME") {
@@ -62,7 +82,7 @@ pub fn default_screenshot_dir() -> PathBuf {
 }
 
 /// Decodes a compact straight-BGRA `RenderImage` thumbnail entirely in memory.
-pub fn decode_thumbnail(path: &Path, max_dim: u32) -> Option<Arc<RenderImage>> {
+pub(crate) fn decode_thumbnail(path: &Path, max_dim: u32) -> Option<Arc<RenderImage>> {
     #[cfg(target_os = "macos")]
     if let Some(img) = macos::decode_thumbnail_imageio(path, max_dim) {
         return Some(img);

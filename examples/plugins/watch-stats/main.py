@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Example out-of-process Iris plugin using the JSON-lines stdio protocol v1.
+"""Example out-of-process Iris plugin using the JSON-lines stdio protocol (v1).
+
+Demonstrates:
+  - `init` state restoration & `set_state` non-secret persistence across restarts
+  - `media_opened` / `tick` playback tracking (`read_state`)
+  - `set_status` (`StatusBadge`) & `set_sidebar` (`Widget` tree)
+  - `command` / `action` handling (`reset`)
 
 Install by copying this folder into:
   - macOS:   ~/Library/Application Support/Iris/plugins/watch-stats/
@@ -7,9 +13,17 @@ Install by copying this folder into:
 Then click "重新扫描插件" in Iris Settings -> 插件.
 """
 
+from __future__ import annotations
+
 import json
 import sys
 import time
+from typing import Any
+
+if hasattr(sys.stdin, "reconfigure"):
+    sys.stdin.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", line_buffering=True)
 
 
 def fmt_duration(seconds: float) -> str:
@@ -19,19 +33,23 @@ def fmt_duration(seconds: float) -> str:
     return f"{h}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
 
 
-def emit(commands: list[dict]) -> None:
-    sys.stdout.write(json.dumps({"type": "commands", "commands": commands}, ensure_ascii=False) + "\n")
+def emit(commands: list[dict[str, Any]]) -> None:
+    if not commands:
+        return
+    sys.stdout.write(
+        json.dumps({"type": "commands", "commands": commands}, ensure_ascii=False) + "\n"
+    )
     sys.stdout.flush()
 
 
-def build_ui(watched: float, opened_count: int, current_file: str) -> list[dict]:
+def build_ui(watched: float, opened_count: int, current_title: str) -> list[dict[str, Any]]:
     return [
         {
             "command": "set_status",
-            "item": {
+            "badge": {
                 "id": "watch-timer",
                 "text": f"已看 {fmt_duration(watched)}",
-                "tooltip": "本次会话累计观看时长 · 点击重置",
+                "tooltip": "累计观看时长 · 点击重置",
                 "accent": False,
                 "action_id": "reset",
             },
@@ -42,12 +60,32 @@ def build_ui(watched: float, opened_count: int, current_file: str) -> list[dict]
                 "title": "观影计时统计",
                 "sections": [
                     {
-                        "heading": "本次会话",
-                        "items": [
-                            {"kind": "key_value", "key": "累计观看", "value": fmt_duration(watched), "accent": True},
-                            {"kind": "key_value", "key": "已打开文件", "value": str(opened_count), "accent": False},
-                            {"kind": "text", "text": current_file or "暂无媒体", "muted": True},
-                            {"kind": "button", "label": "重置计时", "action_id": "reset", "accent": False},
+                        "heading": "播放统计",
+                        "widgets": [
+                            {
+                                "kind": "stat",
+                                "label": "累计观看",
+                                "value": fmt_duration(watched),
+                                "accent": True,
+                            },
+                            {
+                                "kind": "stat",
+                                "label": "本次打开媒体",
+                                "value": str(opened_count),
+                                "accent": False,
+                            },
+                            {
+                                "kind": "label",
+                                "text": current_title or "暂无媒体",
+                                "muted": True,
+                                "mono": False,
+                            },
+                            {
+                                "kind": "button",
+                                "label": "重置计时",
+                                "action_id": "reset",
+                                "accent": False,
+                            },
                         ],
                     }
                 ],
@@ -59,16 +97,16 @@ def build_ui(watched: float, opened_count: int, current_file: str) -> list[dict]
 def main() -> None:
     watched = 0.0
     opened_count = 0
-    current_file = ""
-    last_tick = None
+    current_title = ""
+    last_tick: float | None = None
     last_emitted_sec = -1
 
     for raw in sys.stdin:
-        raw = raw.strip()
-        if not raw:
+        line = raw.strip()
+        if not line:
             continue
         try:
-            msg = json.loads(raw)
+            msg = json.loads(line)
         except json.JSONDecodeError:
             continue
         if msg.get("type") != "event":
@@ -77,16 +115,25 @@ def main() -> None:
         kind = ev.get("event")
 
         if kind == "init":
+            state = ev.get("state") or {}
+            try:
+                watched = max(0.0, float(state.get("watched_secs") or 0.0))
+            except (TypeError, ValueError):
+                watched = 0.0
+            snap = ev.get("snapshot") or {}
+            current_title = str(snap.get("title") or "")
             last_emitted_sec = int(watched)
-            emit(build_ui(watched, opened_count, current_file))
-        elif kind == "file_opened":
+            emit(build_ui(watched, opened_count, current_title))
+
+        elif kind == "media_opened":
             snap = ev.get("snapshot") or {}
             opened_count += 1
-            current_file = snap.get("file_name") or ""
+            current_title = str(snap.get("title") or "")
             last_tick = None
             last_emitted_sec = int(watched)
-            emit(build_ui(watched, opened_count, current_file))
-        elif kind == "position_tick":
+            emit(build_ui(watched, opened_count, current_title))
+
+        elif kind == "tick":
             now = time.monotonic()
             if not ev.get("paused", True):
                 if last_tick is not None:
@@ -97,19 +144,31 @@ def main() -> None:
                 cur_sec = int(watched)
                 if cur_sec != last_emitted_sec:
                     last_emitted_sec = cur_sec
-                    emit(build_ui(watched, opened_count, current_file))
+                    cmds = build_ui(watched, opened_count, current_title)
+                    cmds.append(
+                        {
+                            "command": "set_state",
+                            "key": "watched_secs",
+                            "value": f"{watched:.1f}",
+                        }
+                    )
+                    emit(cmds)
             else:
                 last_tick = None
-        elif kind in ("command_invoked", "action_invoked"):
-            act = ev.get("command_id") or ev.get("action_id")
-            if act == "reset":
+
+        elif kind in ("command", "action"):
+            if ev.get("id") == "reset":
                 watched = 0.0
                 last_tick = None
                 last_emitted_sec = 0
                 emit(
-                    build_ui(watched, opened_count, current_file)
-                    + [{"command": "show_toast", "message": "观影计时已重置"}]
+                    build_ui(watched, opened_count, current_title)
+                    + [
+                        {"command": "set_state", "key": "watched_secs", "value": None},
+                        {"command": "show_toast", "message": "观影计时已重置"},
+                    ]
                 )
+
         elif kind == "shutdown":
             break
 
