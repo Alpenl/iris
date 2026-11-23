@@ -5,9 +5,16 @@ use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
 use std::sync::Arc;
 
-use futures::channel::mpsc::UnboundedReceiver;
+use futures::channel::mpsc::{UnboundedReceiver, unbounded};
 use gpui::RenderImage;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+use windows::Foundation::{EventRegistrationToken, TimeSpan, TypedEventHandler};
+use windows::Media::{
+    MediaPlaybackStatus, MediaPlaybackType, PlaybackPositionChangeRequestedEventArgs as SeekArgs,
+    SystemMediaTransportControls, SystemMediaTransportControlsButton as Button,
+    SystemMediaTransportControlsButtonPressedEventArgs as ButtonArgs,
+    SystemMediaTransportControlsDisplayUpdater, SystemMediaTransportControlsTimelineProperties,
+};
 use windows::Win32::{
     Foundation::{GENERIC_READ, HWND, LPARAM, WPARAM},
     Graphics::Imaging::{
@@ -21,15 +28,19 @@ use windows::Win32::{
             CoUninitialize,
         },
         Power::{ES_CONTINUOUS, ES_DISPLAY_REQUIRED, ES_SYSTEM_REQUIRED, SetThreadExecutionState},
+        WinRT::{
+            ISystemMediaTransportControlsInterop, RO_INIT_SINGLETHREADED, RoInitialize,
+            RoUninitialize,
+        },
     },
     UI::{
         Input::KeyboardAndMouse::{GetAsyncKeyState, ReleaseCapture, VK_LBUTTON},
         WindowsAndMessaging::*,
     },
 };
-use windows::core::{Interface, PCWSTR};
+use windows::core::{HSTRING, Interface, PCWSTR, Result as WinResult, factory};
 
-use super::{MediaKey, PinchEvent, apply_exif_orientation};
+use super::{MediaKey, NowPlaying, PinchEvent, apply_exif_orientation};
 
 fn hwnd(window: &gpui::Window) -> Option<HWND> {
     match HasWindowHandle::window_handle(window).ok()?.as_raw() {
@@ -95,19 +106,181 @@ impl PinchMonitor {
     }
 }
 
-pub(crate) struct MediaKeyBridge;
-impl MediaKeyBridge {
-    pub(crate) fn attach() -> Option<(Self, UnboundedReceiver<MediaKey>)> {
-        None
+// GPUI initializes the window thread as an STA. Balance our WinRT reference
+// on that thread, after releasing the window's controls and delegates.
+struct WinRtApartment(std::marker::PhantomData<std::rc::Rc<()>>);
+
+impl Drop for WinRtApartment {
+    fn drop(&mut self) {
+        unsafe { RoUninitialize() };
     }
-    pub(crate) fn update_now_playing(
-        &self,
-        _title: Option<&str>,
-        _duration: f64,
-        _position: f64,
-        _playing: bool,
-        _speed: f64,
-    ) {
+}
+
+pub(crate) struct MediaKeyBridge {
+    controls: SystemMediaTransportControls,
+    display: SystemMediaTransportControlsDisplayUpdater,
+    timeline: SystemMediaTransportControlsTimelineProperties,
+    buttons: EventRegistrationToken,
+    seek: EventRegistrationToken,
+    published: Option<(MediaPlaybackType, String)>,
+    _apartment: WinRtApartment,
+}
+
+const TICKS_PER_SECOND: f64 = 10_000_000.;
+
+fn timeline_ticks(seconds: f64) -> i64 {
+    if seconds.is_finite() {
+        (seconds.max(0.) * TICKS_PER_SECOND).round() as i64
+    } else {
+        0
+    }
+}
+
+impl MediaKeyBridge {
+    pub(crate) fn attach(window: &gpui::Window) -> Option<(Self, UnboundedReceiver<MediaKey>)> {
+        match Self::for_window(hwnd(window)?) {
+            Ok(bridge) => Some(bridge),
+            Err(err) => {
+                log::warn!("Could not attach Windows media controls: {err}");
+                None
+            }
+        }
+    }
+
+    fn for_window(hwnd: HWND) -> WinResult<(Self, UnboundedReceiver<MediaKey>)> {
+        unsafe { RoInitialize(RO_INIT_SINGLETHREADED)? };
+        let apartment = WinRtApartment(std::marker::PhantomData);
+        let interop =
+            factory::<SystemMediaTransportControls, ISystemMediaTransportControlsInterop>()?;
+        let controls: SystemMediaTransportControls = unsafe { interop.GetForWindow(hwnd)? };
+        controls.SetIsEnabled(false)?;
+        controls.SetPlaybackStatus(MediaPlaybackStatus::Closed)?;
+        controls.SetIsPlayEnabled(true)?;
+        controls.SetIsPauseEnabled(true)?;
+        controls.SetIsNextEnabled(true)?;
+        controls.SetIsPreviousEnabled(true)?;
+        let display = controls.DisplayUpdater()?;
+        let timeline = SystemMediaTransportControlsTimelineProperties::new()?;
+        timeline.SetStartTime(TimeSpan::default())?;
+        timeline.SetMinSeekTime(TimeSpan::default())?;
+        let (tx, rx) = unbounded();
+        let button_tx = tx.clone();
+        let button_handler =
+            TypedEventHandler::<SystemMediaTransportControls, ButtonArgs>::new(move |_, args| {
+                if let Some(args) = args {
+                    let key = match args.Button()? {
+                        Button::Play => MediaKey::Play,
+                        Button::Pause => MediaKey::Pause,
+                        Button::Next => MediaKey::Next,
+                        Button::Previous => MediaKey::Prev,
+                        _ => return Ok(()),
+                    };
+                    let _ = button_tx.unbounded_send(key);
+                }
+                Ok(())
+            });
+        let buttons = controls.ButtonPressed(&button_handler)?;
+        let seek_handler =
+            TypedEventHandler::<SystemMediaTransportControls, SeekArgs>::new(move |_, args| {
+                if let Some(args) = args {
+                    let ticks = args.RequestedPlaybackPosition()?.Duration;
+                    let _ =
+                        tx.unbounded_send(MediaKey::Seek(ticks.max(0) as f64 / TICKS_PER_SECOND));
+                }
+                Ok(())
+            });
+        let seek = match controls.PlaybackPositionChangeRequested(&seek_handler) {
+            Ok(token) => token,
+            Err(err) => {
+                let _ = controls.RemoveButtonPressed(buttons);
+                return Err(err);
+            }
+        };
+        let bridge = Self {
+            controls,
+            display,
+            timeline,
+            buttons,
+            seek,
+            published: None,
+            _apartment: apartment,
+        };
+        Ok((bridge, rx))
+    }
+
+    pub(crate) fn update_now_playing(&mut self, media: Option<NowPlaying<'_>>) {
+        if let Err(err) = self.publish(media) {
+            log::warn!("Could not update Windows media controls: {err}");
+        }
+    }
+
+    fn publish(&mut self, media: Option<NowPlaying<'_>>) -> WinResult<()> {
+        let Some(media) = media else {
+            if self.published.is_some() {
+                self.controls.SetIsEnabled(false)?;
+                self.controls
+                    .SetPlaybackStatus(MediaPlaybackStatus::Closed)?;
+                self.display.ClearAll()?;
+                self.display.Update()?;
+                self.published = None;
+            }
+            return Ok(());
+        };
+        let kind = if media.is_video {
+            MediaPlaybackType::Video
+        } else {
+            MediaPlaybackType::Music
+        };
+        if self.published.as_ref().is_none_or(|(last_kind, title)| {
+            *last_kind != kind || title.as_str() != media.title.as_ref()
+        }) {
+            self.display.ClearAll()?;
+            self.display.SetType(kind)?;
+            let title = HSTRING::from(media.title.as_ref());
+            if media.is_video {
+                self.display.VideoProperties()?.SetTitle(&title)?;
+            } else {
+                self.display.MusicProperties()?.SetTitle(&title)?;
+            }
+            self.display.Update()?;
+            self.controls.SetIsEnabled(true)?;
+            self.published = Some((kind, media.title.into_owned()));
+        }
+        let state = media.state;
+        let status = if state.ended {
+            MediaPlaybackStatus::Stopped
+        } else if !state.loaded {
+            MediaPlaybackStatus::Changing
+        } else if state.paused {
+            MediaPlaybackStatus::Paused
+        } else {
+            MediaPlaybackStatus::Playing
+        };
+        self.controls.SetPlaybackStatus(status)?;
+        self.controls.SetPlaybackRate(state.speed)?;
+        let end = TimeSpan {
+            Duration: timeline_ticks(state.duration),
+        };
+        let position = TimeSpan {
+            Duration: timeline_ticks(state.time_pos).min(end.Duration),
+        };
+        self.timeline.SetEndTime(end)?;
+        self.timeline.SetMaxSeekTime(end)?;
+        self.timeline.SetPosition(position)?;
+        self.controls.UpdateTimelineProperties(&self.timeline)
+    }
+}
+
+impl Drop for MediaKeyBridge {
+    fn drop(&mut self) {
+        let _ = self.controls.RemoveButtonPressed(self.buttons);
+        let _ = self
+            .controls
+            .RemovePlaybackPositionChangeRequested(self.seek);
+        let _ = self.controls.SetIsEnabled(false);
+        let _ = self.controls.SetPlaybackStatus(MediaPlaybackStatus::Closed);
+        let _ = self.display.ClearAll();
+        let _ = self.display.Update();
     }
 }
 
@@ -444,8 +617,17 @@ pub(crate) mod pipe {
 
 #[cfg(test)]
 mod tests {
-    use super::decode_thumbnail_wic;
+    use super::{decode_thumbnail_wic, timeline_ticks};
     use std::path::Path;
+
+    #[test]
+    fn timeline_uses_nonnegative_hundred_nanosecond_ticks() {
+        assert_eq!(timeline_ticks(1.234_567_8), 12_345_678);
+        for unknown in [f64::NAN, f64::INFINITY, -1.] {
+            assert_eq!(timeline_ticks(unknown), 0);
+        }
+        assert_eq!(timeline_ticks(f64::MAX), i64::MAX);
+    }
 
     #[test]
     fn wic_thumbnail_decoder_respects_exif_orientations_and_bgra_channels() {

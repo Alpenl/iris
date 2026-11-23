@@ -306,7 +306,7 @@ impl BuiltinPlugin for GuidesPlugin {
         PluginManifest {
             id: "iris.guides".into(),
             name: "构图辅助线".into(),
-            version: "0.1.0".into(),
+            version: env!("CARGO_PKG_VERSION").into(),
             author: "Iris".into(),
             description:
                 "在视口矢量叠加层绘制三分线、黄金分割、中心十字、2.39:1 电影画幅与安全框参考线"
@@ -565,7 +565,7 @@ impl BuiltinPlugin for AbLoopPlugin {
         PluginManifest {
             id: "iris.ab-loop".into(),
             name: "A-B 循环与标记".into(),
-            version: "0.1.0".into(),
+            version: env!("CARGO_PKG_VERSION").into(),
             author: "Iris".into(),
             description: "设置视频 A-B 区间自动循环播放，并记录当前文件的时间点书签以便审片跳转"
                 .into(),

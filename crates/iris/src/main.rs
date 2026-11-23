@@ -40,7 +40,7 @@ fn main() {
         }
         Some("--help") => {
             println!(
-                "Iris 照片 / 视频播放器\n用法：iris [本地文件或文件夹]\n  --version  显示版本\n  --help     显示本说明"
+                "Iris 照片 / 视频播放器\n用法：iris [本地文件或文件夹…]\n  --version  显示版本\n  --help     显示本说明"
             );
             return;
         }
@@ -54,25 +54,22 @@ fn main() {
         std::env::remove_var("GPUI_DISABLE_DIRECT_COMPOSITION")
     };
     logging::init();
-    let initial = std::env::args_os().nth(1).map(PathBuf::from);
+    let initial: Vec<PathBuf> = std::env::args_os().skip(1).map(PathBuf::from).collect();
     // Paths from the OS (file associations, Finder, a second Windows process).
-    let (open_tx, mut open_rx) = futures::channel::mpsc::unbounded::<PathBuf>();
+    let (open_tx, mut open_rx) = futures::channel::mpsc::unbounded::<Vec<PathBuf>>();
     #[cfg(target_os = "windows")]
-    let _instance = match instance::claim(initial.as_deref(), open_tx.clone()) {
+    let _instance = match instance::claim(&initial, open_tx.clone()) {
         instance::Claim::Primary(guard) => guard,
         instance::Claim::Forwarded => return,
     };
     let app = Application::new().with_assets(assets::Assets);
     app.on_open_urls(move |urls| {
-        for value in urls {
-            // Local file URLs only. A query, another scheme or any other
-            // external string never becomes a backend option or command.
-            if let Ok(url) = url::Url::parse(&value)
-                && url.scheme() == "file"
-                && let Ok(path) = url.to_file_path()
-            {
-                let _ = open_tx.unbounded_send(path);
-            }
+        let paths: Vec<_> = urls
+            .iter()
+            .filter_map(|value| local_file_url(value))
+            .collect();
+        if !paths.is_empty() {
+            let _ = open_tx.unbounded_send(paths);
         }
     });
     app.run(move |cx: &mut App| {
@@ -165,12 +162,10 @@ fn main() {
             }
         };
         cx.spawn(async move |cx| {
-            while let Some(path) = open_rx.next().await {
+            while let Some(paths) = open_rx.next().await {
                 let opened = window.update(cx, |this, window, cx| {
                     window.activate_window();
-                    if !path.as_os_str().is_empty() {
-                        this.open_path(&path, cx);
-                    }
+                    this.open_paths(paths, cx);
                 });
                 if opened.is_err() {
                     break;
@@ -186,6 +181,14 @@ fn main() {
         .detach();
         cx.activate(true);
     });
+}
+
+fn local_file_url(value: &str) -> Option<PathBuf> {
+    let url = url::Url::parse(value).ok()?;
+    if url.scheme() != "file" || url.query().is_some() || url.fragment().is_some() {
+        return None;
+    }
+    url.to_file_path().ok()
 }
 
 fn app_menus() -> Vec<Menu> {
@@ -242,4 +245,18 @@ fn app_menus() -> Vec<Menu> {
             ],
         },
     ]
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn finder_accepts_only_unambiguous_file_urls() {
+        let path = std::env::temp_dir().join("字幕 #1.srt");
+        let url = url::Url::from_file_path(&path).unwrap();
+        assert_eq!(local_file_url(url.as_str()), Some(path));
+        assert!(local_file_url(&format!("{url}?option=x")).is_none());
+        assert!(local_file_url(&format!("{url}#fragment")).is_none());
+        assert!(local_file_url("https://example.com/video.mp4").is_none());
+    }
 }

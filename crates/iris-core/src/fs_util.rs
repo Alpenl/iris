@@ -33,6 +33,20 @@ pub(crate) fn data_dir() -> Option<PathBuf> {
     }
 }
 
+/// Keep the lock on a stable sibling: the data files themselves are replaced by rename.
+/// Closing the returned file releases the OS lock, including on process exit.
+pub(crate) fn lock_store(dir: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::create_dir_all(dir)?;
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(dir.join("records.lock"))?;
+    lock.lock()?;
+    Ok(lock)
+}
+
 /// Atomically writes `bytes` to `path` via a unique sibling `.tmp` file,
 /// cleaning up the temp file on failure and retrying briefly on Windows
 /// transient sharing locks.

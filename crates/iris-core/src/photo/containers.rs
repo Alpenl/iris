@@ -5,12 +5,12 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
 use super::Mirror;
-use super::exif::{ExifSummary, parse_exif_tiff};
+use super::exif::{self, ExifSummary};
 use super::icc::{be16, be32};
 
-const MAX_ICC: usize = 4 << 20;
+pub(super) const MAX_ICC: usize = 4 << 20;
+pub(super) const MAX_EXIF: usize = 1 << 20;
 const MAX_CHUNKS: usize = 4096;
-const MAX_IFD_ENTRIES: usize = 4096;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum PhotoFormat {
@@ -31,7 +31,10 @@ pub(super) fn detect_photo_format(magic: &[u8], hint: Option<&str>) -> Option<Ph
     if magic.len() >= 12 && &magic[..4] == b"RIFF" && &magic[8..12] == b"WEBP" {
         return Some(PhotoFormat::Webp);
     }
-    if magic.starts_with(b"II*\0") || magic.starts_with(b"MM\0*") {
+    if matches!(
+        magic.get(..4),
+        Some(b"II*\0" | b"MM\0*" | b"II+\0" | b"MM\0+")
+    ) {
         return Some(PhotoFormat::Tiff);
     }
     if magic.len() >= 8 && &magic[4..8] == b"ftyp" {
@@ -82,8 +85,8 @@ pub(super) fn jpeg<R: Read + Seek>(
     if read_n(r, 2)? != [0xFF, 0xD8] {
         return None;
     }
-    let mut chunks: Vec<(u8, Vec<u8>)> = Vec::new();
-    let mut total = 0;
+    let mut chunks: Vec<Option<Vec<u8>>> = Vec::new();
+    let (mut total, mut received, mut invalid_icc) = (0, 0, false);
     for _ in 0..MAX_CHUNKS {
         let mut m = [0u8; 2];
         if r.read_exact(&mut m).is_err() || m[0] != 0xFF {
@@ -109,8 +112,10 @@ pub(super) fn jpeg<R: Read + Seek>(
             && !matches!(marker, 0xC4 | 0xC8 | 0xCC)
             && body >= 5
         {
-            let seg = read_n(r, body)?;
+            let mut seg = [0; 5];
+            r.read_exact(&mut seg).ok()?;
             h.size = Some((be16(&seg[3..]) as u32, be16(&seg[1..]) as u32));
+            r.seek(SeekFrom::Current((body - 5) as i64)).ok()?;
         } else if marker == 0xE1
             && (15..=262_144).contains(&body)
             && h.exif_orientation.is_none()
@@ -118,31 +123,62 @@ pub(super) fn jpeg<R: Read + Seek>(
         {
             let seg = read_n(r, body)?;
             if &seg[..6] == b"Exif\0\0" {
-                let parsed = parse_exif_tiff(&seg[6..], !orientation_only);
-                (h.exif_orientation, h.exif) = (parsed.orientation, parsed.summary);
+                let mode = if orientation_only {
+                    exif::Mode::Orientation
+                } else {
+                    exif::Mode::Summary
+                };
+                exif::tiff(&mut std::io::Cursor::new(&seg[6..]), h, mode);
                 if orientation_only {
                     return Some(());
                 }
             }
-        } else if !orientation_only && marker == 0xE2 && body > 14 {
-            let seg = read_n(r, body)?;
-            if &seg[..12] == b"ICC_PROFILE\0" {
-                total += seg.len() - 14;
-                if total > MAX_ICC {
-                    chunks.clear();
-                    break;
+        } else if !orientation_only
+            && marker == 0xE2
+            && body > 14
+            && h.colour.is_none()
+            && !invalid_icc
+        {
+            let mut tag = [0; 14];
+            r.read_exact(&mut tag).ok()?;
+            let len = body - tag.len();
+            if &tag[..12] != b"ICC_PROFILE\0" {
+                r.seek(SeekFrom::Current(len as i64)).ok()?;
+                continue;
+            }
+            let (seq, count) = (usize::from(tag[12]), usize::from(tag[13]));
+            if chunks.is_empty() {
+                chunks.resize_with(count, || None);
+            }
+            if seq == 0
+                || seq > count
+                || count != chunks.len()
+                || chunks[seq - 1].is_some()
+                || len > MAX_ICC - total
+            {
+                invalid_icc = true;
+                chunks.clear();
+                r.seek(SeekFrom::Current(len as i64)).ok()?;
+                continue;
+            }
+            let segment = read_n(r, len)?;
+            if count == 1 {
+                h.colour = Some(ColourTag::Icc(segment));
+                continue;
+            }
+            chunks[seq - 1] = Some(segment);
+            total += len;
+            received += 1;
+            if received == count {
+                let mut profile = Vec::with_capacity(total);
+                for part in chunks.drain(..).flatten() {
+                    profile.extend_from_slice(&part);
                 }
-                chunks.push((seg[12], seg[14..].to_vec()));
+                h.colour = Some(ColourTag::Icc(profile));
             }
         } else {
             r.seek(SeekFrom::Current(body as i64)).ok()?;
         }
-    }
-    if !chunks.is_empty() {
-        chunks.sort_by_key(|c| c.0);
-        h.colour = Some(ColourTag::Icc(
-            chunks.into_iter().flat_map(|c| c.1).collect(),
-        ));
     }
     Some(())
 }
@@ -185,113 +221,48 @@ pub(super) fn webp<R: Read + Seek>(r: &mut R, h: &mut Header) -> Option<()> {
         return None;
     }
     let le24 = |b: &[u8]| u32::from_le_bytes([b[0], b[1], b[2], 0]);
+    let mut left = u64::from(u32::from_le_bytes(head[4..8].try_into().ok()?)).checked_sub(4)?;
+    let mut saw_exif = false;
     for _ in 0..MAX_CHUNKS {
-        let c = read_n(r, 8)?;
-        let len_u32 = u32::from_le_bytes([c[4], c[5], c[6], c[7]]);
-        let len = len_u32 as usize;
-        match &c[..4] {
-            b"VP8X" if (10..=1024).contains(&len) => {
-                let d = read_n(r, len + (len & 1))?;
-                h.size = Some((le24(&d[4..]) + 1, le24(&d[7..]) + 1));
-            }
-            b"ICCP" if len <= MAX_ICC => {
-                h.colour = Some(ColourTag::Icc(read_n(r, len)?));
-                return Some(());
-            }
-            b"VP8L" if h.size.is_none() && len >= 5 => {
-                let d = read_n(r, 5)?;
-                let bits = u32::from_le_bytes([d[1], d[2], d[3], d[4]]);
-                h.size = Some(((bits & 0x3FFF) + 1, ((bits >> 14) & 0x3FFF) + 1));
-                return Some(());
-            }
-            b"VP8 " if h.size.is_none() && len >= 10 => {
-                let d = read_n(r, 10)?;
-                let le14 = |b: &[u8]| u16::from_le_bytes([b[0], b[1]]) as u32 & 0x3FFF;
-                h.size = Some((le14(&d[6..]), le14(&d[8..])));
-                return Some(());
-            }
-            b"VP8 " | b"VP8L" | b"ANIM" => return Some(()),
-            _ => {
-                let skip = i64::from(len_u32) + i64::from(len_u32 & 1);
-                r.seek(SeekFrom::Current(skip)).ok()?;
-            }
-        }
-    }
-    Some(())
-}
-
-pub(super) fn heif<R: Read + Seek>(r: &mut R, h: &mut Header) -> Option<()> {
-    let end = r.seek(SeekFrom::End(0)).ok()?;
-    r.seek(SeekFrom::Start(0)).ok()?;
-    let mut pos = 0u64;
-    let mut found = None;
-    for _ in 0..256 {
-        if pos + 8 > end {
-            return None;
-        }
-        let (kind, header, size) = box_header(r, end - pos)?;
-        if &kind == b"meta" {
-            let body = usize::try_from(size.checked_sub(header)?).ok()?;
-            if body > 16 << 20 {
-                return None;
-            }
-            found = Some(read_n(r, body)?);
+        if left < 8 {
             break;
         }
-        pos = pos.checked_add(size)?;
-        r.seek(SeekFrom::Start(pos)).ok()?;
-    }
-    let meta = found?;
-    let meta = meta.get(4..)?;
-    let iprp = find_box(meta, b"iprp")?;
-    let props: Vec<([u8; 4], &[u8])> = boxes(find_box(iprp, b"ipco")?).collect();
-    let primary = find_box(meta, b"pitm").and_then(|b| match b.first()? {
-        0 => b.get(4..6).map(|v| be16(v) as u32),
-        _ => b.get(4..8).map(be32),
-    });
-    let order: Vec<usize> = match (primary, find_box(iprp, b"ipma")) {
-        (Some(id), Some(ipma)) => ipma_for(ipma, id).unwrap_or_default(),
-        _ => Vec::new(),
-    };
-    let chosen: Vec<&([u8; 4], &[u8])> = if order.is_empty() {
-        props.iter().collect()
-    } else {
-        order
-            .iter()
-            .filter_map(|&i| props.get(i.checked_sub(1)?))
-            .collect()
-    };
-    for (kind, body) in chosen {
-        match kind {
-            b"colr" if body.len() >= 4 => match &body[..4] {
-                b"prof" | b"rICC" if body.len() - 4 <= MAX_ICC => {
-                    h.colour = Some(ColourTag::Icc(body[4..].to_vec()));
-                }
-                b"nclx" if body.len() >= 8 && h.colour.is_none() => {
-                    let (primaries, transfer) = (be16(&body[4..]), be16(&body[6..]));
-                    h.colour = Some(ColourTag::Nclx {
-                        primaries,
-                        transfer,
-                    });
-                }
-                _ => {}
-            },
-            b"ispe" if body.len() >= 12 => h.size = Some((be32(&body[4..]), be32(&body[8..]))),
-            b"irot" if !body.is_empty() => {
-                h.rotate_cw = (h.rotate_cw + (360 - 90 * (body[0] as u16 & 3)) % 360) % 360;
+        let mut c = [0; 8];
+        r.read_exact(&mut c).ok()?;
+        let len = u32::from_le_bytes(c[4..].try_into().ok()?) as usize;
+        let padded = len as u64 + (len & 1) as u64;
+        left = left.checked_sub(8 + padded)?;
+        let start = r.stream_position().ok()?;
+        match &c[..4] {
+            b"VP8X" if len >= 10 => {
+                let mut d = [0; 10];
+                r.read_exact(&mut d).ok()?;
+                h.size = Some((le24(&d[4..]) + 1, le24(&d[7..]) + 1));
             }
-            b"imir" if !body.is_empty() => {
-                add_mirror(
-                    h,
-                    if body[0] & 1 == 0 {
-                        Mirror::Horizontal
-                    } else {
-                        Mirror::Vertical
-                    },
-                );
+            b"ICCP" if len <= MAX_ICC && h.colour.is_none() => {
+                h.colour = Some(ColourTag::Icc(read_n(r, len)?))
+            }
+            b"EXIF" if len <= MAX_EXIF && !saw_exif => {
+                saw_exif = true;
+                let data = read_n(r, len)?;
+                let tiff = data.strip_prefix(b"Exif\0\0").unwrap_or(&data);
+                exif::tiff(&mut std::io::Cursor::new(tiff), h, exif::Mode::Summary);
+            }
+            b"VP8L" if h.size.is_none() && len >= 5 => {
+                let mut d = [0; 5];
+                r.read_exact(&mut d).ok()?;
+                let bits = u32::from_le_bytes(d[1..].try_into().ok()?);
+                h.size = Some(((bits & 0x3FFF) + 1, ((bits >> 14) & 0x3FFF) + 1));
+            }
+            b"VP8 " if h.size.is_none() && len >= 10 => {
+                let mut d = [0; 10];
+                r.read_exact(&mut d).ok()?;
+                let le14 = |b: &[u8]| u16::from_le_bytes([b[0], b[1]]) as u32 & 0x3FFF;
+                h.size = Some((le14(&d[6..]), le14(&d[8..])));
             }
             _ => {}
         }
+        r.seek(SeekFrom::Start(start.checked_add(padded)?)).ok()?;
     }
     Some(())
 }
@@ -306,145 +277,4 @@ pub(super) fn add_mirror(h: &mut Header, m: Mirror) {
             None
         }
     };
-}
-
-fn ipma_for(ipma: &[u8], item: u32) -> Option<Vec<usize>> {
-    let version = *ipma.first()?;
-    let wide_index = be32(ipma.get(..4)?) & 1 != 0;
-    let mut p = 4;
-    let mut take = |n: usize| -> Option<&[u8]> {
-        let s = ipma.get(p..p + n)?;
-        p += n;
-        Some(s)
-    };
-    let count = be32(take(4)?).min(4096);
-    for _ in 0..count {
-        let id = if version < 1 {
-            be16(take(2)?) as u32
-        } else {
-            be32(take(4)?)
-        };
-        let n = take(1)?[0] as usize;
-        let mut indices = Vec::with_capacity(n);
-        for _ in 0..n {
-            let i = if wide_index {
-                (be16(take(2)?) & 0x7FFF) as usize
-            } else {
-                (take(1)?[0] & 0x7F) as usize
-            };
-            indices.push(i);
-        }
-        if id == item {
-            return Some(indices);
-        }
-    }
-    None
-}
-
-fn box_header<R: Read>(r: &mut R, left: u64) -> Option<([u8; 4], u64, u64)> {
-    let h = read_n(r, 8)?;
-    let kind = [h[4], h[5], h[6], h[7]];
-    let (header, size) = match be32(&h) {
-        0 => (8, left),
-        1 => {
-            let l = read_n(r, 8)?;
-            (16, u64::from_be_bytes(l.try_into().ok()?))
-        }
-        s => (8, s as u64),
-    };
-    (size >= header && size <= left).then_some((kind, header, size))
-}
-
-fn boxes(mut buf: &[u8]) -> impl Iterator<Item = ([u8; 4], &[u8])> {
-    std::iter::from_fn(move || {
-        if buf.len() < 8 {
-            return None;
-        }
-        let kind = [buf[4], buf[5], buf[6], buf[7]];
-        let (header, size) = match be32(buf) {
-            0 => (8, buf.len()),
-            1 if buf.len() >= 16 => (
-                16,
-                usize::try_from(u64::from_be_bytes(buf[8..16].try_into().ok()?)).ok()?,
-            ),
-            1 => return None,
-            s => (8, s as usize),
-        };
-        if size < header || size > buf.len() {
-            return None;
-        }
-        let body = &buf[header..size];
-        buf = &buf[size..];
-        Some((kind, body))
-    })
-}
-
-fn find_box<'a>(buf: &'a [u8], kind: &[u8; 4]) -> Option<&'a [u8]> {
-    boxes(buf).find(|(k, _)| k == kind).map(|(_, b)| b)
-}
-
-/// Unified TIFF IFD0 reader (extracts orientation `0x0112`, dimensions, and ICC profile).
-pub(super) fn tiff<R: Read + Seek>(
-    r: &mut R,
-    h: &mut Header,
-    orientation_only: bool,
-) -> Option<()> {
-    let head = read_n(r, 8)?;
-    let le = match &head[..4] {
-        b"II*\0" => true,
-        b"MM\0*" => false,
-        _ => return None,
-    };
-    let u16_ = |b: &[u8]| {
-        if le {
-            u16::from_le_bytes([b[0], b[1]])
-        } else {
-            be16(b)
-        }
-    };
-    let u32_ = |b: &[u8]| {
-        if le {
-            u32::from_le_bytes([b[0], b[1], b[2], b[3]])
-        } else {
-            be32(b)
-        }
-    };
-    r.seek(SeekFrom::Start(u32_(&head[4..]) as u64)).ok()?;
-    let n = (u16_(&read_n(r, 2)?) as usize).min(MAX_IFD_ENTRIES);
-    let entries = read_n(r, n * 12)?;
-    let (mut w, mut ht, mut icc_at) = (None, None, None);
-    for e in entries.as_chunks::<12>().0 {
-        let value = || {
-            if u16_(&e[2..]) == 3 {
-                u16_(&e[8..]) as u32
-            } else {
-                u32_(&e[8..])
-            }
-        };
-        match u16_(e) {
-            0x0112 => {
-                let val = u16_(&e[8..]);
-                if (1..=8).contains(&val) {
-                    h.exif_orientation = Some(val);
-                    if orientation_only {
-                        return Some(());
-                    }
-                }
-            }
-            256 if !orientation_only => w = Some(value()),
-            257 if !orientation_only => ht = Some(value()),
-            34675 if !orientation_only => {
-                icc_at = Some((u32_(&e[8..]) as u64, u32_(&e[4..]) as usize))
-            }
-            _ => {}
-        }
-    }
-    if !orientation_only {
-        h.size = w.zip(ht);
-        if let Some((offset, count)) = icc_at.filter(|&(_, c)| c > 4 && c <= MAX_ICC) {
-            r.seek(SeekFrom::Start(offset)).ok()?;
-            h.colour = Some(ColourTag::Icc(read_n(r, count)?));
-        }
-    }
-    Some(())
 }

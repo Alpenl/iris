@@ -16,6 +16,7 @@ use super::actions::{
     ToggleHFlip, ToggleImageSize, ToggleInfo, ToggleSearch, ToggleVFlip, TriggerPluginCommand,
     ZoomIn, ZoomOut,
 };
+use super::chrome::DirectoryPopup;
 use super::state::{ActiveSource, BuiltinDialog, EscapeStep};
 use crate::platform;
 
@@ -55,6 +56,10 @@ impl IrisWindow {
         let Some(uri) = self.active().session.current_media_uri() else {
             return;
         };
+        if !uri.may_share_identity() {
+            self.show_toast("此链接仅用于本次播放，无法收藏", cx);
+            return;
+        }
         let added = self.store.toggle_favorite(&uri);
         self.rebuild_directory_rows();
         self.show_toast(
@@ -190,7 +195,11 @@ impl IrisWindow {
     ) {
         self.overlays.close_menus();
         if self.chrome.fullscreen {
-            self.overlays.dir_popup = !self.overlays.dir_popup;
+            self.overlays.dir_popup = if self.overlays.dir_popup.is_open() {
+                DirectoryPopup::Hidden
+            } else {
+                DirectoryPopup::Manual
+            };
             self.bump_activity(cx);
             cx.notify();
             return;
@@ -212,7 +221,7 @@ impl IrisWindow {
         cx: &mut Context<Self>,
     ) {
         if self.chrome.fullscreen {
-            self.overlays.dir_popup = true;
+            self.overlays.dir_popup = DirectoryPopup::Manual;
             self.bump_activity(cx);
         } else if !self.settings.directory_open {
             self.settings.directory_open = true;
@@ -453,17 +462,12 @@ impl IrisWindow {
         let rx = cx.prompt_for_paths(PathPromptOptions {
             files: true,
             directories: true,
-            multiple: false,
+            multiple: true,
             prompt: Some("打开".into()),
         });
         cx.spawn(async move |this, cx| {
-            if let Ok(Ok(Some(paths))) = rx.await
-                && let Some(p) = paths.into_iter().next()
-            {
-                let _ = this.update(cx, |this, cx| {
-                    this.catalog.active_source = ActiveSource::Local;
-                    this.open_path(&p, cx);
-                });
+            if let Ok(Ok(Some(paths))) = rx.await {
+                let _ = this.update(cx, |this, cx| this.open_paths(paths, cx));
             }
         })
         .detach();

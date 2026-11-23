@@ -1,0 +1,67 @@
+name: Build pinned media SDK
+on:
+  workflow_call:
+    inputs:
+      target:
+        type: string
+        required: true
+      runner:
+        type: string
+        required: true
+      test_runtime_only:
+        type: boolean
+        default: false
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ${{ inputs.runner }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: '3.12.9'
+      - name: Cache Windows test runtime
+        if: inputs.test_runtime_only
+        id: cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: ${{ runner.temp }}/media-sdk.tar.gz
+          key: iris-test-media-v1-${{ inputs.target }}-${{ hashFiles('scripts/release/**', '.github/workflows/media-sdk.yml') }}
+      - name: Build source-locked media runtime
+        if: steps.cache.outputs.cache-hit != 'true'
+        shell: bash
+        env:
+          TARGET: ${{ inputs.target }}
+          TEST_ONLY: ${{ inputs.test_runtime_only }}
+        run: |
+          set -euo pipefail
+          python -m pip install meson==1.7.0 cmake==3.31.6 ninja==1.11.1.3
+          if [[ "$RUNNER_OS" == Linux ]]; then
+            sudo apt-get update
+            sudo apt-get install -y make pkg-config nasm clang
+          else
+            brew install pkgconf nasm
+          fi
+          python scripts/release/build-media.py --target "$TARGET" --work "$RUNNER_TEMP/media-work" --output "$RUNNER_TEMP/media-sdk" --jobs 3
+          if [[ "$TEST_ONLY" == true ]]; then
+            tar -C "$RUNNER_TEMP" -czf "$RUNNER_TEMP/media-sdk.tar.gz" media-sdk/prefix/bin media-sdk/prefix/lib/mpv.lib
+          else
+            tar -C "$RUNNER_TEMP" -czf "$RUNNER_TEMP/media-sdk.tar.gz" media-sdk
+          fi
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: media-sdk-${{ inputs.target }}
+          path: ${{ runner.temp }}/media-sdk.tar.gz
+          if-no-files-found: error
+          retention-days: ${{ inputs.test_runtime_only && 1 || 14 }}
+      - name: Preserve failed configure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: media-failure-${{ inputs.target }}
+          path: |
+            ${{ runner.temp }}/media-sdk/compliance/
+            ${{ runner.temp }}/media-work/build/**/meson-logs/
+            ${{ runner.temp }}/media-work/build/**/CMakeConfigureLog.yaml
+          if-no-files-found: warn

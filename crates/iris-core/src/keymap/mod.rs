@@ -454,7 +454,7 @@ mod tests {
 
     #[test]
     fn builtin_schemes_have_zero_conflicts_and_lock_text_input_firewall() {
-        assert_eq!(ACTIONS.len(), 50);
+        assert_eq!(ACTIONS.len(), 52);
         for &scheme in KeymapScheme::ALL {
             let km = Keymap {
                 scheme,
@@ -493,6 +493,26 @@ mod tests {
                 effective_gpui_context("Workspace", chord),
                 Some("Workspace")
             );
+        }
+    }
+
+    #[test]
+    fn subtitle_cue_shortcuts_are_video_scoped_in_each_scheme() {
+        for (id, iris_key, mpv_key) in [
+            ("sub_seek_prev", "shift-,", "ctrl-left"),
+            ("sub_seek_next", "shift-.", "ctrl-right"),
+        ] {
+            let action = find_action(id).unwrap();
+            for &scheme in KeymapScheme::ALL {
+                let key = action.key_for_scheme(scheme);
+                let expected = if scheme == KeymapScheme::MpvClassic {
+                    mpv_key
+                } else {
+                    iris_key
+                };
+                assert_eq!(key, expected);
+                assert_eq!(action.gpui_contexts(key), &["Viewport && media == video"]);
+            }
         }
     }
 

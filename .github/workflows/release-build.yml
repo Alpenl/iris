@@ -3,9 +3,9 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: Numeric application version (major.minor.patch)
+        description: Authorized workspace version (0.0.x)
         required: true
-        default: '0.1.0'
+        default: '0.0.1'
       mode:
         description: Local is unsigned; release requires signing and macOS notarization secrets
         type: choice
@@ -28,45 +28,10 @@ jobs:
             runner: macos-15
           - target: macos-x86_64
             runner: macos-15-intel
-    runs-on: ${{ matrix.runner }}
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
-        with:
-          python-version: '3.12.9'
-      - name: Install build tools (not media binaries)
-        shell: bash
-        run: |
-          set -euo pipefail
-          python -m pip install meson==1.7.0 cmake==3.31.6 ninja==1.11.1.3
-          if [[ "$RUNNER_OS" == Linux ]]; then
-            sudo apt-get update
-            sudo apt-get install -y make pkg-config nasm clang
-          else
-            brew install pkgconf nasm
-          fi
-      - name: Build pinned media sources
-        shell: bash
-        run: |
-          set -euo pipefail
-          python scripts/release/build-media.py --target '${{ matrix.target }}' --work "$RUNNER_TEMP/media-work" --output "$RUNNER_TEMP/media-sdk" --jobs 3
-          tar -C "$RUNNER_TEMP" -czf "$RUNNER_TEMP/media-sdk.tar.gz" media-sdk
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        with:
-          name: media-sdk-${{ matrix.target }}
-          path: ${{ runner.temp }}/media-sdk.tar.gz
-          if-no-files-found: error
-          retention-days: 14
-      - name: Preserve configure diagnostics on failure
-        if: failure()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        with:
-          name: media-failure-${{ matrix.target }}
-          path: |
-            ${{ runner.temp }}/media-sdk/compliance/
-            ${{ runner.temp }}/media-work/build/**/meson-logs/
-            ${{ runner.temp }}/media-work/build/**/CMakeConfigureLog.yaml
-          if-no-files-found: warn
+    uses: ./.github/workflows/media-sdk.yml
+    with:
+      target: ${{ matrix.target }}
+      runner: ${{ matrix.runner }}
   package:
     needs: media
     strategy:
@@ -155,6 +120,12 @@ jobs:
         run: |
           set -euo pipefail
           python scripts/release/package.py --sdk "$RUNNER_TEMP/media-sdk" --output "$RUNNER_TEMP/iris-dist" --version "$IRIS_PACKAGE_VERSION" --mode "$IRIS_PACKAGE_MODE"
+      - name: Verify Windows Open With registration and uninstall
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $installer = Get-Item "$env:RUNNER_TEMP/iris-dist/*-setup.exe"
+          python scripts/check-windows-installer.py $installer.FullName
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: Iris-${{ inputs.version }}-${{ matrix.target }}-${{ inputs.mode }}

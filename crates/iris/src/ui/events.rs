@@ -7,9 +7,8 @@ use std::time::{Duration, Instant};
 use gpui::Context;
 use iris_api::HostEvent;
 use iris_core::library::{self, Kind, ScanResult};
-use iris_core::player::{self, SessionEvent, TrackKind};
+use iris_core::player::{self, Command, SessionEvent, TrackKind};
 use iris_core::settings::{OnEof, PhotoDefault};
-use iris_core::store::Store;
 
 use super::IrisWindow;
 use super::state::ActiveSource;
@@ -19,11 +18,47 @@ const SAVE_EVERY: Duration = Duration::from_secs(5);
 const MIN_BAR_TICK_INTERVAL: Duration = Duration::from_millis(250);
 const STATS_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 
+/// Subtitle selections follow the load that owns them, including during a folder scan.
+#[derive(Default)]
+pub(super) struct PendingSubtitles {
+    generation: u64,
+    paths: Vec<PathBuf>,
+}
+
+impl PendingSubtitles {
+    fn add(&mut self, generation: u64, paths: Vec<PathBuf>) {
+        if self.generation == generation && !self.paths.is_empty() {
+            self.paths.extend(paths);
+        } else {
+            self.generation = generation;
+            self.paths = paths;
+        }
+    }
+
+    fn take(&mut self, generation: u64) -> Vec<PathBuf> {
+        let paths = std::mem::take(&mut self.paths);
+        if self.generation == generation {
+            paths
+        } else {
+            Vec::new()
+        }
+    }
+}
+
+fn split_open_paths(mut paths: Vec<PathBuf>) -> (Vec<PathBuf>, Vec<PathBuf>) {
+    paths.retain(|path| !path.as_os_str().is_empty());
+    let subtitles = paths
+        .extract_if(.., |path| library::is_subtitle(path))
+        .collect();
+    (paths, subtitles)
+}
+
 impl IrisWindow {
     pub(super) fn on_events(&mut self, batch: Vec<SessionEvent>, cx: &mut Context<Self>) {
         let was_ended = self.active().session.state().ended;
         let mut need_notify = false;
         let mut saw_position: Option<f64> = None;
+        let mut saw_duration = false;
         let mut saw_pause_or_speed = false;
         let mut saw_loaded_or_reconfig = false;
         let mut saw_ended_now = false;
@@ -35,6 +70,10 @@ impl IrisWindow {
             self.active_mut().session.apply(ev);
             match ev {
                 SessionEvent::Position(t) => saw_position = Some(*t),
+                SessionEvent::Duration(_) => {
+                    saw_duration = true;
+                    need_notify = true;
+                }
                 SessionEvent::Paused(_) | SessionEvent::Speed(_) => {
                     saw_pause_or_speed = true;
                     need_notify = true;
@@ -57,11 +96,17 @@ impl IrisWindow {
             }
         }
         self.active_mut().session.flush_deferred();
+        if saw_loaded_or_reconfig
+            && self.active().session.state().loaded
+            && self.active().pending_path.is_none()
+        {
+            self.flush_pending_subtitles(cx);
+        }
 
         self.sleep_preventer
             .set_active(self.active().session.is_actively_playing_video());
         if self.last_save.elapsed() >= SAVE_EVERY {
-            self.save_progress_async(cx);
+            self.save_progress_sync();
         }
 
         if saw_loaded_or_reconfig && self.overlays.info_open {
@@ -114,11 +159,18 @@ impl IrisWindow {
                     need_notify = true;
                 }
             }
-            self.sync_now_playing(false);
+        }
+
+        let state = self.active().session.state();
+        let force_now_playing = saw_pause_or_speed
+            || saw_loaded_or_reconfig
+            || was_ended != state.ended
+            || (state.paused && (saw_position.is_some() || saw_duration));
+        if force_now_playing || saw_position.is_some() || saw_duration {
+            self.sync_now_playing(force_now_playing);
         }
 
         if saw_pause_or_speed {
-            self.sync_now_playing(true);
             let snap = self.plugin_snapshot();
             if self.broadcast_plugin_event(HostEvent::StateChanged { snapshot: snap }, None, cx) {
                 need_notify = true;
@@ -126,8 +178,7 @@ impl IrisWindow {
         }
 
         if saw_ended_now && !was_ended && self.active().session.state().ended {
-            self.save_progress_async(cx);
-            self.sync_now_playing(true);
+            self.save_progress_sync();
             if matches!(
                 self.active().session.kind(),
                 Some(Kind::Video | Kind::Audio)
@@ -196,16 +247,6 @@ impl IrisWindow {
         self.last_save = Instant::now();
     }
 
-    pub(super) fn save_progress_async(&mut self, cx: &mut Context<Self>) {
-        self.record_progress_memory();
-        if let Some((path, snapshot)) = self.store.take_dirty_snapshot() {
-            cx.background_executor()
-                .spawn(async move { Store::write_snapshot(&path, &snapshot) })
-                .detach();
-        }
-        self.last_save = Instant::now();
-    }
-
     pub(super) fn finish_media_open(&mut self, cx: &mut Context<Self>) {
         if let Some(uri) = self.active().session.current_media_uri() {
             self.store.push_recent(&uri);
@@ -234,7 +275,57 @@ impl IrisWindow {
         }
     }
 
+    pub(crate) fn open_paths(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
+        let (paths, subtitles) = split_open_paths(paths);
+        match paths.as_slice() {
+            [] => {}
+            [path] => self.open_path(path, cx),
+            _ => self.open_multi_queue(paths, cx),
+        }
+        if subtitles.is_empty() {
+            return;
+        }
+        let vp = self.active_mut();
+        vp.pending_subtitles.add(vp.load_generation, subtitles);
+        if vp.pending_path.is_none() && (vp.session.state().loaded || vp.session.kind().is_none()) {
+            self.flush_pending_subtitles(cx);
+        }
+    }
+
+    fn flush_pending_subtitles(&mut self, cx: &mut Context<Self>) {
+        let vp = self.active_mut();
+        let paths = vp.pending_subtitles.take(vp.load_generation);
+        if paths.is_empty() {
+            return;
+        }
+        if !matches!(vp.session.kind(), Some(Kind::Video | Kind::Audio)) {
+            self.show_toast("请先打开视频或音频，再加载字幕", cx);
+            return;
+        }
+        let count = paths.len();
+        let mut failed = 0;
+        let mut last_error = None;
+        for path in paths {
+            let result = std::path::absolute(&path)
+                .map_err(anyhow::Error::from)
+                .and_then(|local| vp.session.execute(Command::LoadSubtitle(local)));
+            if let Err(error) = result {
+                failed += 1;
+                last_error = Some(error);
+            }
+        }
+        if let Some(error) = last_error {
+            self.show_toast(
+                format!("{count} 个字幕文件中有 {failed} 个加载失败 · {error}"),
+                cx,
+            );
+        } else {
+            self.show_toast(format!("已请求加载 {count} 个字幕文件"), cx);
+        }
+    }
+
     pub(crate) fn open_path(&mut self, path: &Path, cx: &mut Context<Self>) {
+        self.cancel_remote_requests();
         self.save_progress_sync();
         self.overlays.close_menus();
         self.catalog.active_source = ActiveSource::Local;
@@ -301,8 +392,16 @@ impl IrisWindow {
                     this.active_mut().session.open(prepared, resume)
                 });
                 match result {
-                    Ok(()) => this.finish_media_open(cx),
-                    Err(e) => this.show_toast(format!("无法打开 · {e}"), cx),
+                    Ok(()) => {
+                        this.finish_media_open(cx);
+                        if this.active().session.kind().is_none() {
+                            this.flush_pending_subtitles(cx);
+                        }
+                    }
+                    Err(e) => {
+                        this.active_mut().pending_subtitles.paths.clear();
+                        this.show_toast(format!("无法打开 · {e}"), cx);
+                    }
                 }
                 this.active_mut().image.reset();
                 cx.notify();
@@ -311,7 +410,8 @@ impl IrisWindow {
         .detach();
     }
 
-    pub(super) fn open_multi_queue(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
+    fn open_multi_queue(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
+        self.cancel_remote_requests();
         self.save_progress_sync();
         self.overlays.close_menus();
         self.catalog.active_source = ActiveSource::Local;
@@ -339,6 +439,8 @@ impl IrisWindow {
                     vp.loading_visible = false;
                 }
                 let Some(prepared) = prepared else {
+                    this.active_mut().pending_subtitles.paths.clear();
+                    this.show_toast("所选项目中没有可播放的媒体", cx);
                     return;
                 };
                 let count = prepared.len();
@@ -357,7 +459,10 @@ impl IrisWindow {
                         this.finish_media_open(cx);
                         this.show_toast(format!("已加入播放队列 · {count} 个文件"), cx);
                     }
-                    Err(e) => this.show_toast(format!("无法打开 · {e}"), cx),
+                    Err(e) => {
+                        this.active_mut().pending_subtitles.paths.clear();
+                        this.show_toast(format!("无法打开 · {e}"), cx);
+                    }
                 }
                 this.active_mut().image.reset();
                 cx.notify();
@@ -420,25 +525,57 @@ impl IrisWindow {
             return;
         }
         self.last_now_playing = Instant::now();
-        if let Some(bridge) = &self.media_keys {
-            let session = &self.active().session;
-            let title = matches!(session.kind(), Some(Kind::Video | Kind::Audio))
-                .then(|| {
-                    session
-                        .current()
-                        .and_then(|p| p.file_name())
-                        .map(|n| n.to_string_lossy().into_owned())
-                        .or_else(|| session.current_title().map(str::to_string))
+        let Some(bridge) = &mut self.media_keys else {
+            return;
+        };
+        let session = &self.viewports[0].session;
+        let media = match session.kind() {
+            Some(kind @ (Kind::Video | Kind::Audio)) => {
+                let title = session
+                    .current_title()
+                    .map(std::borrow::Cow::Borrowed)
+                    .or_else(|| {
+                        session
+                            .current()
+                            .and_then(Path::file_name)
+                            .map(|name| name.to_string_lossy())
+                    });
+                title.map(|title| platform::NowPlaying {
+                    title,
+                    is_video: kind == Kind::Video,
+                    state: session.state(),
                 })
-                .flatten();
-            let st = session.state();
-            bridge.update_now_playing(
-                title.as_deref(),
-                st.duration,
-                st.time_pos,
-                !st.paused && !st.ended,
-                st.speed,
-            );
-        }
+            }
+            _ => None,
+        };
+        bridge.update_now_playing(media);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PendingSubtitles, split_open_paths};
+    use std::path::PathBuf;
+
+    #[test]
+    fn mixed_opens_preserve_media_and_subtitle_order() {
+        let paths = ["A.srt", "first.mkv", "B.ASS", "second.mp4"].map(PathBuf::from);
+        let (media, subtitles) = split_open_paths(paths.into());
+        assert_eq!(media, ["first.mkv", "second.mp4"].map(PathBuf::from));
+        assert_eq!(subtitles, ["A.srt", "B.ASS"].map(PathBuf::from));
+    }
+
+    #[test]
+    fn additional_subtitles_join_only_the_same_pending_load() {
+        let mut pending = PendingSubtitles::default();
+        pending.add(1, vec!["old.srt".into()]);
+        pending.add(2, vec!["new.srt".into()]);
+        pending.add(2, vec!["second.srt".into()]);
+        assert_eq!(
+            pending.take(2),
+            ["new.srt", "second.srt"].map(PathBuf::from)
+        );
+        pending.add(3, vec!["superseded.srt".into()]);
+        assert!(pending.take(4).is_empty());
     }
 }

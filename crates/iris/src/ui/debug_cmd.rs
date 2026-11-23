@@ -76,7 +76,7 @@ impl IrisWindow {
                     self.settings.directory_open,
                     self.settings.directory_width,
                     self.settings.directory_side,
-                    self.overlays.dir_popup,
+                    self.overlays.dir_popup.is_open(),
                     self.overlays.settings_open,
                     self.overlays.info_open,
                     self.overlays.popover,

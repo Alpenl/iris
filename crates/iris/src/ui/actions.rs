@@ -40,6 +40,8 @@ actions!(
         CycleAspect,
         ToggleSubs,
         CycleSub,
+        SubSeekPrev,
+        SubSeekNext,
         SubDelayBack,
         SubDelayForward,
         SubDelayReset,
@@ -114,6 +116,8 @@ fn push_action_binding(out: &mut Vec<KeyBinding>, action_id: &str, key: &str, ct
         "cycle_aspect" => KeyBinding::new(key, CycleAspect, Some(ctx)),
         "toggle_subs" => KeyBinding::new(key, ToggleSubs, Some(ctx)),
         "cycle_sub" => KeyBinding::new(key, CycleSub, Some(ctx)),
+        "sub_seek_prev" => KeyBinding::new(key, SubSeekPrev, Some(ctx)),
+        "sub_seek_next" => KeyBinding::new(key, SubSeekNext, Some(ctx)),
         "sub_delay_back" => KeyBinding::new(key, SubDelayBack, Some(ctx)),
         "sub_delay_forward" => KeyBinding::new(key, SubDelayForward, Some(ctx)),
         "sub_delay_reset" => KeyBinding::new(key, SubDelayReset, Some(ctx)),
@@ -257,6 +261,8 @@ impl IrisWindow {
             .on_action(cx.listener(Self::exit_fullscreen))
             .on_action(cx.listener(Self::toggle_subs))
             .on_action(cx.listener(Self::cycle_sub))
+            .on_action(cx.listener(Self::sub_seek_prev))
+            .on_action(cx.listener(Self::sub_seek_next))
             .on_action(cx.listener(Self::sub_delay_back))
             .on_action(cx.listener(Self::sub_delay_forward))
             .on_action(cx.listener(Self::sub_delay_reset))

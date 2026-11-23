@@ -107,14 +107,23 @@ impl PreparedQueue {
     }
 }
 
-/// Resolves a multi-file drop queue off the UI thread using slow-share-safe path resolution.
+/// Expands selected folders in place and preserves the first occurrence of each media file.
 pub fn prepare_queue(paths: Vec<PathBuf>) -> Option<PreparedQueue> {
-    let entries: Vec<Entry> = paths
-        .into_iter()
-        .map(|p| library::safe_resolve_path(&p))
-        .filter(|p| p.is_file())
-        .filter_map(library::entry_from_path)
-        .collect();
+    let mut entries = Vec::new();
+    for path in paths {
+        let path = library::safe_resolve_path(&path);
+        let Ok(metadata) = path.metadata() else {
+            continue;
+        };
+        if metadata.is_dir() {
+            entries.extend(library::scan_local_or_share(&path).entries);
+        } else if metadata.is_file()
+            && let Some(entry) = library::entry_from_path(path)
+        {
+            entries.push(entry);
+        }
+    }
+    crate::catalog::dedup_suffix(&mut entries, 0, |entry| &entry.path);
     let first = entries.first()?;
     let folder = first
         .path
@@ -176,6 +185,25 @@ mod tests {
 
         assert!(prepare(&dir.join("missing.mp4"), None).is_err());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn multi_open_expands_folders_in_place_without_repeating_files() {
+        let dir = std::env::temp_dir().join(format!("iris-queue-batch-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in ["b.mp4", "a.mkv", "title.srt"] {
+            std::fs::write(dir.join(name), []).unwrap();
+        }
+        let queue = prepare_queue(vec![dir.join("b.mp4"), dir.clone(), dir.join("a.mkv")]).unwrap();
+        assert_eq!(
+            queue
+                .entries()
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            ["b.mp4", "a.mkv"]
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

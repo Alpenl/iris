@@ -11,6 +11,7 @@ use iris_api::{PluginModal, SourceEntry, StreamVariant};
 use iris_core::catalog::{CatalogItem, MediaFilter};
 use iris_core::preset::{PresetCaptureScope, SidebarMode};
 
+use super::chrome::DirectoryPopup;
 use super::context_menu::ContextMenu;
 use super::kit::text_buffer::TextInputBuffers;
 use super::sidebar::DirRow;
@@ -83,7 +84,6 @@ pub(super) struct PluginSourceView {
     pub(super) auth_hint: Option<String>,
     pub(super) loading: bool,
     pub(super) error: Option<String>,
-    pub(super) active_request_id: String,
 }
 
 /// Tracks which media source is currently browsed in the sidebar `Files` view.
@@ -117,14 +117,54 @@ pub(super) struct ActiveStreamMeta {
     pub(super) active_variant: Option<String>,
 }
 
-/// Pending asynchronous `SourceResolve` request metadata.
-#[derive(Clone, Debug)]
-pub(super) struct PendingResolve {
+#[derive(Debug)]
+pub(super) enum SourceOperation {
+    Browse {
+        append: bool,
+    },
+    Resolve {
+        entry_id: String,
+        title: Option<String>,
+    },
+}
+
+#[derive(Debug)]
+pub(super) struct PendingSource {
     pub(super) req_id: String,
+    pub(super) deadline: Instant,
     pub(super) plugin_id: String,
     pub(super) source_id: String,
-    pub(super) entry_id: String,
-    pub(super) title: Option<String>,
+    pub(super) operation: SourceOperation,
+}
+
+impl PendingSource {
+    pub(super) fn matches(&self, plugin_id: &str, req_id: &str) -> bool {
+        self.plugin_id == plugin_id && self.req_id == req_id
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum StreamReply {
+    Proactive,
+    Requested {
+        source_id: String,
+        entry_id: String,
+        title: Option<String>,
+    },
+}
+
+/// Dropping the window or superseding a load must wake its blocking network read.
+pub(super) struct RemoteLoad {
+    pub(super) cancel: iris_core::vfs::HttpCancel,
+    pub(super) plugin_id: Option<String>,
+    pub(super) source_id: Option<String>,
+    pub(super) _task: gpui::Task<()>,
+}
+
+impl Drop for RemoteLoad {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+    }
 }
 
 /// Unified sidebar catalog & virtual-list browsing state.
@@ -142,7 +182,87 @@ pub(super) struct CatalogState {
     pub(super) thumbs: ThumbCache,
     pub(super) dir_scroll: UniformListScrollHandle,
     pub(super) source_req_seq: u64,
-    pub(super) pending_resolve: Option<PendingResolve>,
+    pub(super) pending_source: Option<PendingSource>,
+    pub(super) source_timeout: Option<gpui::Task<()>>,
+    pub(super) remote_load: Option<RemoteLoad>,
+    pub(super) remote_work_slot: Arc<futures::lock::Mutex<()>>,
+}
+
+impl CatalogState {
+    pub(super) fn take_pending_source(&mut self) -> Option<PendingSource> {
+        let pending = self.pending_source.take()?;
+        self.source_timeout = None;
+        if matches!(pending.operation, SourceOperation::Browse { .. })
+            && let ActiveSource::Plugin(view) = &mut self.active_source
+            && view.plugin_id == pending.plugin_id
+            && view.source_id == pending.source_id
+        {
+            view.loading = false;
+        }
+        Some(pending)
+    }
+
+    pub(super) fn take_reply(
+        &mut self,
+        plugin_id: &str,
+        req_id: &str,
+        accepts: impl FnOnce(&PendingSource) -> bool,
+    ) -> Option<PendingSource> {
+        let pending = self.pending_source.as_ref()?;
+        if pending.matches(plugin_id, req_id) && accepts(pending) {
+            self.take_pending_source()
+        } else {
+            None
+        }
+    }
+
+    pub(super) fn accept_stream(
+        &mut self,
+        plugin_id: &str,
+        req_id: Option<&str>,
+    ) -> Option<StreamReply> {
+        let Some(id) = req_id else {
+            return Some(StreamReply::Proactive);
+        };
+        let pending = self.take_reply(plugin_id, id, |p| {
+            Instant::now() < p.deadline && matches!(p.operation, SourceOperation::Resolve { .. })
+        })?;
+        let SourceOperation::Resolve { entry_id, title } = pending.operation else {
+            unreachable!()
+        };
+        Some(StreamReply::Requested {
+            source_id: pending.source_id,
+            entry_id,
+            title,
+        })
+    }
+
+    pub(super) fn take_page(
+        &mut self,
+        plugin_id: &str,
+        req_id: &str,
+        source_id: &str,
+    ) -> Option<bool> {
+        let pending = self.take_reply(plugin_id, req_id, |p| {
+            Instant::now() < p.deadline
+                && p.source_id == source_id
+                && matches!(p.operation, SourceOperation::Browse { .. })
+        })?;
+        Some(matches!(
+            pending.operation,
+            SourceOperation::Browse { append: true }
+        ))
+    }
+
+    pub(super) fn has_remote_work_for(&self, pid: &str, sid: Option<&str>) -> bool {
+        self.pending_source
+            .as_ref()
+            .is_some_and(|p| p.plugin_id == pid && sid.is_none_or(|s| s == p.source_id))
+            || self.remote_load.as_ref().is_some_and(|load| {
+                load.plugin_id.as_deref() == Some(pid)
+                    && sid.is_none_or(|s| load.source_id.as_deref() == Some(s))
+            })
+    }
 }
 
 impl Default for CatalogState {
@@ -161,14 +281,17 @@ impl Default for CatalogState {
             thumbs: ThumbCache::default(),
             dir_scroll: UniformListScrollHandle::new(),
             source_req_seq: 0,
-            pending_resolve: None,
+            pending_source: None,
+            source_timeout: None,
+            remote_load: None,
+            remote_work_slot: Arc::new(futures::lock::Mutex::new(())),
         }
     }
 }
 
 /// Manages mutually exclusive modals, popovers, command palette, and shortcut recorder.
 pub(super) struct OverlayState {
-    pub(super) dir_popup: bool,
+    pub(super) dir_popup: DirectoryPopup,
     pub(super) settings_open: bool,
     pub(super) settings_tab: SettingsTab,
     pub(super) info_open: bool,
@@ -186,7 +309,7 @@ pub(super) struct OverlayState {
 impl Default for OverlayState {
     fn default() -> Self {
         Self {
-            dir_popup: false,
+            dir_popup: DirectoryPopup::Hidden,
             settings_open: false,
             settings_tab: SettingsTab::Appearance,
             info_open: false,
@@ -205,8 +328,11 @@ impl Default for OverlayState {
 
 impl OverlayState {
     pub(super) fn has_blocking(&self) -> bool {
-        self.dir_popup
-            || self.popover.is_some()
+        self.dir_popup.is_open() || self.has_menu_or_modal()
+    }
+
+    pub(super) fn has_menu_or_modal(&self) -> bool {
+        self.popover.is_some()
             || self.settings_open
             || self.palette_open
             || self.context_menu.is_some()
@@ -231,7 +357,7 @@ impl OverlayState {
     }
 
     pub(super) fn close_all(&mut self) {
-        self.dir_popup = false;
+        self.dir_popup = DirectoryPopup::Hidden;
         self.popover = None;
         self.settings_open = false;
         self.palette_open = false;
@@ -364,8 +490,8 @@ impl OverlayState {
         } else if self.info_open {
             self.info_open = false;
             EscapeStep::CloseInfo
-        } else if self.dir_popup {
-            self.dir_popup = false;
+        } else if self.dir_popup.is_open() {
+            self.dir_popup = DirectoryPopup::Hidden;
             EscapeStep::CloseDirPopup
         } else if buffers.search_open {
             buffers.search_open = false;
@@ -482,5 +608,149 @@ impl ThumbCache {
             }
             self.entries.insert(path, (stamp, img));
         }
+    }
+}
+
+#[cfg(test)]
+mod remote_lifecycle_tests {
+    use super::{
+        ActiveSource, CatalogState, PendingSource, PluginSourceView, RemoteLoad, SourceOperation,
+        StreamReply,
+    };
+    use std::time::{Duration, Instant};
+
+    fn request(id: &str, operation: SourceOperation) -> PendingSource {
+        PendingSource {
+            req_id: id.into(),
+            deadline: Instant::now() + Duration::from_secs(30),
+            plugin_id: "plugin".into(),
+            source_id: "source".into(),
+            operation,
+        }
+    }
+
+    fn resolve(id: &str) -> PendingSource {
+        request(
+            id,
+            SourceOperation::Resolve {
+                entry_id: id.into(),
+                title: Some("selected".into()),
+            },
+        )
+    }
+
+    #[test]
+    fn resolve_only_accepts_the_latest_explicit_reply_once() {
+        let mut catalog = CatalogState {
+            pending_source: Some(resolve("B")),
+            ..Default::default()
+        };
+        assert_eq!(catalog.accept_stream("plugin", Some("A")), None);
+        assert_eq!(catalog.accept_stream("plugin", Some("")), None);
+        assert_eq!(catalog.accept_stream("other", Some("B")), None);
+        assert_eq!(
+            catalog.accept_stream("plugin", None),
+            Some(StreamReply::Proactive)
+        );
+        assert_eq!(
+            catalog.accept_stream("plugin", Some("B")),
+            Some(StreamReply::Requested {
+                source_id: "source".into(),
+                entry_id: "B".into(),
+                title: Some("selected".into())
+            })
+        );
+        assert_eq!(catalog.accept_stream("plugin", Some("B")), None);
+        assert_eq!(catalog.accept_stream("plugin", Some("A")), None);
+    }
+
+    #[test]
+    fn old_errors_cannot_dismiss_a_new_browse_or_consume_its_page() {
+        let mut catalog = CatalogState {
+            pending_source: Some(request("page-2", SourceOperation::Browse { append: true })),
+            source_timeout: Some(gpui::Task::ready(())),
+            ..Default::default()
+        };
+        assert!(catalog.take_reply("plugin", "page-1", |_| true).is_none());
+        assert_eq!(catalog.accept_stream("plugin", Some("page-2")), None);
+        assert_eq!(catalog.take_page("plugin", "page-2", "other-source"), None);
+        assert!(catalog.source_timeout.is_some());
+        assert_eq!(catalog.take_page("plugin", "page-2", "source"), Some(true));
+        assert!(catalog.source_timeout.is_none());
+        assert_eq!(catalog.take_page("plugin", "page-2", "source"), None);
+    }
+
+    #[test]
+    fn timeout_and_navigation_discard_late_replies() {
+        let mut catalog = CatalogState {
+            pending_source: Some(resolve("old")),
+            ..Default::default()
+        };
+        catalog.take_pending_source();
+        assert_eq!(catalog.accept_stream("plugin", Some("old")), None);
+
+        let mut expired = resolve("slow");
+        expired.deadline = Instant::now();
+        catalog.pending_source = Some(expired);
+        // An already queued reply can reach the UI before the deadline callback.
+        assert_eq!(catalog.accept_stream("plugin", Some("slow")), None);
+        assert!(catalog.take_reply("plugin", "slow", |_| true).is_some());
+        assert_eq!(catalog.accept_stream("plugin", Some("slow")), None);
+    }
+
+    #[test]
+    fn silent_browse_expires_and_releases_its_loading_indicator() {
+        let mut slow = request("slow", SourceOperation::Browse { append: false });
+        slow.deadline = Instant::now();
+        let mut catalog = CatalogState {
+            pending_source: Some(slow),
+            source_timeout: Some(gpui::Task::ready(())),
+            active_source: ActiveSource::Plugin(Box::new(PluginSourceView {
+                plugin_id: "plugin".into(),
+                plugin_name: "Plugin".into(),
+                source_id: "source".into(),
+                source_name: "Source".into(),
+                supports_search: false,
+                auth_command_id: None,
+                folder_id: None,
+                parent_id: None,
+                title: String::new(),
+                entries: Vec::new(),
+                next_page: None,
+                authenticated: true,
+                auth_hint: None,
+                loading: true,
+                error: None,
+            })),
+            ..Default::default()
+        };
+        assert_eq!(catalog.take_page("plugin", "slow", "source"), None);
+        assert!(catalog.take_reply("plugin", "earlier", |_| true).is_none());
+        assert!(matches!(&catalog.active_source, ActiveSource::Plugin(v) if v.loading));
+        assert!(catalog.take_reply("plugin", "slow", |_| true).is_some());
+        assert!(matches!(&catalog.active_source, ActiveSource::Plugin(v) if !v.loading));
+        assert!(catalog.source_timeout.is_none());
+        assert_eq!(catalog.take_page("plugin", "slow", "source"), None);
+    }
+
+    #[test]
+    fn replacing_remote_load_cancels_reader_and_serializes_preparation() {
+        let cancel = iris_core::vfs::HttpCancel::default();
+        let mut catalog = CatalogState {
+            remote_load: Some(RemoteLoad {
+                cancel: cancel.clone(),
+                plugin_id: Some("plugin".into()),
+                source_id: Some("source".into()),
+                _task: gpui::Task::ready(()),
+            }),
+            ..Default::default()
+        };
+        let active = catalog.remote_work_slot.try_lock().unwrap();
+        assert!(catalog.has_remote_work_for("plugin", Some("source")));
+        catalog.remote_load = None;
+        assert!(cancel.is_cancelled());
+        assert!(catalog.remote_work_slot.try_lock().is_none());
+        drop(active);
+        assert!(catalog.remote_work_slot.try_lock().is_some());
     }
 }

@@ -1,7 +1,7 @@
 {
   "id": "example.watch-stats",
   "name": "观影计时统计",
-  "version": "0.1.0",
+  "version": "0.0.1",
   "author": "Iris Examples",
   "description": "外部进程插件示例：记录累计实际播放时长并跨会话持久化，在底栏与侧栏展示统计并注册命令面板动作。",
   "protocol": 1,

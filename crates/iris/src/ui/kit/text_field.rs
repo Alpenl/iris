@@ -142,8 +142,10 @@ impl IrisWindow {
             ActiveSlot::Search => Some(&mut self.text_inputs.search_input),
             ActiveSlot::Palette => Some(&mut self.text_inputs.palette_input),
             ActiveSlot::Form => {
-                let key = self.text_inputs.active_form_key.clone()?;
-                Some(self.text_inputs.form_fields.entry(key).or_default())
+                let buffers = &mut self.text_inputs.buffers;
+                buffers
+                    .form_fields
+                    .get_mut(buffers.active_form_key.as_deref()?)
             }
         }
     }
@@ -162,17 +164,22 @@ impl IrisWindow {
         cx.notify();
     }
 
-    pub(in crate::ui) fn focus_form_field(
+    fn focus_form_field(
         &mut self,
         key: String,
         seed: Option<&str>,
+        secret: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.text_inputs
+        let state = self
+            .text_inputs
             .form_fields
             .entry(key.clone())
             .or_insert_with(|| TextInputState::with_text(seed.unwrap_or("")));
+        if secret {
+            state.mark_secret();
+        }
         self.text_inputs.active_form_key = Some(key);
         self.text_inputs.form_focus.focus(window);
         cx.notify();
@@ -186,19 +193,17 @@ impl IrisWindow {
     ) -> AnyElement {
         let t = ThemeTokens::of(cx);
         let fallback;
-        let (state_ref, focused, focus_handle, secret, ctx_tag) = match &spec.kind {
+        let (state_ref, focused, focus_handle, ctx_tag) = match &spec.kind {
             TextFieldKind::Search => (
                 &self.text_inputs.search_input,
                 window.is_some_and(|w| self.text_inputs.search_focus.is_focused(w)),
                 self.text_inputs.search_focus.clone(),
-                false,
                 "SearchInput",
             ),
             TextFieldKind::Palette => (
                 &self.text_inputs.palette_input,
                 window.is_some_and(|w| self.text_inputs.palette_focus.is_focused(w)),
                 self.text_inputs.palette_focus.clone(),
-                false,
                 "CommandPalette",
             ),
             TextFieldKind::Form {
@@ -214,18 +219,15 @@ impl IrisWindow {
                     fallback = TextInputState::with_text(seed.as_deref().unwrap_or(""));
                     &fallback
                 };
-                (
-                    st,
-                    is_foc,
-                    self.text_inputs.form_focus.clone(),
-                    *secret,
-                    "FormInput",
-                )
+                if *secret {
+                    st.mark_secret();
+                }
+                (st, is_foc, self.text_inputs.form_focus.clone(), "FormInput")
             }
         };
 
         let is_empty = state_ref.is_empty();
-        let shown = state_ref.display_text_masked(focused, secret);
+        let shown = state_ref.display_text(focused);
         let placeholder = spec.placeholder;
         let (kind_click, kind_key) = (spec.kind.clone(), spec.kind);
         let (focus_ime, entity_ime) = (focus_handle.clone(), cx.entity().clone());
@@ -289,9 +291,9 @@ impl IrisWindow {
                     match &kind_click {
                         TextFieldKind::Search => this.text_inputs.search_focus.focus(w),
                         TextFieldKind::Palette => this.text_inputs.palette_focus.focus(w),
-                        TextFieldKind::Form { key, seed, .. } => {
-                            this.focus_form_field(key.clone(), seed.as_deref(), w, cx)
-                        }
+                        TextFieldKind::Form {
+                            key, seed, secret, ..
+                        } => this.focus_form_field(key.clone(), seed.as_deref(), *secret, w, cx),
                     }
                     cx.stop_propagation();
                     cx.notify();
@@ -333,18 +335,15 @@ impl IrisWindow {
         w: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let (slot, secret) = match kind {
-            TextFieldKind::Search => (ActiveSlot::Search, false),
-            TextFieldKind::Palette => (ActiveSlot::Palette, false),
-            TextFieldKind::Form {
-                key, seed, secret, ..
-            } => {
-                self.text_inputs
-                    .form_fields
-                    .entry(key.clone())
-                    .or_insert_with(|| TextInputState::with_text(seed.as_deref().unwrap_or("")));
-                (ActiveSlot::Form, *secret)
+        let slot = match kind {
+            TextFieldKind::Search => ActiveSlot::Search,
+            TextFieldKind::Palette => ActiveSlot::Palette,
+            TextFieldKind::Form { key, .. }
+                if self.text_inputs.active_form_key.as_deref() == Some(key.as_str()) =>
+            {
+                ActiveSlot::Form
             }
+            TextFieldKind::Form { .. } => return,
         };
         if self
             .slot_ref(slot)
@@ -361,28 +360,20 @@ impl IrisWindow {
                     }
                     cx.notify();
                 }
-                "c" if !secret => {
-                    if let Some(i) = self.slot_ref(slot) {
-                        let s = if i.selected_text().is_empty() {
-                            i.text()
-                        } else {
-                            i.selected_text()
-                        };
-                        if !s.is_empty() {
-                            cx.write_to_clipboard(ClipboardItem::new_string(s.to_string()));
-                        }
+                "c" => {
+                    if let Some(text) = self.slot_ref(slot).and_then(|i| i.clipboard_text(true)) {
+                        cx.write_to_clipboard(ClipboardItem::new_string(text.to_owned()));
                     }
                 }
                 "x" => {
-                    if let Some(i) = self.slot_mut(slot) {
-                        let sel = i.selected_text().to_string();
-                        if !sel.is_empty() {
-                            if !secret {
-                                cx.write_to_clipboard(ClipboardItem::new_string(sel));
-                            }
-                            i.backspace();
-                            self.notify_slot_edited(slot, cx);
+                    if let Some(i) = self.slot_mut(slot)
+                        && !i.selected_range.is_empty()
+                    {
+                        if let Some(text) = i.clipboard_text(false) {
+                            cx.write_to_clipboard(ClipboardItem::new_string(text.to_owned()));
                         }
+                        i.backspace();
+                        self.notify_slot_edited(slot, cx);
                     }
                 }
                 "v" => {
@@ -488,9 +479,7 @@ impl EntityInputHandler for IrisWindow {
         _: &mut Context<Self>,
     ) -> Option<String> {
         let i = self.slot_ref(self.active_slot(w)?)?;
-        let r = i.range_from_utf16(&r16);
-        adj.replace(i.range_to_utf16(&r));
-        Some(i.content[r].to_string())
+        i.native_text_for_range(r16, adj)
     }
     fn selected_text_range(
         &mut self,
@@ -560,6 +549,6 @@ impl EntityInputHandler for IrisWindow {
         _: &mut Context<Self>,
     ) -> Option<usize> {
         let i = self.slot_ref(self.active_slot(w)?)?;
-        Some(i.offset_to_utf16(i.content.len()))
+        Some(i.offset_to_utf16(i.text().len()))
     }
 }

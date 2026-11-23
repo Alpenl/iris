@@ -168,7 +168,7 @@ impl Mpv {
         // SAFETY: `self.handle` is valid and `n`, `v` are NUL-terminated `CString`s.
         check(
             unsafe { sys::mpv_set_option_string(self.handle, n.as_ptr(), v.as_ptr()) },
-            || format!("set_option {name}={value}"),
+            || format!("set_option {name}"),
         )
     }
 
@@ -197,7 +197,7 @@ impl Mpv {
         // kept alive by `owned` for the duration of the call.
         check(
             unsafe { sys::mpv_command(self.handle, ptrs.as_mut_ptr()) },
-            || format!("command {args:?}"),
+            || format!("command {}", args.first().copied().unwrap_or("<empty>")),
         )
     }
 
@@ -210,7 +210,12 @@ impl Mpv {
         // kept alive by `owned` until `mpv_command_async` returns.
         check(
             unsafe { sys::mpv_command_async(self.handle, 0, ptrs.as_mut_ptr()) },
-            || format!("command_async {args:?}"),
+            || {
+                format!(
+                    "command_async {}",
+                    args.first().copied().unwrap_or("<empty>")
+                )
+            },
         )
     }
 
@@ -311,7 +316,7 @@ impl Mpv {
         // `Vec` buffers, and `CString`s stay alive and unmoved until `mpv_command_node_async` returns.
         check(
             unsafe { sys::mpv_command_node_async(self.handle, 0, &raw mut root_node) },
-            || format!("loadfile_with_options {url}"),
+            || "loadfile_with_options".into(),
         )
     }
 

@@ -1,6 +1,7 @@
 //! Unified directory catalog model (`CatalogItem`) and decoupled playback queue (`PlayQueue`).
 
 use std::cmp::Ordering;
+use std::collections::HashSet;
 
 use iris_api::{SourceEntry, SourceEntryKind, StreamVariant};
 use serde::{Deserialize, Serialize};
@@ -210,6 +211,35 @@ pub fn filter_catalog_items(
         .collect()
 }
 
+/// Compacts a newly appended suffix in input order, without cloning any keys.
+pub(crate) fn dedup_suffix<T, K: Eq + std::hash::Hash + ?Sized>(
+    items: &mut Vec<T>,
+    start: usize,
+    key: impl Fn(&T) -> &K,
+) {
+    if start == items.len() {
+        return;
+    }
+    let mut seen = HashSet::with_capacity(items.len());
+    seen.extend(items[..start].iter().map(&key));
+    let duplicates: Vec<usize> = items[start..]
+        .iter()
+        .enumerate()
+        .filter_map(|(index, item)| (!seen.insert(key(item))).then_some(start + index))
+        .collect();
+    if let Some(&first) = duplicates.first() {
+        let mut duplicates = duplicates.into_iter().peekable();
+        let mut index = first;
+        items
+            .extract_if(first.., |_| {
+                let duplicate = duplicates.next_if_eq(&index).is_some();
+                index += 1;
+                duplicate
+            })
+            .for_each(drop);
+    }
+}
+
 /// Single playable/viewable item inside [`PlayQueue`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QueueItem {
@@ -292,13 +322,10 @@ impl PlayQueue {
 
     /// Appends multiple `QueueItem`s, deduplicating by `uri`. Returns count inserted.
     pub fn extend(&mut self, extra: impl IntoIterator<Item = QueueItem>) -> usize {
-        let mut added = 0;
-        for item in extra {
-            if self.push(item) {
-                added += 1;
-            }
-        }
-        added
+        let start = self.items.len();
+        self.items.extend(extra);
+        dedup_suffix(&mut self.items, start, |item| &item.uri);
+        self.items.len() - start
     }
 
     /// Appends all media items from `catalog_items` (skipping folders), deduplicating by `uri`.
@@ -341,13 +368,7 @@ impl PlayQueue {
     }
 
     pub fn dedup(&mut self) {
-        let mut kept: Vec<QueueItem> = Vec::with_capacity(self.items.len());
-        for item in self.items.drain(..) {
-            if !kept.iter().any(|existing| existing.uri == item.uri) {
-                kept.push(item);
-            }
-        }
-        self.items = kept;
+        dedup_suffix(&mut self.items, 0, |item| &item.uri);
     }
 
     pub fn sort_by_title(&mut self, ascending: bool) {
@@ -443,6 +464,30 @@ mod tests {
             filter_catalog_items(&items, "", MediaFilter::FavoritesOnly, |u| u == &fav_uri);
         assert_eq!(only_fav.len(), 1);
         assert_eq!(only_fav[0].name, "ep2.mkv");
+    }
+
+    #[test]
+    fn bulk_queue_keeps_first_occurrence_and_input_order() {
+        let make_item = |i: usize, title: &str| {
+            QueueItem::new(
+                MediaUri::Local(format!("{i}.mp4").into()),
+                title,
+                Kind::Video,
+            )
+        };
+        let mut queue = PlayQueue::new();
+        queue.push(make_item(0, "existing"));
+        assert_eq!(
+            queue.extend(
+                (0..10_000).flat_map(|i| [make_item(i, "first"), make_item(i, "duplicate")])
+            ),
+            9_999
+        );
+        assert_eq!(queue.len(), 10_000);
+        assert_eq!(queue.items()[0].title, "existing");
+        for (i, item) in queue.items().iter().enumerate().skip(1) {
+            assert_eq!(item, &make_item(i, "first"));
+        }
     }
 
     #[test]

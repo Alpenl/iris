@@ -179,6 +179,23 @@ impl MediaUri {
         MediaUri::Local(PathBuf::from(s))
     }
 
+    /// Direct URLs with userinfo, queries or fragments are session-only. Parameter
+    /// names cannot reliably distinguish a resource selector from a bearer token.
+    /// A plugin-provided stable identity is independent of its playback URL.
+    pub fn may_share_identity(&self) -> bool {
+        match self {
+            Self::HttpUrl(raw) => Url::parse(raw).is_ok_and(|url| {
+                matches!(url.scheme(), "http" | "https")
+                    && url.host().is_some()
+                    && url.username().is_empty()
+                    && url.password().is_none()
+                    && url.query().is_none()
+                    && url.fragment().is_none()
+            }),
+            Self::Local(_) | Self::Plugin { .. } => true,
+        }
+    }
+
     pub fn is_local(&self) -> bool {
         matches!(self, MediaUri::Local(_))
     }

@@ -139,11 +139,7 @@ impl PluginManager {
         if self.external_dir_override.is_some() {
             self.external_dir_override = Some(external_dir.map(Path::to_path_buf));
         }
-        for p in self.plugins.values_mut() {
-            p.stop_runtime();
-        }
-        self.plugins.clear();
-        while self.builtin_rx.try_recv().is_ok() {}
+        self.shutdown();
 
         let mut report = PollReport {
             commands: Vec::new(),
@@ -219,6 +215,25 @@ impl PluginManager {
             snapshot,
             loaded,
         )
+    }
+
+    /// Deliver shutdown and release all plugin-owned processes and slots. Safe to call again.
+    pub fn shutdown(&mut self) {
+        // Start each plugin's grace period before waiting for any one of them.
+        for plugin in self.plugins.values_mut() {
+            if let Runtime::External {
+                proc: Some(process),
+                ..
+            } = &mut plugin.runtime
+            {
+                process.request_shutdown();
+            }
+        }
+        for plugin in self.plugins.values_mut() {
+            plugin.stop_runtime();
+        }
+        self.plugins.clear();
+        while self.builtin_rx.try_recv().is_ok() {}
     }
 
     pub fn set_enabled(&mut self, id: &str, enabled: bool) -> PollReport {
@@ -319,12 +334,20 @@ impl PluginManager {
             .collect()
     }
 
-    pub fn overlay_nodes(&self) -> Vec<(&str, &OverlayNode)> {
+    pub fn overlay_nodes(&self) -> impl Iterator<Item = (&str, &OverlayNode)> {
+        let mut remaining = 2048;
         self.plugins
             .values()
             .filter(|p| p.is_running())
             .flat_map(|p| p.overlay.iter().map(move |n| (p.manifest.id.as_str(), n)))
-            .collect()
+            .take_while(move |(_, node)| {
+                let cost = slots::overlay_elements(node);
+                if cost > remaining {
+                    return false;
+                }
+                remaining -= cost;
+                true
+            })
     }
 
     pub fn toolbar_buttons(&self) -> Vec<(&str, &ToolbarButton)> {
@@ -447,11 +470,24 @@ impl PluginManager {
         report
     }
 
-    pub fn send_to(&mut self, plugin_id: &str, event: HostEvent) -> PollReport {
+    pub fn send_to(&mut self, plugin_id: &str, mut event: HostEvent) -> PollReport {
         let (vault, state_dir) = (&self.vault, self.state_dir.as_deref());
         let Some(loaded) = self.plugins.get_mut(plugin_id).filter(|l| l.is_running()) else {
             return PollReport::default();
         };
+        if !loaded.manifest.has_permission(Permission::ReadState) {
+            match &mut event {
+                HostEvent::Init { snapshot, .. }
+                | HostEvent::Action { snapshot, .. }
+                | HostEvent::Command { snapshot, .. } => *snapshot = PlaybackSnapshot::default(),
+                HostEvent::MediaOpened { .. }
+                | HostEvent::StateChanged { .. }
+                | HostEvent::Tick { .. } => {
+                    return PollReport::default();
+                }
+                _ => {}
+            }
+        }
         let mut report = PollReport::default();
         if let HostEvent::ModalCancel { id } = &event
             && loaded.modal.as_ref().is_some_and(|m| &m.id == id)
@@ -462,5 +498,50 @@ impl PluginManager {
         let mut encoded = None;
         dispatch_to_loaded(loaded, &event, &mut encoded, vault, state_dir, &mut report);
         report
+    }
+}
+
+impl Drop for PluginManager {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn visible_overlays_share_one_expanded_frame_budget() {
+        let (mut manager, _) =
+            PluginManager::new_empty(None, Some(None), CredentialVault::in_memory());
+        for i in 0..8 {
+            let id = format!("test.overlay-{i}");
+            let mut plugin = LoadedPlugin::new(
+                None,
+                iris_api::PluginManifest {
+                    id: id.clone(),
+                    ..Default::default()
+                },
+                PluginSource::Builtin,
+                true,
+                Runtime::Declarative,
+            );
+            plugin.overlay = vec![
+                OverlayNode::Grid {
+                    cols: 16,
+                    rows: 16,
+                    color: iris_api::Color::White,
+                    opacity: 0.5
+                };
+                16
+            ];
+            manager.plugins.insert(id, plugin);
+        }
+        let cost: usize = manager
+            .overlay_nodes()
+            .map(|(_, node)| slots::overlay_elements(node))
+            .sum();
+        assert_eq!(cost, (2048 / 30) * 30);
     }
 }

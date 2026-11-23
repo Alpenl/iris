@@ -1,7 +1,6 @@
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
-use std::net::{TcpListener, UdpSocket};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::net::TcpListener;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
@@ -130,6 +129,9 @@ fn chunked_decoding_and_credential_stripping_across_redirect() {
     headers.insert("Authorization".into(), "Bearer super-secret".into());
     headers.insert("Proxy-Authorization".into(), "Basic dXNlcjpwYXNz".into());
     headers.insert("Cookie".into(), "sid=12345".into());
+    headers.insert("X-Iris-Bridge-Token".into(), "source-only".into());
+    headers.insert("Referer".into(), "https://origin.example/signed".into());
+    headers.insert("User-Agent".into(), "private-user-agent".into());
 
     let payload = fetch_head_bytes(
         &format!("http://127.0.0.1:{redirect_port}/start"),
@@ -146,79 +148,35 @@ fn chunked_decoding_and_credential_stripping_across_redirect() {
     assert!(!forwarded.contains("authorization:"));
     assert!(!forwarded.contains("proxy-authorization:"));
     assert!(!forwarded.contains("cookie:"));
+    assert!(!forwarded.contains("x-iris-bridge-token:"));
+    assert!(!forwarded.contains("referer:"));
+    assert!(!forwarded.contains("private-user-agent"));
     assert!(forwarded.contains("range: bytes=0-63"));
 }
 
 #[test]
-fn redirect_ssrf_blocks_link_local_file_scheme_and_external_to_loopback() {
-    // 1. Redirect to link-local metadata IP (169.254.169.254) is blocked before connecting.
-    let redir_meta = TcpListener::bind("127.0.0.1:0").unwrap();
-    let meta_port = redir_meta.local_addr().unwrap().port();
-    let srv1 = thread::spawn(move || {
-        let (mut sock, _) = redir_meta.accept().unwrap();
-        let mut buf = [0u8; 1024];
-        let _ = sock.read(&mut buf);
-        sock.write_all(
-            b"HTTP/1.1 302 Found\r\nLocation: http://169.254.169.254/latest/meta-data/\r\nContent-Length: 0\r\n\r\n",
-        )
-        .unwrap();
-    });
-    assert!(
-        fetch_head_bytes(
-            &format!("http://127.0.0.1:{meta_port}/a.jpg"),
-            &BTreeMap::new(),
-            32
-        )
-        .is_err()
+fn redirects_revalidate_schemes_and_private_hosts_before_connecting() {
+    let second = TcpListener::bind("127.0.0.1:0").unwrap();
+    let other_host = format!(
+        "http://localhost:{}/other",
+        second.local_addr().unwrap().port()
     );
-    srv1.join().unwrap();
-
-    // 2. Non-loopback LAN listener redirecting to 127.0.0.1:<port> is blocked by SSRF guard.
-    let lan_ip = UdpSocket::bind("0.0.0.0:0")
-        .and_then(|s| {
-            s.connect("192.0.2.1:80")?;
-            Ok(s.local_addr()?.ip())
-        })
-        .ok()
-        .filter(|ip| !ip.is_loopback() && !ip.is_unspecified());
-
-    if let Some(ip) = lan_ip
-        && let Ok(ext_listener) = TcpListener::bind((ip, 0))
-    {
-        let ext_addr = ext_listener.local_addr().unwrap();
-        let victim_listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let victim_port = victim_listener.local_addr().unwrap().port();
-        let victim_hit = Arc::new(AtomicBool::new(false));
-        let victim_hit_srv = Arc::clone(&victim_hit);
-
-        let _ = victim_listener.set_nonblocking(true);
-        let ext_srv = thread::spawn(move || {
-            let (mut sock, _) = ext_listener.accept().unwrap();
-            let mut buf = [0u8; 1024];
-            let _ = sock.read(&mut buf);
-            let resp = format!(
-                "HTTP/1.1 301 Moved Permanently\r\nLocation: http://127.0.0.1:{victim_port}/secret\r\nContent-Length: 0\r\n\r\n"
-            );
-            sock.write_all(resp.as_bytes()).unwrap();
+    second.set_nonblocking(true).unwrap();
+    for location in ["ftp://localhost/unsupported", &other_host] {
+        let origin = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/media", origin.local_addr().unwrap());
+        thread::scope(|scope| {
+            scope.spawn(|| {
+                let (mut socket, _) = origin.accept().unwrap();
+                let _ = socket.read(&mut [0; 2048]);
+                write!(
+                    socket,
+                    "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\n\r\n"
+                )
+                .unwrap();
+            });
+            assert!(fetch_head_bytes(&url, &BTreeMap::new(), 32).is_err());
         });
-
-        let res = fetch_head_bytes(
-            &format!("http://{ext_addr}/public.jpg"),
-            &BTreeMap::new(),
-            32,
-        );
-        assert!(
-            res.is_err(),
-            "external -> loopback redirect must fail closed"
-        );
-        ext_srv.join().unwrap();
-
-        if victim_listener.accept().is_ok() {
-            victim_hit_srv.store(true, Ordering::SeqCst);
-        }
-        assert!(
-            !victim_hit.load(Ordering::SeqCst),
-            "loopback victim listener must never receive redirected request"
-        );
+        assert!(matches!(second.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock));
     }
 }

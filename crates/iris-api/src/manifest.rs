@@ -117,7 +117,7 @@ impl Default for PluginManifest {
         Self {
             id: String::new(),
             name: String::new(),
-            version: "0.1.0".into(),
+            version: env!("CARGO_PKG_VERSION").into(),
             author: String::new(),
             description: String::new(),
             protocol: PROTOCOL_VERSION,
@@ -210,7 +210,6 @@ mod tests {
         let mut m = PluginManifest {
             id: "acme.stats".into(),
             name: "Stats".into(),
-            version: "0.1.0".into(),
             protocol: PROTOCOL_VERSION,
             entry: Some("main.py".into()),
             permissions: vec![Permission::ReadState],

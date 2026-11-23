@@ -137,12 +137,8 @@ impl IrisWindow {
             .flex()
             .flex_col()
             .bg(if floating { t.overlay } else { t.panel })
-            .when(!floating && side == Side::Left, |d| {
-                d.border_r_1().border_color(t.line)
-            })
-            .when(!floating && side == Side::Right, |d| {
-                d.border_l_1().border_color(t.line)
-            })
+            .when(side == Side::Left, |d| d.border_r_1().border_color(t.line))
+            .when(side == Side::Right, |d| d.border_l_1().border_color(t.line))
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .child(
                 div()

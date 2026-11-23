@@ -42,14 +42,22 @@ pub(crate) struct PinchEvent {
     pub(crate) position: [f64; 2],
 }
 
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum MediaKey {
     Play,
     Pause,
+    #[cfg(target_os = "macos")]
     Toggle,
     Next,
     Prev,
+    #[cfg(target_os = "windows")]
+    Seek(f64),
+}
+
+pub(crate) struct NowPlaying<'a> {
+    pub(crate) title: std::borrow::Cow<'a, str>,
+    pub(crate) is_video: bool,
+    pub(crate) state: &'a iris_core::player::PlaybackState,
 }
 
 /// Default folder for saved screenshots (`Desktop` on macOS, `Pictures`/`Desktop` on Windows).

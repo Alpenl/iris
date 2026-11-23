@@ -2,6 +2,9 @@
 #ifndef AppVersion
   #error AppVersion is required
 #endif
+#if Copy(AppVersion, 1, 4) != "0.0."
+  #error Only 0.0.x Iris packages are authorized
+#endif
 #ifndef Payload
   #error Payload is required
 #endif
@@ -24,8 +27,18 @@ UninstallDisplayIcon={app}\iris.exe
 LicenseFile={#LicenseFile}
 CloseApplications=yes
 RestartApplications=no
+ChangesAssociations=yes
 [Files]
 Source: "{#Payload}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+[Registry]
+Root: HKCU; Subkey: "Software\Classes\Iris.Media"; ValueType: string; ValueData: "Iris media"; Flags: uninsdeletekey
+Root: HKCU; Subkey: "Software\Classes\Iris.Media\DefaultIcon"; ValueType: string; ValueData: "{app}\iris.exe,0"
+Root: HKCU; Subkey: "Software\Classes\Iris.Media\shell\open\command"; ValueType: string; ValueData: """{app}\iris.exe"" ""%1"""
+#define Extensions "mp4 m4v mkv mov webm avi ts m2ts flv wmv mpg mpeg jpg jpeg png webp gif heic heif avif tif tiff bmp mp3 flac wav m4a aac ogg opus alac aiff wma "
+#sub RegisterExtension
+Root: HKCU; Subkey: "Software\Classes\.{#Copy(Extensions, 1, Pos(" ", Extensions) - 1)}\OpenWithProgids"; ValueType: string; ValueName: "Iris.Media"; ValueData: ""; Flags: uninsdeletevalue uninsdeletekeyifempty
+#endsub
+#for {0; Len(Extensions) > 0; Extensions = Copy(Extensions, Pos(" ", Extensions) + 1, Len(Extensions))} RegisterExtension
 [Icons]
 Name: "{group}\Iris"; Filename: "{app}\iris.exe"; WorkingDir: "{app}"
 Name: "{userdesktop}\Iris"; Filename: "{app}\iris.exe"; WorkingDir: "{app}"; Tasks: desktopicon

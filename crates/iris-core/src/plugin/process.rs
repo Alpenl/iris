@@ -1,16 +1,24 @@
 //! Out-of-process stdio plugin transport, bounded JSON line reader, and wake signaling.
 
+use std::cell::Cell;
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::path::Path;
-use std::process::{Child, Command as ProcessCommand, Stdio};
+#[cfg(unix)]
+use std::process::{Child, Stdio};
+use std::process::{Command as ProcessCommand, ExitStatus};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
-use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
 use iris_api::{HostCommand, HostEvent, HostMessageRef, PluginManifest, PluginMessage};
+
+#[cfg(windows)]
+#[path = "windows_process.rs"]
+mod windows;
+#[cfg(windows)]
+use windows::Child;
 
 /// Maximum JSON line accepted from an external plugin (2 MiB, fits large `ProvideSourcePage` payloads).
 pub(super) const MAX_LINE_BYTES: usize = 2 * 1024 * 1024;
@@ -20,6 +28,19 @@ pub(super) const MAX_DRAIN_PER_POLL: usize = 256;
 const SHUTDOWN_GRACE: Duration = Duration::from_millis(150);
 const MAX_STDERR_LINES: usize = 100;
 const MAX_STDERR_LINE_BYTES: usize = 4 * 1024;
+
+// The two callbacks of the line reader share one allowance per process/stream.
+struct LogBudget(Cell<u16>);
+
+impl LogBudget {
+    fn take(&self) -> bool {
+        let Some(left) = self.0.get().checked_sub(1) else {
+            return false;
+        };
+        self.0.set(left);
+        true
+    }
+}
 
 /// Coalesced event-driven wake signal from plugin background threads to the UI loop.
 #[derive(Clone)]
@@ -103,10 +124,55 @@ pub(super) fn read_bounded_lines(
 
 pub(super) struct ExternalProcess {
     child: Child,
-    stdin_tx: Option<SyncSender<Arc<String>>>,
-    writer_thread: Option<JoinHandle<()>>,
-    rx: Receiver<PluginMessage>,
+    stdin_tx: Option<SyncSender<(Arc<String>, bool)>>,
+    tick_pending: Arc<AtomicBool>,
+    rx: Receiver<Vec<HostCommand>>,
     disconnected: bool,
+    stop_deadline: Option<Instant>,
+}
+
+#[cfg(unix)]
+fn child_status(child: &mut Child) -> std::io::Result<Option<ExitStatus>> {
+    use std::os::unix::process::ExitStatusExt;
+    // Keep the leader waitable until the group has been signalled. Reaping it early
+    // could let the OS recycle its process-group ID before shutdown.
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    if unsafe {
+        libc::waitid(
+            libc::P_PID,
+            child.id(),
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    } != 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    if unsafe { info.si_pid() } == 0 {
+        return Ok(None);
+    }
+    let code = unsafe { info.si_status() };
+    let raw = match info.si_code {
+        libc::CLD_EXITED => code << 8,
+        libc::CLD_DUMPED => code | 0x80,
+        _ => code,
+    };
+    Ok(Some(ExitStatus::from_raw(raw)))
+}
+
+#[cfg(windows)]
+fn child_status(child: &mut Child) -> std::io::Result<Option<ExitStatus>> {
+    child.status()
+}
+
+fn exit_reason(status: ExitStatus) -> String {
+    #[cfg(target_os = "macos")]
+    if std::os::unix::process::ExitStatusExt::signal(&status) == Some(libc::SIGKILL) {
+        return format!(
+            "进程已退出 ({status})。请查看系统日志并核验插件来源、签名和 Gatekeeper 提示。"
+        );
+    }
+    format!("进程已退出 ({status})")
 }
 
 impl ExternalProcess {
@@ -149,40 +215,66 @@ impl ExternalProcess {
         } else {
             ProcessCommand::new(&canonical_entry)
         };
-        cmd.args(&manifest.args)
-            .current_dir(&canonical_dir)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        #[cfg(target_os = "windows")]
-        {
-            use std::os::windows::process::CommandExt;
-            cmd.creation_flags(0x0800_0000);
-        }
-        let mut child = cmd.spawn().map_err(|e| format!("spawn failed: {e}"))?;
-        let mut stdin = child.stdin.take().ok_or("missing stdin pipe")?;
-        let stdout = child.stdout.take().ok_or("missing stdout pipe")?;
-        let stderr = child.stderr.take();
+        cmd.args(&manifest.args).current_dir(&canonical_dir);
+        #[cfg(windows)]
+        let (child, mut stdin, stdout, stderr) =
+            windows::spawn(&cmd).map_err(|e| format!("plugin job launch failed: {e}"))?;
+        #[cfg(unix)]
+        let (child, mut stdin, stdout, stderr) = {
+            use std::os::unix::process::CommandExt;
+            let mut child = cmd
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .process_group(0)
+                .spawn()
+                .map_err(|e| {
+                    #[cfg(target_os = "macos")]
+                    if e.kind() == ErrorKind::PermissionDenied {
+                        return format!(
+                            "spawn failed: {e}. 请核验插件来源、执行权限、签名和 Gatekeeper 提示。"
+                        );
+                    }
+                    format!("spawn failed: {e}")
+                })?;
+            let stdin = child.stdin.take().ok_or("missing stdin pipe")?;
+            let stdout = child.stdout.take().ok_or("missing stdout pipe")?;
+            let stderr = child.stderr.take().ok_or("missing stderr pipe")?;
+            (child, stdin, stdout, stderr)
+        };
 
-        let (stdin_tx, stdin_rx) = mpsc::sync_channel::<Arc<String>>(MAX_STDIN_QUEUE);
+        let (stdin_tx, stdin_rx) = mpsc::sync_channel::<(Arc<String>, bool)>(MAX_STDIN_QUEUE);
+        let tick_pending = Arc::new(AtomicBool::new(false));
+        let writer_tick = Arc::clone(&tick_pending);
         let pid_w = manifest.id.clone();
-        let writer_thread = std::thread::Builder::new()
+        let writer = std::thread::Builder::new()
             .name(format!("iris-plugin-w-{pid_w}"))
             .spawn(move || {
-                while let Ok(line) = stdin_rx.recv() {
+                while let Ok((line, tick)) = stdin_rx.recv() {
                     if stdin.write_all(line.as_bytes()).is_err() || stdin.flush().is_err() {
-                        break;
+                        return;
+                    }
+                    if tick {
+                        writer_tick.store(false, Ordering::Relaxed);
                     }
                 }
-            })
-            .ok();
+                // Disconnecting the sender requests shutdown without competing for a queue slot.
+                // Dropping this thread's stdin handle then delivers EOF to the protocol reader.
+                if let Ok(shutdown) = encode_event(&HostEvent::Shutdown) {
+                    let _ = stdin
+                        .write_all(shutdown.as_bytes())
+                        .and_then(|()| stdin.flush());
+                }
+            });
 
         let (tx, rx) = mpsc::sync_channel(MAX_STDOUT_QUEUE);
         let plugin_id = manifest.id.clone();
         let wake_out = wake.clone();
-        let _ = std::thread::Builder::new()
+        let reader = std::thread::Builder::new()
             .name(format!("iris-plugin-r-{plugin_id}"))
             .spawn(move || {
+                let warnings = LogBudget(Cell::new(16));
+                let logs = LogBudget(Cell::new(100));
                 read_bounded_lines(
                     stdout,
                     MAX_LINE_BYTES,
@@ -195,22 +287,45 @@ impl ExternalProcess {
                             return true;
                         }
                         match serde_json::from_str::<PluginMessage>(trimmed) {
-                            Ok(msg) => match tx.try_send(msg) {
+                            Ok(PluginMessage::Commands { mut commands }) => {
+                                // Protect the inter-thread queue too. One oversized overlay does
+                                // not invalidate a source-page reply in the same batch.
+                                commands.retain(|command| {
+                                    if let HostCommand::SetOverlay { nodes } = command
+                                        && !super::slots::overlay_fits(nodes)
+                                    {
+                                        if warnings.take() {
+                                            log::warn!("plugin {plugin_id} exceeded overlay budget");
+                                        }
+                                        return false;
+                                    }
+                                    true
+                                });
+                                if commands.is_empty() { return true; }
+                                match tx.try_send(commands) {
                                 Ok(()) => {
                                     if let Some(w) = &wake_out {
                                         w.notify();
                                     }
                                 }
                                 Err(TrySendError::Full(_)) => {
-                                    log::warn!("plugin {plugin_id} output queue full; dropping");
+                                    if warnings.take() {
+                                        log::warn!("plugin {plugin_id} output queue full; dropping");
+                                    }
                                 }
                                 Err(TrySendError::Disconnected(_)) => return false,
-                            },
-                            Err(e) => log::warn!("plugin {plugin_id} invalid JSON: {e}"),
+                                }
+                            }
+                            Ok(PluginMessage::Log { message }) if logs.take() => {
+                                let end = message.floor_char_boundary(MAX_STDERR_LINE_BYTES.min(message.len()));
+                                log::info!(target: "iris::plugin", "[{plugin_id}] {}", message[..end].escape_debug());
+                            }
+                            Err(e) if warnings.take() => log::warn!("plugin {plugin_id} invalid JSON (line {}, column {})", e.line(), e.column()),
+                            _ => {}
                         }
                         true
                     },
-                    || log::warn!("plugin {plugin_id} exceeded max line ({MAX_LINE_BYTES} B)"),
+                    || { if warnings.take() { log::warn!("plugin {plugin_id} exceeded max line ({MAX_LINE_BYTES} B)"); } },
                 );
                 drop(tx);
                 if let Some(w) = &wake_out {
@@ -219,9 +334,9 @@ impl ExternalProcess {
             });
 
         // Drain stderr continuously until EOF even after `MAX_STDERR_LINES` so plugins never get SIGPIPE.
-        if let Some(stderr) = stderr {
+        let stderr_reader = {
             let pid_e = manifest.id.clone();
-            let _ = std::thread::Builder::new()
+            std::thread::Builder::new()
                 .name(format!("iris-plugin-e-{pid_e}"))
                 .spawn(move || {
                     let mut logged = 0usize;
@@ -233,7 +348,7 @@ impl ExternalProcess {
                                 let text = String::from_utf8_lossy(buf);
                                 let trimmed = text.trim();
                                 if !trimmed.is_empty() {
-                                    log::warn!(target: "iris::plugin::stderr", "[{pid_e}] {trimmed}");
+                                    log::warn!(target: "iris::plugin::stderr", "[{pid_e}] {}", trimmed.escape_debug());
                                     logged += 1;
                                 }
                             }
@@ -241,16 +356,23 @@ impl ExternalProcess {
                         },
                         || {},
                     );
-                });
-        }
+                })
+        };
 
-        Ok(Self {
+        let process = Self {
             child,
             stdin_tx: Some(stdin_tx),
-            writer_thread,
+            tick_pending,
             rx,
             disconnected: false,
-        })
+            stop_deadline: None,
+        };
+        writer
+            .and(reader)
+            .and(stderr_reader)
+            .map(|_| ())
+            .map_err(|e| format!("plugin pipe thread failed: {e}"))?;
+        Ok(process)
     }
 
     pub(super) fn send_encoded(
@@ -259,9 +381,16 @@ impl ExternalProcess {
         droppable: bool,
     ) -> Result<(), String> {
         let tx = self.stdin_tx.as_ref().ok_or("plugin stdin closed")?;
-        match tx.try_send(line) {
+        // One pending tick is enough. A burst of position updates must leave room for user commands.
+        if droppable && self.tick_pending.swap(true, Ordering::Relaxed) {
+            return Ok(());
+        }
+        match tx.try_send((line, droppable)) {
             Ok(()) => Ok(()),
-            Err(TrySendError::Full(_)) if droppable => Ok(()),
+            Err(TrySendError::Full(_)) if droppable => {
+                self.tick_pending.store(false, Ordering::Relaxed);
+                Ok(())
+            }
             Err(TrySendError::Full(_)) => Err("plugin stdin queue full (unresponsive)".into()),
             Err(TrySendError::Disconnected(_)) => Err("plugin stdin closed".into()),
         }
@@ -278,10 +407,7 @@ impl ExternalProcess {
         let mut cmds = Vec::new();
         for _ in 0..MAX_DRAIN_PER_POLL {
             match self.rx.try_recv() {
-                Ok(PluginMessage::Commands { commands }) => cmds.extend(commands),
-                Ok(PluginMessage::Log { message }) => {
-                    log::info!(target: "iris::plugin", "{message}")
-                }
+                Ok(commands) => cmds.extend(commands),
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     self.disconnected = true;
@@ -289,37 +415,43 @@ impl ExternalProcess {
                 }
             }
         }
-        let exited = self.disconnected.then(|| match self.child.try_wait() {
-            Ok(Some(status)) => format!("进程已退出 ({status})"),
-            Ok(None) => "输出通道已关闭".into(),
-            Err(e) => format!("进程状态异常: {e}"),
-        });
+        let exited = self
+            .disconnected
+            .then(|| match child_status(&mut self.child) {
+                Ok(Some(status)) => exit_reason(status),
+                Ok(None) => "输出通道已关闭".into(),
+                Err(e) => format!("进程状态异常: {e}"),
+            });
         (cmds, exited)
     }
 
-    pub(super) fn stop(&mut self) {
-        if let Some(tx) = self.stdin_tx.take()
-            && let Ok(line) = encode_event(&HostEvent::Shutdown)
-        {
-            let _ = tx.try_send(line);
-        }
-        let deadline = Instant::now() + SHUTDOWN_GRACE;
+    pub(super) fn request_shutdown(&mut self) -> Instant {
+        drop(self.stdin_tx.take());
+        *self
+            .stop_deadline
+            .get_or_insert_with(|| Instant::now() + SHUTDOWN_GRACE)
+    }
+
+    fn stop(&mut self) {
+        let deadline = self.request_shutdown();
         loop {
-            match self.child.try_wait() {
+            match child_status(&mut self.child) {
                 Ok(Some(_)) => break,
                 Ok(None) if Instant::now() < deadline => {
                     std::thread::sleep(Duration::from_millis(10));
                 }
-                _ => {
-                    let _ = self.child.kill();
-                    let _ = self.child.wait();
-                    break;
-                }
+                _ => break,
             }
         }
-        if let Some(w) = self.writer_thread.take() {
-            let _ = w.join();
+        // Signal the whole group/job even if the plugin itself exited cooperatively.
+        #[cfg(unix)]
+        {
+            unsafe { libc::kill(-(self.child.id() as libc::pid_t), libc::SIGKILL) };
+            let _ = self.child.kill();
+            let _ = self.child.wait();
         }
+        #[cfg(windows)]
+        self.child.close_job_and_wait();
     }
 }
 
@@ -332,6 +464,37 @@ impl Drop for ExternalProcess {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn log_allowance_stays_exhausted() {
+        let budget = LogBudget(Cell::new(2));
+        assert!(budget.take());
+        assert!(budget.take());
+        for _ in 0..1024 {
+            assert!(!budget.take());
+        }
+    }
+
+    #[test]
+    fn line_limit_accepts_full_two_mib_frame_and_resynchronizes() {
+        let mut bytes = vec![b'a'; MAX_LINE_BYTES - 1];
+        bytes.push(b'\n');
+        bytes.extend(std::iter::repeat_n(b'b', MAX_LINE_BYTES));
+        bytes.extend_from_slice(b"\nok\n");
+        let mut sizes = Vec::new();
+        let mut dropped = 0;
+        read_bounded_lines(
+            bytes.as_slice(),
+            MAX_LINE_BYTES,
+            |line| {
+                sizes.push(line.len());
+                true
+            },
+            || dropped += 1,
+        );
+        assert_eq!(sizes, [MAX_LINE_BYTES, 3]);
+        assert_eq!(dropped, 1);
+    }
 
     #[test]
     fn bounded_line_reader_skips_oversized_lines_without_allocating() {

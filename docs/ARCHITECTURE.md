@@ -25,11 +25,11 @@ crates/
 - `crates/iris-mpv/src/{lib,render,sys}.rs`：手写 C 声明（`sys` 与 `Mpv::raw` 均收紧为 `pub(crate)`）与安全薄封装。短属性名路径采用栈缓冲（`with_cstr`）避免热路径堆分配；提供 `Mpv::loadfile_with_options`（经 `mpv_command_node_async` 构造 `MPV_FORMAT_NODE_MAP` 结构化传递单文件选项与重复键 `http-header-fields-append` / `sub-files-append`，零字符串转义注入风险）；渲染层仅暴露窄能力 `RenderHandle`（OpenGL 与 D3D11 共用）。
 - `crates/iris-mpv/build.rs`：macOS 默认按序检测 `/opt/homebrew/lib` 与 `/usr/local/lib` 的 libmpv；其他平台必须用 `MPV_LIB_DIR` 指定。始终动态链接。
 - `crates/iris-api/src/{lib,manifest,source,workbench,overlay,wire}.rs`：单版本正交插件协议（`PROTOCOL_VERSION = 1`），定义 `PluginManifest`（拒绝绝对路径、盘符与 `..` 穿越，强校验协议版本与权限）、`SourceProviderSpec`/`SourceDescriptor`（支持动态多实例 `SetSources` 与连接管理 `SourceManage`）、`PlaybackSnapshot`、`StreamSpec`、统一声明式控件树 `Widget`（13 种）、`OverlayNode`（7 种）、`UiThemeSpec`/`ChromeLayoutSpec`（保留全量高自由度字段，大命令变体内部 `Box` 化瘦身），以及带异步回调通道 `PluginResponder` 的 `BuiltinPlugin` trait。
-- `crates/iris-core/src/player/{mod,model,prepare,backend,inspect}.rs`：`Session`（内部字段私有化）持有播放状态机、本地目录快照与当前规范化 `MediaUri`，统一处理语义命令、结构化远程流直连（`open_remote` 经 `loadfile_with_options` 直交 `libmpv`，异源或带独立请求头的外挂字幕经有界预取 + `memory://` 挂载防 `Authorization` 跨域泄露）、照片加载选项、动态解码指标与事件批处理。`player::prepare` 在后台线程调用 `library::safe_resolve_path` 与免 `stat` 风暴的 `scan_local_or_share`。
+- `crates/iris-core/src/player/`：`Session` 持有播放状态、本地目录和规范化 `MediaUri`。无自定义头的流交给 libmpv；需携带头的媒体使用会话专属的凭据隔离转发器。独立授权字幕经有界预取挂载。`player::prepare` 在线程池上解析本地路径和目录。
 - `crates/iris-core/src/{media_uri,catalog,store,vault,preset}.rs`：
   - `media_uri.rs`：三元正交寻址 `MediaUri`（`Local` | `HttpUrl` | `Plugin`，自动无损升级历史 `webdav://` URI）。
   - `catalog.rs`：跨本地、插件源与收藏统一的 `CatalogItem` 排序/过滤纯函数，以及与当前浏览文件夹彻底解耦的独立播放队列 `PlayQueue`。
-  - `store.rs`：单表 `MediaUri` 主键的收藏、续播进度（`records.tsv`）与最近打开（`recent.tsv`），纯内存快照由后台线程异步原子落盘。
+  - `store.rs`：以稳定媒体身份保存收藏、续播和最近记录。写入时取得文件锁，重读磁盘、合并修改字段并原子替换。写入失败保留待保存变更，旧记录在迁移成功后退役。
   - `vault.rs`：系统安全凭据库 `CredentialVault`（macOS Keychain / Windows Credential Manager，单条上限 2048B，失败显式报错，绝不降级明文文件；按 `builtin.<id>` 与 `ext.<id>` 物理分桶隔离，测试注入 `in_memory()`）。
   - `preset.rs`：`1B+` 稀疏工作区预设（`Option<T>` 补丁 + 显式插件启停差量与退出指令），`settings.conf` 始终只存纯净个人基线，运行期通过内存 `PresetRevert` 自动回正。
 - `crates/iris-core/src/plugin/`（`mod,types,process,slots,snapshot,builtins,webdav/`）：`PluginManager` 统一托管内置插件（`iris.guides`、`iris.ab-loop` 以及 100% 走标准协议的官方免挂载 `iris.webdav`，保留 `iris.*` 命名空间并通过 `PluginResponder` 后台非阻塞执行网络 `PROPFIND`）、零进程声明式主题插件与外部 JSON-lines stdio 子进程插件（单行上限 2 MiB，`stderr` 超 100 行静默 drain 不断管），通过 `DirtySlots` 值相等脏检测守住全屏 `0 Hz` 空转防线。
@@ -129,13 +129,13 @@ NSWindow contentView
 │  · ThemeTokens│ ◀────────────────────────────────────────────────── │  (iris-core)            │
 │  · 无边框护栏  │  DirtySlots 门控后的 HostCommand (主题/多源/弹窗/流)  │  ├── iris.webdav (内置) │
 │  · ui/kit 原语│                                                     │  ├── iris.guides/ab-loop│
-│  · 统一侧栏    │  mpv_command_node_async (http-header-fields-append) │  ├── DeclarativeTheme   │
-└──────────────┘ ───▶ libmpv 原生网络栈 (HTTPS / Range / HLS / 127.0.0.1)│  └── Vault (builtin/ext)│
-                      └── 256KiB 远程图片色彩头探测 (photo::probe_bytes)└─────────────────────────┘
+│  · 统一侧栏    │  mpv_command_node_async (loadfile)                  │  ├── DeclarativeTheme   │
+└──────────────┘ ───▶ libmpv（无请求头直连，带头流经会话专属转发器）    │  └── Vault (builtin/ext)│
+                      └── 远程图片按预算探测（photo::probe_remote）       └─────────────────────────┘
 ```
 
 - **绝不接触实时像素，保留高自由度控制面定制**：视频与照片帧始终留在原生视频层；本体默认遵循方向 C 模块面板，同时允许插件通过 `UiTheme` / `ChromeLayoutSpec` 自由定制色板、圆角/栏高度量与 `hide_titlebar` 无标题栏影院窗（宿主强制提供顶缘 `absolute()` 悬浮唤醒标题栏、视口修饰键/阈值拖拽与最低对比度逃生护栏）。
-- **零注入直通 `libmpv` 网络栈（淘汰本地流代理网关）**：远程流经 `vfs::validate_stream_url` 阻断 `file://`/`lavfi:` 等伪协议后，通过 `iris-mpv` 的 `mpv_command_node_async`（`MPV_FORMAT_NODE_MAP` 重复键 `http-header-fields-append`）结构化直交 `libmpv`（完整保留系统 TLS、HTTP Keep-Alive、高并发 `Range` 拖拽与 HLS `.m3u8` 分片）；同时放行 `127.0.0.1:<port>=1024..` 供外部 SMBv3/SFTP/私有加密分片插件在子进程内桥接本地流，并在控制面 `http_client` 中拦截外部地址 `30x` 跳往回环/链路本地地址防 SSRF。
+- **播放传输**：宿主验证 HTTP(S) 地址并通过结构化 mpv 命令打开媒体。带请求头的流经仅绑定回环地址的会话转发器：用限时于该播放会话的资源地址处理 HLS 播放列表、密钥与分片，逐次依据源选择请求头。VFS 在实际连接前检查解析后的地址，限制公网跳转到私网。显式授权的局域网 NAS 和高端口回环插件源仍可使用。
 - **全协议插件化与分桶凭据托管（`SetState` + `CredentialVault`）**：内核与 UI 零具体网盘/WebDAV 特判（官方 `iris.webdav` 100% 按标准 `iris-api` 协议实现，经 `PluginResponder` 在后台工作线程执行 `PROPFIND`）。敏感凭据按 `builtin.<id>` 与 `ext.<id>` 物理分桶存入系统安全凭据库（单条上限 2048B，失败显式报错，严禁降级写明文文件）。
 - **异步防卡顿与 `DirtySlots` 全屏 `0 Hz` 门控**：外部子进程单行上限提升至 2 MiB，`stderr` 超 100 行后静默 drain 不断管；仅在槽位实际发生值变化且对当前视图可见时才触发 UI 重绘。
 
@@ -167,7 +167,8 @@ NSWindow contentView
 - **外部插件与凭据隔离**：`plugin.json` 拒绝绝对路径、`..` 穿越与保留前缀 `iris.*`；凭据库按 `builtin.<id>` 与 `ext.<id>` 物理分桶且严禁明文文件降级；stdout 单行限 2 MiB、单次轮询限 256 条消息，`stderr` 超限后静默排空防 `BrokenPipeError`；Windows 子进程启用 `CREATE_NO_WINDOW`。
 - 任意 mpv 控制仅用于 debug／显式 `devtools` 构建，同用户访问，普通 release 不监听；不得把性能测试二进制当发行包。
 - 媒体和所在目录只读；设置、日志、收藏进度（`records.tsv`）、最近打开（`recent.tsv`）与外部插件（`plugins/`）全部保存在系统应用数据目录，不往媒体目录写隐藏文件或缓存（缩略图底条仅驻留内存）。
-- Windows 单实例：`Local\Iris.Player` 互斥量判断是否已有实例；后来的进程把绝对路径（UTF-16，长度前缀，上限 32767 个单位）写进 `\\.\pipe\iris-open-<会话号>-<用户 SID>` 后退出。管道和调试管道共用 `platform::pipe::create_inbound`：只建第一个实例、拒绝远程客户端、DACL 只给当前用户。客户端先用 `GetNamedPipeServerSessionId` 确认服务端在同一登录会话。管道里只有路径，进到界面后和拖入的路径走同一条 `open_path`。设置了 `IRIS_SETTINGS` 的测试实例不参加单实例。
+- Windows 用 `Local\Iris.Player.Batch.<用户 SID>` 互斥量识别当前登录会话中的播放器。后启动的进程向 `\\.\pipe\iris-open-batch-<会话号>-<用户 SID>` 转发整批绝对路径。消息以小端 `u32` 路径数开头，每条路径由小端 `u32` 长度和 UTF-16LE 内容组成。接收端限制每批 16,384 条路径、每条 32,767 个 UTF-16 单位、整批 1,048,576 个单位。空批次唤起已有窗口。管道通过 `platform::pipe::create_inbound` 限制首个实例、拒绝远程客户端，DACL 仅授权当前用户。客户端用 `GetNamedPipeServerSessionId` 检查服务端会话。`IRIS_SETTINGS` 隔离测试实例独立运行。
+- 命令行参数、Finder 的本地文件 URL、文件选择器和视口拖放都把一次选择交给 `open_paths`。单个媒体沿用同目录浏览。多个媒体按选择顺序排队，所选目录在队列中展开一层，同一文件保留首次出现的位置。混选的外挂字幕等待本次媒体加载后依次挂载，单独选中的字幕挂载到正在播放或正在打开的音视频。切换媒体会使上一批待挂载字幕失效。
 
 ## 9. 规划目录树与实际代码
 

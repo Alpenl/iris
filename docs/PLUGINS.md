@@ -2,7 +2,7 @@
 
 Iris 的插件架构从第一性原理出发，围绕四根支柱构建单一、正交的控制面协议（`PROTOCOL_VERSION = 1`）：
 
-1. **全远程协议插件化（`Permission::MediaSource`）**：本地内核仅提供通用网络传输与安全底座，所有远程协议（WebDAV、NAS、S3、Alist、媒体服、直播与各类网盘）100% 通过统一的 `MediaSource` 插件接入（支持动态注册多服务器实例 `SetSources`、连接增删改 `SourceManage`、目录层级、远程关键词搜索、分页加载、多清晰度/线路切换、外挂字幕与扫码/Token 登录）。远程流经宿主校验协议安全后通过 `mpv_command_node_async`（单文件 `http-header-fields-append`）结构化直交 `libmpv` 原生网络栈（零命令行拼接注入风险，完整保留 HTTP Keep-Alive、Range 拖拽与 HLS 分片；同时允许插件返回 `http://127.0.0.1:<port>=1024..` 本地回环流以支撑 SMBv3/SFTP/私有加密分片桥接）；远程图片按需拉取前 256 KiB 文件头完成 Display P3 / Adobe RGB 色彩管理与 EXIF/HEIC 方向校正。
+1. **远程数据源（`media_source`）**：插件通过统一的 `MediaSource` 协议提供目录、搜索、分页、多服务器、授权、播放线路和外挂字幕。提供 `source_id` 与 `entry_id` 可让收藏和续播跨授权更新保持有效。无自定义请求头的媒体由 libmpv 直接打开。带头的媒体经播放会话专属的本地转发器读取，宿主将凭据限定到获授权的源。插件也可自行提供仅绑定回环高端口的流。远程照片从 256 KiB 前缀起步，在请求和字节预算内按需读取后置元数据。
 2. **高自由度参数化工作台与统一声明式控件树（`UiTheme` / `UiToolbar` / `UiSidebar` / `UiModal` / `UiStatus` / `UiOverlay`）**：本体默认保持方向 C 视觉一致，但不限制插件自由度——UI 插件可动态接管全套主题配色令牌（`#RRGGBB[AA]`）、圆角与栏高尺度、无边框影院窗口（`hide_titlebar`，宿主自动提供顶缘叠层唤醒标题栏、视口拖拽与最低对比度逃生护栏）、悬浮控制栏（`floating_dock`）与底栏常驻按钮显隐；侧栏面板（`SidebarPanel`）与非破坏性异步校验弹窗（`PluginModal`）共用同一套 13 种声明式 `Widget` 控件；视口层通过归一化 `OverlayNode` 绘制边框/填充卡片、辅助线、时间码/字幕文本、频谱柱状条与可点击 HUD 按钮。
 3. **原子握手、状态持久化与分桶加密凭据库（`SetState` / `SetSecret`）**：非敏感偏好键值（`state`）由宿主自动落盘，敏感密码/令牌（`secrets`，单条上限 2048B）按 `builtin.<id>` / `ext.<id>` 物理隔离存入系统凭据库（macOS Keychain / Windows Credential Manager，失败显式报错，绝不降级明文文件），并在插件启动时通过单次原子 `Init` 事件连同当前播放快照一并注入。
 4. **像素与安全严格隔离**：解码、色彩空间转换与原生交换链由内核独占，插件绝不经手实时像素数据，且通过 `DirtySlots` 值相等脏检测守住全屏隐藏控制栏下的 `0 Hz` 空转防线。
@@ -73,7 +73,7 @@ Iris 的插件架构从第一性原理出发，围绕四根支柱构建单一、
      "payload": {
        "event": "init",
        "protocol": 1,
-       "host_version": "0.1.0",
+       "host_version": "0.0.1",
        "state": { "skin": "neon" },
        "secrets": { "access_token": "tok_xxx" },
        "snapshot": { "uri": null, "title": null, "kind": null, "position": 0.0, "duration": 0.0, "paused": true, "volume": 100.0, "muted": false, "speed": 1.0, "favorite": false, "chapter": -1, "is_live": false, "buffering": false }
@@ -88,8 +88,8 @@ Iris 的插件架构从第一性原理出发，围绕四根支柱构建单一、
      {"event": "action", "id": "set_opacity", "value": "0.85", "snapshot": { ... }}
      ```
 4. **非破坏性弹窗交互**：用户点击确认时宿主保持弹窗开启（保留已输入内容）并发送 `modal_submit { id, values }`，插件校验成功后显式发送 `close_modal` 关闭弹窗（校验失败仅发 `show_toast` 或更新同 `id` 弹窗即可原地提示）；用户按 `Esc` 或取消时宿主强制立即关窗并发送 `modal_cancel { id }`。
-5. **虚拟数据源请求与多实例管理**：`source_browse { request_id, source_id, folder_id, page, query }`、`source_resolve { request_id, source_id, entry_id, folder_id, variant }`、`source_manage { source_id, action: "configure" | "remove" }`（配合 `set_sources { sources }` 动态增删改多个服务器实例）。
-6. **退出清理**：`shutdown`。
+5. **虚拟数据源请求**：`source_browse` 和 `source_resolve` 的应答须回传收到的 `request_id`。只接受当前插件当前请求的一次应答；浏览和解析请求 30 秒超时。插件主动打开媒体时省略 `resolve_stream.request_id`。`source_manage` 处理服务器配置与移除。
+6. **退出清理**：插件应在 `shutdown` 或 stdin EOF 时停止工作并关闭自己的子进程和监听端口。Windows 在创建插件进程时就将其加入宿主持有的 Job。即使 Iris 在插件执行第一条指令前退出，系统也会回收该进程。
 
 ### 4.2 统一声明式控件 `Widget`（侧栏与弹窗同构复用）
 
@@ -113,6 +113,8 @@ Iris 的插件架构从第一性原理出发，围绕四根支柱构建单一、
 
 所有颜色字段统一使用 `Color`：语义令牌 `"white"`、`"muted"`、`"dim"`、`"dark"`、`"accent"`，或十六进制 `"#RRGGBB"` / `"#RRGGBBAA"`。`OverlayNode` 支持 7 种归一化（`0.0..=1.0`）节点：
 
+单个插件最多提交 64 个节点，展开后最多 512 个绘制元素；每帧全部插件合计最多 2,048 个。超限更新保留上一次有效叠层。播放快照只对具备 `read_state` 的插件开放，适用于 `init`、`command` 和 `action`。
+
 - `box`：`{ x, y, w, h, fill, border, border_width, radius, opacity }`
 - `line`：`{ x1, y1, x2, y2, color, width, opacity }`
 - `grid`：`{ cols, rows, color, opacity }`
@@ -131,7 +133,7 @@ Iris 的插件架构从第一性原理出发，围绕四根支柱构建单一、
 {
   "id": "acme.cloud-drive",
   "name": "示例网盘插件",
-  "version": "0.1.0",
+  "version": "0.0.1",
   "protocol": 1,
   "entry": "main.py",
   "permissions": ["media_source", "ui_modal", "notifications"],

@@ -14,16 +14,13 @@ pub fn snapshot_from_session(session: &Session, favorite: bool) -> PlaybackSnaps
         Kind::Photo => MediaKind::Photo,
         Kind::Audio => MediaKind::Audio,
     });
-    let uri = session.current_uri().map(String::from).or_else(|| {
+    let (uri, title) = snapshot_identity(session.current_media_uri(), || {
         session
             .current()
-            .map(|p| MediaUri::Local(p.to_path_buf()).to_uri_string())
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().into_owned())
+            .or_else(|| session.current_title().map(String::from))
     });
-    let title = session
-        .current()
-        .and_then(|p| p.file_name())
-        .map(|n| n.to_string_lossy().into_owned())
-        .or_else(|| session.current_title().map(String::from));
     PlaybackSnapshot {
         uri,
         title,
@@ -41,6 +38,17 @@ pub fn snapshot_from_session(session: &Session, favorite: bool) -> PlaybackSnaps
     }
 }
 
+fn snapshot_identity(
+    uri: Option<MediaUri>,
+    title: impl FnOnce() -> Option<String>,
+) -> (Option<String>, Option<String>) {
+    if uri.as_ref().is_some_and(|uri| !uri.may_share_identity()) {
+        // Remote display titles can themselves contain the submitted URL.
+        return (None, None);
+    }
+    (uri.map(|uri| uri.to_uri_string()), title())
+}
+
 pub(super) fn sync_cached_snapshot(cached: &mut PlaybackSnapshot, event: &HostEvent) {
     match event {
         HostEvent::MediaOpened { snapshot } | HostEvent::StateChanged { snapshot } => {
@@ -56,5 +64,28 @@ pub(super) fn sync_cached_snapshot(cached: &mut PlaybackSnapshot, event: &HostEv
             cached.paused = *paused;
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn private_open_cannot_expose_url_in_snapshot_uri_or_fallback_title() {
+        let signed = "https://media.test/video?arbitrary-credential=secret";
+        assert_eq!(
+            snapshot_identity(Some(MediaUri::parse(signed)), || Some(signed.into())),
+            (None, None)
+        );
+        for identity in [
+            "iris-plugin://cloud/drive/42",
+            "https://media.test/public.mp4",
+        ] {
+            assert_eq!(
+                snapshot_identity(Some(MediaUri::parse(identity)), || Some("Video".into())),
+                (Some(identity.into()), Some("Video".into()))
+            );
+        }
     }
 }

@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use iris_api::{
-    BuiltinPlugin, ChromeLayoutSpec, HostCommand, HostEvent, OverlayNode, Permission,
+    BuiltinPlugin, ChromeLayoutSpec, Color, HostCommand, HostEvent, OverlayNode, Permission,
     PluginManifest, PluginModal, SidebarPanel, SourceDescriptor, StatusBadge, ToolbarButton,
     UiThemeSpec, is_valid_id,
 };
@@ -101,6 +101,7 @@ pub(super) struct LoadedPlugin {
     pub(super) modal: Option<PluginModal>,
     pub(super) active_theme: Option<UiThemeSpec>,
     pub(super) active_chrome: Option<ChromeLayoutSpec>,
+    warnings_left: u8,
 }
 
 impl LoadedPlugin {
@@ -132,6 +133,7 @@ impl LoadedPlugin {
             modal: None,
             active_theme: None,
             active_chrome: None,
+            warnings_left: 16,
         }
     }
 
@@ -252,6 +254,101 @@ fn set_if_changed<T: PartialEq>(slot: &mut T, next: T, flag: &mut bool) {
     }
 }
 
+// Count GPUI children too: a grid, histogram, or button can expand into many elements.
+pub(super) fn overlay_elements(node: &OverlayNode) -> usize {
+    match node {
+        OverlayNode::Grid { cols, rows, .. } => {
+            usize::from((*cols).clamp(2, 16) + (*rows).clamp(2, 16) - 2)
+        }
+        OverlayNode::Bars { values, .. } => 1 + values.len(),
+        OverlayNode::Crosshair { .. } => 2,
+        OverlayNode::Text { .. } | OverlayNode::Button { .. } => 4,
+        OverlayNode::Line { .. } | OverlayNode::Box { .. } => 1,
+    }
+}
+
+pub(super) fn overlay_fits(nodes: &[OverlayNode]) -> bool {
+    fn color_fits(color: &Color) -> bool {
+        !matches!(color, Color::Hex(s) if s.len() > 9)
+    }
+
+    if nodes.len() > 64 {
+        return false;
+    }
+    let mut elements = 0;
+    let mut text_bytes = 0;
+    for node in nodes {
+        let fits = match node {
+            OverlayNode::Box { fill, border, .. } => fill.iter().chain(border).all(color_fits),
+            OverlayNode::Line { color, .. }
+            | OverlayNode::Crosshair { color, .. }
+            | OverlayNode::Grid { color, .. } => color_fits(color),
+            OverlayNode::Bars { values, color, .. } => values.len() <= 128 && color_fits(color),
+            OverlayNode::Text {
+                text, color, bg, ..
+            } => {
+                text_bytes += text.len();
+                text.len() <= 4096 && color_fits(color) && bg.iter().all(color_fits)
+            }
+            OverlayNode::Button {
+                id,
+                action_id,
+                icon,
+                label,
+                ..
+            } => {
+                text_bytes += label.len();
+                id.len() <= 256
+                    && action_id.len() <= 256
+                    && icon.as_ref().is_none_or(|s| s.len() <= 256)
+                    && label.len() <= 4096
+            }
+        };
+        if !fits || text_bytes > 16 * 1024 {
+            return false;
+        }
+        elements += overlay_elements(node);
+        if elements > 512 {
+            return false;
+        }
+    }
+    true
+}
+
+// Keep payloads (including credential keys, values, and stream headers) out of refusal logs.
+fn command_name(cmd: &HostCommand) -> &'static str {
+    macro_rules! variants {
+        ($($variant:ident),+ $(,)?) => {
+            match cmd { $(HostCommand::$variant { .. } => stringify!($variant)),+ }
+        };
+    }
+    variants!(
+        TogglePlayback,
+        SeekRelative,
+        SeekAbsolute,
+        SetSpeed,
+        SetVolume,
+        ToggleMute,
+        OpenNext,
+        OpenPrevious,
+        ToggleFavorite,
+        ShowToast,
+        SetState,
+        SetSecret,
+        SetSidebar,
+        SetStatus,
+        SetOverlay,
+        SetToolbar,
+        OpenModal,
+        CloseModal,
+        SetTheme,
+        SetSources,
+        ProvideSourcePage,
+        ResolveStream,
+        SourceError,
+    )
+}
+
 pub(super) fn apply_plugin_commands(
     loaded: &mut LoadedPlugin,
     vault: &CredentialVault,
@@ -263,12 +360,15 @@ pub(super) fn apply_plugin_commands(
         if let Some(perm) = cmd.required_permission()
             && !loaded.manifest.has_permission(perm)
         {
-            log::warn!(
-                "plugin {} denied {:?} (missing {:?})",
-                loaded.manifest.id,
-                cmd,
-                perm
-            );
+            if loaded.warnings_left > 0 {
+                loaded.warnings_left -= 1;
+                log::warn!(
+                    "plugin {} denied {} (missing {:?})",
+                    loaded.manifest.id,
+                    command_name(&cmd),
+                    perm
+                );
+            }
             continue;
         }
         match cmd {
@@ -288,8 +388,11 @@ pub(super) fn apply_plugin_commands(
             }
             HostCommand::SetSecret { key, value } => {
                 let scope = secret_scope(&loaded.source, &loaded.manifest.id);
-                if let Err(e) = vault.set_secret(&scope, &key, value.as_deref()) {
-                    log::warn!("plugin {} failed secret '{}': {e}", loaded.manifest.id, key);
+                if vault.set_secret(&scope, &key, value.as_deref()).is_err()
+                    && loaded.warnings_left > 0
+                {
+                    loaded.warnings_left -= 1;
+                    log::warn!("plugin {} failed to store credential", loaded.manifest.id);
                 }
             }
             HostCommand::SetSources { sources } => {
@@ -307,7 +410,12 @@ pub(super) fn apply_plugin_commands(
                 );
             }
             HostCommand::SetOverlay { nodes } => {
-                set_if_changed(&mut loaded.overlay, nodes, &mut dirty.overlay);
+                if overlay_fits(&nodes) {
+                    set_if_changed(&mut loaded.overlay, nodes, &mut dirty.overlay);
+                } else if loaded.warnings_left > 0 {
+                    loaded.warnings_left -= 1;
+                    log::warn!("plugin {} exceeded overlay budget", loaded.manifest.id);
+                }
             }
             HostCommand::SetToolbar { buttons } => {
                 set_if_changed(&mut loaded.toolbar, buttons, &mut dirty.toolbar);
@@ -376,5 +484,96 @@ pub(super) fn merge_chrome(dst: &mut ChromeLayoutSpec, src: &ChromeLayoutSpec) {
         if !dst.hidden_dock_buttons.contains(btn) {
             dst.hidden_dock_buttons.push(btn.clone());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn refusal_labels_never_include_command_fields() {
+        let command = HostCommand::SetSecret {
+            key: "private key".into(),
+            value: Some("private value".into()),
+        };
+        assert_eq!(command_name(&command), "SetSecret");
+    }
+
+    #[test]
+    fn overlay_enforces_nested_and_expanded_limits_before_replacement() {
+        let mut plugin = LoadedPlugin::new(
+            None,
+            PluginManifest {
+                permissions: vec![Permission::UiOverlay],
+                ..Default::default()
+            },
+            PluginSource::Builtin,
+            true,
+            Runtime::Declarative,
+        );
+        let vault = CredentialVault::in_memory();
+        let small: OverlayNode =
+            serde_json::from_value(serde_json::json!({"kind":"grid", "cols":2, "rows":2})).unwrap();
+        let grid = OverlayNode::Grid {
+            cols: 16,
+            rows: 16,
+            color: Color::White,
+            opacity: 1.0,
+        };
+        let make_text = |text: String| {
+            serde_json::from_value(
+                serde_json::json!({"kind":"text", "text":text, "x":0.5, "y":0.5}),
+            )
+            .unwrap()
+        };
+        let bars = OverlayNode::Bars {
+            x: 0.0,
+            y: 0.0,
+            w: 1.0,
+            h: 1.0,
+            values: vec![0.1; 129],
+            color: Color::White,
+            opacity: 0.5,
+        };
+        assert!(
+            apply_plugin_commands(
+                &mut plugin,
+                &vault,
+                None,
+                vec![HostCommand::SetOverlay {
+                    nodes: vec![small.clone()]
+                }]
+            )
+            .1
+            .overlay
+        );
+        for invalid in [
+            vec![small.clone(); 65],
+            vec![grid; 18],
+            vec![bars],
+            vec![make_text("字".repeat(1400))],
+            vec![make_text("x".repeat(4096)); 5],
+        ] {
+            let (_, dirty) = apply_plugin_commands(
+                &mut plugin,
+                &vault,
+                None,
+                vec![HostCommand::SetOverlay { nodes: invalid }],
+            );
+            assert!(!dirty.overlay);
+            assert_eq!(plugin.overlay.as_slice(), std::slice::from_ref(&small));
+        }
+        assert!(
+            apply_plugin_commands(
+                &mut plugin,
+                &vault,
+                None,
+                vec![HostCommand::SetOverlay { nodes: Vec::new() }]
+            )
+            .1
+            .overlay
+        );
+        assert!(plugin.overlay.is_empty());
     }
 }

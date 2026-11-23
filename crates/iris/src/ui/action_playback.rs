@@ -7,8 +7,9 @@ use super::IrisWindow;
 use super::actions::{
     CycleAudio, CycleSub, FrameBack, FrameForward, NextChapter, OpenNextMedia, OpenPreviousMedia,
     PrevChapter, ResetSpeed, SeekBackwardExact, SeekBackwardLarge, SeekForwardExact,
-    SeekForwardLarge, SpeedDown, SpeedUp, SubDelayBack, SubDelayForward, SubDelayReset, ToggleLoop,
-    ToggleMute, TogglePause, ToggleSubs, VolumeDown, VolumeUp,
+    SeekForwardLarge, SpeedDown, SpeedUp, SubDelayBack, SubDelayForward, SubDelayReset,
+    SubSeekNext, SubSeekPrev, ToggleLoop, ToggleMute, TogglePause, ToggleSubs, VolumeDown,
+    VolumeUp,
 };
 
 impl IrisWindow {
@@ -160,6 +161,37 @@ impl IrisWindow {
         }
         self.active_mut().announce_sub = true;
         self.command(Command::NextSubtitle, cx);
+    }
+
+    pub(super) fn sub_seek_prev(
+        &mut self,
+        _: &SubSeekPrev,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.seek_subtitle_cue(Command::SubSeekPrev, cx);
+    }
+
+    pub(super) fn sub_seek_next(
+        &mut self,
+        _: &SubSeekNext,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.seek_subtitle_cue(Command::SubSeekNext, cx);
+    }
+
+    fn seek_subtitle_cue(&mut self, command: Command, cx: &mut Context<Self>) {
+        if self
+            .active()
+            .session
+            .selected_track(TrackKind::Sub)
+            .is_none()
+        {
+            self.show_osd("请先选择字幕轨道", cx);
+            return;
+        }
+        self.command(command, cx);
     }
 
     pub(super) fn sub_delay_back(

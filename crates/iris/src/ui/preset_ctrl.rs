@@ -8,6 +8,7 @@ use iris_core::player::Command;
 use iris_core::preset::{PresetCaptureScope, PresetManager, SidebarMode};
 
 use super::IrisWindow;
+use super::chrome::DirectoryPopup;
 use crate::platform;
 use crate::theme::ThemeTokens;
 
@@ -104,7 +105,8 @@ impl IrisWindow {
                 self.persist_user_settings();
             }
         } else {
-            self.overlays.dir_popup = true;
+            self.overlays.dir_popup = DirectoryPopup::Manual;
+            self.bump_activity(cx);
         }
         cx.notify();
     }

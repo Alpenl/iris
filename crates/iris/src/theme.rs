@@ -13,7 +13,7 @@ pub(crate) const FONT_MONO: &str = "IBM Plex Mono";
 const TITLEBAR_H: f32 = 36.;
 /// The control bar under the picture; floating in fullscreen.
 const DOCK_H: f32 = 44.;
-/// Gap between the floating bar or popups and the screen edge in fullscreen.
+/// Padding for fullscreen overlays such as the media title and info panel.
 pub(crate) const FLOAT_GAP: f32 = 16.;
 const ROW_H: f32 = 28.;
 pub(crate) const BUTTON: f32 = 28.;

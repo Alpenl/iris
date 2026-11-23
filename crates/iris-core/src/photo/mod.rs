@@ -3,7 +3,9 @@
 
 mod containers;
 mod exif;
+mod heif;
 pub mod icc;
+mod sparse;
 
 use std::fs::File;
 use std::io::{BufRead, BufReader, Cursor, Read, Seek};
@@ -11,6 +13,7 @@ use std::path::Path;
 
 pub use exif::ExifSummary;
 pub use icc::Colour;
+pub use sparse::probe_remote;
 
 use containers::{ColourTag, Header, PhotoFormat, detect_photo_format};
 
@@ -124,8 +127,8 @@ fn run_probe<R: Read + Seek>(r: &mut R, fmt: PhotoFormat) -> Header {
         PhotoFormat::Jpeg => containers::jpeg(r, &mut h, false),
         PhotoFormat::Png => containers::png(r, &mut h),
         PhotoFormat::Webp => containers::webp(r, &mut h),
-        PhotoFormat::Heif => containers::heif(r, &mut h),
-        PhotoFormat::Tiff => containers::tiff(r, &mut h, false),
+        PhotoFormat::Heif => heif::probe(r, &mut h),
+        PhotoFormat::Tiff => exif::tiff(r, &mut h, exif::Mode::Image),
     };
     h
 }
@@ -148,7 +151,7 @@ pub fn exif_orientation(path: &Path) -> u16 {
             let _ = containers::jpeg(&mut r, &mut h, true);
         }
         PhotoFormat::Tiff => {
-            let _ = containers::tiff(&mut r, &mut h, true);
+            let _ = exif::tiff(&mut r, &mut h, exif::Mode::Orientation);
         }
         _ => return 1,
     }

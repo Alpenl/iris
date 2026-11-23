@@ -5,6 +5,7 @@ mod backend;
 mod inspect;
 mod model;
 mod prepare;
+mod relay;
 
 use std::cell::Cell;
 use std::path::{Path, PathBuf};
@@ -13,13 +14,13 @@ use std::sync::Arc;
 use anyhow::{Result, bail};
 use futures::channel::mpsc::UnboundedReceiver;
 use iris_mpv::{Mpv, RenderHandle};
-use url::Url;
+use relay::PlaybackRelay;
 
 use crate::library::{self, Entry, FolderEntry, Kind, SortBy, SortOrder};
 use crate::media_uri::MediaUri;
 use crate::photo::Photo;
 use crate::settings::{Hwdec, OnEof, Settings};
-use crate::vfs::{self, http_client::sanitize_headers};
+use crate::vfs::{self, http_client::origin_headers};
 
 pub use model::{
     AspectMode, AudioDevice, Chapter, Command, MediaStats, PlaybackState, RemoteMediaRequest,
@@ -42,19 +43,12 @@ pub struct Session {
     pub(super) last_remote: Option<RemoteMediaRequest>,
     expected_mpv_path: Option<String>,
     pending_remote_subs: Vec<String>,
+    playback_relay: Option<PlaybackRelay>,
     pub(super) extra_rotate: u16,
     pub(super) user_hwdec: Cell<Hwdec>,
     pub(super) subtitle_inset: f64,
     pub(super) tracks_dirty: bool,
     pub(super) chapters_dirty: bool,
-}
-
-fn same_exact_origin(a: &Url, b: &Url) -> bool {
-    a.scheme() == b.scheme()
-        && a.host_str()
-            .zip(b.host_str())
-            .is_some_and(|(ha, hb)| ha.eq_ignore_ascii_case(hb))
-        && a.port_or_known_default() == b.port_or_known_default()
 }
 
 impl Session {
@@ -73,6 +67,7 @@ impl Session {
             last_remote: None,
             expected_mpv_path: None,
             pending_remote_subs: Vec::new(),
+            playback_relay: None,
             extra_rotate: 0,
             user_hwdec: Cell::new(Hwdec::AutoSafe),
             subtitle_inset: 0.,
@@ -179,6 +174,7 @@ impl Session {
         self.current_title = None;
         self.expected_mpv_path = None;
         self.pending_remote_subs.clear();
+        self.playback_relay = None;
         self.kind = None;
         self.photo_meta = None;
         self.last_remote = None;
@@ -274,8 +270,8 @@ impl Session {
         self.chapters_dirty = false;
     }
 
-    /// Opens a direct HTTP(S) or plugin stream via structured `Mpv::loadfile_with_options`,
-    /// isolating cross-origin subtitles from stream credentials.
+    /// Opens direct HTTP(S) playback or scopes authenticated media and its HLS
+    /// resources to a cancellable per-playback relay.
     pub fn open_remote(
         &mut self,
         req: RemoteMediaRequest,
@@ -284,11 +280,17 @@ impl Session {
     ) -> Result<()> {
         let saved_remote = req.clone();
         let main_url = vfs::validate_stream_url(&req.playback_url)?;
-        let clean_headers = sanitize_headers(&req.headers);
+        let clean_headers = origin_headers(&main_url, &req.headers);
+        let relay = if clean_headers.is_empty() {
+            None
+        } else {
+            Some(PlaybackRelay::start(main_url.clone(), clean_headers)?)
+        };
+        let playback_url = match &relay {
+            Some(relay) => relay.url(&main_url)?,
+            None => main_url.to_string(),
+        };
         let mut owned_opts: Vec<(&'static str, String)> = Vec::new();
-        for (name, val) in &clean_headers {
-            owned_opts.push(("http-header-fields-append", format!("{name}: {val}")));
-        }
         if let Some(photo) = &req.photo {
             owned_opts.extend(photo.mpv_options());
         } else if !req.is_live
@@ -305,13 +307,16 @@ impl Session {
             match sub {
                 RemoteSubtitle::Url(raw_sub) => {
                     let sub_url = vfs::validate_stream_url(&raw_sub)?;
-                    if same_exact_origin(&main_url, &sub_url) || clean_headers.is_empty() {
-                        owned_opts.push(("sub-files-append", sub_url.into()));
-                    } else {
-                        bail!(
-                            "cross-origin subtitle URL requires prefetching into RemoteSubtitle::InlineText when stream headers are present"
-                        );
-                    }
+                    let url = match &relay {
+                        Some(relay) if sub_url.origin() == main_url.origin() => {
+                            relay.url(&sub_url)?
+                        }
+                        Some(_) => bail!(
+                            "cross-origin subtitle requires a separately prefetched attachment"
+                        ),
+                        None => sub_url.into(),
+                    };
+                    owned_opts.push(("sub-files-append", url));
                 }
                 RemoteSubtitle::InlineText(text) => {
                     let clean = text.replace('\0', "");
@@ -331,12 +336,13 @@ impl Session {
         let opt_refs: Vec<(&str, &str)> =
             owned_opts.iter().map(|(k, v)| (*k, v.as_str())).collect();
         self.mpv
-            .loadfile_with_options(main_url.as_str(), "replace", &opt_refs)?;
+            .loadfile_with_options(&playback_url, "replace", &opt_refs)?;
+        self.playback_relay = relay;
         self.reset_for_load(
             None,
             req.uri.to_uri_string(),
             Some(req.title),
-            main_url.into(),
+            playback_url,
             pending_subs,
             req.kind,
             req.is_live,
@@ -368,6 +374,7 @@ impl Session {
             owned_opts.iter().map(|(k, v)| (*k, v.as_str())).collect();
         self.mpv
             .loadfile_with_options(&mpv_path, "replace", &opt_refs)?;
+        self.playback_relay = None;
         self.reset_for_load(
             Some(path.to_path_buf()),
             canonical_uri,
@@ -491,6 +498,9 @@ impl Session {
     }
 
     pub fn shutdown(&self) {
+        if let Some(relay) = &self.playback_relay {
+            relay.cancel();
+        }
         let _ = self.mpv.command(&["quit"]);
     }
 }

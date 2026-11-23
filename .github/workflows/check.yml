@@ -25,7 +25,14 @@ jobs:
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - run: cargo clippy --locked --workspace --all-targets --release -- -D warnings
       - run: cargo clippy --locked --workspace --all-targets --features iris/devtools -- -D warnings
+  windows-media:
+    uses: ./.github/workflows/media-sdk.yml
+    with:
+      target: windows-x86_64
+      runner: ubuntu-24.04
+      test_runtime_only: true
   windows:
+    needs: windows-media
     runs-on: windows-2025
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
@@ -38,8 +45,19 @@ jobs:
           set -euo pipefail
           rustup toolchain install 1.100.0 --profile minimal --component clippy --component rustfmt
           rustup default 1.100.0
-      # Type checks and lints only: nothing links libmpv, and no unofficial DLL is downloaded.
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: media-sdk-windows-x86_64
+          path: ${{ runner.temp }}
+      - name: Load pinned Windows test runtime
+        shell: pwsh
+        run: |
+          tar -C $env:RUNNER_TEMP -xzf "$env:RUNNER_TEMP/media-sdk.tar.gz"
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          "MPV_LIB_DIR=$env:RUNNER_TEMP\media-sdk\prefix\lib" >> $env:GITHUB_ENV
+          "$env:RUNNER_TEMP\media-sdk\prefix\bin" >> $env:GITHUB_PATH
       - run: python scripts/check-project.py
+      - run: cargo test --locked --workspace
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - run: cargo clippy --locked --workspace --all-targets --release -- -D warnings
       - run: cargo clippy --locked --workspace --all-targets --features iris/devtools -- -D warnings

@@ -156,10 +156,20 @@ pub enum RemoteSubtitle {
 
 impl RemoteSubtitle {
     /// Prefetches a remote subtitle (up to 8 MiB) off the UI thread into [`RemoteSubtitle::InlineText`].
-    pub fn prefetch(url: &str, headers: &BTreeMap<String, String>) -> Result<Self> {
+    pub fn prefetch(
+        url: &str,
+        headers: &BTreeMap<String, String>,
+        cancel: &crate::vfs::HttpCancel,
+    ) -> Result<Self> {
         const MAX_SUBTITLE_BYTES: usize = 8 * 1024 * 1024;
-        let resp =
-            crate::vfs::http_client::request_bytes("GET", url, headers, None, MAX_SUBTITLE_BYTES)?;
+        let resp = crate::vfs::http_client::request_bytes_cancellable(
+            "GET",
+            url,
+            headers,
+            None,
+            MAX_SUBTITLE_BYTES,
+            cancel,
+        )?;
         if !(200..300).contains(&resp.status) {
             bail!("subtitle HTTP fetch failed with status {}", resp.status);
         }
@@ -317,6 +327,8 @@ pub enum Command {
     ToggleSubtitles,
     NextSubtitle,
     SelectSubtitle(Option<i64>),
+    SubSeekPrev,
+    SubSeekNext,
     SubDelayBy(f64),
     SetSubDelay(f64),
     LoadSubtitle(PathBuf),

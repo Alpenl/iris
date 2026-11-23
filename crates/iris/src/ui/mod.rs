@@ -40,7 +40,7 @@ use gpui::{
 use iris_core::catalog::PlayQueue;
 use iris_core::input::{self, PointerCommand, PointerInput};
 use iris_core::keymap::Keymap;
-use iris_core::library::{self, Kind};
+use iris_core::library::Kind;
 use iris_core::player::{Command, Session};
 use iris_core::plugin::PluginManager;
 use iris_core::preset::{PresetManager, PresetRuntime};
@@ -61,7 +61,7 @@ use state::{CatalogState, OverlayState, PopoverKind};
 use viewport::Viewport;
 
 use crate::platform::{self, MediaKey, MediaKeyBridge, PinchMonitor, SleepPreventer};
-use crate::theme::{FLOAT_GAP, FONT_UI, ThemeTokens};
+use crate::theme::{FONT_UI, ThemeTokens};
 use crate::video::VideoSurface;
 
 pub(crate) struct IrisWindow {
@@ -100,7 +100,7 @@ impl IrisWindow {
         preset_rt: PresetRuntime,
         init_plugin_cmds: Vec<(String, String)>,
         keymap: Keymap,
-        initial: Option<PathBuf>,
+        initial: Vec<PathBuf>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -206,20 +206,28 @@ impl IrisWindow {
             monitor
         });
 
-        let media_keys = MediaKeyBridge::attach().map(|(bridge, mut mk_rx)| {
+        let media_keys = MediaKeyBridge::attach(window).map(|(bridge, mut mk_rx)| {
             cx.spawn(async move |this, cx| {
                 while let Some(key) = mk_rx.next().await {
-                    let ok = this.update(cx, |this, cx| match key {
-                        MediaKey::Play if this.active().session.state().paused => {
-                            this.command(Command::TogglePlayback, cx);
+                    let ok = this.update(cx, |this, cx| {
+                        let state = this.active().session.state();
+                        match key {
+                            MediaKey::Play if state.paused || state.ended => {
+                                this.command(Command::TogglePlayback, cx);
+                            }
+                            MediaKey::Pause if !state.paused && !state.ended => {
+                                this.command(Command::TogglePlayback, cx);
+                            }
+                            #[cfg(target_os = "macos")]
+                            MediaKey::Toggle => this.command(Command::TogglePlayback, cx),
+                            MediaKey::Next => this.step(1, true, cx),
+                            MediaKey::Prev => this.step(-1, true, cx),
+                            #[cfg(target_os = "windows")]
+                            MediaKey::Seek(seconds) => {
+                                this.command(Command::SeekAbsolute(seconds), cx)
+                            }
+                            _ => {}
                         }
-                        MediaKey::Pause if !this.active().session.state().paused => {
-                            this.command(Command::TogglePlayback, cx);
-                        }
-                        MediaKey::Toggle => this.command(Command::TogglePlayback, cx),
-                        MediaKey::Next => this.step(1, true, cx),
-                        MediaKey::Prev => this.step(-1, true, cx),
-                        _ => {}
                     });
                     if ok.is_err() {
                         break;
@@ -334,9 +342,7 @@ impl IrisWindow {
         {
             this.command(Command::SetSpeed(v), cx);
         }
-        if let Some(path) = initial {
-            this.open_path(&path, cx);
-        }
+        this.open_paths(initial, cx);
         this
     }
 
@@ -362,6 +368,8 @@ impl IrisWindow {
         }
         self.shutdown_done = true;
         self.sleep_preventer.set_active(false);
+        self.media_keys.take();
+        self.plugins.shutdown();
         self.save_progress_sync();
         let (vol, spd) = {
             let st = self.active().session.state();
@@ -428,7 +436,7 @@ impl Render for IrisWindow {
         }
 
         let inset = if (fullscreen || floating_dock) && self.chrome.chrome_visible {
-            (f32::from(t.dock_h) + FLOAT_GAP + 8.) as f64
+            (f32::from(t.dock_h) + 8.) as f64
         } else {
             0.
         };
@@ -475,31 +483,7 @@ impl Render for IrisWindow {
 
         self.bind_window_actions(root, cx)
             .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| {
-                let is_video = this.active().session.kind() == Some(Kind::Video);
-                let dropped = paths.paths();
-                if is_video {
-                    for p in dropped {
-                        if library::is_subtitle(p) {
-                            this.command(Command::LoadSubtitle(p.clone()), cx);
-                            let name = p
-                                .file_name()
-                                .map(|n| n.to_string_lossy().into_owned())
-                                .unwrap_or_default();
-                            this.show_toast(format!("已加载字幕 · {name}"), cx);
-                            return;
-                        }
-                    }
-                }
-                let media_files: Vec<PathBuf> = dropped
-                    .iter()
-                    .filter(|p| p.is_file() && library::kind_of(p).is_some())
-                    .cloned()
-                    .collect();
-                if media_files.len() > 1 {
-                    this.open_multi_queue(media_files, cx);
-                } else if let Some(first) = dropped.first() {
-                    this.open_path(first, cx);
-                }
+                this.open_paths(paths.paths().to_vec(), cx);
             }))
             .on_mouse_move(cx.listener(Self::on_root_mouse_move))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_root_mouse_up))

@@ -1,10 +1,12 @@
 //! Independent `PlayQueue` sidebar panel: supports mixed local, HTTP(S), and
 //! `MediaSource` plugin URIs, appending files or catalog items, item removal, and clear.
 
+use std::ops::Range;
+
 use gpui::{
     Context, InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ParentElement,
     PathPromptOptions, SharedString, StatefulInteractiveElement, Styled, Window, div,
-    prelude::FluentBuilder, px,
+    prelude::FluentBuilder, px, uniform_list,
 };
 use iris_core::catalog::QueueItem;
 use iris_core::library;
@@ -58,9 +60,8 @@ impl IrisWindow {
 
     pub(super) fn render_sidebar_queue(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let t = ThemeTokens::of(cx);
-        let items: Vec<QueueItem> = self.queue.items().to_vec();
-        let cur_uri = self.active().session.current_media_uri();
-        let has_catalog = self.catalog.items.iter().any(|i| !i.is_folder());
+        let item_count = self.queue.len();
+        let has_catalog = self.catalog.items.iter().any(|item| !item.is_folder());
 
         div()
             .flex_1()
@@ -91,81 +92,73 @@ impl IrisWindow {
                         )
                     }),
             )
-            .child(
+            .child(if item_count == 0 {
                 div()
-                    .id("sidebar-queue-scroll")
-                    .flex_1()
-                    .min_h(px(0.))
-                    .overflow_y_scroll()
-                    .p(px(4.))
-                    .flex()
-                    .flex_col()
-                    .when(items.is_empty(), |d| {
-                        d.child(
-                            div()
-                                .p(px(14.))
-                                .text_size(px(12.))
-                                .text_color(t.text_faint)
-                                .child("播放队列为空。在任意本地或远程条目上右键选择「加入播放队列」即可跨目录混合排队。"),
-                        )
-                    })
-                    .children(items.into_iter().enumerate().map(|(ix, item)| {
-                        let is_cur = cur_uri.as_ref() == Some(&item.uri);
-                        let prog = self.store.progress_ratio(&item.uri);
-                        let badge: Option<SharedString> = match &item.uri {
-                            MediaUri::Local(_) => None,
-                            MediaUri::Plugin { plugin_id, .. } if plugin_id == "iris.webdav" => {
-                                Some("DAV".into())
-                            }
-                            MediaUri::Plugin { .. } => Some("云源".into()),
-                            MediaUri::HttpUrl(_) => Some("URL".into()),
-                        };
-                        let rm_btn = row_action_icon(("q-rm", ix), Icon::Close, false, false, t)
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.queue.remove_at(ix);
-                                cx.notify();
+                    .p(px(14.))
+                    .text_size(px(12.))
+                    .text_color(t.text_faint)
+                    .child("播放队列为空。在任意本地或远程条目上右键选择「加入播放队列」即可跨目录混合排队。")
+                    .into_any_element()
+            } else {
+                uniform_list(
+                    "sidebar-queue-scroll",
+                    item_count,
+                    cx.processor(|this, range: Range<usize>, _, cx| {
+                        let cur_uri = this.active().session.current_media_uri();
+                        let t = ThemeTokens::of(cx);
+                        range.filter_map(|ix| {
+                            let item = this.queue.get(ix)?;
+                            let badge: Option<SharedString> = match &item.uri {
+                                MediaUri::Local(_) => None,
+                                MediaUri::Plugin { plugin_id, .. } if plugin_id == "iris.webdav" => Some("DAV".into()),
+                                MediaUri::Plugin { .. } => Some("云源".into()),
+                                MediaUri::HttpUrl(_) => Some("URL".into()),
+                            };
+                            let remove = row_action_icon(("q-rm", ix), Icon::Close, false, false, t)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.queue.remove_at(ix);
+                                    cx.stop_propagation();
+                                    cx.notify();
+                                }));
+                            Some(media_row(
+                                ("q-row", ix),
+                                MediaRowSpec {
+                                    kind: item.kind,
+                                    title: item.title.clone().into(),
+                                    meta: badge,
+                                    is_current: cur_uri.as_ref() == Some(&item.uri),
+                                    is_live: false,
+                                    progress: this.store.progress_ratio(&item.uri),
+                                    trailing: Some(remove.into_any_element()),
+                                },
+                                t,
+                            )
+                            .on_mouse_down(MouseButton::Right, cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
+                                if let Some(item) = this.queue.get(ix) {
+                                    this.overlays.open_context_menu(ContextMenu {
+                                        pos: ev.position,
+                                        target: ContextTarget::Media {
+                                            uri: item.uri.clone(),
+                                            title: item.title.clone(),
+                                            kind: Some(item.kind),
+                                            folder_id: None,
+                                        },
+                                    });
+                                    cx.stop_propagation();
+                                    cx.notify();
+                                }
                             }))
-                            .into_any_element();
-
-                        let uri_open = item.uri.clone();
-                        let title_open = item.title.clone();
-                        let uri_menu = item.uri;
-                        let title_menu = item.title.clone();
-                        let kind = item.kind;
-
-                        media_row(
-                            ("q-row", ix),
-                            MediaRowSpec {
-                                kind,
-                                title: item.title.into(),
-                                meta: badge,
-                                is_current: is_cur,
-                                is_live: false,
-                                progress: prog,
-                                trailing: Some(rm_btn),
-                            },
-                            t,
-                        )
-                        .on_mouse_down(
-                            MouseButton::Right,
-                            cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
-                                this.overlays.open_context_menu(ContextMenu {
-                                    pos: ev.position,
-                                    target: ContextTarget::Media {
-                                        uri: uri_menu.clone(),
-                                        title: title_menu.clone(),
-                                        kind: Some(kind),
-                                        folder_id: None,
-                                    },
-                                });
-                                cx.stop_propagation();
-                                cx.notify();
-                            }),
-                        )
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.open_media_uri(&uri_open, Some(title_open.clone()), cx);
-                        }))
-                    })),
-            )
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if let Some(item) = this.queue.get(ix).cloned() {
+                                    this.open_media_uri(&item.uri, Some(item.title), cx);
+                                }
+                            })))
+                        }).collect()
+                    }),
+                )
+                .flex_1()
+                .min_h(px(0.))
+                .into_any_element()
+            })
     }
 }

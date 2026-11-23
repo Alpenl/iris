@@ -35,28 +35,21 @@ impl IrisWindow {
         &self,
         cx: &mut Context<Self>,
     ) -> Option<impl IntoElement> {
-        let tagged_nodes: Vec<(String, OverlayNode)> = self
-            .plugins
-            .overlay_nodes()
-            .into_iter()
-            .map(|(pid, n)| (pid.to_string(), n.clone()))
-            .collect();
-        if tagged_nodes.is_empty() {
-            return None;
-        }
+        let mut tagged_nodes = self.plugins.overlay_nodes().peekable();
+        tagged_nodes.peek()?;
 
         let t = ThemeTokens::of(cx);
-        let mut elements: Vec<AnyElement> = Vec::with_capacity(tagged_nodes.len());
+        let mut elements: Vec<AnyElement> = Vec::new();
 
-        for (idx, (pid, node)) in tagged_nodes.into_iter().enumerate() {
-            match node {
+        for (idx, (pid, node)) in tagged_nodes.enumerate() {
+            match *node {
                 OverlayNode::Box {
                     x,
                     y,
                     w,
                     h,
-                    fill,
-                    border,
+                    ref fill,
+                    ref border,
                     border_width,
                     radius,
                     opacity,
@@ -94,11 +87,11 @@ impl IrisWindow {
                     y1,
                     x2,
                     y2,
-                    color,
+                    ref color,
                     width,
                     opacity,
                 } => {
-                    let c = resolve_overlay_color(&color, opacity, t);
+                    let c = resolve_overlay_color(color, opacity, t);
                     let lw = if width.is_finite() {
                         width.clamp(1., 6.)
                     } else {
@@ -133,10 +126,10 @@ impl IrisWindow {
                 OverlayNode::Grid {
                     cols,
                     rows,
-                    color,
+                    ref color,
                     opacity,
                 } => {
-                    let c = resolve_overlay_color(&color, opacity, t);
+                    let c = resolve_overlay_color(color, opacity, t);
                     let cols = cols.clamp(2, 16);
                     let rows = rows.clamp(2, 16);
                     for i in 1..cols {
@@ -168,10 +161,10 @@ impl IrisWindow {
                     x,
                     y,
                     size,
-                    color,
+                    ref color,
                     opacity,
                 } => {
-                    let c = resolve_overlay_color(&color, opacity, t);
+                    let c = resolve_overlay_color(color, opacity, t);
                     let cx_pos = x.clamp(0., 1.);
                     let cy_pos = y.clamp(0., 1.);
                     let arm = size.clamp(0.01, 0.5);
@@ -199,10 +192,10 @@ impl IrisWindow {
                 OverlayNode::Text {
                     x,
                     y,
-                    text: content,
+                    text: ref content,
                     size,
-                    color,
-                    bg,
+                    ref color,
+                    ref bg,
                     mono,
                     align,
                     opacity,
@@ -212,7 +205,7 @@ impl IrisWindow {
                     } else {
                         12.
                     };
-                    let fg = resolve_overlay_color(&color, opacity, t);
+                    let fg = resolve_overlay_color(color, opacity, t);
                     let y_clamped = y.clamp(0., 0.98);
                     let chip = div()
                         .font_family(if mono { FONT_MONO } else { FONT_UI })
@@ -230,7 +223,7 @@ impl IrisWindow {
                                 .border_1()
                                 .border_color(t.line)
                         })
-                        .child(content);
+                        .child(content.clone());
 
                     let positioned = match align {
                         TextAlign::Left => div()
@@ -265,12 +258,12 @@ impl IrisWindow {
                     y,
                     w,
                     h,
-                    values,
-                    color,
+                    ref values,
+                    ref color,
                     opacity,
                 } => {
                     if !values.is_empty() {
-                        let c = resolve_overlay_color(&color, opacity, t);
+                        let c = resolve_overlay_color(color, opacity, t);
                         elements.push(
                             div()
                                 .absolute()
@@ -281,7 +274,7 @@ impl IrisWindow {
                                 .flex()
                                 .items_end()
                                 .gap(px(1.))
-                                .children(values.into_iter().take(128).map(|v| {
+                                .children(values.iter().copied().map(|v| {
                                     let ratio = if v.is_finite() { v.clamp(0., 1.) } else { 0. };
                                     div().flex_1().min_w(px(1.)).h(relative(ratio)).bg(c)
                                 }))
@@ -290,16 +283,18 @@ impl IrisWindow {
                     }
                 }
                 OverlayNode::Button {
-                    id,
+                    ref id,
                     x,
                     y,
-                    label,
-                    icon: icon_name,
+                    ref label,
+                    icon: ref icon_name,
                     accent: hi,
-                    action_id,
+                    ref action_id,
                 } => {
                     let btn_id = SharedString::from(format!("hud-btn:{idx}:{pid}:{id}"));
                     let glyph = icon_name.as_deref().and_then(Icon::from_name);
+                    let pid = pid.to_owned();
+                    let action_id = action_id.clone();
                     elements.push(
                         div()
                             .id(btn_id)
@@ -329,7 +324,7 @@ impl IrisWindow {
                             .when(glyph.is_none() && hi, |d| {
                                 d.child(div().size(px(5.)).bg(t.accent))
                             })
-                            .when(!label.is_empty(), |d| d.child(label))
+                            .when(!label.is_empty(), |d| d.child(label.clone()))
                             .into_any_element(),
                     );
                 }

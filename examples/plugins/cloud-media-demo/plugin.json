@@ -1,7 +1,7 @@
 {
   "id": "example.cloud-media-demo",
   "name": "云盘与视频源演示",
-  "version": "0.1.0",
+  "version": "0.0.1",
   "author": "Iris Examples",
   "description": "官方参考插件：演示云盘扫码/Token 授权弹窗、系统密钥库持久化、多级目录浏览、搜索过滤与多清晰度在线流解析。",
   "protocol": 1,

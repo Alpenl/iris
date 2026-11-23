@@ -3,19 +3,19 @@
 
 mod imageio;
 
-use std::ffi::{CString, c_char, c_void};
+use std::ffi::{c_char, c_void};
 use std::ptr;
 use std::sync::Once;
 
 use cocoa::base::{NO, YES, id, nil};
-use cocoa::foundation::{NSPoint, NSRect};
+use cocoa::foundation::{NSPoint, NSRect, NSString};
 use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
 use objc::declare::ClassDecl;
 use objc::runtime::{Class, Object, Sel};
 use objc::{class, msg_send, sel, sel_impl};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
-use super::{MediaKey, PinchEvent};
+use super::{MediaKey, NowPlaying, PinchEvent};
 
 pub(super) use imageio::decode_thumbnail_imageio;
 #[cfg(any(debug_assertions, feature = "devtools"))]
@@ -48,12 +48,54 @@ pub(crate) fn hide_traffic_lights(window: &gpui::Window) {
     }
 }
 
-/// Floats the window above normal windows (`NSFloatingWindowLevel = 3`).
+unsafe extern "C" {
+    fn objc_getAssociatedObject(object: id, key: *const c_void) -> id;
+    fn objc_setAssociatedObject(object: id, key: *const c_void, value: id, policy: usize);
+}
+
+fn floating_collection_behavior(original: usize) -> usize {
+    const JOIN_ALL_SPACES: usize = 1 << 0;
+    const MOVE_TO_ACTIVE_SPACE: usize = 1 << 1;
+    const FULL_SCREEN_PRIMARY: usize = 1 << 7;
+    const FULL_SCREEN_AUXILIARY: usize = 1 << 8;
+    const FULL_SCREEN_NONE: usize = 1 << 9;
+    (original & !(MOVE_TO_ACTIVE_SPACE | FULL_SCREEN_PRIMARY | FULL_SCREEN_NONE))
+        | JOIN_ALL_SPACES
+        | FULL_SCREEN_AUXILIARY
+}
+
+/// Keep the original level and collection behavior on the NSWindow itself so
+/// repeated preset applications cannot overwrite them or outlive the window.
 pub(crate) fn set_always_on_top(window: &gpui::Window, on: bool) {
+    static RESTORE_KEY: u8 = 0;
+    const RETAIN_NONATOMIC: usize = 1;
+    const FLOATING_LEVEL: isize = 3;
     let Some(win) = ns_window(window) else { return };
-    let level: isize = if on { 3 } else { 0 };
+    let key = (&raw const RESTORE_KEY).cast();
     unsafe {
-        let _: () = msg_send![win, setLevel: level];
+        let saved = objc_getAssociatedObject(win, key);
+        if on && saved == nil {
+            let level: isize = msg_send![win, level];
+            let behavior: usize = msg_send![win, collectionBehavior];
+            let values: [id; 2] = [
+                msg_send![class!(NSNumber), numberWithInteger: level],
+                msg_send![class!(NSNumber), numberWithUnsignedInteger: behavior],
+            ];
+            let snapshot: id =
+                msg_send![class!(NSArray), arrayWithObjects: values.as_ptr() count: values.len()];
+            objc_setAssociatedObject(win, key, snapshot, RETAIN_NONATOMIC);
+            let _: () =
+                msg_send![win, setCollectionBehavior: floating_collection_behavior(behavior)];
+            let _: () = msg_send![win, setLevel: level.max(FLOATING_LEVEL)];
+        } else if !on && saved != nil {
+            let saved_level: id = msg_send![saved, objectAtIndex: 0usize];
+            let saved_behavior: id = msg_send![saved, objectAtIndex: 1usize];
+            let level: isize = msg_send![saved_level, integerValue];
+            let behavior: usize = msg_send![saved_behavior, unsignedIntegerValue];
+            let _: () = msg_send![win, setLevel: level];
+            let _: () = msg_send![win, setCollectionBehavior: behavior];
+            objc_setAssociatedObject(win, key, nil, RETAIN_NONATOMIC);
+        }
     }
 }
 
@@ -312,7 +354,7 @@ pub(crate) struct MediaKeyBridge {
 }
 
 impl MediaKeyBridge {
-    pub(crate) fn attach() -> Option<(Self, UnboundedReceiver<MediaKey>)> {
+    pub(crate) fn attach(_window: &gpui::Window) -> Option<(Self, UnboundedReceiver<MediaKey>)> {
         unsafe {
             if dlopen(
                 c"/System/Library/Frameworks/MediaPlayer.framework/MediaPlayer".as_ptr(),
@@ -350,14 +392,7 @@ impl MediaKeyBridge {
         }
     }
 
-    pub(crate) fn update_now_playing(
-        &self,
-        title: Option<&str>,
-        duration: f64,
-        position: f64,
-        playing: bool,
-        speed: f64,
-    ) {
+    pub(crate) fn update_now_playing(&mut self, media: Option<NowPlaying<'_>>) {
         unsafe {
             let Some(info_cls) = Class::get("MPNowPlayingInfoCenter") else {
                 return;
@@ -366,7 +401,7 @@ impl MediaKeyBridge {
             if center == nil {
                 return;
             }
-            let Some(title) = title else {
+            let Some(media) = media else {
                 let _: () = msg_send![center, setNowPlayingInfo: nil];
                 let _: () = msg_send![center, setPlaybackState: 0usize];
                 return;
@@ -376,16 +411,30 @@ impl MediaKeyBridge {
                 msg_send![class!(NSString), stringWithUTF8String: ptr]
             };
             let ns_num = |v: f64| -> id { msg_send![class!(NSNumber), numberWithDouble: v] };
-            let title_c = CString::new(title.replace('\0', "")).unwrap_or_default();
-            let _: () = msg_send![dict, setObject: ns_cstr(title_c.as_ptr()) forKey: ns_cstr(c"title".as_ptr())];
-            if duration > 0. {
-                let _: () = msg_send![dict, setObject: ns_num(duration) forKey: ns_cstr(c"playbackDuration".as_ptr())];
-                let _: () = msg_send![dict, setObject: ns_num(position.max(0.)) forKey: ns_cstr(c"MPNowPlayingInfoPropertyElapsedPlaybackTime".as_ptr())];
+            let state = media.state;
+            let title = NSString::alloc(nil).init_str(&media.title);
+            let _: () = msg_send![dict, setObject: title forKey: ns_cstr(c"title".as_ptr())];
+            let _: () = msg_send![title, release];
+            let media_type = if media.is_video { 2. } else { 1. };
+            let _: () = msg_send![dict, setObject: ns_num(media_type) forKey: ns_cstr(c"MPNowPlayingInfoPropertyMediaType".as_ptr())];
+            if state.duration > 0. {
+                let _: () = msg_send![dict, setObject: ns_num(state.duration) forKey: ns_cstr(c"playbackDuration".as_ptr())];
+                let _: () = msg_send![dict, setObject: ns_num(state.time_pos.max(0.)) forKey: ns_cstr(c"MPNowPlayingInfoPropertyElapsedPlaybackTime".as_ptr())];
             }
-            let rate = if playing { speed.clamp(0.1, 8.0) } else { 0.0 };
+            let rate = if state.paused || state.ended {
+                0.
+            } else {
+                state.speed
+            };
             let _: () = msg_send![dict, setObject: ns_num(rate) forKey: ns_cstr(c"MPNowPlayingInfoPropertyPlaybackRate".as_ptr())];
             let _: () = msg_send![center, setNowPlayingInfo: dict];
-            let pb_state: usize = if playing { 1 } else { 2 };
+            let pb_state: usize = if state.ended {
+                3
+            } else if state.paused {
+                2
+            } else {
+                1
+            };
             let _: () = msg_send![center, setPlaybackState: pb_state];
         }
     }
@@ -473,4 +522,21 @@ pub(crate) fn synth_mouse(
             let _: () = msg_send![view, mouseUp: make(2, 1)];
         }
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::floating_collection_behavior;
+
+    #[test]
+    fn floating_preserves_unrelated_space_flags_and_excludes_conflicting_roles() {
+        let stationary = 1 << 4;
+        let move_to_active = 1 << 1;
+        for full_screen_role in [0, 1 << 7, 1 << 8, 1 << 9] {
+            let original = stationary | move_to_active | full_screen_role;
+            let floating = floating_collection_behavior(original);
+            assert_eq!(floating, stationary | 1 | (1 << 8));
+            assert_eq!(floating_collection_behavior(floating), floating);
+        }
+    }
 }

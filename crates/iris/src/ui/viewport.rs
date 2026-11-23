@@ -35,6 +35,7 @@ pub(super) struct Viewport {
     pub(super) pending_win_drag_origin: Option<Point<Pixels>>,
     pub(super) load_generation: u64,
     pub(super) pending_path: Option<PathBuf>,
+    pub(super) pending_subtitles: super::events::PendingSubtitles,
     pub(super) loading_visible: bool,
     pub(super) pending_photo_actual: bool,
     pub(super) cached_stats: Option<MediaStats>,
@@ -54,6 +55,7 @@ impl Viewport {
             pending_win_drag_origin: None,
             load_generation: 0,
             pending_path: None,
+            pending_subtitles: Default::default(),
             loading_visible: false,
             pending_photo_actual: false,
             cached_stats: None,
@@ -168,6 +170,10 @@ impl IrisWindow {
         let vp = self.active();
         let last_rect = vp.rect.clone();
         let video = vp.video.clone();
+        // macOS delivers a window-exit event even when the app stays active on this display.
+        let on_exit = (crate::platform::IS_MACOS && fullscreen).then(|| {
+            cx.listener(|this, _: &gpui::MouseExitEvent, w, cx| this.on_window_pointer_exit(w, cx))
+        });
         let probe = canvas(
             move |bounds, _, _| {
                 let r = VideoRect([
@@ -185,7 +191,15 @@ impl IrisWindow {
                     v.set_frame(x, y, w, h);
                 }
             },
-            |_, _, _, _| {},
+            move |_, _, window, _| {
+                if let Some(on_exit) = on_exit {
+                    window.on_mouse_event(move |event, phase, window, cx| {
+                        if phase.capture() {
+                            on_exit(event, window, cx);
+                        }
+                    });
+                }
+            },
         )
         .absolute()
         .size_full();
@@ -443,22 +457,34 @@ impl IrisWindow {
             .when(show_filmstrip, |d| {
                 d.children(self.render_photo_filmstrip(fullscreen, t, cx))
             })
+            .when(fullscreen && self.overlays.dir_popup.is_open(), |d| {
+                let popup = div()
+                    .absolute()
+                    .top_0()
+                    .bottom(px(dock_h))
+                    .w(px(self.settings.directory_width))
+                    .overflow_hidden()
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+                    .child(self.render_sidebar(true, window, cx));
+                d.child(if self.settings.directory_side == Side::Left {
+                    popup.left_0()
+                } else {
+                    popup.right_0()
+                })
+            })
             .when(floating_dock && self.chrome.chrome_visible, |d| {
                 let slot = self.chrome.probes.dock_bounds.clone();
                 let seam = matches!(kind, Some(Kind::Video | Kind::Audio));
                 d.child(
                     div()
                         .absolute()
-                        .bottom(px(FLOAT_GAP))
-                        .left(px(FLOAT_GAP))
-                        .right(px(FLOAT_GAP))
+                        .bottom_0()
+                        .left_0()
+                        .right_0()
                         .h(t.dock_h)
-                        .rounded(t.radius_lg)
                         .bg(t.overlay)
                         .border_color(t.line)
-                        .border_l_1()
-                        .border_r_1()
-                        .border_b_1()
                         .when(!seam, |d| d.border_t_1())
                         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                         .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
@@ -472,24 +498,6 @@ impl IrisWindow {
             })
             .when_some(self.overlays.popover, |d, pop| {
                 d.child(self.render_popover(pop, fullscreen, cx))
-            })
-            .when(fullscreen && self.overlays.dir_popup, |d| {
-                let popup = div()
-                    .absolute()
-                    .top(px(FLOAT_GAP))
-                    .bottom(px(dock_h + FLOAT_GAP + 8.))
-                    .rounded(t.radius_lg)
-                    .border_1()
-                    .border_color(t.line)
-                    .overflow_hidden()
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
-                    .child(self.render_sidebar(true, window, cx));
-                d.child(if self.settings.directory_side == Side::Left {
-                    popup.left(px(FLOAT_GAP))
-                } else {
-                    popup.right(px(FLOAT_GAP))
-                })
             })
     }
 }

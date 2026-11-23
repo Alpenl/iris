@@ -15,7 +15,7 @@ use super::actions::OpenFile;
 use super::kit::{badge_pill, icon};
 use super::state::BuiltinDialog;
 use crate::assets::Icon;
-use crate::theme::{BUTTON, FLOAT_GAP, FONT_MONO, ThemeTokens};
+use crate::theme::{BUTTON, FONT_MONO, ThemeTokens};
 
 impl IrisWindow {
     pub(super) fn render_audio_card(&self, t: ThemeTokens) -> impl IntoElement {
@@ -315,7 +315,7 @@ impl IrisWindow {
         let slice = &photos[start..(start + WINDOW).min(photos.len())];
         let floating_dock = fullscreen || self.effective_floating_dock();
         let bottom = if floating_dock && self.chrome.chrome_visible {
-            f32::from(t.dock_h) + FLOAT_GAP + 8.
+            f32::from(t.dock_h) + 8.
         } else {
             10.
         };

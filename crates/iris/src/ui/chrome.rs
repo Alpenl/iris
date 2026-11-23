@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use gpui::{
     Bounds, Context, MouseButton, MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollWheelEvent,
-    SharedString, Window, px,
+    SharedString, Size, Window, px,
 };
 use iris_core::player::Command;
 use iris_core::settings::{MAX_DIRECTORY_WIDTH, MIN_DIRECTORY_WIDTH, Side};
@@ -18,6 +18,67 @@ use crate::platform;
 use crate::theme::ThemeTokens;
 
 const SEEK_DRAG_INTERVAL: Duration = Duration::from_millis(40);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum DirectoryPopup {
+    Hidden,
+    Hover,
+    Manual,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DirectoryZone {
+    Outside,
+    Edge,
+    Panel,
+}
+
+impl DirectoryZone {
+    fn at(
+        position: Point<Pixels>,
+        viewport: Size<Pixels>,
+        dock_h: Pixels,
+        side: Side,
+        panel_w: Pixels,
+    ) -> Self {
+        // GPUI positions and sizes are local logical pixels, including on secondary displays.
+        if position.x < px(0.)
+            || position.x >= viewport.width
+            || position.y < px(0.)
+            || position.y >= viewport.height - dock_h
+        {
+            return Self::Outside;
+        }
+        let distance = match side {
+            Side::Left => position.x,
+            Side::Right => viewport.width - position.x,
+        };
+        if distance <= px(4.) {
+            Self::Edge
+        } else if distance <= panel_w {
+            Self::Panel
+        } else {
+            Self::Outside
+        }
+    }
+}
+
+impl DirectoryPopup {
+    pub(super) fn is_open(self) -> bool {
+        self != Self::Hidden
+    }
+
+    fn on_pointer(self, previous: DirectoryZone, current: DirectoryZone) -> Self {
+        match self {
+            Self::Hidden if current == DirectoryZone::Edge && previous != DirectoryZone::Edge => {
+                Self::Hover
+            }
+            Self::Hover if current == DirectoryZone::Outside => Self::Hidden,
+            // A keyboard or toolbar toggle owns its panel until explicitly dismissed.
+            _ => self,
+        }
+    }
+}
 
 /// Shared layout probes written during GPUI paint/prepaint for hit-testing and popovers.
 #[derive(Default)]
@@ -118,13 +179,21 @@ impl IrisWindow {
         !self.chrome.fullscreen || self.chrome.chrome_visible
     }
 
-    pub(super) fn sync_fullscreen(&mut self, window: &Window, cx: &mut Context<Self>) {
+    pub(super) fn sync_fullscreen(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let fs = window.is_fullscreen();
         if fs == self.chrome.fullscreen {
+            // Windows reports a move onto another monitor via window hover loss.
+            if fs && !window.is_window_hovered() {
+                self.on_window_pointer_exit(window, cx);
+            }
             return;
         }
         self.chrome.fullscreen = fs;
-        self.overlays.dir_popup = false;
+        self.overlays.dir_popup = DirectoryPopup::Hidden;
+        self.chrome.mouse_pos = Some(window.mouse_position());
+        if !self.sidebar_is_visible() && self.text_inputs.search_focus.is_focused(window) {
+            self.focus.focus(window);
+        }
         self.overlays.close_menus();
         self.chrome.chrome_visible = true;
         if fs {
@@ -332,14 +401,54 @@ impl IrisWindow {
         }
     }
 
+    fn directory_hover_allowed(&self, window: &Window) -> bool {
+        !self.overlays.has_menu_or_modal()
+            && self.plugins.active_modal().is_none()
+            && !self.text_inputs.is_any_focused(window)
+    }
+
+    pub(super) fn on_window_pointer_exit(&mut self, window: &Window, cx: &mut Context<Self>) {
+        self.chrome.mouse_pos = None;
+        if self.overlays.dir_popup == DirectoryPopup::Hover && self.directory_hover_allowed(window)
+        {
+            self.overlays.dir_popup = DirectoryPopup::Hidden;
+            self.bump_activity(cx);
+            cx.notify();
+        }
+    }
+
     pub(super) fn on_root_mouse_move(
         &mut self,
         ev: &MouseMoveEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.chrome.mouse_pos = Some(ev.position);
-        let hot_h = f32::from(ThemeTokens::of(cx).titlebar_h) + 8.;
+        let previous = self.chrome.mouse_pos.replace(ev.position);
+        let t = ThemeTokens::of(cx);
+        if self.chrome.fullscreen
+            && ev.pressed_button.is_none()
+            && self.directory_hover_allowed(window)
+        {
+            let viewport = window.viewport_size();
+            let zone = |position| {
+                DirectoryZone::at(
+                    position,
+                    viewport,
+                    t.dock_h,
+                    self.settings.directory_side,
+                    px(self.settings.directory_width),
+                )
+            };
+            let next = self.overlays.dir_popup.on_pointer(
+                previous.map_or(DirectoryZone::Outside, zone),
+                zone(ev.position),
+            );
+            if next != self.overlays.dir_popup {
+                self.overlays.dir_popup = next;
+                cx.notify();
+            }
+        }
+        let hot_h = f32::from(t.titlebar_h) + 8.;
         let in_hot = !self.chrome.fullscreen && f32::from(ev.position.y) <= hot_h;
         if in_hot != self.chrome.titlebar_hover {
             self.chrome.titlebar_hover = in_hot;
@@ -443,5 +552,54 @@ impl IrisWindow {
             self.seek_to_x(ev.position.x, true);
             cx.notify();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DirectoryPopup, DirectoryZone};
+    use gpui::px;
+    use iris_core::settings::Side;
+
+    #[test]
+    fn fullscreen_directory_edges_use_viewport_coordinates_and_exclude_the_dock() {
+        use DirectoryZone::{Edge, Outside, Panel};
+
+        for width in [960., 1920.] {
+            let viewport = gpui::size(px(width), px(720.));
+            for side in [Side::Left, Side::Right] {
+                let zone = |distance: f32, y: f32| {
+                    let x = if side == Side::Left {
+                        distance
+                    } else {
+                        width - distance
+                    };
+                    DirectoryZone::at(gpui::point(px(x), px(y)), viewport, px(44.), side, px(280.))
+                };
+                assert_eq!(zone(1., 0.), Edge);
+                assert_eq!(zone(4., 675.), Edge);
+                assert_eq!(zone(5., 360.), Panel);
+                assert_eq!(zone(279., 360.), Panel);
+                assert_eq!(zone(281., 360.), Outside);
+                assert_eq!(zone(width - 1., 360.), Outside);
+                assert_eq!(zone(1., 676.), Outside);
+                assert_eq!(zone(-1., 360.), Outside);
+            }
+        }
+    }
+
+    #[test]
+    fn directory_hover_requires_fresh_edge_entry_and_respects_manual_open() {
+        use DirectoryPopup::{Hidden, Hover, Manual};
+        use DirectoryZone::{Edge, Outside, Panel};
+
+        assert_eq!(Hidden.on_pointer(Outside, Panel), Hidden);
+        assert_eq!(Hidden.on_pointer(Outside, Edge), Hover);
+        assert_eq!(Hover.on_pointer(Edge, Panel), Hover);
+        assert_eq!(Hover.on_pointer(Panel, Outside), Hidden);
+        // Esc at the edge stays dismissed through further moves within the trigger strip.
+        assert_eq!(Hidden.on_pointer(Edge, Edge), Hidden);
+        assert_eq!(Hidden.on_pointer(Panel, Edge), Hover);
+        assert_eq!(Manual.on_pointer(Panel, Outside), Manual);
     }
 }

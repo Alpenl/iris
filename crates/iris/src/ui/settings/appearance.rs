@@ -319,7 +319,7 @@ impl IrisWindow {
             )
             .child(setting_row(
                 "侧栏停靠位置",
-                "窗口停靠与全屏弹出时侧栏所在的一侧",
+                "全屏时将鼠标移到这一侧的屏幕边缘可展开侧栏，移回画面可收起",
                 segmented(
                     "set-dir-side",
                     &[("左侧", Side::Left), ("右侧", Side::Right)],

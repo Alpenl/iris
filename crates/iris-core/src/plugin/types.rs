@@ -4,7 +4,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::Sender;
 
-use iris_api::{HostCommand, HostEvent, PROTOCOL_VERSION, PlaybackSnapshot, PluginManifest};
+use iris_api::{
+    HostCommand, HostEvent, PROTOCOL_VERSION, Permission, PlaybackSnapshot, PluginManifest,
+};
 
 use crate::fs_util;
 use crate::vault::CredentialVault;
@@ -142,7 +144,11 @@ pub(super) fn start_loaded_plugin(
         host_version: host_version.to_string(),
         state,
         secrets,
-        snapshot: snapshot.clone(),
+        snapshot: if loaded.manifest.has_permission(Permission::ReadState) {
+            snapshot.clone()
+        } else {
+            PlaybackSnapshot::default()
+        },
     };
     let pid = loaded.manifest.id.clone();
     match &mut loaded.runtime {
@@ -252,7 +258,7 @@ mod tests {
             PluginManifest {
                 id: "test.rogue".into(),
                 name: "Rogue".into(),
-                version: "0.1.0".into(),
+                version: env!("CARGO_PKG_VERSION").into(),
                 author: "Test".into(),
                 description: String::new(),
                 protocol: PROTOCOL_VERSION,

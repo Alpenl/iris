@@ -4,6 +4,7 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::time::Duration;
 
 use gpui::{Context, Window};
 use iris_api::{HostEvent, SourceEntryKind, SourceManageAction, StreamSpec, SubtitleAttachment};
@@ -16,7 +17,12 @@ use iris_core::preset::SidebarMode;
 use iris_core::vfs::{self, PinnedBookmark};
 
 use super::IrisWindow;
-use super::state::{ActiveSource, ActiveStreamMeta, PendingResolve, PluginSourceView};
+use super::state::{
+    ActiveSource, ActiveStreamMeta, PendingSource, PluginSourceView, RemoteLoad, SourceOperation,
+    StreamReply,
+};
+
+const SOURCE_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn same_origin(a: &url::Url, b: &url::Url) -> bool {
     a.scheme() == b.scheme()
@@ -27,7 +33,56 @@ fn same_origin(a: &url::Url, b: &url::Url) -> bool {
 }
 
 impl IrisWindow {
+    pub(super) fn cancel_remote_requests(&mut self) {
+        let pending = self.catalog.take_pending_source();
+        let was_resolving =
+            pending.is_some_and(|p| matches!(p.operation, SourceOperation::Resolve { .. }));
+        if self.catalog.remote_load.take().is_some() || was_resolving {
+            let vp = self.active_mut();
+            vp.load_generation += 1;
+            vp.loading_visible = false;
+        }
+    }
+
+    fn begin_source_request(
+        &mut self,
+        plugin_id: &str,
+        source_id: &str,
+        operation: SourceOperation,
+        cx: &mut Context<Self>,
+    ) -> String {
+        self.cancel_remote_requests();
+        let vp = self.active_mut();
+        vp.load_generation += 1;
+        vp.pending_path = None;
+        vp.loading_visible = matches!(operation, SourceOperation::Resolve { .. });
+        let prefix = match operation {
+            SourceOperation::Browse { .. } => "browse",
+            SourceOperation::Resolve { .. } => "resolve",
+        };
+        self.catalog.source_req_seq += 1;
+        let request_id = format!("{prefix}-{}", self.catalog.source_req_seq);
+        self.catalog.pending_source = Some(PendingSource {
+            req_id: request_id.clone(),
+            deadline: std::time::Instant::now() + SOURCE_TIMEOUT,
+            plugin_id: plugin_id.to_owned(),
+            source_id: source_id.to_owned(),
+            operation,
+        });
+        let id = request_id.clone();
+        let pid = plugin_id.to_owned();
+        let timer = cx.background_executor().timer(SOURCE_TIMEOUT);
+        self.catalog.source_timeout = Some(cx.spawn(async move |this, cx| {
+            timer.await;
+            let _ = this.update(cx, |this, cx| {
+                this.handle_source_error(&pid, &id, "数据源请求超时".into(), cx);
+            });
+        }));
+        request_id
+    }
+
     pub(super) fn browse_local_source(&mut self, cx: &mut Context<Self>) {
+        self.cancel_remote_requests();
         self.catalog.active_source = ActiveSource::Local;
         self.catalog.sidebar_mode = SidebarMode::Files;
         self.rebuild_directory_rows();
@@ -165,6 +220,7 @@ impl IrisWindow {
             .into_iter()
             .find(|(pid, _, s)| *pid == plugin_id && s.id == source_id)
         else {
+            self.cancel_remote_requests();
             self.show_toast("该插件数据源未启用或不可用", cx);
             return;
         };
@@ -175,13 +231,14 @@ impl IrisWindow {
             s.supports_search,
             s.auth_command_id.clone(),
         );
-        self.catalog.source_req_seq += 1;
-        let req_id = format!("browse-{}", self.catalog.source_req_seq);
-        if page.is_some()
-            && let ActiveSource::Plugin(ps) = &mut self.catalog.active_source
-        {
+        let append = page.is_some()
+            && matches!(&self.catalog.active_source,
+            ActiveSource::Plugin(ps) if ps.plugin_id == pid && ps.source_id == source_id && ps.folder_id == folder_id);
+        let req_id =
+            self.begin_source_request(&pid, source_id, SourceOperation::Browse { append }, cx);
+        if append && let ActiveSource::Plugin(ps) = &mut self.catalog.active_source {
             ps.loading = true;
-            ps.active_request_id = req_id.clone();
+            ps.error = None;
         } else {
             self.catalog.sidebar_mode = SidebarMode::Files;
             self.catalog.active_source = ActiveSource::Plugin(Box::new(PluginSourceView {
@@ -200,7 +257,6 @@ impl IrisWindow {
                 auth_hint: None,
                 loading: true,
                 error: None,
-                active_request_id: req_id.clone(),
             }));
         }
         self.rebuild_directory_rows();
@@ -226,6 +282,11 @@ impl IrisWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if action == SourceManageAction::Remove
+            && self.catalog.has_remote_work_for(plugin_id, Some(source_id))
+        {
+            self.cancel_remote_requests();
+        }
         if action == SourceManageAction::Remove
             && matches!(
                 &self.catalog.active_source,
@@ -255,16 +316,15 @@ impl IrisWindow {
         variant: Option<String>,
         cx: &mut Context<Self>,
     ) {
-        self.catalog.source_req_seq += 1;
-        let req_id = format!("resolve-{}", self.catalog.source_req_seq);
-        self.catalog.pending_resolve = Some(PendingResolve {
-            req_id: req_id.clone(),
-            plugin_id: plugin_id.to_string(),
-            source_id: source_id.to_string(),
-            entry_id: entry_id.to_string(),
-            title,
-        });
-        self.active_mut().loading_visible = true;
+        let req_id = self.begin_source_request(
+            plugin_id,
+            source_id,
+            SourceOperation::Resolve {
+                entry_id: entry_id.to_owned(),
+                title,
+            },
+            cx,
+        );
         let folder_id = match &self.catalog.active_source {
             ActiveSource::Plugin(ps) if ps.plugin_id == plugin_id && ps.source_id == source_id => {
                 ps.folder_id.clone()
@@ -330,36 +390,35 @@ impl IrisWindow {
         let low = name.to_ascii_lowercase();
         let is_live = low.ends_with(".m3u8") || low.contains("live");
         let kind = library::kind_of(Path::new(&name)).unwrap_or(Kind::Video);
-        self.catalog.active_stream_meta = None;
         self.open_remote_media(
-            MediaUri::HttpUrl(clean_url.clone()),
-            name,
-            clean_url,
-            BTreeMap::new(),
-            kind,
-            is_live,
+            RemoteMediaRequest {
+                uri: MediaUri::HttpUrl(clean_url.clone()),
+                title: name,
+                playback_url: clean_url,
+                headers: BTreeMap::new(),
+                kind,
+                is_live,
+                photo: None,
+                subtitles: Vec::new(),
+            },
+            None,
             Vec::new(),
             cx,
         );
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn open_remote_media(
         &mut self,
-        uri: MediaUri,
-        title: String,
-        playback_url: String,
-        headers: BTreeMap<String, String>,
-        kind: Kind,
-        is_live: bool,
+        mut req: RemoteMediaRequest,
+        meta: Option<ActiveStreamMeta>,
         attachments: Vec<SubtitleAttachment>,
         cx: &mut Context<Self>,
     ) {
-        let Ok(stream_url) = vfs::validate_stream_url(&playback_url) else {
-            self.active_mut().loading_visible = false;
+        let Ok(stream_url) = vfs::validate_stream_url(&req.playback_url) else {
             self.show_toast("远程流地址不合法（仅允许 HTTP/HTTPS）", cx);
             return;
         };
+        self.cancel_remote_requests();
         self.save_progress_sync();
         self.overlays.close_menus();
         let generation = {
@@ -371,72 +430,94 @@ impl IrisWindow {
         };
         cx.notify();
 
-        let (url_bg, hdr_bg, hint) = (playback_url.clone(), headers.clone(), title.clone());
-        let task = cx.background_executor().spawn(async move {
-            let photo = if kind == Kind::Photo {
-                vfs::fetch_head_bytes(&url_bg, &hdr_bg, 256 * 1024)
-                    .ok()
-                    .map(|head| photo::probe_bytes(&head, Some(&hint)))
-            } else {
-                None
-            };
-            let mut subs = Vec::new();
-            for att in attachments {
-                let Ok(sub_url) = vfs::validate_stream_url(&att.url) else {
-                    continue;
-                };
-                if !att.headers.is_empty()
-                    || (!hdr_bg.is_empty() && !same_origin(&stream_url, &sub_url))
-                {
-                    match RemoteSubtitle::prefetch(sub_url.as_str(), &att.headers) {
-                        Ok(s) => subs.push(s),
-                        Err(e) => {
-                            log::warn!("prefetching remote subtitle '{}' failed: {e}", att.label)
-                        }
-                    }
-                } else {
-                    subs.push(RemoteSubtitle::Url(sub_url.to_string()));
+        let cancel = vfs::HttpCancel::default();
+        let task = if req.kind != Kind::Photo && attachments.is_empty() {
+            gpui::Task::ready(Some(req))
+        } else {
+            let worker_cancel = cancel.clone();
+            let slot = self.catalog.remote_work_slot.clone();
+            cx.background_executor().spawn(async move {
+                let _permit = slot.lock().await;
+                if worker_cancel.is_cancelled() {
+                    return None;
                 }
-            }
-            (photo, subs)
-        });
+                if req.kind == Kind::Photo {
+                    req.photo = Some(photo::probe_remote(
+                        &req.playback_url,
+                        &req.headers,
+                        Some(&req.title),
+                        &worker_cancel,
+                    ));
+                }
+                for att in attachments {
+                    if worker_cancel.is_cancelled() {
+                        return None;
+                    }
+                    let Ok(sub_url) = vfs::validate_stream_url(&att.url) else {
+                        continue;
+                    };
+                    if !att.headers.is_empty()
+                        || (!req.headers.is_empty() && !same_origin(&stream_url, &sub_url))
+                    {
+                        match RemoteSubtitle::prefetch(
+                            sub_url.as_str(),
+                            &att.headers,
+                            &worker_cancel,
+                        ) {
+                            Ok(s) => req.subtitles.push(s),
+                            Err(e) => {
+                                log::warn!(
+                                    "prefetching remote subtitle '{}' failed: {e}",
+                                    att.label
+                                )
+                            }
+                        }
+                    } else {
+                        req.subtitles.push(RemoteSubtitle::Url(sub_url.to_string()));
+                    }
+                }
+                (!worker_cancel.is_cancelled()).then_some(req)
+            })
+        };
 
-        cx.spawn(async move |this, cx| {
-            let (photo, subtitles) = task.await;
+        let plugin_id = meta.as_ref().and_then(|m| m.plugin_id.clone());
+        let source_id = meta.as_ref().and_then(|m| m.source_id.clone());
+        let completion = cx.spawn(async move |this, cx| {
+            let Some(req) = task.await else { return };
             let _ = this.update(cx, |this, cx| {
                 if this.active().load_generation != generation {
                     return;
                 }
+                this.catalog.remote_load = None;
                 this.active_mut().loading_visible = false;
-                let resume = if this.settings.resume_playback && !is_live && kind == Kind::Video {
-                    this.store.resume(&uri)
-                } else {
-                    0.
-                };
-                let req = RemoteMediaRequest {
-                    uri,
-                    title,
-                    playback_url,
-                    headers,
-                    kind,
-                    is_live,
-                    photo,
-                    subtitles,
-                };
+                let resume =
+                    if this.settings.resume_playback && !req.is_live && req.kind == Kind::Video {
+                        this.store.resume(&req.uri)
+                    } else {
+                        0.
+                    };
                 let settings = this.settings.clone();
                 match this
                     .active_mut()
                     .session
                     .open_remote(req, &settings, resume)
                 {
-                    Ok(()) => this.finish_media_open(cx),
+                    Ok(()) => {
+                        this.catalog.active_stream_meta = meta.filter(|m| !m.variants.is_empty());
+                        this.finish_media_open(cx);
+                    }
                     Err(e) => this.show_toast(format!("无法打开远程流 · {e}"), cx),
                 }
                 this.active_mut().image.reset();
                 cx.notify();
             });
-        })
-        .detach();
+        });
+        self.catalog.remote_load = Some(RemoteLoad {
+            cancel,
+            plugin_id,
+            source_id,
+            _task: completion,
+        });
     }
 
     pub(super) fn handle_plugin_resolved_stream(
@@ -446,23 +527,23 @@ impl IrisWindow {
         stream: StreamSpec,
         cx: &mut Context<Self>,
     ) {
-        let req_id_str = request_id.as_deref().unwrap_or("");
-        let (source_id, entry_id, fallback_title) = match self.catalog.pending_resolve.take() {
-            Some(p)
-                if p.plugin_id == plugin_id
-                    && (req_id_str.is_empty() || p.req_id == req_id_str) =>
-            {
-                (
-                    stream.source_id.clone().or(Some(p.source_id)),
-                    stream.entry_id.clone().or(Some(p.entry_id)),
-                    p.title,
-                )
-            }
-            other => {
-                self.catalog.pending_resolve = other;
-                (stream.source_id.clone(), stream.entry_id.clone(), None)
-            }
-        };
+        let (source_id, entry_id, fallback_title) =
+            match self.catalog.accept_stream(plugin_id, request_id.as_deref()) {
+                None => return,
+                Some(StreamReply::Proactive) => (stream.source_id, stream.entry_id, None),
+                Some(StreamReply::Requested {
+                    source_id,
+                    entry_id,
+                    title,
+                }) => {
+                    self.active_mut().loading_visible = false;
+                    (
+                        stream.source_id.or(Some(source_id)),
+                        stream.entry_id.or(Some(entry_id)),
+                        title,
+                    )
+                }
+            };
         let title = stream
             .title
             .or(fallback_title)
@@ -481,20 +562,25 @@ impl IrisWindow {
             },
             _ => MediaUri::HttpUrl(stream.url.clone()),
         };
-        self.catalog.active_stream_meta = (!stream.variants.is_empty()).then(|| ActiveStreamMeta {
+        let meta = ActiveStreamMeta {
             plugin_id: Some(plugin_id.to_string()),
             source_id,
             entry_id,
             variants: stream.variants,
             active_variant: stream.active_variant,
-        });
+        };
         self.open_remote_media(
-            uri,
-            title,
-            stream.url,
-            stream.headers,
-            kind,
-            is_live,
+            RemoteMediaRequest {
+                uri,
+                title,
+                playback_url: stream.url,
+                headers: stream.headers,
+                kind,
+                is_live,
+                photo: None,
+                subtitles: Vec::new(),
+            },
+            Some(meta),
             stream.subtitles,
             cx,
         );

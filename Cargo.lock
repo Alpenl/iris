@@ -2461,7 +2461,7 @@ checksum = "791930b43c0d5973160d90a8f3894509f2b273430f5c5c73b668636d0287c5c0"
 
 [[package]]
 name = "iris"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "anyhow",
  "cocoa",
@@ -2482,7 +2482,7 @@ dependencies = [
 
 [[package]]
 name = "iris-api"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -2490,7 +2490,7 @@ dependencies = [
 
 [[package]]
 name = "iris-core"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "anyhow",
  "base64",
@@ -2499,9 +2499,11 @@ dependencies = [
  "httparse",
  "iris-api",
  "iris-mpv",
+ "libc",
  "log",
  "miniz_oxide 0.8.9",
  "percent-encoding",
+ "ring",
  "roxmltree",
  "rustls",
  "rustls-native-certs",
@@ -2515,7 +2517,7 @@ dependencies = [
 
 [[package]]
 name = "iris-mpv"
-version = "0.1.0"
+version = "0.0.1"
 
 [[package]]
 name = "is_terminal_polyfill"

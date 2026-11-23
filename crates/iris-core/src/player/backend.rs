@@ -124,7 +124,13 @@ pub(super) fn spawn_event_pump(mpv: Arc<Mpv>) -> UnboundedReceiver<SessionEvent>
                         level,
                         text,
                     }) => {
-                        log::warn!(target: "iris::mpv", "{prefix}/{level}: {}", text.trim_end());
+                        // Demuxers include stream URLs and relative signed paths in errors.
+                        let detail = if text.contains("://") || text.contains('?') {
+                            "media URL omitted"
+                        } else {
+                            text.trim_end()
+                        };
+                        log::warn!(target: "iris::mpv", "{prefix}/{level}: {detail}");
                     }
                     Some(ev) => {
                         if let Some(event) = SessionEvent::from_backend(ev)
@@ -462,6 +468,8 @@ impl Session {
             Command::SelectSubtitle(None) => {
                 self.mpv.command_async(&["set", "sub-visibility", "no"])?;
             }
+            Command::SubSeekPrev => self.mpv.command_async(&["sub-seek", "-1"])?,
+            Command::SubSeekNext => self.mpv.command_async(&["sub-seek", "1"])?,
             Command::SubDelayBy(delta) => {
                 let next = ((self.state.sub_delay + delta) * 100.).round() / 100.;
                 self.mpv
@@ -574,5 +582,64 @@ impl Session {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, Instant};
+
+    use super::*;
+
+    #[test]
+    fn subtitle_cue_commands_seek_between_cues_while_paused() {
+        let mut session = Session::new().unwrap();
+        session.mpv.set_property_string("vo", "null").unwrap();
+        // Six seconds of 2x2 YUV420 video. ASCII samples keep the memory URL NUL-free.
+        let video = format!(
+            "memory://YUV4MPEG2 W2 H2 F10:1 Ip A1:1 C420jpeg\n{}",
+            "FRAME\nxxxxxx".repeat(60)
+        );
+        let subs = concat!(
+            "memory://1\n00:00:01,000 --> 00:00:02,000\nFirst\n\n",
+            "2\n00:00:04,000 --> 00:00:05,000\nSecond\n"
+        );
+        session
+            .mpv
+            .loadfile_with_options(
+                &video,
+                "replace",
+                &[
+                    ("pause", "yes"),
+                    ("start", "1.1"),
+                    ("sub-files-append", subs),
+                ],
+            )
+            .unwrap();
+
+        let wait_for_cue = |mpv: &Mpv, text: &str, start: f64| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let position = mpv.get_property_f64("time-pos").ok();
+                let subtitle = mpv.get_property_string("sub-text").ok();
+                if position.is_some_and(|pos| (pos - start).abs() <= 0.2)
+                    && subtitle.as_deref() == Some(text)
+                {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "expected {text} at {start}s, got {subtitle:?} at {position:?}"
+                );
+                let _ = mpv.wait_event(0.05);
+            }
+        };
+        wait_for_cue(&session.mpv, "First", 1.0);
+        session.execute(Command::SubSeekNext).unwrap();
+        wait_for_cue(&session.mpv, "Second", 4.0);
+        session.execute(Command::SubSeekPrev).unwrap();
+        wait_for_cue(&session.mpv, "First", 1.0);
+        assert_eq!(session.mpv.get_property_string("pause").unwrap(), "yes");
+        session.shutdown();
     }
 }

@@ -1,9 +1,9 @@
 name: Release recipe policy
 on:
   pull_request:
-    paths: ['scripts/release/**', '.github/workflows/release-*.yml', 'LICENSE-*', 'Cargo.toml', 'Cargo.lock', 'crates/**/Cargo.toml', 'deny.toml']
+    paths: ['scripts/release/**', '.github/workflows/release-*.yml', '.github/workflows/media-sdk.yml', 'LICENSE-*', 'Cargo.toml', 'Cargo.lock', 'crates/**/Cargo.toml', 'deny.toml']
   push:
-    paths: ['scripts/release/**', '.github/workflows/release-*.yml', 'LICENSE-*', 'Cargo.toml', 'Cargo.lock', 'crates/**/Cargo.toml', 'deny.toml']
+    paths: ['scripts/release/**', '.github/workflows/release-*.yml', '.github/workflows/media-sdk.yml', 'LICENSE-*', 'Cargo.toml', 'Cargo.lock', 'crates/**/Cargo.toml', 'deny.toml']
 permissions:
   contents: read
 jobs:

@@ -77,6 +77,9 @@ metadata = json.loads(
     ).stdout
 )
 pkgs = {p["name"]: p for p in metadata["packages"]}
+version = pkgs["iris"]["version"]
+assert re.fullmatch(r"0\.0\.(0|[1-9][0-9]*)", version), "Only 0.0.x Iris builds are authorized"
+assert all(p["version"] == version for p in pkgs.values()), "Workspace package versions differ"
 
 for crate_name in ("iris", "iris-core"):
     default_feats = pkgs[crate_name]["features"].get("default", [])

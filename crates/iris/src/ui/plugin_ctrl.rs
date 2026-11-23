@@ -7,7 +7,7 @@ use iris_core::player::Command;
 use iris_core::plugin::{self, PollReport};
 
 use super::IrisWindow;
-use super::state::ActiveSource;
+use super::state::{ActiveSource, SourceOperation};
 
 impl IrisWindow {
     pub(super) fn plugin_snapshot(&self) -> PlaybackSnapshot {
@@ -20,7 +20,7 @@ impl IrisWindow {
 
     pub(super) fn sidebar_is_visible(&self) -> bool {
         if self.chrome.fullscreen {
-            self.overlays.dir_popup
+            self.overlays.dir_popup.is_open()
         } else {
             self.settings.directory_open
         }
@@ -123,19 +123,7 @@ impl IrisWindow {
             HostCommand::SourceError {
                 request_id,
                 message,
-            } => {
-                self.overlays.clear_submitting_for_plugin(pid);
-                self.active_mut().loading_visible = false;
-                if let ActiveSource::Plugin(ps) = &mut self.catalog.active_source
-                    && ps.plugin_id == pid
-                    && (request_id.is_empty() || ps.active_request_id == request_id)
-                {
-                    ps.loading = false;
-                    ps.error = Some(message.clone());
-                    self.rebuild_directory_rows();
-                }
-                self.show_toast(format!("数据源错误 · {message}"), cx);
-            }
+            } => self.handle_source_error(pid, &request_id, message, cx),
             HostCommand::CloseModal { .. } => {
                 self.plugins.dismiss_modal(pid);
                 self.overlays.complete_plugin_modal_close(
@@ -283,6 +271,9 @@ impl IrisWindow {
             self.settings.disabled_plugins.push(id.to_string());
         }
         self.preset_rt.record_user_edit(&self.settings);
+        if !enabled && self.catalog.has_remote_work_for(id, None) {
+            self.cancel_remote_requests();
+        }
         let snap = self.plugin_snapshot();
         let report = self.plugins.set_enabled_with_snapshot(id, enabled, snap);
         self.apply_poll_report(report, None, cx);
@@ -299,6 +290,15 @@ impl IrisWindow {
     }
 
     pub(super) fn reload_plugins(&mut self, cx: &mut Context<Self>) {
+        if self.catalog.pending_source.is_some()
+            || self
+                .catalog
+                .remote_load
+                .as_ref()
+                .is_some_and(|load| load.plugin_id.is_some())
+        {
+            self.cancel_remote_requests();
+        }
         let snap = self.plugin_snapshot();
         let report = self
             .plugins
@@ -313,13 +313,14 @@ impl IrisWindow {
         req_id: &str,
         page: SourcePage,
     ) {
+        let Some(append) = self.catalog.take_page(plugin_id, req_id, &page.source_id) else {
+            return;
+        };
         if let ActiveSource::Plugin(ps) = &mut self.catalog.active_source
             && ps.plugin_id == plugin_id
             && ps.source_id == page.source_id
-            && (req_id.is_empty() || ps.active_request_id == req_id)
         {
-            let appending = !ps.entries.is_empty() && ps.folder_id == page.folder_id;
-            ps.loading = false;
+            let appending = append && ps.folder_id == page.folder_id;
             ps.error = None;
             ps.folder_id = page.folder_id;
             ps.parent_id = page.parent_id;
@@ -334,5 +335,27 @@ impl IrisWindow {
             }
             self.rebuild_directory_rows();
         }
+    }
+
+    pub(super) fn handle_source_error(
+        &mut self,
+        plugin_id: &str,
+        request_id: &str,
+        message: String,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(pending) = self.catalog.take_reply(plugin_id, request_id, |_| true) else {
+            return;
+        };
+        match pending.operation {
+            SourceOperation::Resolve { .. } => self.active_mut().loading_visible = false,
+            SourceOperation::Browse { .. } => {
+                if let ActiveSource::Plugin(ps) = &mut self.catalog.active_source {
+                    ps.error = Some(message.clone());
+                    self.rebuild_directory_rows();
+                }
+            }
+        }
+        self.show_toast(format!("数据源错误 · {message}"), cx);
     }
 }

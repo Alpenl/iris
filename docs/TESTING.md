@@ -5,12 +5,13 @@
 ```bash
 brew install mpv                 # 开发用的 libmpv（GPL 构建，不能拿去分发）
 cargo build --release --features devtools  # 性能/控制测试专用，不能作为发行包
-cargo test --locked --workspace            # 72 项单元/端到端测试：协议与多源权限、插件隔离/异步校验与外部 stdio 握手、内置 iris.webdav、稀疏预设与基线保护、!TextInput 打字防火墙、硬解镜像自动回拷切换、照片/ICC 单遍解析、Windows WIC 缩略图方向/通道、UI 契约与 ThemeTokens 安全兜底
+cargo test --locked --workspace            # 单元、协议与端到端回归
 python3 scripts/check-project.py           # 仓库约束：递归 UI/mpv 隔离、iris-core 与 iris-api 依赖门禁、devtools 默认特性门禁、单文件 650/850 行预算、SVG 图标与插件清单校验
 cargo deny check licenses        # 依赖许可证检查，需要先 cargo install cargo-deny
 ```
 
 libmpv 不在 `/opt/homebrew/lib` 时用 `MPV_LIB_DIR` 指定。
+Windows 需将自建 SDK 的 `prefix/lib` 设为 `MPV_LIB_DIR` 并将 `prefix/bin` 加入 `PATH`。Windows 与 macOS 的 PR 检查均执行 `cargo test --locked --workspace`。
 
 ## 测试素材
 
@@ -48,9 +49,24 @@ python3 scripts/icc-report.py out/
 
 ## 实测结果
 
-环境：Apple Silicon，P3 屏，release 构建，窗口 1440×900，Homebrew mpv 0.42。
+### 0.0.1 审计修复回归（Windows x64，2026-11-23）
+
+- `cargo test --locked --workspace` 通过 115 项，覆盖旧历史迁移、并发写入、权限与日志、请求乱序和超时、远程照片稀疏读取、万项队列及子进程清理。使用真实 libmpv 的两源 HLS 用例检查跨源分片接收的请求头。
+- 实际打开两个视频与一份字幕，首个视频播放并挂上该字幕，队列保留两项。Windows 系统媒体会话显示正确标题，系统暂停命令使 Iris 进入暂停状态。另用第二个 Iris 进程投递含空格和中文的媒体与两份字幕，第二进程以 `0` 退出，主实例打开所选媒体并挂上两份字幕。
+- 通过临时插件实际播放受请求头保护的 HLS 视频，服务端收到了播放列表及三个分片。关闭窗口后，隔离数据目录的日志与可逆编码记录均未检出该次凭据。
+- 在创建输出目录前，打包脚本拒绝与当前 `0.0.x` 工作区不符的版本，含签名发行模式。Windows PR 工作流使用锁定源码生成的媒体运行库执行全工作区测试。
+- 本地未签名的 Windows x64 安装包和 ZIP 的 SHA-256 与构建清单一致。安装后读取到 33 种扩展名的 `OpenWithProgids` 值与正确的带引号启动命令。安装版 `--version` 返回 `Iris 0.0.1`，在仅含系统目录的 `PATH` 下实际显示 MP4 和 JPEG，两个窗口均以退出码 `0` 关闭。卸载后程序及 Iris 的关联值清除。验收结果保存在 `target/qa-0.0.1/result.json`。
+- 本轮 macOS 跨全屏空间置顶与 Keychain 升级体验仍需 Mac 实机验证。Windows Authenticode、macOS Developer ID 签名与公证仍需发行凭据。
+
+#### Windows 插件启动与全屏目录
+
+- 在真实 Iris 启动 Python 插件时捕获 Windows 的进程创建事件，在插件入口执行前强制结束 Iris。观察到宿主与插件均退出，插件入口的标记文件未创建。另一个回归用例在子进程执行前检查它已经属于指定的 Job。
+- 在 3840×2160（175% 缩放）与 2560×1600（150% 缩放）的屏幕上分别验证右、左停靠。检查截图最外侧的像素，确认进度条横跨整个视口，目录紧贴停靠边缘。鼠标进入目录后停留，目录保持展开。移回画面或直接跨到旁边的显示器后收起。退出全屏时恢复原先的窗口目录设置。
+- 工作区 121 项测试通过，Clippy 与架构门禁通过。截图、布局测量与进程退出记录位于 `target/qa-edge-0.0.1/`。
 
 ### 照片边界（2026-11-20）
+环境：Apple Silicon，P3 屏，release 构建，窗口 1440×900，Homebrew mpv 0.42。
+
 
 | 项目 | 结果 | 说明 |
 |---|---|---|

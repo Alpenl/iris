@@ -1,6 +1,6 @@
-//! Windows file associations start a new process per file; forward the path
-//! to the running instance of this user and logon session instead. Only a
-//! bounded file path crosses the pipe, never a playback option or command.
+//! Windows file associations forward each open selection to the running instance
+//! of this user and logon session. The versioned wire format carries only bounded
+//! UTF-16 paths, with an empty batch requesting window activation.
 //! macOS needs none of this: LaunchServices delivers opens to the running app.
 
 #[cfg(any(target_os = "windows", test))]
@@ -9,16 +9,43 @@ mod wire {
 
     /// Longest Windows path in UTF-16 units (the `\\?\` limit).
     pub(super) const MAX_UNITS: usize = 32_767;
+    pub(super) const MAX_PATHS: usize = 16_384;
+    pub(super) const MAX_BATCH_UNITS: usize = 1_048_576;
 
-    /// Reads a length-prefixed UTF-16LE path payload with strict size and NUL checks.
-    pub(super) fn read_path_units(reader: &mut impl Read) -> io::Result<Vec<u16>> {
-        let mut len = [0u8; 4];
-        reader.read_exact(&mut len)?;
-        let len = u32::from_le_bytes(len) as usize;
-        if len > MAX_UNITS {
+    fn read_length(reader: &mut impl Read) -> io::Result<usize> {
+        let mut bytes = [0; 4];
+        reader.read_exact(&mut bytes)?;
+        Ok(u32::from_le_bytes(bytes) as usize)
+    }
+
+    pub(super) fn read_batch<T>(
+        reader: &mut impl Read,
+        decode: impl Fn(&[u16]) -> T,
+    ) -> io::Result<Vec<T>> {
+        let count = read_length(reader)?;
+        if count > MAX_PATHS {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "file path is too long",
+                "too many file paths",
+            ));
+        }
+        let mut remaining = MAX_BATCH_UNITS;
+        let mut paths = Vec::with_capacity(count);
+        for _ in 0..count {
+            let units = read_path_units(reader, remaining)?;
+            remaining -= units.len();
+            paths.push(decode(&units));
+        }
+        Ok(paths)
+    }
+
+    /// Reads a length-prefixed UTF-16LE path payload with strict size and NUL checks.
+    fn read_path_units(reader: &mut impl Read, remaining: usize) -> io::Result<Vec<u16>> {
+        let len = read_length(reader)?;
+        if len == 0 || len > MAX_UNITS.min(remaining) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid file path length",
             ));
         }
         let mut bytes = vec![0u8; len * 2];
@@ -44,10 +71,10 @@ mod imp {
     use futures::channel::mpsc::UnboundedSender;
     use std::ffi::OsString;
     use std::fs::OpenOptions;
-    use std::io::{self, Read, Write};
+    use std::io::{self, Write};
     use std::os::windows::ffi::{OsStrExt, OsStringExt};
     use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
-    use std::path::{Path, PathBuf};
+    use std::path::PathBuf;
     use std::time::{Duration, Instant};
     use windows_sys::Win32::Foundation::{
         ERROR_ALREADY_EXISTS, ERROR_PIPE_CONNECTED, GetLastError,
@@ -58,7 +85,7 @@ mod imp {
     use windows_sys::Win32::System::RemoteDesktop::ProcessIdToSessionId;
     use windows_sys::Win32::System::Threading::{CreateMutexW, GetCurrentProcessId};
 
-    use super::wire::{MAX_UNITS, read_path_units};
+    use super::wire::{MAX_BATCH_UNITS, MAX_PATHS, MAX_UNITS, read_batch};
 
     /// Holds the per-session mutex for the life of the primary instance.
     pub(crate) struct Guard {
@@ -84,7 +111,7 @@ mod imp {
     /// Becomes the primary instance or hands `initial` to the existing one.
     /// Files later sent by other processes arrive on `opened`. Isolated test
     /// instances (`IRIS_SETTINGS`) never take part.
-    pub(crate) fn claim(initial: Option<&Path>, opened: UnboundedSender<PathBuf>) -> Claim {
+    pub(crate) fn claim(initial: &[PathBuf], opened: UnboundedSender<Vec<PathBuf>>) -> Claim {
         if std::env::var_os("IRIS_SETTINGS").is_some() {
             return Claim::Primary(Guard { _handle: None });
         }
@@ -95,8 +122,11 @@ mod imp {
                 return Claim::Primary(Guard { _handle: None });
             }
         };
-        let endpoint = format!(r"\\.\pipe\iris-open-{session}-{sid}");
-        let name: Vec<u16> = r"Local\Iris.Player".encode_utf16().chain(Some(0)).collect();
+        let endpoint = format!(r"\\.\pipe\iris-open-batch-{session}-{sid}");
+        let name: Vec<u16> = format!(r"Local\Iris.Player.Batch.{sid}")
+            .encode_utf16()
+            .chain(Some(0))
+            .collect();
         // SAFETY: NUL-terminated name; a non-null handle immediately gains an owner.
         let (mutex, exists) = unsafe {
             let handle = CreateMutexW(std::ptr::null(), 0, name.as_ptr());
@@ -128,16 +158,32 @@ mod imp {
         Claim::Primary(Guard { _handle: mutex })
     }
 
-    fn forward(endpoint: &str, session: u32, path: Option<&Path>) -> io::Result<()> {
-        let path = path.map(std::path::absolute).transpose()?;
-        let units: Vec<u16> = path
-            .map(|p| p.as_os_str().encode_wide().collect())
-            .unwrap_or_default();
-        if units.len() > MAX_UNITS {
+    fn forward(endpoint: &str, session: u32, paths: &[PathBuf]) -> io::Result<()> {
+        if paths.len() > MAX_PATHS {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "file path is too long",
+                "too many file paths",
             ));
+        }
+        let mut message = (paths.len() as u32).to_le_bytes().to_vec();
+        let mut remaining = MAX_BATCH_UNITS;
+        for path in paths {
+            let path = std::path::absolute(path)?;
+            let start = message.len();
+            message.extend_from_slice(&[0; 4]);
+            let mut len = 0;
+            for unit in path.as_os_str().encode_wide() {
+                if len == MAX_UNITS.min(remaining) || unit == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "invalid file path batch",
+                    ));
+                }
+                message.extend_from_slice(&unit.to_le_bytes());
+                len += 1;
+            }
+            message[start..start + 4].copy_from_slice(&(len as u32).to_le_bytes());
+            remaining -= len;
         }
         let deadline = Instant::now() + Duration::from_secs(3);
         let mut pipe = loop {
@@ -157,15 +203,10 @@ mod imp {
                 "pipe server is in another session",
             ));
         }
-        let mut message = Vec::with_capacity(4 + units.len() * 2);
-        message.extend_from_slice(&(units.len() as u32).to_le_bytes());
-        units
-            .iter()
-            .for_each(|unit| message.extend_from_slice(&unit.to_le_bytes()));
         pipe.write_all(&message)
     }
 
-    fn serve(mut pipe: std::fs::File, opened: UnboundedSender<PathBuf>) {
+    fn serve(mut pipe: std::fs::File, opened: UnboundedSender<Vec<PathBuf>>) {
         while !opened.is_closed() {
             // SAFETY: the pipe handle is owned by `pipe` for the whole loop.
             if unsafe { ConnectNamedPipe(pipe.as_raw_handle(), std::ptr::null_mut()) } == 0 {
@@ -175,9 +216,9 @@ mod imp {
                     return;
                 }
             }
-            match read_path(&mut pipe) {
-                Ok(path) => {
-                    let _ = opened.unbounded_send(path);
+            match read_batch(&mut pipe, |units| PathBuf::from(OsString::from_wide(units))) {
+                Ok(paths) => {
+                    let _ = opened.unbounded_send(paths);
                 }
                 Err(e) => log::warn!("file-open message: {e}"),
             }
@@ -190,10 +231,6 @@ mod imp {
             }
         }
     }
-
-    pub(super) fn read_path(reader: &mut impl Read) -> io::Result<PathBuf> {
-        read_path_units(reader).map(|units| PathBuf::from(OsString::from_wide(&units)))
-    }
 }
 
 #[cfg(target_os = "windows")]
@@ -201,7 +238,7 @@ pub(crate) use imp::{Claim, claim};
 
 #[cfg(test)]
 mod tests {
-    use super::wire::{MAX_UNITS, read_path_units};
+    use super::wire::{MAX_PATHS, MAX_UNITS, read_batch};
     use std::io::{self, Cursor};
 
     fn encode_units(units: &[u16]) -> Vec<u8> {
@@ -214,43 +251,43 @@ mod tests {
     }
 
     #[test]
-    fn read_path_boundaries_roundtrip_and_reject_oversize_nul_or_truncated() {
-        // 1. Empty path (bring window forward)
+    fn wire_batches_preserve_order_unicode_and_activation() {
+        let decode = |units: &[u16]| units.to_vec();
         assert!(
-            read_path_units(&mut Cursor::new(encode_units(&[])))
+            read_batch(&mut Cursor::new([0; 4]), decode)
                 .unwrap()
                 .is_empty()
         );
+        let names: Vec<Vec<_>> = [r"D:\媒体库\测试 视频.mkv", r"D:\媒体库\中文字幕.srt"]
+            .iter()
+            .map(|s| s.encode_utf16().collect())
+            .collect();
+        let mut data = 2u32.to_le_bytes().to_vec();
+        for name in &names {
+            data.extend(encode_units(name));
+        }
+        assert_eq!(read_batch(&mut Cursor::new(data), decode).unwrap(), names);
+    }
 
-        // 2. Normal UTF-16LE CJK path
-        let sample = r"D:\媒体库\测试 视频.mkv";
-        let sample_u16: Vec<u16> = sample.encode_utf16().collect();
-        let decoded = read_path_units(&mut Cursor::new(encode_units(&sample_u16))).unwrap();
-        assert_eq!(String::from_utf16(&decoded).unwrap(), sample);
-
-        // 3. Oversized length (> MAX_UNITS) rejected immediately before allocation
-        let oversize = ((MAX_UNITS + 1) as u32).to_le_bytes();
-        let err_big = read_path_units(&mut Cursor::new(oversize)).unwrap_err();
-        assert_eq!(err_big.kind(), io::ErrorKind::InvalidData);
-
-        // 4. Embedded NUL code unit rejected
-        let err_nul = read_path_units(&mut Cursor::new(encode_units(&[65, 0, 66]))).unwrap_err();
-        assert_eq!(err_nul.kind(), io::ErrorKind::InvalidData);
-
-        // 5. Truncated header or truncated payload rejected
+    #[test]
+    fn wire_rejects_whole_batch_on_invalid_path_or_count() {
+        for invalid in [
+            encode_units(&[]),
+            encode_units(&[65, 0, 66]),
+            ((MAX_UNITS + 1) as u32).to_le_bytes().to_vec(),
+            vec![2, 0, 0, 0, 1],
+        ] {
+            let mut data = 2u32.to_le_bytes().to_vec();
+            data.extend(encode_units(&[65]));
+            data.extend(invalid);
+            assert!(read_batch(&mut Cursor::new(data), |_| ()).is_err());
+        }
+        let count = ((MAX_PATHS + 1) as u32).to_le_bytes();
         assert_eq!(
-            read_path_units(&mut Cursor::new([1u8, 0]))
+            read_batch(&mut Cursor::new(count), |_| ())
                 .unwrap_err()
                 .kind(),
-            io::ErrorKind::UnexpectedEof
-        );
-        let mut truncated = encode_units(&sample_u16);
-        truncated.pop();
-        assert_eq!(
-            read_path_units(&mut Cursor::new(truncated))
-                .unwrap_err()
-                .kind(),
-            io::ErrorKind::UnexpectedEof
+            io::ErrorKind::InvalidData
         );
     }
 }

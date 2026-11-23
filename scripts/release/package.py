@@ -18,6 +18,7 @@ import struct
 import subprocess
 import sys
 import tarfile
+import tomllib
 import zipfile
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -50,9 +51,9 @@ def application_inputs():
     ]
     files += [
         p
-        for directory in ("crates", "Resources")
+        for directory in ("crates", "Resources", "scripts/release")
         for p in (ROOT / directory).rglob("*")
-        if p.is_file() and p.name != ".DS_Store"
+        if p.is_file() and p.name != ".DS_Store" and "__pycache__" not in p.parts and p.suffix != ".pyc"
     ]
     return {p.relative_to(ROOT).as_posix(): sha(p) for p in sorted(files)}
 
@@ -268,12 +269,6 @@ def application_source(destination):
         target = app / rel
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(file, target)
-    shutil.copytree(
-        ROOT / "scripts/release",
-        app / "scripts/release",
-        dirs_exist_ok=True,
-        ignore=shutil.ignore_patterns(".DS_Store", "__pycache__", "*.pyc"),
-    )
     for name in ("LICENSE-MIT", "LICENSE-APACHE"):
         shutil.copy2(ROOT / name, destination / name)
 
@@ -282,7 +277,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--sdk", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--version", required=True, help="Three numeric components, e.g. 0.1.0")
+    parser.add_argument("--version", required=True, help="Must match the authorized 0.0.x workspace version")
     parser.add_argument("--mode", choices=["local", "release"], required=True)
     parser.add_argument("--resume", action="store_true", help="Resume only when application and SDK inputs are unchanged")
     parser.add_argument("--adopt-completed-vendor", action="store_true",
@@ -295,8 +290,10 @@ def main():
         help="embedded (default) bundles corresponding source tarballs inside compliance/; sidecar emits them alongside the package",
     )
     args = parser.parse_args()
-    if not re.fullmatch(r"\d+\.\d+\.\d+", args.version):
-        parser.error("version must be numeric major.minor.patch")
+    with (ROOT / "Cargo.toml").open("rb") as file:
+        workspace_version = tomllib.load(file)["workspace"]["package"]["version"]
+    if not re.fullmatch(r"0\.0\.(0|[1-9][0-9]*)", args.version) or args.version != workspace_version:
+        parser.error(f"only the current 0.0.x workspace version ({workspace_version}) is authorized")
     sdk, output = args.sdk.resolve(), args.output.resolve()
     compliance = sdk / "compliance"
     manifest = json.loads((compliance / "build-manifest.json").read_text())
@@ -394,7 +391,9 @@ def main():
             plistlib.dump({"CFBundleExecutable": "iris", "CFBundleIdentifier": "io.github.alpenl.iris",
                           "CFBundleName": "Iris", "CFBundlePackageType": "APPL", "CFBundleShortVersionString": args.version,
                           "CFBundleVersion": args.version, "LSMinimumSystemVersion": "11.0", "NSHighResolutionCapable": True,
-                          "LSApplicationCategoryType": "public.app-category.video"}, file)
+                          "LSApplicationCategoryType": "public.app-category.video",
+                          "CFBundleDocumentTypes": [{"CFBundleTypeName": "Media", "CFBundleTypeRole": "Viewer",
+                              "LSHandlerRank": "Alternate", "LSItemContentTypes": ["public.movie", "public.audio", "public.image"]}]}, file)
     if not executable.exists():
         shutil.copy2(built, executable)
     elif sha(executable) != state["build"]:

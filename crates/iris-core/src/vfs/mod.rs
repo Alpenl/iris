@@ -10,7 +10,8 @@ use serde::{Deserialize, Serialize};
 use crate::fs_util;
 use crate::media_uri::MediaUri;
 
-pub use http_client::{fetch_head_bytes, validate_stream_url};
+pub(crate) use http_client::fetch_range;
+pub use http_client::{HttpCancel, fetch_head_bytes, validate_stream_url};
 
 /// User-pinned local folder, network share, or `MediaSource` plugin folder.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

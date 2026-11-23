@@ -9,6 +9,7 @@ use gpui::{Point, RenderImage, px};
 use image::{Frame, RgbaImage};
 use iris_api::{PluginModal, Widget};
 
+use super::chrome::DirectoryPopup;
 use super::context_menu::{ContextMenu, ContextTarget};
 use super::kit::text_buffer::{TextInputBuffers, TextInputState};
 use super::state::{
@@ -128,7 +129,7 @@ fn overlay_mutual_exclusion_and_escape_priority_never_skip_or_stall() {
     assert!(ov.dialog.is_some() && ov.context_menu.is_none());
 
     // Stack all layers simultaneously and peel them one by one via `Esc`.
-    ov.dir_popup = true;
+    ov.dir_popup = DirectoryPopup::Manual;
     ov.info_open = true;
     ov.popover = Some(PopoverKind::More);
     ov.settings_open = true;

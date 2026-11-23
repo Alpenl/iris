@@ -77,7 +77,7 @@ fn manifest_with(id: &str, entry: Option<&str>, perms: Vec<Permission>) -> Plugi
     PluginManifest {
         id: id.into(),
         name: id.into(),
-        version: "0.1.0".into(),
+        version: env!("CARGO_PKG_VERSION").into(),
         author: "Test".into(),
         description: String::new(),
         protocol: PROTOCOL_VERSION,
@@ -412,6 +412,177 @@ for raw in sys.stdin:
 }
 
 #[test]
+fn read_state_gates_handshake_and_targeted_snapshots() {
+    assert!(
+        python_available(),
+        "Python is required for the plugin transport test"
+    );
+    let env = TestEnv::new("read-state");
+    let script = r#"import json, sys
+with open('events.jsonl', 'w', encoding='utf-8') as output:
+    for raw in sys.stdin:
+        ev = json.loads(raw)['payload']
+        if 'snapshot' in ev:
+            print(json.dumps(ev), file=output, flush=True)
+"#;
+    for (name, read_state) in [("acme.reader", true), ("acme.private", false)] {
+        let mut permissions = Vec::new();
+        if read_state {
+            permissions.push(Permission::ReadState);
+        }
+        write_ext_plugin(
+            &env.ext_dir,
+            name,
+            &manifest_with(name, Some("main.py"), permissions),
+            script,
+        );
+    }
+    let mut mgr = env.manager(&["acme.reader".into(), "acme.private".into()]);
+    let snapshot = PlaybackSnapshot {
+        uri: Some("file:///private/movie.mkv".into()),
+        title: Some("Private".into()),
+        position: 42.0,
+        ..Default::default()
+    };
+    for (name, expected) in [
+        ("acme.reader", &snapshot),
+        ("acme.private", &PlaybackSnapshot::default()),
+    ] {
+        mgr.set_enabled_with_snapshot(name, true, snapshot.clone());
+        mgr.send_to(
+            name,
+            HostEvent::Action {
+                id: "action".into(),
+                value: None,
+                snapshot: snapshot.clone(),
+            },
+        );
+        mgr.send_to(name, cmd_ev("ping", snapshot.clone()));
+        let file = env.ext_dir.join(name).join("events.jsonl");
+        poll_until(&mut mgr, |_, _| {
+            std::fs::read_to_string(&file).is_ok_and(|s| s.lines().count() == 3)
+        });
+        let events = std::fs::read_to_string(&file).unwrap();
+        let events: Vec<serde_json::Value> = events
+            .lines()
+            .map(|s| serde_json::from_str(s).unwrap())
+            .collect();
+        assert_eq!(events.len(), 3);
+        for (event, kind) in events.iter().zip(["init", "action", "command"]) {
+            assert_eq!(event["event"], kind);
+            assert_eq!(event["snapshot"], serde_json::to_value(expected).unwrap());
+        }
+    }
+}
+
+const TREE_PLUGIN: &str = r#"import json, os, pathlib, subprocess, sys
+child = r'''
+import os, pathlib, time
+with open('child.lock', 'w+b') as f:
+    if os.name == 'nt':
+        import msvcrt
+        msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+    else:
+        import fcntl
+        fcntl.flock(f, fcntl.LOCK_EX)
+    pathlib.Path('ready').touch()
+    time.sleep(20)
+'''
+helper = None
+for raw in sys.stdin:
+    event = json.loads(raw)['payload']['event']
+    if event == 'init':
+        helper = subprocess.Popen([sys.executable, '-c', child], stdin=subprocess.DEVNULL)
+    elif event == 'shutdown':
+        pathlib.Path('shutdown').touch()
+if not pathlib.Path('shutdown').exists() and os.name != 'nt':
+    helper.terminate()
+    helper.wait()
+pathlib.Path('eof').touch()
+"#;
+
+fn install_tree_plugin(env: &TestEnv) -> PathBuf {
+    let name = "acme.tree";
+    write_ext_plugin(
+        &env.ext_dir,
+        name,
+        &manifest_with(name, Some("main.py"), vec![]),
+        TREE_PLUGIN,
+    );
+    env.ext_dir.join(name)
+}
+
+fn wait_for_file(path: &Path) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !path.is_file() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    path.is_file()
+}
+
+fn assert_helper_released_lock(dir: &Path) {
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(dir.join("child.lock"))
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while file.try_lock().is_err() {
+        assert!(
+            Instant::now() < deadline,
+            "plugin helper retained its file lock"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn normal_quit_delivers_shutdown_then_eof_and_cleans_up_descendants() {
+    assert!(python_available());
+    let env = TestEnv::new("normal-quit");
+    let dir = install_tree_plugin(&env);
+    let mut mgr = env.manager(&[]);
+    assert!(wait_for_file(&dir.join("ready")));
+    mgr.shutdown();
+    assert!(dir.join("shutdown").is_file() && dir.join("eof").is_file());
+    assert_helper_released_lock(&dir);
+    mgr.shutdown();
+}
+
+#[test]
+fn abrupt_plugin_host_exit() {
+    const FIXTURE: &str = "IRIS_E2E_CHILD_PLUGIN_DIR";
+    if let Some(dir) = std::env::var_os(FIXTURE) {
+        let _mgr = PluginManager::with_dirs_and_vault(
+            Some(Path::new(&dir)),
+            None,
+            &[],
+            CredentialVault::in_memory(),
+        );
+        thread::sleep(Duration::from_secs(20));
+        return;
+    }
+    assert!(python_available());
+    let env = TestEnv::new("abrupt-quit");
+    let dir = install_tree_plugin(&env);
+    let mut host = ProcessCommand::new(std::env::current_exe().unwrap())
+        .args(["--exact", "abrupt_plugin_host_exit"])
+        .env(FIXTURE, &env.ext_dir)
+        .spawn()
+        .unwrap();
+    let ready = wait_for_file(&dir.join("ready"));
+    host.kill().unwrap();
+    host.wait().unwrap();
+    assert!(ready, "plugin helper did not start");
+    #[cfg(unix)]
+    assert!(
+        wait_for_file(&dir.join("eof")),
+        "plugin must receive EOF when the host disappears"
+    );
+    assert_helper_released_lock(&dir);
+}
+
+#[test]
 fn external_stderr_250_lines_and_large_json_line_never_crash_or_drop() {
     if !python_available() {
         return;
@@ -431,6 +602,7 @@ for raw in sys.stdin:
         entries = [{"id": f"e{i}", "name": f"Item {i}.mp4", "kind": "video", "variants": []} for i in range(1200)]
         page = {"source_id": "s", "folder_id": None, "parent_id": None, "title": "Big", "entries": entries, "next_page": None, "authenticated": True, "auth_hint": None}
         cmds = [{"command": "set_status", "badge": {"id": "ok", "text": "ALIVE-400", "accent": True}}, {"command": "provide_source_page", "request_id": "big", "page": page}]
+        cmds.insert(0, {"command": "set_overlay", "nodes": [{"kind": "grid", "rows": 3, "cols": 3}] * 65})
         sys.stdout.write(json.dumps({"type": "commands", "commands": cmds}) + "\n")
         sys.stdout.flush()
     elif ev.get("event") == "shutdown":
@@ -442,6 +614,7 @@ for raw in sys.stdin:
         vec![
             Permission::ReadState,
             Permission::UiStatus,
+            Permission::UiOverlay,
             Permission::MediaSource,
         ],
     );
@@ -470,6 +643,7 @@ for raw in sys.stdin:
             && r.commands.iter().any(|(_, c)| matches!(c, HostCommand::ProvideSourcePage { page, .. } if page.entries.len() == 1200))
     });
     assert!(!rep.commands.is_empty() && mgr.status_badges()[0].1.text == "ALIVE-400");
+    assert!(!mgr.overlay_nodes().any(|(id, _)| id == "acme.chatty"));
 }
 
 #[test]
@@ -549,14 +723,11 @@ fn external_example_plugins_end_to_end_never_silently_skips_errors() {
     );
     poll_until(&mut mgr, |m, _| {
         m.active_ui_overrides().1.is_some()
-            && m.overlay_nodes()
-                .iter()
-                .any(|(p, _)| *p == "example.cinema-ui")
+            && m.overlay_nodes().any(|(p, _)| p == "example.cinema-ui")
     });
     assert!(
         mgr.overlay_nodes()
-            .iter()
-            .any(|(p, n)| *p == "example.cinema-ui" && matches!(n, OverlayNode::Button { .. }))
+            .any(|(p, n)| p == "example.cinema-ui" && matches!(n, OverlayNode::Button { .. }))
     );
 
     let _ = mgr.poll();

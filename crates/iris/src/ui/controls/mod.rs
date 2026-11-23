@@ -1,5 +1,5 @@
 //! Responsive control bar (`render_dock`): docked at `t.dock_h` in windowed mode
-//! or floating with `t.radius_lg`, breakpoint calculation, volume bar, and window actions.
+//! or overlaid on the picture, breakpoint calculation, volume bar, and window actions.
 
 mod fields;
 mod timeline;
@@ -23,7 +23,7 @@ use super::actions::{
 };
 use super::kit::{ghost, icon, icon_button, icon_on_ghost, separator, tip};
 use crate::assets::Icon;
-use crate::theme::{BUTTON, FLOAT_GAP, FONT_MONO, ThemeTokens};
+use crate::theme::{BUTTON, FONT_MONO, ThemeTokens};
 
 fn anchor_wrap(
     slot: Rc<Cell<Option<Bounds<Pixels>>>>,
@@ -53,17 +53,12 @@ impl IrisWindow {
         tip(label, self.key_hint(action_id))
     }
 
-    fn dock_available_width(&self, floating: bool, window: &Window) -> f32 {
+    fn dock_available_width(&self, window: &Window) -> f32 {
         let total = f32::from(window.viewport_size().width);
-        let player_w = if !self.chrome.fullscreen && self.settings.directory_open {
+        if !self.chrome.fullscreen && self.settings.directory_open {
             (total - self.settings.directory_width).max(0.)
         } else {
             total
-        };
-        if floating {
-            (player_w - FLOAT_GAP * 2.).max(0.)
-        } else {
-            player_w
         }
     }
 
@@ -77,7 +72,7 @@ impl IrisWindow {
         let kind = self.active().session.kind();
         let left = self.settings.directory_side == Side::Left;
         let compact = self.effective_compact_controls();
-        let avail_w = self.dock_available_width(floating, window);
+        let avail_w = self.dock_available_width(window);
         let narrow = avail_w < if compact { 720. } else { 640. };
         let tiny = avail_w < if compact { 520. } else { 500. };
         let dir_open = self.sidebar_is_visible();
@@ -175,7 +170,7 @@ impl IrisWindow {
         let seam = timeline.is_some();
         div()
             .relative()
-            .when(floating, |d| d.size_full().rounded(t.radius_lg))
+            .when(floating, |d| d.size_full())
             .when(!floating, |d| {
                 d.h(t.dock_h)
                     .w_full()

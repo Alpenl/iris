@@ -121,7 +121,7 @@ impl IrisWindow {
             }
         } else {
             let bottom = if floating_dock {
-                f32::from(t.dock_h) + FLOAT_GAP + 8.
+                f32::from(t.dock_h) + 8.
             } else {
                 8.
             };
@@ -129,7 +129,7 @@ impl IrisWindow {
             if let Some(left) = left_px {
                 base.left(px(left))
             } else {
-                base.right(px(if floating_dock { FLOAT_GAP + 12. } else { 12. }))
+                base.right(px(12.))
             }
         }
     }
