@@ -133,10 +133,48 @@ fn shortcut_recording_needs_visible_settings_and_recorder_focus() {
 
 #[test]
 fn platform_primary_workspace_keys_preserve_text_editing() {
-    use iris_core::keymap::{canonical_binding, effective_gpui_context, reserved_shortcut};
+    use gpui::{Action, KeyContext, Keystroke};
+    use iris_core::keymap::{
+        Keymap, KeymapScheme, effective_gpui_context, find_action, reserved_shortcut,
+    };
 
-    for key in ["secondary-q", "secondary-p", "secondary-,", "secondary-o"] {
-        assert!(gpui::Keystroke::parse(&canonical_binding(key).unwrap()).is_ok());
+    use super::actions::{Quit, TakeScreenshot, runtime_bindings};
+
+    let bindings = runtime_bindings(&Keymap::default());
+    let mut classic = Keymap::default();
+    classic.scheme = KeymapScheme::MpvClassic;
+    let classic_bindings = runtime_bindings(&classic);
+    let typing = [
+        KeyContext::parse("Workspace").unwrap(),
+        KeyContext::parse("TextInput").unwrap(),
+    ];
+    for (id, action) in [
+        ("quit", &Quit as &dyn Action),
+        ("take_screenshot", &TakeScreenshot),
+    ] {
+        let entry = find_action(id).unwrap();
+        let typed = Keystroke::parse(entry.default_key).unwrap();
+        let binding = bindings
+            .iter()
+            .find(|binding| action.partial_eq(binding.action()))
+            .unwrap();
+        assert_eq!(binding.match_keystrokes(&[typed]), Some(false));
+        assert!(binding.predicate().unwrap().depth_of(&typing).is_some());
+        let classic_binding = classic_bindings
+            .iter()
+            .find(|binding| action.partial_eq(binding.action()))
+            .unwrap();
+        let typed = Keystroke::parse(&classic.effective_key(id)).unwrap();
+        assert_eq!(classic_binding.match_keystrokes(&[typed]), Some(false));
+        assert!(
+            classic_binding
+                .predicate()
+                .unwrap()
+                .depth_of(&typing)
+                .is_none()
+        );
+    }
+    for key in ["secondary-p", "secondary-,", "secondary-o"] {
         assert_eq!(effective_gpui_context("Workspace", key), Some("Workspace"));
     }
     for key in [
@@ -155,6 +193,61 @@ fn platform_primary_workspace_keys_preserve_text_editing() {
         reserved_shortcut("secondary-alt-shift-r").map(|(id, _)| id),
         Some("reset_appearance")
     );
+}
+
+#[test]
+fn recorded_shifted_symbols_match_runtime_bindings() {
+    use gpui::{Action, Keystroke};
+    use iris_core::keymap::{Keymap, format_keystroke_display, normalize_gpui_keystroke};
+
+    use super::actions::{ActivatePreset, TakeScreenshot, TriggerPluginCommand, runtime_bindings};
+
+    let mut keymap = Keymap::default();
+    keymap.overrides.extend([
+        ("take_screenshot".into(), "secondary-shift-/".into()),
+        ("preset:review".into(), "secondary-!".into()),
+        ("plugin:demo:command".into(), "secondary-shift--".into()),
+    ]);
+    let bindings = runtime_bindings(&keymap);
+    let preset = ActivatePreset {
+        id: "review".into(),
+    };
+    let plugin = TriggerPluginCommand {
+        plugin_id: "demo".into(),
+        command_id: "command".into(),
+    };
+    for (action, glyph, base) in [
+        (&TakeScreenshot as &dyn Action, "?", "/"),
+        (&preset, "!", "1"),
+        (&plugin, "_", "-"),
+    ] {
+        // GPUI reports the shifted glyph with Shift cleared on all supported platforms.
+        let typed = Keystroke::parse(&format!("secondary-{glyph}")).unwrap();
+        let recorded = normalize_gpui_keystroke(
+            &typed.key,
+            typed.modifiers.platform,
+            typed.modifiers.control,
+            typed.modifiers.alt,
+            typed.modifiers.shift,
+        )
+        .unwrap();
+        assert_eq!(recorded, format!("secondary-shift-{base}"));
+        assert_eq!(
+            format_keystroke_display(&recorded, false),
+            format!("Ctrl+Shift+{base}"),
+        );
+        assert_eq!(
+            format_keystroke_display(&recorded, true),
+            format!("⇧⌘{base}"),
+        );
+        let binding = bindings
+            .iter()
+            .find(|binding| action.partial_eq(binding.action()))
+            .unwrap();
+        assert_eq!(binding.match_keystrokes(&[typed]), Some(false));
+        let unshifted = Keystroke::parse(&format!("secondary-{base}")).unwrap();
+        assert_eq!(binding.match_keystrokes(&[unshifted]), None);
+    }
 }
 
 #[test]

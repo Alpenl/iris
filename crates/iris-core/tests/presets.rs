@@ -132,14 +132,22 @@ fn sparse_revert_user_edit_promotion_crash_restart_and_custom_crud() {
 
     // 5. Custom preset capture, collision-safe slug generation, update, and deletion.
     restarted_active.directory_side = Side::Right;
-    restarted_active.disabled_plugins = vec!["ext.distraction".into()];
+    restarted_rt.set_plugin_enabled(&mut restarted_active, "ext.noise", true);
+    restarted_rt.set_plugin_enabled(&mut restarted_active, "ext.distraction", false);
+    restarted_rt.set_plugin_enabled(&mut restarted_active, "ext.temporary", false);
+    restarted_rt.set_plugin_enabled(&mut restarted_active, "ext.temporary", true);
+    assert_eq!(
+        Settings::load_from(&settings_file).disabled_plugins,
+        ["ext.distraction"],
+        "GUI toggles persist immediately"
+    );
     let captured = PresetManager::capture_from_current(
         "cinema",
         "我的剪辑视图",
         "右侧宽栏",
         PresetCaptureScope::default(),
         &restarted_active,
-        restarted_rt.baseline(),
+        &restarted_rt,
         SidebarMode::Queue,
         Some((1440.0, 900.0)),
         1.5,
@@ -154,12 +162,38 @@ fn sparse_revert_user_edit_promotion_crash_restart_and_custom_crud() {
         "custom-1",
         PresetCaptureScope::default(),
         &restarted_active,
-        restarted_rt.baseline(),
+        &restarted_rt,
         SidebarMode::Sources,
         None,
         1.25,
         AspectMode::Original,
     ));
+    let updated = mgr.get(&custom_id).unwrap().plugins.as_ref().unwrap();
+    assert_eq!(updated.enable_plugins, ["ext.noise"]);
+    assert_eq!(updated.disable_plugins, ["ext.distraction"]);
+
+    restarted_rt.switch_preset(&mgr, &custom_id, &mut restarted_active, layout);
+    let (mut active, mut rt, _) = PresetRuntime::restore_on_startup_with_path(
+        &mgr,
+        Settings::load_from(&settings_file),
+        None,
+    );
+    // A reopened preset's explicit selections remain in its update even when the edits
+    // were already committed to the personal baseline during the previous session.
+    rt.set_plugin_enabled(&mut active, "ext.annoying", false);
+    assert!(mgr.update_from_current(
+        &custom_id,
+        PresetCaptureScope::default(),
+        &active,
+        &rt,
+        SidebarMode::Sources,
+        None,
+        1.25,
+        AspectMode::Original,
+    ));
+    let updated = mgr.get(&custom_id).unwrap().plugins.as_ref().unwrap();
+    assert_eq!(updated.enable_plugins, ["ext.noise"]);
+    assert_eq!(updated.disable_plugins, ["ext.annoying", "ext.distraction"]);
     assert_eq!(mgr.next_id("pip"), "custom-1");
     assert_eq!(mgr.next_id("custom-1"), "default");
     assert!(mgr.delete_custom("custom-1"));

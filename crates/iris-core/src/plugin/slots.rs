@@ -163,28 +163,23 @@ impl LoadedPlugin {
             .unwrap_or(&self.manifest.sources)
     }
 
-    pub(super) fn stop_runtime(&mut self) {
+    pub(super) fn shutdown_builtin(&mut self) -> Vec<HostCommand> {
         self.builtin_generation = None;
         match &mut self.runtime {
-            Runtime::External { proc, .. } => {
-                proc.take();
-            }
-            Runtime::Builtin(b) if self.enabled => {
-                let _ = b.handle_event(&HostEvent::Shutdown);
-            }
-            _ => {}
+            Runtime::Builtin(b) if self.enabled => b.handle_event(&HostEvent::Shutdown),
+            _ => Vec::new(),
         }
     }
 
     pub(super) fn seed_manifest_theme(&mut self) -> DirtySlots {
         let mut dirty = DirtySlots::default();
-        if self.manifest.has_permission(Permission::UiTheme)
-            && (self.active_theme != self.manifest.theme
-                || self.active_chrome != self.manifest.chrome)
-        {
-            self.active_theme = self.manifest.theme.clone();
-            self.active_chrome = self.manifest.chrome.clone();
-            dirty.theme = true;
+        if self.manifest.has_permission(Permission::UiTheme) {
+            let chrome = self.manifest.chrome.as_ref().filter(|c| chrome_fits(c));
+            if self.active_theme != self.manifest.theme || self.active_chrome.as_ref() != chrome {
+                self.active_theme = self.manifest.theme.clone();
+                self.active_chrome = chrome.cloned();
+                dirty.theme = true;
+            }
         }
         if self.manifest.has_permission(Permission::MediaSource)
             && !self.manifest.sources.is_empty()
@@ -202,7 +197,7 @@ impl LoadedPlugin {
             status: self.status_badge.take().is_some(),
             toolbar: !std::mem::take(&mut self.toolbar).is_empty(),
             overlay: !std::mem::take(&mut self.overlay).is_empty(),
-            theme: self.active_theme.take().is_some() || self.active_chrome.take().is_some(),
+            theme: self.active_theme.take().is_some() | self.active_chrome.take().is_some(),
             modal: self.modal.take().is_some(),
             sources: had_sources,
         };
@@ -222,6 +217,8 @@ fn plugin_state_path_in(state_dir: Option<&Path>, plugin_id: &str) -> Option<Pat
 const MAX_STATE_BYTES: usize = 512 * 1024;
 const MAX_UI_ELEMENTS: usize = 256;
 const MAX_UI_TEXT_BYTES: usize = 64 * 1024;
+const MAX_HIDDEN_DOCK_BUTTONS: usize = 64;
+pub(super) const HIDDEN_DOCK_BUTTONS_BYTE_BUDGET: usize = MAX_UI_TEXT_BYTES - 2;
 static NEXT_MODAL_ORDER: AtomicU64 = AtomicU64::new(0);
 
 fn json_string_bytes(s: &str) -> usize {
@@ -255,6 +252,11 @@ fn ui_fits<T: serde::Serialize>(value: &T, elements: usize) -> bool {
         }
     }
     elements <= MAX_UI_ELEMENTS && serde_json::to_writer(Budget(MAX_UI_TEXT_BYTES), value).is_ok()
+}
+
+fn chrome_fits(chrome: &ChromeLayoutSpec) -> bool {
+    let count = chrome.hidden_dock_buttons.len();
+    count <= MAX_HIDDEN_DOCK_BUTTONS && ui_fits(chrome, count)
 }
 
 fn widget_elements(widget: &Widget) -> usize {
@@ -518,6 +520,13 @@ fn command_name(cmd: &HostCommand) -> &'static str {
     )
 }
 
+pub(super) fn is_persistence_command(command: &HostCommand) -> bool {
+    matches!(
+        command,
+        HostCommand::SetState { .. } | HostCommand::SetSecret { .. }
+    )
+}
+
 pub(super) fn apply_plugin_commands(
     loaded: &mut LoadedPlugin,
     vault: &CredentialVault,
@@ -646,6 +655,9 @@ pub(super) fn apply_plugin_commands(
                 }
             }
             HostCommand::SetTheme { theme, chrome } => {
+                if chrome.as_ref().is_some_and(|c| !chrome_fits(c)) {
+                    continue;
+                }
                 let next_t = theme.map(|b| *b);
                 if loaded.active_theme != next_t || loaded.active_chrome != chrome {
                     loaded.active_theme = next_t;
@@ -697,7 +709,11 @@ pub(super) fn merge_theme(dst: &mut UiThemeSpec, src: &UiThemeSpec) {
     );
 }
 
-pub(super) fn merge_chrome(dst: &mut ChromeLayoutSpec, src: &ChromeLayoutSpec) {
+pub(super) fn merge_chrome(
+    dst: &mut ChromeLayoutSpec,
+    src: &ChromeLayoutSpec,
+    hidden_bytes: &mut usize,
+) {
     macro_rules! cp { ($($f:ident),+) => { $(if let Some(v) = src.$f { dst.$f = Some(v); })+ }; }
     cp!(
         hide_titlebar,
@@ -706,8 +722,15 @@ pub(super) fn merge_chrome(dst: &mut ChromeLayoutSpec, src: &ChromeLayoutSpec) {
         compact_controls
     );
     for btn in &src.hidden_dock_buttons {
+        if dst.hidden_dock_buttons.len() == MAX_HIDDEN_DOCK_BUTTONS {
+            break;
+        }
         if !dst.hidden_dock_buttons.contains(btn) {
-            dst.hidden_dock_buttons.push(btn.clone());
+            let cost = json_string_bytes(btn) + 1;
+            if cost <= *hidden_bytes {
+                *hidden_bytes -= cost;
+                dst.hidden_dock_buttons.push(btn.clone());
+            }
         }
     }
 }
@@ -715,6 +738,63 @@ pub(super) fn merge_chrome(dst: &mut ChromeLayoutSpec, src: &ChromeLayoutSpec) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chrome_hides_at_most_64_buttons_within_the_byte_limit() {
+        let chrome = |hidden_dock_buttons| ChromeLayoutSpec {
+            hidden_dock_buttons,
+            ..Default::default()
+        };
+        let accepted = chrome((0..64).map(|i| format!("button-{i}")).collect());
+        let too_many = chrome(vec!["button".into(); 65]);
+        let too_big = chrome(vec!["\n".repeat(MAX_UI_TEXT_BYTES / 2)]);
+        let mut plugin = LoadedPlugin::new(
+            None,
+            PluginManifest {
+                permissions: vec![Permission::UiTheme],
+                chrome: Some(too_many.clone()),
+                ..Default::default()
+            },
+            PluginSource::Builtin,
+            true,
+            Runtime::Declarative,
+        );
+        assert!(!plugin.seed_manifest_theme().theme);
+        assert!(plugin.active_chrome.is_none());
+        let vault = CredentialVault::in_memory();
+        for (candidate, replaced) in [
+            (accepted.clone(), true),
+            (too_many, false),
+            (too_big, false),
+        ] {
+            let (_, dirty) = apply_plugin_commands(
+                &mut plugin,
+                &vault,
+                None,
+                vec![HostCommand::SetTheme {
+                    theme: None,
+                    chrome: Some(candidate),
+                }],
+            );
+            assert_eq!(dirty.theme, replaced);
+            assert_eq!(plugin.active_chrome.as_ref(), Some(&accepted));
+        }
+
+        let mut merged = ChromeLayoutSpec::default();
+        let mut bytes = HIDDEN_DOCK_BUTTONS_BYTE_BUDGET;
+        merge_chrome(&mut merged, &accepted, &mut bytes);
+        merge_chrome(&mut merged, &chrome(vec!["extra".into()]), &mut bytes);
+        assert_eq!(merged, accepted);
+
+        let mut merged = ChromeLayoutSpec::default();
+        let mut bytes = HIDDEN_DOCK_BUTTONS_BYTE_BUDGET;
+        let a = chrome(vec!["x".repeat(MAX_UI_TEXT_BYTES / 2)]);
+        let b = chrome(vec!["y".repeat(MAX_UI_TEXT_BYTES / 2)]);
+        assert!(chrome_fits(&a) && chrome_fits(&b));
+        merge_chrome(&mut merged, &a, &mut bytes);
+        merge_chrome(&mut merged, &b, &mut bytes);
+        assert_eq!(merged, a);
+    }
 
     #[test]
     fn refusal_labels_never_include_command_fields() {

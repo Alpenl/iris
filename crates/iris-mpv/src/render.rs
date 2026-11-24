@@ -10,14 +10,18 @@ use std::ffi::{c_char, c_int, c_void};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr;
 use std::sync::Arc;
+#[cfg(target_os = "windows")]
+use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 
 use crate::{Error, Mpv, Result, check, sys};
+#[cfg(target_os = "windows")]
+use crate::{Event, with_cstr};
 
 pub type GetProcAddress =
     unsafe extern "C" fn(ctx: *mut c_void, name: *const c_char) -> *mut c_void;
 
-/// Capability-restricted handle granting video surface workers access ONLY to
-/// render context creation and display color-space target properties.
+/// Capability-restricted handle for render context creation, display color
+/// management, and video track recovery after a device reset.
 #[derive(Clone)]
 pub struct RenderHandle(Arc<Mpv>);
 
@@ -26,38 +30,141 @@ impl RenderHandle {
         Self(mpv)
     }
 
+    /// Configure output before creating a render context for this player.
+    /// These synchronous calls must not run on an active render thread.
     pub fn set_display_color_target(&self, prim: &str, trc: &str) -> Result<()> {
         self.0.set_property_string("target-prim", prim)?;
         self.0.set_property_string("target-trc", trc)
     }
 
+    /// Queues a display profile change. Safe on an active render thread.
     pub fn set_display_icc_profile(&self, path: &str) -> Result<()> {
-        self.0.set_property_string("icc-profile", path)
+        self.0.set_property_string_async("icc-profile", path)
     }
 
-    /// Returns the currently selected concrete video track id (e.g. `"1"`), if any.
-    pub fn active_vid(&self) -> Option<String> {
-        self.0
-            .get_property_string("vid")
-            .ok()
-            .filter(|v| !v.is_empty() && v != "no" && v != "auto")
-    }
-
-    /// Re-attaches `vid` after recreating a GPU render context so hardware decoding
-    /// (`d3d11va`) and `vo=libmpv` bind to the new device. Returns `false` if `mpv`
-    /// unloaded the file while the VO was closed (e.g. still images or silent clips).
-    pub fn restore_vid(&self, vid: &str) -> bool {
-        if self
+    /// Requests the selected concrete video track before freeing a lost device.
+    /// The client event loop delivers the result and signals `wake`. Keep
+    /// servicing render updates while waiting for it.
+    #[cfg(target_os = "windows")]
+    pub fn request_active_vid(
+        &self,
+        wake: SyncSender<()>,
+    ) -> Result<Receiver<Option<ActiveVideoTrack>>> {
+        let (tx, rx) = mpsc::channel();
+        let mut recovery = self
             .0
-            .get_property_string("path")
-            .is_ok_and(|p| !p.is_empty())
-        {
-            let _ = self.0.set_property_string("vid", vid);
-            true
-        } else {
-            false
+            .video_recovery
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let Some(entry) = recovery.entry else {
+            return Ok(rx);
+        };
+        if recovery.pending.is_some() {
+            return Err(Error {
+                code: sys::MPV_ERROR_INVALID_PARAMETER,
+                context: "video track query already pending".into(),
+            });
+        }
+        with_cstr("vid", |name| {
+            // SAFETY: The live handle queues a copy of the property name.
+            check(
+                unsafe {
+                    sys::mpv_get_property_async(
+                        self.0.raw(),
+                        VideoRecovery::QUERY_VID,
+                        name,
+                        sys::MPV_FORMAT_STRING,
+                    )
+                },
+                || "get_property_async vid".into(),
+            )
+        })?;
+        recovery.pending = Some(VideoTrackRequest { entry, tx, wake });
+        Ok(rx)
+    }
+
+    /// Queues video reattachment after recreating the render context, provided
+    /// the corresponding file is still active in the client event stream.
+    #[cfg(target_os = "windows")]
+    pub fn restore_vid(&self, track: ActiveVideoTrack) -> Result<()> {
+        let recovery = self
+            .0
+            .video_recovery
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if recovery.entry == Some(track.entry) {
+            self.0
+                .set_property_string_async("vid", &track.id.to_string())?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "windows")]
+pub struct ActiveVideoTrack {
+    entry: i64,
+    id: i64,
+}
+
+#[cfg(target_os = "windows")]
+struct VideoTrackRequest {
+    entry: i64,
+    tx: Sender<Option<ActiveVideoTrack>>,
+    wake: SyncSender<()>,
+}
+
+#[cfg(target_os = "windows")]
+#[derive(Default)]
+pub(crate) struct VideoRecovery {
+    entry: Option<i64>,
+    pending: Option<VideoTrackRequest>,
+}
+
+#[cfg(target_os = "windows")]
+impl VideoRecovery {
+    pub(crate) const QUERY_VID: u64 = 1;
+
+    pub(crate) fn on_event(&mut self, event: &Event) {
+        match *event {
+            Event::StartFile(entry) => self.entry = Some(entry),
+            Event::EndFile {
+                playlist_entry_id, ..
+            } if self.entry == Some(playlist_entry_id) => {
+                self.entry = None;
+            }
+            Event::QueueOverflow => self.entry = None,
+            Event::Shutdown => {
+                self.entry = None;
+                self.reply(None);
+            }
+            _ => (),
         }
     }
+
+    pub(crate) fn reply(&mut self, vid: Option<i64>) {
+        if let Some(VideoTrackRequest { entry, tx, wake }) = self.pending.take() {
+            let track = vid
+                .filter(|_| self.entry == Some(entry))
+                .map(|id| ActiveVideoTrack { entry, id });
+            let _ = tx.send(track);
+            let _ = wake.try_send(());
+        }
+    }
+}
+
+#[cfg(all(test, target_os = "windows"))]
+#[test]
+fn recovery_discards_track_from_replaced_file() {
+    let (wake, woke) = mpsc::sync_channel(1);
+    let (tx, rx) = mpsc::channel();
+    let mut recovery = VideoRecovery {
+        entry: Some(7),
+        pending: Some(VideoTrackRequest { entry: 7, tx, wake }),
+    };
+    recovery.on_event(&Event::StartFile(8));
+    recovery.reply(Some(3));
+    woke.try_recv().expect("video worker notified");
+    assert!(rx.try_recv().expect("query completed").is_none());
 }
 
 type UpdateFn = Box<dyn Fn() + Send + Sync>;
@@ -227,10 +334,45 @@ impl RenderContext {
         }
     }
 
-    /// Returns `MPV_RENDER_UPDATE_*` flags. Call before deciding whether to render.
-    pub fn update(&self) -> u64 {
-        // SAFETY: `self.ctx` is a valid `mpv_render_context`.
+    /// Services advanced-control requests and returns `MPV_RENDER_UPDATE_*` flags.
+    /// Call after each update notification, including when no drawable is available.
+    ///
+    /// # Safety
+    /// For OpenGL, the context used to create this render context must be current.
+    pub unsafe fn update(&self) -> u64 {
+        // SAFETY: `self.ctx` is valid and the caller guarantees the OpenGL context if needed.
         unsafe { sys::mpv_render_context_update(self.ctx) }
+    }
+
+    /// Advances the current frame without drawing to a target. mpv holds the
+    /// image for the next redraw. Follow a successful skip with `report_swap`
+    /// if the context normally reports frame presentations.
+    ///
+    /// # Safety
+    /// For OpenGL, the same GL context used to create this render context must be current.
+    pub unsafe fn skip_frame(&self) -> Result<()> {
+        let mut skip: c_int = 1;
+        let mut block: c_int = 0;
+        let mut params = [
+            sys::mpv_render_param {
+                type_: sys::MPV_RENDER_PARAM_SKIP_RENDERING,
+                data: (&mut skip as *mut c_int).cast(),
+            },
+            sys::mpv_render_param {
+                type_: sys::MPV_RENDER_PARAM_BLOCK_FOR_TARGET_TIME,
+                data: (&mut block as *mut c_int).cast(),
+            },
+            sys::mpv_render_param {
+                type_: sys::MPV_RENDER_PARAM_INVALID,
+                data: ptr::null_mut(),
+            },
+        ];
+        // SAFETY: The caller supplies the matching GL context if required, and
+        // the terminated parameters request a skip without any target surface.
+        check(
+            unsafe { sys::mpv_render_context_render(self.ctx, params.as_mut_ptr()) },
+            || "mpv_render_context_render(skip)".into(),
+        )
     }
 
     /// Renders the current frame into the given GL framebuffer.

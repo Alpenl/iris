@@ -3,7 +3,7 @@
 //! provider creation, active media source actions, and permission pills).
 
 use gpui::{
-    AnyElement, Context, FontWeight, IntoElement, ParentElement, SharedString,
+    AnyElement, Context, FontWeight, InteractiveElement, IntoElement, ParentElement, SharedString,
     StatefulInteractiveElement, Styled, div, prelude::FluentBuilder, px,
 };
 use iris_api::{Permission, SourceDescriptor, SourceManageAction};
@@ -284,9 +284,7 @@ impl IrisWindow {
         let source_rows: Vec<AnyElement> = plugin_sources
             .into_iter()
             .enumerate()
-            .map(|(si, src)| {
-                Self::render_plugin_source_row(pid.clone(), i * 32 + si, enabled, src, t, cx)
-            })
+            .map(|(si, src)| Self::render_plugin_source_row(pid.clone(), si, enabled, src, t, cx))
             .collect();
         let perm_pills = info.manifest.permissions.into_iter().map(|perm| {
             let hi = matches!(
@@ -297,6 +295,7 @@ impl IrisWindow {
         });
 
         vstack(6.)
+            .id(("plugin-card", i))
             .p(px(10.))
             .rounded(t.radius_md)
             .bg(t.window_bg)

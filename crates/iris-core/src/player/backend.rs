@@ -46,7 +46,7 @@ pub(super) mod prop {
 }
 
 pub(super) fn create() -> Result<Arc<Mpv>> {
-    let mpv = Mpv::create()?;
+    let mut mpv = Mpv::create()?;
     for (k, v) in [
         ("vo", "libmpv"),
         ("hwdec", "auto-safe"),
@@ -207,7 +207,9 @@ pub(super) fn spawn_event_pump(
                             }
                             _ => (),
                         }
-                        let _ = mpv.continue_hook(*id);
+                        // SAFETY: This event came from this handle's wait_event call, and this
+                        // is its only continuation after completing the hook's work.
+                        let _ = unsafe { mpv.continue_hook(*id) };
                         continue;
                     }
                     Event::QueueOverflow => {
@@ -281,6 +283,7 @@ fn enable_hls(mpv: &Mpv, service: &Service) -> Result<bool> {
 
 fn disable_hls(mpv: &Mpv) -> Result<()> {
     mpv.set_property_string("file-local-options/access-references", "no")?;
+    mpv.set_property_string("file-local-options/demuxer", "")?;
     mpv.set_property_string("file-local-options/demuxer-lavf-format", "")?;
     mpv.set_property_string("file-local-options/demuxer-lavf-o", "")?;
     Ok(())
@@ -450,11 +453,25 @@ impl Session {
 
     pub fn display_size(&self) -> (i64, i64) {
         let (w, h) = self.state.video_size;
-        // HEIF container transforms are already baked into the filtered frame.
-        if !self.is_current_heif() && self.display_rotation() % 180 == 90 {
+        // The HEIF format filter writes rotation metadata, leaving the frame axes unchanged.
+        if self.display_axes_swapped() {
             (h, w)
         } else {
             (w, h)
+        }
+    }
+
+    fn display_axes_swapped(&self) -> bool {
+        self.display_rotation() % 180 == 90
+    }
+
+    /// Returns user mirror flags in horizontal/vertical display order.
+    pub fn display_flips(&self) -> (bool, bool) {
+        let (hflip, vflip) = (self.state.hflip, self.state.vflip);
+        if self.display_axes_swapped() {
+            (vflip, hflip)
+        } else {
+            (hflip, vflip)
         }
     }
 
@@ -732,7 +749,7 @@ impl Session {
             }
             command @ (Command::ToggleHFlip | Command::ToggleVFlip) => {
                 let horizontal = matches!(command, Command::ToggleHFlip);
-                if horizontal != (self.display_rotation() % 180 == 90) {
+                if horizontal != self.display_axes_swapped() {
                     self.state.hflip = !self.state.hflip;
                 } else {
                     self.state.vflip = !self.state.vflip;

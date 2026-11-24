@@ -12,6 +12,7 @@ mod types;
 mod webdav;
 
 use std::collections::BTreeMap;
+use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
@@ -29,8 +30,8 @@ use crate::vault::CredentialVault;
 use builtins::{AbLoopPlugin, GuidesPlugin};
 use process::{MAX_DRAIN_PER_POLL, WakeSignal};
 use slots::{
-    LoadedPlugin, Runtime, apply_plugin_commands, default_plugin_state_dir, merge_chrome,
-    merge_theme,
+    HIDDEN_DOCK_BUTTONS_BYTE_BUDGET, LoadedPlugin, Runtime, apply_plugin_commands,
+    default_plugin_state_dir, is_persistence_command, merge_chrome, merge_theme,
 };
 use snapshot::sync_cached_snapshot;
 use types::{
@@ -42,6 +43,9 @@ use webdav::WebDavPlugin;
 pub use slots::DirtySlots;
 pub use snapshot::snapshot_from_session;
 pub use types::{PluginInfo, PluginSource, PluginStatus, PollReport, plugins_dir};
+
+const PROCESS_STOP_BUDGET: Duration = Duration::from_millis(200);
+const STATE_FLUSH_BUDGET: Duration = Duration::from_millis(200);
 
 pub struct PluginManager {
     plugins: BTreeMap<String, LoadedPlugin>,
@@ -245,15 +249,24 @@ impl PluginManager {
         )
     }
 
-    /// Deliver shutdown and request termination within one bounded grace period.
+    /// Deliver shutdown, preserve persistence commands, and flush the state writer.
     pub fn shutdown(&mut self) {
         self.stop_plugins(true);
     }
 
     fn stop_plugins(&mut self, flush_state: bool) {
-        let deadline = Instant::now() + Duration::from_millis(200);
         self.startup_report = PollReport::default();
-        for plugin in self.plugins.values_mut() {
+        let _ = self.stop_runtimes(None);
+        if flush_state && let Some(writer) = &self.state_writer {
+            writer.wait_until(Instant::now() + STATE_FLUSH_BUDGET);
+        }
+        self.plugins.clear();
+    }
+
+    fn stop_runtimes(&mut self, id: Option<&str>) -> PollReport {
+        let deadline = Instant::now() + PROCESS_STOP_BUDGET;
+        let bound = id.map_or(Bound::Unbounded, Bound::Included);
+        for (_, plugin) in self.plugins.range_mut::<str, _>((bound, bound)) {
             if let Runtime::External {
                 proc: Some(process),
                 ..
@@ -262,23 +275,54 @@ impl PluginManager {
                 process.request_shutdown();
             }
         }
-        for plugin in self.plugins.values() {
-            if let Runtime::External {
-                proc: Some(process),
-                ..
-            } = &plugin.runtime
-            {
-                process.wait_for_termination(deadline);
+
+        let mut report = PollReport::default();
+        if id.is_none_or(|id| self.plugins[id].builtin_generation.is_some()) {
+            self.drain_builtin_replies(&mut report, |plugin_id| {
+                id.is_none_or(|id| id == plugin_id)
+            });
+        }
+        let (vault, state_dir) = (&self.vault, self.state_dir.as_deref());
+        for (_, plugin) in self.plugins.range_mut::<str, _>((bound, bound)) {
+            let mut commands = plugin.shutdown_builtin();
+            commands.retain(is_persistence_command);
+            let _ = apply_plugin_commands(plugin, vault, state_dir, commands);
+        }
+
+        // Service every bounded stdout queue each round. A blocked plugin reader can
+        // otherwise prevent its stdin reader from ever reaching Shutdown.
+        loop {
+            let mut pending = false;
+            let mut progressed = false;
+            for (_, plugin) in self.plugins.range_mut::<str, _>((bound, bound)) {
+                let Runtime::External { proc, .. } = &mut plugin.runtime else {
+                    continue;
+                };
+                let Some(process) = proc else { continue };
+                let (commands, finished, drained) = process.drain_shutdown();
+                progressed |= drained;
+                if finished {
+                    *proc = None;
+                } else {
+                    pending = true;
+                }
+                let _ = apply_plugin_commands(plugin, vault, state_dir, commands);
+            }
+            if !pending || Instant::now() >= deadline {
+                break;
+            }
+            if progressed {
+                std::thread::yield_now();
+            } else {
+                std::thread::sleep(Duration::from_millis(1));
             }
         }
-        if flush_state && let Some(writer) = &self.state_writer {
-            writer.wait_until(deadline);
+        for (_, plugin) in self.plugins.range_mut::<str, _>((bound, bound)) {
+            if let Runtime::External { proc, .. } = &mut plugin.runtime {
+                *proc = None;
+            }
         }
-        for plugin in self.plugins.values_mut() {
-            plugin.stop_runtime();
-        }
-        self.plugins.clear();
-        while self.builtin_rx.try_recv().is_ok() {}
+        report
     }
 
     pub fn set_enabled(&mut self, id: &str, enabled: bool) -> PollReport {
@@ -292,35 +336,26 @@ impl PluginManager {
         snapshot: PlaybackSnapshot,
     ) -> PollReport {
         self.last_snapshot = snapshot.clone();
-        let Some(mut loaded) = self.plugins.remove(id) else {
+        let Some(loaded) = self.plugins.get(id) else {
             return PollReport::default();
         };
         if loaded.enabled == enabled {
-            self.plugins.insert(id.to_string(), loaded);
             return PollReport::default();
         }
-        let report = if !enabled {
-            if let Runtime::External {
-                proc: Some(process),
-                ..
-            } = &mut loaded.runtime
-            {
-                let deadline = Instant::now() + Duration::from_millis(200);
-                process.request_shutdown();
-                process.wait_for_termination(deadline);
-            }
-            loaded.stop_runtime();
-            loaded.enabled = false;
-            loaded.status = PluginStatus::Disabled;
-            PollReport {
-                dirty: loaded.clear_slots(),
-                status_changed: true,
-                ..Default::default()
-            }
+        let mut report = if enabled {
+            PollReport::default()
         } else {
-            loaded.enabled = true;
-            self.start_loaded(&snapshot, &mut loaded)
+            self.stop_runtimes(Some(id))
         };
+        let mut loaded = self.plugins.remove(id).unwrap();
+        loaded.enabled = enabled;
+        if enabled {
+            report = self.start_loaded(&snapshot, &mut loaded);
+        } else {
+            loaded.status = PluginStatus::Disabled;
+            report.dirty.merge(loaded.clear_slots());
+            report.status_changed = true;
+        }
         self.plugins.insert(id.to_string(), loaded);
         report
     }
@@ -433,6 +468,7 @@ impl PluginManager {
 
     pub fn active_ui_overrides(&self) -> (Option<UiThemeSpec>, Option<ChromeLayoutSpec>) {
         let (mut merged_theme, mut merged_chrome) = (None, None);
+        let mut hidden_bytes = HIDDEN_DOCK_BUTTONS_BYTE_BUDGET;
         for p in self
             .plugins
             .values()
@@ -445,6 +481,7 @@ impl PluginManager {
                 merge_chrome(
                     merged_chrome.get_or_insert_with(ChromeLayoutSpec::default),
                     c,
+                    &mut hidden_bytes,
                 );
             }
         }
@@ -475,16 +512,12 @@ impl PluginManager {
         report
     }
 
-    pub fn poll(&mut self) -> PollReport {
-        if let Some(wake) = &self.wake {
-            wake.clear();
-        }
-        let mut report = std::mem::take(&mut self.startup_report);
+    fn drain_builtin_replies(&mut self, report: &mut PollReport, stopping: impl Fn(&str) -> bool) {
         let (vault, state_dir) = (&self.vault, self.state_dir.as_deref());
 
         for index in 0..MAX_DRAIN_PER_POLL {
             match self.builtin_rx.try_recv() {
-                Ok((pid, token, cmds)) => {
+                Ok((pid, token, mut cmds)) => {
                     if let Some(loaded) = self.plugins.get_mut(&pid).filter(|loaded| {
                         loaded.is_running()
                             && loaded
@@ -492,6 +525,9 @@ impl PluginManager {
                                 .as_ref()
                                 .is_some_and(|generation| token.as_ptr() == Arc::as_ptr(generation))
                     }) {
+                        if stopping(&pid) {
+                            cmds.retain(is_persistence_command);
+                        }
                         let (fwd, dirty) = apply_plugin_commands(loaded, vault, state_dir, cmds);
                         report.dirty.merge(dirty);
                         report
@@ -507,6 +543,15 @@ impl PluginManager {
                 Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
             }
         }
+    }
+
+    pub fn poll(&mut self) -> PollReport {
+        if let Some(wake) = &self.wake {
+            wake.clear();
+        }
+        let mut report = std::mem::take(&mut self.startup_report);
+        self.drain_builtin_replies(&mut report, |_| false);
+        let (vault, state_dir) = (&self.vault, self.state_dir.as_deref());
 
         for (pid, loaded) in &mut self.plugins {
             if !loaded.enabled {
@@ -578,6 +623,86 @@ impl Drop for PluginManager {
 mod tests {
     use super::*;
     use iris_api::HostCommand;
+
+    #[test]
+    fn disabling_builtin_keeps_persistence_from_pending_replies_and_shutdown() {
+        const ID: &str = "iris.test-shutdown";
+        struct Fixture;
+        impl BuiltinPlugin for Fixture {
+            fn manifest(&self) -> iris_api::PluginManifest {
+                iris_api::PluginManifest {
+                    id: ID.into(),
+                    permissions: vec![Permission::Notifications, Permission::Secrets],
+                    ..Default::default()
+                }
+            }
+
+            fn handle_event(&mut self, event: &HostEvent) -> Vec<HostCommand> {
+                if !matches!(event, HostEvent::Shutdown) {
+                    return Vec::new();
+                }
+                vec![
+                    HostCommand::SetState {
+                        key: "state".into(),
+                        value: Some("final".into()),
+                    },
+                    HostCommand::SetSecret {
+                        key: "token".into(),
+                        value: Some("final".into()),
+                    },
+                    HostCommand::ShowToast {
+                        message: "stale".into(),
+                    },
+                ]
+            }
+        }
+
+        let (mut manager, _) =
+            PluginManager::new_empty(None, Some(None), CredentialVault::in_memory());
+        let mut loaded = LoadedPlugin::new(
+            None,
+            Fixture.manifest(),
+            PluginSource::Builtin,
+            true,
+            Runtime::Builtin(Box::new(Fixture)),
+        );
+        let _ = manager.start_loaded(&PlaybackSnapshot::default(), &mut loaded);
+        let token = Arc::downgrade(loaded.builtin_generation.as_ref().unwrap());
+        manager.plugins.insert(ID.into(), loaded);
+        manager
+            .builtin_tx
+            .send((
+                ID.into(),
+                token,
+                vec![
+                    HostCommand::SetState {
+                        key: "queued".into(),
+                        value: Some("kept".into()),
+                    },
+                    HostCommand::SetSecret {
+                        key: "token".into(),
+                        value: Some("before shutdown".into()),
+                    },
+                    HostCommand::ShowToast {
+                        message: "stale".into(),
+                    },
+                ],
+            ))
+            .unwrap();
+
+        assert!(manager.set_enabled(ID, false).commands.is_empty());
+        let loaded = &manager.plugins[ID];
+        assert!(loaded.builtin_generation.is_none());
+        assert_eq!(loaded.state.get("queued").map(String::as_str), Some("kept"));
+        assert_eq!(loaded.state.get("state").map(String::as_str), Some("final"));
+        assert_eq!(
+            manager
+                .vault
+                .get_secret("builtin.iris.test-shutdown", "token")
+                .as_deref(),
+            Some("final"),
+        );
+    }
 
     #[test]
     fn modals_keep_arrival_order_when_another_plugin_opens_one() {

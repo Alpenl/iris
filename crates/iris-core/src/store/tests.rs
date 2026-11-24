@@ -311,6 +311,28 @@ fn locked_records_keep_pending_edits_for_the_next_save() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
+#[test]
+fn opening_while_locked_loads_history_and_preserves_the_resume_baseline() {
+    let dir = test_dir("startup-lock");
+    let clip = MediaUri::parse("resume.mkv");
+    let mut writer = Store::load_from_dir(&dir);
+    assert!(writer.toggle_favorite(&clip));
+    assert!(writer.remember(&clip, 30., 100., false));
+    writer.push_recent(&clip);
+
+    let lock = fs_util::lock_file(&dir.join("records.lock")).unwrap();
+    let mut reader = Store::load_from_dir(&dir);
+    assert_eq!(reader.recent(), std::slice::from_ref(&clip));
+    assert!(reader.is_favorite(&clip));
+    assert_eq!(reader.resume(&clip), 30.);
+    assert!(reader.remember(&clip, 40., 100., false));
+    drop(lock);
+
+    reader.save();
+    assert_eq!(Store::load_from_dir(&dir).resume(&clip), 40.);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 #[cfg(windows)]
 #[test]
 fn windows_legacy_unc_record_migrates_to_local_path_encoding() {

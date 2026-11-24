@@ -150,6 +150,10 @@ fn push_action_binding(out: &mut Vec<KeyBinding>, action_id: &str, key: &str, ct
 /// Clears and re-applies all active keyboard bindings from `keymap` at runtime.
 pub(crate) fn rebind_keys(cx: &mut App, keymap: &Keymap) {
     cx.clear_key_bindings();
+    cx.bind_keys(runtime_bindings(keymap));
+}
+
+pub(super) fn runtime_bindings(keymap: &Keymap) -> Vec<KeyBinding> {
     let mut bindings = Vec::with_capacity(96);
 
     for entry in keymap::actions() {
@@ -157,11 +161,11 @@ pub(crate) fn rebind_keys(cx: &mut App, keymap: &Keymap) {
         if keymap::reserved_shortcut(&key).is_some() {
             continue;
         }
-        let Some(key) = keymap::canonical_binding(&key) else {
+        let Some(binding) = keymap::gpui_binding(&key) else {
             continue;
         };
         for &ctx in entry.gpui_contexts(&key) {
-            push_action_binding(&mut bindings, entry.id, &key, ctx);
+            push_action_binding(&mut bindings, entry.id, &binding, ctx);
         }
     }
 
@@ -176,12 +180,12 @@ pub(crate) fn rebind_keys(cx: &mut App, keymap: &Keymap) {
 
     for (preset_id, key) in keymap.preset_bindings() {
         if keymap::reserved_shortcut(key).is_none()
-            && let Some(key) = keymap::canonical_binding(key)
-            && gpui::Keystroke::parse(&key).is_ok()
-            && let Some(ctx) = keymap::effective_gpui_context("Workspace", &key)
+            && let Some(binding) = keymap::gpui_binding(key)
+            && gpui::Keystroke::parse(&binding).is_ok()
+            && let Some(ctx) = keymap::effective_gpui_context("Workspace", key)
         {
             bindings.push(KeyBinding::new(
-                &key,
+                &binding,
                 ActivatePreset {
                     id: preset_id.to_string(),
                 },
@@ -192,12 +196,12 @@ pub(crate) fn rebind_keys(cx: &mut App, keymap: &Keymap) {
 
     for (plugin_id, cmd_id, key) in keymap.plugin_bindings() {
         if keymap::reserved_shortcut(key).is_none()
-            && let Some(key) = keymap::canonical_binding(key)
-            && gpui::Keystroke::parse(&key).is_ok()
-            && let Some(ctx) = keymap::effective_gpui_context("Workspace", &key)
+            && let Some(binding) = keymap::gpui_binding(key)
+            && gpui::Keystroke::parse(&binding).is_ok()
+            && let Some(ctx) = keymap::effective_gpui_context("Workspace", key)
         {
             bindings.push(KeyBinding::new(
-                &key,
+                &binding,
                 TriggerPluginCommand {
                     plugin_id: plugin_id.to_string(),
                     command_id: cmd_id.to_string(),
@@ -207,7 +211,7 @@ pub(crate) fn rebind_keys(cx: &mut App, keymap: &Keymap) {
         }
     }
 
-    cx.bind_keys(bindings);
+    bindings
 }
 
 impl IrisWindow {

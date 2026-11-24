@@ -69,6 +69,35 @@ fn playlist_routes_bind_urls_extensions_and_playback_keys() {
     );
 }
 
+#[test]
+fn playlist_rejects_ambiguous_attribute_grammar() {
+    let routes = Routes::new("127.0.0.1:9898".parse().unwrap()).unwrap();
+    let base = Url::parse("https://media.example/playlist.m3u8").unwrap();
+    for attrs in [
+        "METHOD=AES-128 IV=0x1234",
+        "METHOD=AES-128\tIV=0x1234",
+        "METHOD= \"NONE\"",
+        "NAME=\"a\\\"b\"",
+        "NAME=\"a\"X=1",
+        "NAME=a=b",
+        "NAME=a,",
+        "name=a",
+    ] {
+        assert!(
+            rewrite_playlist(&format!("#EXTM3U\n#EXT-X-KEY:{attrs}\n"), &base, &routes).is_err(),
+            "{attrs}"
+        );
+    }
+    let scalars =
+        "#EXTM3U\n#EXT-X-TARGETDURATION:2\n#EXT-X-PROGRAM-DATE-TIME:2026-01-01T00:00:00Z\n";
+    assert_eq!(rewrite_playlist(scalars, &base, &routes).unwrap(), scalars);
+    let extension = "#EXTM3U\n#EXT-X-CUE-OUT:30\n#EXT-X-TARGETDURATION:2\n#EXT-X-PROGRAM-DATE-TIME:2026-01-01T00:00:00Z\n";
+    assert_eq!(
+        rewrite_playlist(extension, &base, &routes).unwrap(),
+        scalars
+    );
+}
+
 /// Static fixture origins run entirely on loopback. Every requested resource and
 /// every observed credential is recorded for assertions after libmpv opens the file.
 struct Fixture {
@@ -246,6 +275,47 @@ fn playback_seek_preserves_range_and_representation_length() {
     assert!(reply.starts_with("HTTP/1.1 206"));
     assert!(reply.contains("content-range: bytes 10-13/100\r\n"));
     assert!(reply.contains("content-length: 4\r\n"));
+    assert!(reply.ends_with("\r\n\r\nabcd"));
+}
+
+#[test]
+fn saturated_relay_admits_seek_after_a_worker_releases_its_slot() {
+    let origin = Fixture::new(|_| {
+        (
+            "206 Partial Content",
+            "Content-Range: bytes 0-3/100\r\n".into(),
+            b"abcd".to_vec(),
+        )
+    });
+    let url = Url::parse(&format!("http://{}/clip.mp4", origin.address)).unwrap();
+    let relay = PlaybackRelay::start(url.clone(), BTreeMap::new()).unwrap();
+    let local = Url::parse(&relay.url(&url).unwrap()).unwrap();
+    let authority = relay.service.routes.authority;
+    let mut occupied: Vec<_> = (0..RELAY_WORKERS)
+        .map(|_| relay.service.reserve_worker().unwrap())
+        .collect();
+
+    let mut client = TcpStream::connect(authority).unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_millis(200)))
+        .unwrap();
+    write!(
+        client,
+        "GET {} HTTP/1.1\r\nHost: {authority}\r\nRange: bytes=0-3\r\n\r\n",
+        local.path()
+    )
+    .unwrap();
+    let pending = client.peek(&mut [0]);
+    assert!(
+        matches!(&pending, Err(e) if matches!(e.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock)),
+        "seek was answered at capacity: {pending:?}"
+    );
+    drop(occupied.pop());
+
+    client.set_read_timeout(Some(CLIENT_TIMEOUT)).unwrap();
+    let mut reply = String::new();
+    client.read_to_string(&mut reply).unwrap();
+    assert!(reply.starts_with("HTTP/1.1 206"), "{reply}");
     assert!(reply.ends_with("\r\n\r\nabcd"));
 }
 

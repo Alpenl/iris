@@ -78,7 +78,20 @@ impl Store {
             refresh_recent: true,
             ..Self::default()
         };
-        store.save();
+        match fs_util::lock_file(&dir.join("records.lock")) {
+            Ok(_lock) => store.sync(dir),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                // Each canonical file is atomically replaced. Read the last complete
+                // snapshots now, and defer any migration or writes until we own the lock.
+                if let Err(e) = Self::read_records(&dir.join("records.tsv"), &mut store.records) {
+                    log::error!("reading records during lock contention: {e}");
+                }
+                if let Err(e) = Self::read_recent(&dir.join("recent.tsv"), &mut store.recent) {
+                    log::error!("reading recent list during lock contention: {e}");
+                }
+            }
+            Err(e) => log::error!("locking media store failed: {e}"),
+        }
         store
     }
 
@@ -193,13 +206,17 @@ impl Store {
                 return;
             }
         };
+        self.sync(&dir);
+    }
+
+    fn sync(&mut self, dir: &Path) {
         if (self.refresh_records || self.clear_all_progress || !self.edits.is_empty())
-            && let Err(e) = self.sync_records(&dir)
+            && let Err(e) = self.sync_records(dir)
         {
             log::error!("synchronizing records failed: {e}");
         }
         if (self.refresh_recent || self.clear_all_recent || !self.recent_pushes.is_empty())
-            && let Err(e) = self.sync_recent(&dir)
+            && let Err(e) = self.sync_recent(dir)
         {
             log::error!("synchronizing recent list failed: {e}");
         }

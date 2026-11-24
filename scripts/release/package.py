@@ -5,14 +5,17 @@ Use --mode local for unsigned distributions. For a signed release, run
 --prepare-only before provisioning signing credentials. Run --resume
 --package-only with the same inputs after provisioning credentials.
 Windows requires MSVC, the Windows SDK, and Inno Setup 6 (ISCC in PATH).
+Signing prefers PowerShell 7 and falls back to inbox Windows PowerShell.
+macOS bundles resolve relocated SDK dylibs through the verified manifest.
 Rust compliance requires cargo-deny 0.22.0 and the workspace Cargo.lock.
 """
 import argparse
 import hashlib
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import plistlib
+import posixpath
 import re
 import shutil
 import struct
@@ -190,44 +193,107 @@ def windows_dependencies(executable, prefix, manifest, destination):
     return graph
 
 
+def _mac_sdk_dylibs(prefix, files, arch):
+    """Index pinned paths and install IDs without consulting import paths on disk."""
+    paths, identities = {}, {}
+    origins = set()
+    by_id, by_name = {}, {}
+    for name, digest in files.items():
+        relative = PurePosixPath(name)
+        if relative.suffix != ".dylib":
+            continue
+        if relative.is_absolute() or ".." in relative.parts:
+            raise RuntimeError(f"Invalid SDK dylib path: {name}")
+        source = (prefix / name).resolve(strict=True)
+        if not source.is_relative_to(prefix) or files.get(source.relative_to(prefix).as_posix()) != digest:
+            raise RuntimeError(f"Unverified media dylib: {prefix / name}")
+        if source not in identities:
+            if not source.is_file() or sha(source) != digest:
+                raise RuntimeError(f"Unverified media dylib: {source}")
+            output = run(["otool", "-arch", arch, "-D", source]).splitlines()[1:]
+            if len(output) != 1 or not output[0].strip():
+                raise RuntimeError(f"Missing dylib install ID: {source}")
+            identity = output[0].strip()
+            identities[source] = identity
+            by_id.setdefault(identity, set()).add(source)
+        paths[relative] = source
+        by_name.setdefault(relative.name, set()).add(source)
+        identity_path = PurePosixPath(identities[source])
+        # An ID ending in a known path in this SDK identifies its original prefix.
+        # This also lets other absolute imports name pinned aliases under that prefix.
+        if identity_path.is_absolute() and identity_path.parts[-len(relative.parts):] == relative.parts:
+            origin = identity_path.parents[len(relative.parts) - 1]
+            if origin != PurePosixPath("/"):
+                origins.add(origin)
+    return paths, by_id, by_name, origins, identities
+
+
 def mac_dependencies(executable, prefix, manifest, frameworks, arch):
-    available = {p.name: p for p in (prefix / "lib").glob("*.dylib")}
-    queue = [executable]
-    seen = set()
+    paths, by_id, by_name, origins, identities = _mac_sdk_dylibs(prefix, manifest["files"], arch)
+    current = PurePosixPath(prefix.as_posix())
+
+    def resolve(dep, path, loader):
+        candidates = set(by_id.get(dep, ()))
+        if path.is_absolute():
+            if path.is_relative_to(current):
+                candidates.add(paths.get(path.relative_to(current)))
+            else:
+                for origin in origins:
+                    if path.is_relative_to(origin):
+                        candidates.add(paths.get(path.relative_to(origin)))
+        else:
+            marker, _, tail = dep.partition("/")
+            if marker == "@loader_path":
+                directory = loader.relative_to(prefix).parent.as_posix() if loader else "lib"
+                candidates.add(paths.get(PurePosixPath(posixpath.normpath(posixpath.join(directory, tail)))))
+            elif marker == "@rpath" or dep == path.name:
+                relative = PurePosixPath(tail if marker == "@rpath" else dep)
+                candidates.add(paths.get(PurePosixPath("lib") / relative))
+                candidates.add(paths.get(relative))
+                candidates.discard(None)
+                if not candidates and len(relative.parts) == 1:
+                    candidates.update(by_name.get(relative.name, ()))
+        candidates.discard(None)
+        if not candidates or path.suffix != ".dylib":
+            raise RuntimeError("External dylib outside pinned SDK: " + dep)
+        if len(candidates) != 1:
+            raise RuntimeError("Ambiguous pinned SDK dylib: " + dep)
+        return next(iter(candidates))
+
+    bundled = {}
+    queue = [(executable, None)]
     graph = {}
     while queue:
-        binary = queue.pop()
-        if binary.name in seen:
-            continue
-        seen.add(binary.name)
+        binary, source = queue.pop()
         archs = run(["lipo", "-archs", binary]).strip().split()
         if arch not in archs:
             raise RuntimeError(f"Wrong architecture: {binary}: {archs}")
-        deps = [line.strip().split(" (", 1)[0] for line in run(["otool", "-L", binary]).splitlines()[1:]]
+        deps = [line.strip().rsplit(" (compatibility version ", 1)[0]
+                for line in run(["otool", "-arch", arch, "-L", binary]).splitlines()[1:]]
         graph[binary.name] = deps
-        identity = run(["otool", "-D", binary]).splitlines()[1:]
+        identity = identities.get(source)
         if identity:
             run(["install_name_tool", "-id", "@rpath/" + binary.name, binary])
-        for dep in deps:
-            if identity and dep == identity[0].strip():
+        for dep in dict.fromkeys(deps):
+            if dep == identity:
                 continue
-            if dep.startswith(("/System/Library/", "/usr/lib/")):
-                continue
-            if dep.startswith(("/opt/homebrew/", "/usr/local/", "/opt/local/")):
+            path = PurePosixPath(posixpath.normpath(dep))
+            if dep.startswith(("/opt/homebrew/", "/usr/local/", "/opt/local/")) or path.as_posix().startswith(
+                    ("/opt/homebrew/", "/usr/local/", "/opt/local/")):
                 raise RuntimeError("Homebrew/MacPorts media forbidden: " + dep)
-            name = Path(dep).name
-            source = available.get(name)
-            if source is None or (dep.startswith("/") and not Path(dep).is_relative_to(prefix)):
-                raise RuntimeError("External dylib outside pinned SDK: " + dep)
-            if manifest["files"].get(source.relative_to(prefix).as_posix()) != sha(source):
-                raise RuntimeError("Unverified media dylib: " + str(source))
-            target = frameworks / name
-            if not target.exists():
-                shutil.copy2(source, target, follow_symlinks=True)
-                queue.append(target)
-            run(["install_name_tool", "-change", dep, "@rpath/" + name, binary])
+            if path.as_posix().startswith(("/System/Library/", "/usr/lib/")):
+                continue
+            dependency = resolve(dep, path, source)
+            target = frameworks / path.name
+            if target not in bundled:
+                shutil.copy2(dependency, target)
+                bundled[target] = dependency
+                queue.append((target, dependency))
+            elif bundled[target] != dependency:
+                raise RuntimeError(f"Conflicting dylibs for bundle path: {target.name}")
+            run(["install_name_tool", "-change", dep, "@rpath/" + target.name, binary])
         # Remove every build-machine rpath, including implicit Cargo/build.rs paths.
-        loads = run(["otool", "-l", binary])
+        loads = run(["otool", "-arch", arch, "-l", binary])
         for rpath in re.findall(r"cmd LC_RPATH\s+cmdsize \d+\s+path (.*?) \(offset", loads):
             run(["install_name_tool", "-delete_rpath", rpath, binary])
         run(["install_name_tool", "-add_rpath", "@executable_path/../Frameworks" if binary == executable else "@loader_path", binary])
@@ -390,14 +456,27 @@ def notarize(submission, target, evidence):
     run(["xcrun", "stapler", "staple", target])
     run(["xcrun", "stapler", "validate", target])
 
+def _windows_signer():
+    host = shutil.which("pwsh.exe")
+    if host:
+        host = Path(host).resolve()
+    else:
+        system_root = os.environ.get("SystemRoot")
+        host = Path(system_root) / "System32/WindowsPowerShell/v1.0/powershell.exe" if system_root else None
+        if host is None or not host.is_file():
+            raise RuntimeError("Windows signing requires pwsh.exe or inbox Windows PowerShell")
+    script = Path(__file__).resolve().with_name("sign-windows.ps1")
+    return [host, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script, "-File"]
+
 
 def sign_payload(payload, executable, frameworks, notices, graph, target, mode, version, windows, output):
     release = mode == "release"
     record = {"mode": mode, "signing": "unsigned-local", "notarization": "not-requested",
               "target": target, "version": version, "native_dependencies": graph}
     if windows and release:
+        signer = _windows_signer()
         for file in [executable, *sorted(frameworks.glob("*.dll"))]:
-            run(["pwsh", "-NoProfile", "-File", Path(__file__).with_name("sign-windows.ps1"), "-File", file])
+            run([*signer, file])
         record["signing"] = "authenticode-verified"
     if not windows:
         signing = ["--timestamp", "--options", "runtime"] if release else []
@@ -442,9 +521,10 @@ def build_installer(payload, output, artifact, version, release):
         if cache.exists():
             shutil.rmtree(cache)
         cache.mkdir()
-        script = str(Path(__file__).with_name("sign-windows.ps1")).replace("$", "$$")
+        # Use Inno's quote and dollar macros after Windows argument quoting.
+        signer = subprocess.list2cmdline(_windows_signer()).replace("$", "$$").replace('"', "$q")
         args += ["/DSignedRelease", "/DSignedUninstallerDir=" + str(cache),
-                 f"/Siris=pwsh.exe -NoProfile -File $q{script}$q -File $f"]
+                 f"/Siris={signer} $f"]
     run([*args, Path(__file__).with_name("windows-installer.iss")])
     if release:
         run(["signtool", "verify", "/pa", "/all", output / (artifact + "-setup.exe")])
@@ -512,7 +592,10 @@ def main():
         parser.error("--package-only requires --resume and completed preparation")
     # Verify the entire SDK before compiling, including import libraries and headers.
     for relative, digest in manifest["files"].items():
-        file = prefix / relative
+        path = Path(relative)
+        file = prefix / path
+        if not windows and (path.is_absolute() or ".." in path.parts or not file.resolve().is_relative_to(prefix)):
+            raise RuntimeError("SDK path outside pinned prefix: " + relative)
         if not file.is_file() or sha(file) != digest:
             raise RuntimeError("SDK checksum mismatch: " + relative)
     if manifest["ffmpeg"] != {"gpl": False, "version3": False, "nonfree": False, "chromaprint": False, "shared": True}:

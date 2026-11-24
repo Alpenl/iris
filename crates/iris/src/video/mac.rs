@@ -56,6 +56,7 @@ unsafe extern "C" {
     fn CGLRetainContext(ctx: CGLContextObj) -> CGLContextObj;
     fn CGLReleaseContext(ctx: CGLContextObj);
     fn CGLReleasePixelFormat(pix: CGLPixelFormatObj);
+    fn CGLGetCurrentContext() -> CGLContextObj;
     fn CGLSetCurrentContext(ctx: CGLContextObj) -> c_int;
     fn CGLLockContext(ctx: CGLContextObj) -> c_int;
     fn CGLUnlockContext(ctx: CGLContextObj) -> c_int;
@@ -102,6 +103,8 @@ struct LayerState {
     pixel_format: CGLPixelFormatObj,
     gl: CGLContextObj,
     render: Mutex<Option<RenderContext>>,
+    /// The update thread has seen a frame Core Animation has yet to draw.
+    pending: AtomicBool,
     /// Render even without a new mpv frame (resize, margins changed).
     force: AtomicBool,
     drawable: AtomicBool,
@@ -109,6 +112,86 @@ struct LayerState {
 
 unsafe impl Send for LayerState {}
 unsafe impl Sync for LayerState {}
+
+// Used outside CA's draw callback, which already owns the CGL lock and has
+// the context current. Always acquire CGL before the render mutex.
+struct CurrentContext {
+    gl: CGLContextObj,
+    previous: CGLContextObj,
+}
+
+impl CurrentContext {
+    fn lock(gl: CGLContextObj) -> Option<Self> {
+        unsafe {
+            if CGLLockContext(gl) != 0 {
+                log::error!("could not lock video CGL context");
+                return None;
+            }
+            let previous = CGLGetCurrentContext();
+            if CGLSetCurrentContext(gl) != 0 {
+                CGLUnlockContext(gl);
+                log::error!("could not make video CGL context current");
+                return None;
+            }
+            Some(Self { gl, previous })
+        }
+    }
+}
+
+impl Drop for CurrentContext {
+    fn drop(&mut self) {
+        unsafe {
+            CGLSetCurrentContext(self.previous);
+            CGLUnlockContext(self.gl);
+        }
+    }
+}
+
+impl LayerState {
+    fn needs_display(&self) -> bool {
+        self.drawable.load(Ordering::Acquire)
+            && (self.force.load(Ordering::Acquire) || self.pending.load(Ordering::Acquire))
+    }
+
+    fn service_update(&self) {
+        let Some(_gl) = CurrentContext::lock(self.gl) else {
+            return;
+        };
+        let guard = self.render.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: `_gl` locks the matching CGL context and keeps it current.
+        if let Some(render) = guard.as_ref()
+            && unsafe { render.update() } & RenderContext::UPDATE_FRAME != 0
+        {
+            self.pending.store(true, Ordering::Release);
+        }
+    }
+
+    fn skip_pending_frame(&self) -> bool {
+        if !self.pending.load(Ordering::Acquire) {
+            return false;
+        }
+        let Some(_gl) = CurrentContext::lock(self.gl) else {
+            return false;
+        };
+        let guard = self.render.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(render) = guard.as_ref() else {
+            return false;
+        };
+        // CA may have drawn on another thread while we waited for the lock.
+        if !self.pending.load(Ordering::Acquire) {
+            return false;
+        }
+        if let Err(e) = unsafe { render.skip_frame() } {
+            log::error!("skipping video frame failed: {e}");
+            return false;
+        }
+        render.report_swap();
+        self.pending.store(false, Ordering::Release);
+        // mpv retains the skipped image as its current frame for the next draw.
+        self.force.store(true, Ordering::Release);
+        true
+    }
+}
 
 impl Drop for LayerState {
     fn drop(&mut self) {
@@ -121,9 +204,10 @@ impl Drop for LayerState {
         {
             unsafe {
                 CGLLockContext(self.gl);
+                let previous = CGLGetCurrentContext();
                 CGLSetCurrentContext(self.gl);
                 drop(render);
-                CGLSetCurrentContext(ptr::null_mut());
+                CGLSetCurrentContext(previous);
                 CGLUnlockContext(self.gl);
             }
         }
@@ -203,20 +287,7 @@ extern "C" fn can_draw(
         let Some(state) = state_of(this) else {
             return NO;
         };
-        if !state.drawable.load(Ordering::Acquire) {
-            return NO;
-        }
-        let guard = state.render.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(render) = guard.as_ref() else {
-            return NO;
-        };
-        let force = state.force.swap(false, Ordering::AcqRel);
-        let flags = render.update();
-        if force || flags & RenderContext::UPDATE_FRAME != 0 {
-            YES
-        } else {
-            NO
-        }
+        if state.needs_display() { YES } else { NO }
     })
 }
 
@@ -243,6 +314,7 @@ extern "C" fn draw(
         }
         // CA has made its FBO and the context supplied by copy_context current.
         // Never block the main thread waiting for a frame's display time.
+        state.force.swap(false, Ordering::AcqRel);
         let block = unsafe { pthread_main_np() } == 0;
         if let Err(e) = unsafe { render.render_gl(fbo, vp[2], vp[3], true, block) } {
             state.force.store(true, Ordering::Release);
@@ -250,6 +322,7 @@ extern "C" fn draw(
             return;
         }
         unsafe { glFlush() };
+        state.pending.store(false, Ordering::Release);
         render.report_swap();
     });
 }
@@ -343,6 +416,7 @@ impl VideoSurface {
                 pixel_format: pf,
                 gl,
                 render: Mutex::new(None),
+                pending: AtomicBool::new(false),
                 force: AtomicBool::new(true),
                 drawable: AtomicBool::new(false),
             });
@@ -352,11 +426,12 @@ impl VideoSurface {
             // the screen, as it does for GPUI's layer.
             mpv.set_display_color_target("display-p3", "srgb")?;
 
-            CGLSetCurrentContext(gl);
-            let render_res = RenderContext::new_gl(mpv, gl_get_proc_address, ptr::null_mut())
-                .context("creating mpv render context");
-            CGLSetCurrentContext(ptr::null_mut());
-            let render = render_res?;
+            let mut render = {
+                let _current = CurrentContext::lock(gl)
+                    .ok_or_else(|| anyhow!("could not activate the video CGL context"))?;
+                RenderContext::new_gl(mpv, gl_get_proc_address, ptr::null_mut())
+                    .context("creating mpv render context")?
+            };
 
             // The layer owns its state from publication through Objective-C
             // deallocation. Core Animation can retain it beyond view removal.
@@ -364,25 +439,41 @@ impl VideoSurface {
             (*layer).set_ivar("irisState", Arc::into_raw(state.clone()) as *mut c_void);
             let _: id = msg_send![layer, retain];
             let layer_ref = SendId(layer);
+            let worker_state = Arc::clone(&state);
             let (tx, rx) = mpsc::sync_channel::<()>(1);
             let worker = std::thread::Builder::new()
                 .name("iris-video".into())
                 .spawn(move || {
                     let layer = layer_ref;
                     while rx.recv().is_ok() {
-                        autoreleasepool(|| {
-                            let _: () = msg_send![layer.0, display];
-                            let _: () = msg_send![class!(CATransaction), flush];
-                        });
+                        // CA can decline to call can_draw/draw (minimized, hidden,
+                        // or on another Space). Always service mpv independently.
+                        worker_state.service_update();
+                        if worker_state.needs_display() {
+                            autoreleasepool(|| {
+                                let _: () = msg_send![class!(CATransaction), begin];
+                                let _: () = msg_send![layer.0, display];
+                                let _: () = msg_send![class!(CATransaction), commit];
+                                let _: () = msg_send![class!(CATransaction), flush];
+                            });
+                        }
+                        if worker_state.skip_pending_frame() {
+                            autoreleasepool(|| {
+                                let _: () = msg_send![class!(CATransaction), begin];
+                                let _: () = msg_send![layer.0, setNeedsDisplay];
+                                let _: () = msg_send![class!(CATransaction), commit];
+                            });
+                        }
                     }
                     let _: () = msg_send![layer.0, release];
                 });
             let worker = match worker {
                 Ok(worker) => worker,
                 Err(error) => {
+                    let previous = CGLGetCurrentContext();
                     CGLSetCurrentContext(gl);
                     drop(render);
-                    CGLSetCurrentContext(ptr::null_mut());
+                    CGLSetCurrentContext(previous);
                     let _: () = msg_send![layer, release];
                     let _: () = msg_send![layer, release];
                     return Err(error.into());
@@ -414,7 +505,6 @@ impl VideoSurface {
                 Ordering::Release,
             );
             let cb_tx = tx.clone();
-            let mut render = render;
             render.set_update_callback(move || {
                 let _ = cb_tx.try_send(());
             });
@@ -507,9 +597,10 @@ impl VideoSurface {
         if let Some(render) = render {
             unsafe {
                 CGLLockContext(self.state.gl);
+                let previous = CGLGetCurrentContext();
                 CGLSetCurrentContext(self.state.gl);
                 drop(render);
-                CGLSetCurrentContext(ptr::null_mut());
+                CGLSetCurrentContext(previous);
                 CGLUnlockContext(self.state.gl);
             }
         }

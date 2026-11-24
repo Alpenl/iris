@@ -165,7 +165,7 @@ fn normalize_key(raw: &str) -> Option<String> {
     })
 }
 
-/// Normalizes spelling and rejects malformed chords before handing them to GPUI.
+/// Normalizes spelling and rejects malformed chords for storage and conflict checks.
 pub fn canonical_binding(spec: &str) -> Option<String> {
     let (mods, raw_key) = split_keystroke(spec)?;
     let (cmd, ctrl, alt, mut shift) = parse_mods(&mods, false)?;
@@ -173,19 +173,24 @@ pub fn canonical_binding(spec: &str) -> Option<String> {
     let explicit_ctrl = mods
         .iter()
         .any(|m| m.eq_ignore_ascii_case("ctrl") || m.eq_ignore_ascii_case("control"));
-    let key = normalize_key(raw_key)?;
+    let normalized_key = normalize_key(raw_key)?;
+    let mut key = normalized_key.as_str();
     shift |= raw_key.len() == 1 && raw_key.as_bytes()[0].is_ascii_uppercase();
-    // GPUI's platform keystrokes can encode shifted punctuation by its resulting glyph.
-    let shifted_glyph = shift.then(|| shifted_punctuation(&key)).flatten();
-    let key = if let Some(glyph) = shifted_glyph {
-        shift = false;
-        glyph
-    } else if shift && SHIFTED_PUNCTUATION.contains(key.as_str()) {
-        shift = false;
-        &key
-    } else {
-        &key
-    };
+    if cmd || ctrl || alt {
+        // Modified glyph aliases carry an implicit Shift: Ctrl+? is Ctrl+Shift+/.
+        if let Some(base) = punctuation_equivalent(key, SHIFTED_KEYS, UNSHIFTED_KEYS) {
+            key = base;
+            shift = true;
+        }
+    } else if shift {
+        // Bare symbols keep their glyph spelling (e.g. the default + binding).
+        if let Some(glyph) = punctuation_equivalent(key, UNSHIFTED_KEYS, SHIFTED_KEYS) {
+            key = glyph;
+            shift = false;
+        } else if key.len() == 1 && SHIFTED_KEYS.contains(key) {
+            shift = false;
+        }
+    }
     let mut out = String::with_capacity(spec.len());
     for (on, prefix) in [
         (secondary, "secondary-"),
@@ -202,14 +207,28 @@ pub fn canonical_binding(spec: &str) -> Option<String> {
     Some(out)
 }
 
-const SHIFTED_PUNCTUATION: &str = "~!@#$%^&*()_+{}|:\"<>?";
+const UNSHIFTED_KEYS: &str = "`1234567890-=[]\\;',./";
+const SHIFTED_KEYS: &str = "~!@#$%^&*()_+{}|:\"<>?";
 
-fn shifted_punctuation(key: &str) -> Option<&'static str> {
+fn punctuation_equivalent(key: &str, from: &str, to: &'static str) -> Option<&'static str> {
     if key.len() != 1 {
         return None;
     }
-    let i = "`1234567890-=[]\\;',./".find(key)?;
-    SHIFTED_PUNCTUATION.get(i..i + 1)
+    let i = from.find(key)?;
+    to.get(i..i + 1)
+}
+
+/// Converts a portable shortcut into GPUI's keybinding spelling. GPUI reports the
+/// shifted glyph and clears Shift for these keys, even with other modifiers held.
+pub fn gpui_binding(spec: &str) -> Option<String> {
+    let mut binding = canonical_binding(spec)?;
+    if let Some((prefix, key)) = binding.rsplit_once("shift-")
+        && let Some(glyph) = punctuation_equivalent(key, UNSHIFTED_KEYS, SHIFTED_KEYS)
+    {
+        binding.truncate(prefix.len());
+        binding.push_str(glyph);
+    }
+    Some(binding)
 }
 
 /// Whether a chord is owned by an invariant application shortcut on this platform.
@@ -634,6 +653,24 @@ mod tests {
             assert_eq!(
                 canonicalize_for_host("shift-,", is_macos),
                 canonicalize_for_host("<", is_macos)
+            );
+            let mut km = Keymap::default();
+            km.overrides
+                .insert("take_screenshot".into(), "secondary-?".into());
+            let query = format!("{primary}-shift-/");
+            assert_eq!(
+                km.find_conflict_for_os("Workspace", &query, "preset:review", is_macos)
+                    .as_deref(),
+                Some(find_action("take_screenshot").unwrap().title),
+            );
+            assert!(
+                km.find_conflict_for_os(
+                    "Workspace",
+                    &format!("{primary}-/"),
+                    "preset:review",
+                    is_macos,
+                )
+                .is_none()
             );
             assert_eq!(
                 canonicalize_for_host("arrowleft", is_macos),

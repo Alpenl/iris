@@ -384,18 +384,10 @@ impl IrisWindow {
         t: ThemeTokens,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let playable: Vec<_> = self
-            .catalog
-            .items
-            .iter()
-            .filter(|i| !i.is_folder())
-            .collect();
         let pos_str = self
-            .active()
-            .session
-            .current_media_uri()
-            .and_then(|u| playable.iter().position(|i| i.uri == u))
-            .map_or_else(|| "—".to_string(), |i| (i + 1).to_string());
+            .catalog
+            .current_playable_number
+            .map_or_else(|| "—".to_string(), |number| number.to_string());
         let counter = hstack(if compact { 4. } else { 6. })
             .pl(px(if compact { 6. } else { 10. }))
             .font_family(FONT_MONO)
@@ -405,7 +397,7 @@ impl IrisWindow {
             .child(
                 div()
                     .text_color(t.text_dim)
-                    .child(playable.len().to_string()),
+                    .child(self.catalog.playable_count.to_string()),
             );
         hstack(if compact { 1. } else { 2. })
             .child(self.step_button("prev", -1, t, cx))
@@ -423,7 +415,7 @@ impl IrisWindow {
     ) -> impl IntoElement {
         let view = &self.active().image;
         let state = self.active().session.state();
-        let (hflip, strip_on) = (state.hflip, self.settings.photo_filmstrip);
+        let strip_on = self.settings.photo_filmstrip;
         let more_pop = self.overlays.popover == Some(PopoverKind::More);
         let (viewport, media) = self.image_geometry();
         let pct_str = (viewport[0] > 0. && state.video_size.0 > 0)
@@ -441,6 +433,7 @@ impl IrisWindow {
         let strip_btn = icon_button(strip_id, Icon::Filmstrip, strip_on, t)
             .tooltip(self.act_tip(strip_tip, "toggle_filmstrip"))
             .on_click(cx.listener(|this, _, w, cx| this.toggle_filmstrip(&ToggleFilmstrip, w, cx)));
+        let (hflip, _) = self.active().session.display_flips();
         let flip_btn = icon_button(("hflip", usize::from(hflip)), Icon::FlipH, hflip, t)
             .tooltip(self.act_tip("水平镜像翻转", "toggle_hflip"))
             .on_click(cx.listener(|this, _, w, cx| this.toggle_hflip(&ToggleHFlip, w, cx)));

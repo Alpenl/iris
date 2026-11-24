@@ -189,6 +189,7 @@ pub struct PresetTransition {
 #[derive(Clone, Debug)]
 pub struct PresetRuntime {
     baseline: Settings,
+    plugin_capture_baseline: Vec<String>,
     revert: PresetRevert,
     has_active_preset: bool,
     initial_plugins: BTreeMap<String, bool>,
@@ -251,6 +252,7 @@ impl PresetRuntime {
             }),
         };
         let mut rt = Self {
+            plugin_capture_baseline: loaded.disabled_plugins.clone(),
             baseline: loaded,
             revert: PresetRevert::default(),
             has_active_preset: false,
@@ -418,6 +420,11 @@ impl PresetRuntime {
         trans
     }
 
+    pub fn set_plugin_enabled(&mut self, active_settings: &mut Settings, id: &str, enabled: bool) {
+        set_plugin_disabled(&mut active_settings.disabled_plugins, id, !enabled);
+        self.record_user_edit(active_settings);
+    }
+
     pub fn record_user_edit(&mut self, active_settings: &Settings) {
         let mut next = active_settings.clone();
         next.active_preset.clone_from(&self.baseline.active_preset);
@@ -456,6 +463,39 @@ impl PresetRuntime {
         }
         self.baseline = next;
         self.persist_baseline();
+    }
+
+    fn capture_plugin_patch(&self, active: &Settings) -> PluginPatch {
+        // Manual toggles are persisted immediately. Compare to the session's starting
+        // baseline so recording the settings edit does not erase the capture delta.
+        let baseline = &self.plugin_capture_baseline;
+        let disabled = &active.disabled_plugins;
+        let mut patch = PluginPatch {
+            enable_plugins: baseline
+                .iter()
+                .filter(|id| !disabled.contains(id))
+                .cloned()
+                .collect(),
+            disable_plugins: disabled
+                .iter()
+                .filter(|id| !baseline.contains(id))
+                .cloned()
+                .collect(),
+            ..Default::default()
+        };
+        // Keep explicit overrides the active preset still applies, including after
+        // restart when a previously captured toggle may already match the baseline.
+        for (id, &forced_disabled) in &self.initial_plugins {
+            if forced_disabled == disabled.contains(id) && forced_disabled == baseline.contains(id)
+            {
+                if forced_disabled {
+                    patch.disable_plugins.push(id.clone());
+                } else {
+                    patch.enable_plugins.push(id.clone());
+                }
+            }
+        }
+        patch
     }
 
     pub fn is_modified(&self, active_settings: &Settings) -> bool {
@@ -626,7 +666,7 @@ impl PresetManager {
         description: impl Into<String>,
         scope: PresetCaptureScope,
         s: &Settings,
-        baseline: &Settings,
+        runtime: &PresetRuntime,
         mode: SidebarMode,
         win: Option<(f32, f32)>,
         sp: f64,
@@ -659,21 +699,7 @@ impl PresetManager {
             seek_step: s.seek_step.clamp(1.0, 60.0), sub_scale: s.sub_scale.clamp(0.5, 2.5),
             aspect: asp, photo_default: s.photo_default, single_click_pause: s.single_click_pause,
         }});
-        let plugins = scope.plugins.then(|| PluginPatch {
-            enable_plugins: baseline
-                .disabled_plugins
-                .iter()
-                .filter(|id| !s.disabled_plugins.contains(id))
-                .cloned()
-                .collect(),
-            disable_plugins: s
-                .disabled_plugins
-                .iter()
-                .filter(|id| !baseline.disabled_plugins.contains(id))
-                .cloned()
-                .collect(),
-            ..Default::default()
-        });
+        let plugins = scope.plugins.then(|| runtime.capture_plugin_patch(s));
         let mut p = WorkspacePreset {
             id: id.into(),
             name: name.into(),
@@ -714,7 +740,7 @@ impl PresetManager {
         id: &str,
         scope: PresetCaptureScope,
         s: &Settings,
-        baseline: &Settings,
+        runtime: &PresetRuntime,
         mode: SidebarMode,
         win: Option<(f32, f32)>,
         sp: f64,
@@ -729,7 +755,7 @@ impl PresetManager {
             .plugins
             .as_ref()
             .map(|p| (p.plugin_commands.clone(), p.on_exit_commands.clone()));
-        let mut up = Self::capture_from_current(id, n, d, scope, s, baseline, mode, win, sp, asp);
+        let mut up = Self::capture_from_current(id, n, d, scope, s, runtime, mode, win, sp, asp);
         if let (Some(pl), Some((cmds, exit))) = (&mut up.plugins, hooks) {
             (pl.plugin_commands, pl.on_exit_commands) = (cmds, exit);
         }

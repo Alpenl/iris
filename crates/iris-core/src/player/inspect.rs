@@ -70,7 +70,7 @@ impl Session {
                 .ok()
                 .and_then(|s| s.parse::<i64>().ok())
         };
-        let (w, h) = self.state.video_size;
+        let (w, h) = self.display_size();
         MediaStats {
             file_name,
             file_size,
@@ -105,7 +105,7 @@ impl Session {
                 .ok()
                 .and_then(|s| s.parse::<i64>().ok())
         };
-        let (w, h) = self.state.video_size;
+        let (w, h) = self.display_size();
         stats.resolution = (w > 0 && h > 0).then_some((w, h));
         stats.hwdec.clone_from(&self.state.hwdec);
         match self.kind {
@@ -234,6 +234,30 @@ pub(super) fn parse_audio_device_list_json(raw: &str) -> Vec<AudioDevice> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn heif_resolution_and_mirrors_follow_display_axes() {
+        let mut session = Session::new().unwrap();
+        session.kind = Some(Kind::Photo);
+        session.photo_meta = Some(crate::photo::Photo {
+            heif: true,
+            rotate_cw: 90,
+            ..Default::default()
+        });
+        session.state.video_size = (1200, 800);
+        session.state.vflip = true;
+
+        assert_eq!(session.display_size(), (800, 1200));
+        assert_eq!(session.display_flips(), (true, false));
+        let mut stats = session.media_stats();
+        assert_eq!(stats.resolution, Some((800, 1200)));
+
+        session.extra_rotate = 90;
+        assert_eq!(session.display_flips(), (false, true));
+        session.refresh_dynamic_stats(&mut stats);
+        assert_eq!(stats.resolution, Some((1200, 800)));
+        session.shutdown();
+    }
 
     #[test]
     fn parses_mpv_track_chapter_and_audio_device_json() {

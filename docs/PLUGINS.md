@@ -90,6 +90,7 @@ Iris 的插件架构从第一性原理出发，围绕四根支柱构建单一、
 4. **非破坏性弹窗交互**：用户点击确认时宿主保持弹窗开启（保留已输入内容）并发送 `modal_submit { id, values }`，插件校验成功后显式发送 `close_modal` 关闭弹窗（校验失败仅发 `show_toast` 或更新同 `id` 弹窗即可原地提示）；用户按 `Esc` 或取消时宿主强制立即关窗并发送 `modal_cancel { id }`。
 5. **虚拟数据源请求**：`source_browse` 和 `source_resolve` 的应答须回传收到的 `request_id`。只接受当前插件当前请求的一次应答；浏览和解析请求 30 秒超时。插件主动打开媒体时省略 `resolve_stream.request_id`。`source_manage` 处理服务器配置与移除。
 6. **退出清理**：插件应在 `shutdown` 或 stdin EOF 时关闭自己的子进程和监听端口。Windows 在创建进程时就把插件加入宿主持有的 Job，宿主异常退出时由系统回收。Unix 宿主停止插件时清理插件进程组。自行创建新会话的辅助进程由插件负责回收。
+   禁用、重新扫描和退出插件时，宿主继续读取受限的 stdout 队列，处理其中的 `set_state` 和 `set_secret`，并丢弃 UI 更新。退出宿主时，状态文件有独立的刷盘时限。
 
 - `refresh_source` 携带 `source_id`，通知宿主为当前显示的该数据源重新发起浏览请求，例如登录完成后刷新列表。插件使用新 `source_browse` 事件中的 `request_id` 回包。
 
@@ -112,6 +113,10 @@ Iris 的插件架构从第一性原理出发，围绕四根支柱构建单一、
 - `qr_code`：`{ label, data, matrix, hint }`（高清点阵二维码渲染 + 一键复制内容）
 - `link`：`{ label, url, button_text }`
 - `divider`：分隔线
+
+`set_sidebar`、`open_modal`、`set_toolbar`、`set_status` 每次更新最多接受 256 个 UI 元素，序列化后的 JSON 数据最多 64 KiB。元素数包括侧栏分组、控件和展开后的子项（例如按钮组的按钮、选择项和二维码点阵行）。超限更新会保留上一次有效内容。
+
+`set_theme` 的 `chrome.hidden_dock_buttons` 最多接受 64 项，`chrome` 序列化后最多 64 KiB。
 
 ### 4.3 视口叠层节点 `OverlayNode` 与统一色彩 `Color`
 

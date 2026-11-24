@@ -14,7 +14,10 @@ use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::time::{Duration, Instant};
 
 use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
+
 use iris_api::{HostCommand, HostEvent, HostMessageRef, PluginManifest, PluginMessage};
+
+use super::slots::is_persistence_command;
 
 #[cfg(windows)]
 #[path = "windows_process.rs"]
@@ -597,22 +600,26 @@ impl ExternalProcess {
         )
     }
 
-    pub(super) fn drain(&mut self) -> (Vec<HostCommand>, Option<String>) {
+    fn drain_commands(&mut self, stopping: bool) -> (Vec<HostCommand>, usize) {
         let mut cmds = Vec::new();
-        let mut drained = 0;
-        for _ in 0..MAX_STDOUT_QUEUE {
+        for drained in 0..MAX_STDOUT_QUEUE {
             match self.rx.try_recv() {
-                Ok(commands) => {
-                    cmds.extend(commands);
-                    drained += 1;
+                Ok(commands) if stopping => {
+                    cmds.extend(commands.into_iter().filter(is_persistence_command));
                 }
-                Err(TryRecvError::Empty) => break,
+                Ok(commands) => cmds.extend(commands),
+                Err(TryRecvError::Empty) => return (cmds, drained),
                 Err(TryRecvError::Disconnected) => {
                     self.disconnected = true;
-                    break;
+                    return (cmds, drained);
                 }
             }
         }
+        (cmds, MAX_STDOUT_QUEUE)
+    }
+
+    pub(super) fn drain(&mut self) -> (Vec<HostCommand>, Option<String>) {
+        let (cmds, drained) = self.drain_commands(false);
         if self.exit.is_none() {
             self.exit = self.exit_rx.try_recv().ok();
         }
@@ -639,10 +646,12 @@ impl ExternalProcess {
         drop(self.stop_tx.take());
     }
 
-    pub(super) fn wait_for_termination(&self, deadline: Instant) {
-        let _ = self
-            .stopped
-            .recv_timeout(deadline.saturating_duration_since(Instant::now()));
+    pub(super) fn drain_shutdown(&mut self) -> (Vec<HostCommand>, bool, bool) {
+        let (cmds, drained) = self.drain_commands(true);
+        // A process can exit before its reader has delivered the last commands.
+        let finished =
+            self.disconnected && !matches!(self.stopped.try_recv(), Err(TryRecvError::Empty));
+        (cmds, finished, drained != 0)
     }
 }
 

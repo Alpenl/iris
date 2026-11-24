@@ -39,8 +39,8 @@ python3 scripts/icc-report.py out/
 - 输出：`out/results.json`（每次运行追加一行 JSON）、`out/<测试>-<文件>.png` 截图、`out/iris-stderr.log`。
 - `--bin PATH` 可以换一个二进制，用来对比改动前后（例如先把旧版复制出来）。
 - 翻页延迟的计时截止到 mpv 报出新文件的 `video-params` 为止，不含大纹理上传和上屏，真实延迟只会更长。
-- `scripts/icc-report.py out/` 读取 `icc` 测试的截图，取视频区中心 100×100 像素的平均值，和 ColorSync 从源配置文件转换到截图内嵌的显示器配置文件的预期值比较。误差在 3 个色阶左右算一致。需要 numpy 和 Pillow（`pip3 install --user numpy pillow`）；Pillow 装在用户目录时不要用 `python3 -I`。
-- Windows 的 `snap` 是可见桌面矩形截图，窗口必须置顶、未被遮挡；不要将混入其他窗口的截图当成色彩或布局通过证据。`icc-report.py` 依赖 macOS ColorSync，Windows 不运行它来冒充系统色彩验证。
+- `scripts/icc-report.py out/` 使用 Pillow / LittleCMS（`python3 -m pip install Pillow`）将源配置文件转换到显示器色域，与截图内视频区中心最多 100×100 像素的平均值比较。默认允许 3 个色阶误差。脚本优先使用截图内嵌的 ICC，未标记截图需传 `--display-profile 路径`，确认显示器以 sRGB 输出时可传 `--assume-srgb`。
+- Windows 的 `snap` 截取可见桌面矩形。确保窗口置顶且无遮挡，并在校验未标记截图时指定采集所用的显示器配置文件。
 
 ## 调试控制管道
 
@@ -59,6 +59,12 @@ python3 scripts/icc-report.py out/
 - Windows 无签名安装包和 ZIP 已生成，两次打包续跑的 `SHA256SUMS` 一致，清单中的 SHA-256 逐件校验通过。许可包和对应源码分别归档。产物在 `target/audit-final-release/`。安装测试检测到本机已有 Iris 注册信息后退出。
 - Windows CI 原先已运行工作区和 UI 契约测试，插件指南原先已列出 `OverlayNode` 配额。仓库中的 shell 脚本已有 LF，现用 `.gitattributes` 让签出时也保留 LF。
 - TCP 建连支持取消。系统 DNS 调用在后台完成，同一主机合并请求，最多同时保留 8 项。Unix 插件负责自行脱离进程组的辅助进程，Windows 使用 Job 回收。macOS 原生窗口、媒体键和 Keychain 变更需要 macOS 实机验证。
+
+### 审计复审回归（Windows x64）
+
+- 专项用例覆盖 HLS 属性语法、HTTP 中继在限流后恢复接收 Range 请求、历史文件锁竞争、插件停机落盘、预设捕获插件差量与文本输入时的快捷键。
+- 独立 Windows 实窗验证了 480 px 窄窗和 560×320 小窗中的命令面板、遮罩右键隔离、最小化时切换视频并继续播放、D3D11 设备重建后恢复可见硬解画面，以及 90° HEIF 的 `2000×3000` 显示尺寸。复审截图位于 `target/audit-fix-smoke/`。
+- macOS SDK 迁移使用打包回归测试验证路径解析。OpenGL 图层与真正的 macOS 打包仍需在 macOS 上运行验证。
 
 ### 0.0.1 审计修复回归（Windows x64，2026-11-23）
 

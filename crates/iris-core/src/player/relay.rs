@@ -5,8 +5,8 @@
 use std::collections::BTreeMap;
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpStream};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -29,7 +29,11 @@ const MAX_REQUEST: usize = 24 * 1024;
 const MAX_PLAYLIST: usize = 4 * 1024 * 1024;
 const MAX_REWRITTEN_PLAYLIST: usize = 16 * 1024 * 1024;
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(10);
-static ACTIVE_WORKERS: AtomicUsize = AtomicUsize::new(0);
+const RELAY_WORKERS: usize = 8;
+const GLOBAL_WORKERS: usize = 32;
+const SLOT_WAIT: Duration = Duration::from_secs(1);
+static ACTIVE_WORKERS: Mutex<usize> = Mutex::new(0);
+static WORKER_AVAILABLE: Condvar = Condvar::new();
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RouteKind {
@@ -225,6 +229,9 @@ impl PlaybackRelay {
 
     pub(super) fn cancel(&self) {
         self.service.cancel.cancel();
+        // Synchronize with the admission check before waking the listener.
+        let _workers = ACTIVE_WORKERS.lock().unwrap();
+        WORKER_AVAILABLE.notify_all();
         let _ = self.wake.wake();
     }
 }
@@ -242,29 +249,47 @@ struct Worker(Arc<Service>);
 
 impl Drop for Worker {
     fn drop(&mut self) {
+        let mut active = ACTIVE_WORKERS.lock().unwrap();
         self.0.workers.fetch_sub(1, Ordering::Relaxed);
-        ACTIVE_WORKERS.fetch_sub(1, Ordering::Relaxed);
+        *active -= 1;
+        WORKER_AVAILABLE.notify_all();
     }
 }
 
 impl Service {
-    fn dispatch(self: &Arc<Self>, mut socket: TcpStream) -> Option<thread::JoinHandle<()>> {
-        if self.workers.load(Ordering::Relaxed) >= 8
-            || ACTIVE_WORKERS
-                .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-                    (n < 32).then_some(n + 1)
-                })
-                .is_err()
+    fn reserve_worker(self: &Arc<Self>) -> Option<Worker> {
+        // The listener holds at most one accepted socket while waiting. A
+        // superseded range can release its slot without a new request or polling.
+        let (mut active, _) = WORKER_AVAILABLE
+            .wait_timeout_while(ACTIVE_WORKERS.lock().unwrap(), SLOT_WAIT, |active| {
+                !self.cancel.is_cancelled()
+                    && (*active >= GLOBAL_WORKERS
+                        || self.workers.load(Ordering::Relaxed) >= RELAY_WORKERS)
+            })
+            .unwrap();
+        if self.cancel.is_cancelled()
+            || *active >= GLOBAL_WORKERS
+            || self.workers.load(Ordering::Relaxed) >= RELAY_WORKERS
         {
+            return None;
+        }
+        *active += 1;
+        self.workers.fetch_add(1, Ordering::Relaxed);
+        Some(Worker(Arc::clone(self)))
+    }
+
+    fn dispatch(self: &Arc<Self>, mut socket: TcpStream) -> Option<thread::JoinHandle<()>> {
+        let Some(worker) = self.reserve_worker() else {
+            if self.cancel.is_cancelled() {
+                return None;
+            }
             // Drain the ordinary small request before replying so closing the
             // socket does not discard the response as an unread-data reset.
             let _ = read_request(&mut socket, Duration::from_millis(100));
             let _ = socket.set_write_timeout(Some(Duration::from_millis(100)));
             let _ = socket.write_all(b"HTTP/1.1 503 Service Unavailable\r\nRetry-After: 1\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
             return None;
-        }
-        self.workers.fetch_add(1, Ordering::Relaxed);
-        let worker = Worker(Arc::clone(self));
+        };
         thread::Builder::new().name("iris-media-request".into()).spawn(move || {
             let service = &worker.0;
             let Ok(_registration) = service.cancel.register(&socket) else { return };
@@ -561,12 +586,43 @@ fn rewrite_playlist(input: &str, base: &Url, routes: &Routes) -> Result<String> 
             if line.starts_with("#EXT-X-STREAM-INF:") {
                 variant = true;
             }
-            if line.starts_with("#EXT-X-")
-                && let Some((tag, attrs)) = line.split_once(':')
+            if let Some((tag, attrs)) = line.split_once(':')
+                && tag.starts_with("#EXT-X-")
             {
-                out.push_str(tag);
-                out.push(':');
-                rewrite_attributes(tag, attrs, base, routes, &mut rewritten, &mut out)?;
+                match tag {
+                    // Scalar tags never consult the attribute parser.
+                    "#EXT-X-VERSION"
+                    | "#EXT-X-TARGETDURATION"
+                    | "#EXT-X-MEDIA-SEQUENCE"
+                    | "#EXT-X-DISCONTINUITY-SEQUENCE"
+                    | "#EXT-X-PLAYLIST-TYPE"
+                    | "#EXT-X-BYTERANGE"
+                    | "#EXT-X-PROGRAM-DATE-TIME"
+                    | "#EXT-X-BITRATE" => out.push_str(line),
+                    "#EXT-X-STREAM-INF"
+                    | "#EXT-X-KEY"
+                    | "#EXT-X-MEDIA"
+                    | "#EXT-X-MAP"
+                    | "#EXT-X-START"
+                    | "#EXT-X-DATERANGE"
+                    | "#EXT-X-I-FRAME-STREAM-INF"
+                    | "#EXT-X-IMAGE-STREAM-INF"
+                    | "#EXT-X-SESSION-DATA"
+                    | "#EXT-X-SESSION-KEY"
+                    | "#EXT-X-PART"
+                    | "#EXT-X-PART-INF"
+                    | "#EXT-X-SERVER-CONTROL"
+                    | "#EXT-X-SKIP"
+                    | "#EXT-X-PRELOAD-HINT"
+                    | "#EXT-X-RENDITION-REPORT" => {
+                        out.push_str(tag);
+                        out.push(':');
+                        rewrite_attributes(tag, attrs, base, routes, &mut rewritten, &mut out)?;
+                    }
+                    // Preserve compatibility with private scalar extensions by
+                    // skipping unrecognized tags before they reach the demuxer.
+                    _ => continue,
+                }
             } else {
                 out.push_str(line);
             }
@@ -625,30 +681,55 @@ fn rewrite_attributes(
     rewritten: &mut RewrittenUris,
     out: &mut String,
 ) -> Result<()> {
-    while !attrs.is_empty() {
-        let mut quoted = false;
-        let end = attrs
-            .bytes()
-            .position(|b| {
-                if b == b'"' {
-                    quoted = !quoted;
-                }
-                b == b',' && !quoted
-            })
-            .unwrap_or(attrs.len());
-        ensure!(!quoted, "unterminated HLS attribute");
-        let attr = &attrs[..end];
-        if let Some((key, value)) = attr.split_once('=')
-            && (key.trim() == "URI" || key.trim().ends_with("-URI"))
-        {
-            let raw = value
-                .trim()
-                .strip_prefix('"')
-                .and_then(|s| s.strip_suffix('"'))
-                .context("invalid HLS URI attribute")?;
+    // Accept an unambiguous subset of RFC 8216 §4.2. In particular, do not
+    // pass whitespace-delimited attributes or quotes interpreted by libavformat.
+    loop {
+        let (key, rest) = attrs
+            .split_once('=')
+            .context("missing HLS attribute value")?;
+        ensure!(
+            !key.is_empty()
+                && key
+                    .bytes()
+                    .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'-'),
+            "invalid HLS attribute name"
+        );
+        let (raw, tail, quoted) = if let Some(rest) = rest.strip_prefix('"') {
+            let (value, tail) = rest.split_once('"').context("unterminated HLS attribute")?;
+            ensure!(
+                !value.contains(['\\', '\t']),
+                "invalid quoted HLS attribute"
+            );
+            (value, tail, true)
+        } else {
+            let end = rest.find(',').unwrap_or(rest.len());
+            let value = &rest[..end];
+            ensure!(
+                !value.is_empty()
+                    && value
+                        .bytes()
+                        .all(|b| !b.is_ascii_whitespace() && !matches!(b, b'=' | b'"' | b'\\')),
+                "invalid unquoted HLS attribute"
+            );
+            (value, &rest[end..], false)
+        };
+        let next = if tail.is_empty() {
+            None
+        } else {
+            Some(
+                tail.strip_prefix(',')
+                    .filter(|s| !s.is_empty())
+                    .context("invalid HLS attribute separator")?,
+            )
+        };
+        out.push_str(key);
+        out.push('=');
+        if quoted {
+            out.push('"');
+        }
+        if key == "URI" || key.ends_with("-URI") {
+            ensure!(quoted && !raw.is_empty(), "invalid HLS URI attribute");
             let url = validate_stream_url(base.join(raw)?.as_str())?;
-            out.push_str(key);
-            out.push_str("=\"");
             let (kind, fallback) = match tag {
                 "#EXT-X-MEDIA"
                 | "#EXT-X-I-FRAME-STREAM-INF"
@@ -659,19 +740,19 @@ fn rewrite_attributes(
                 _ => (RouteKind::Media, "ts"),
             };
             rewrite_uri(url, kind, fallback, routes, rewritten, out)?;
-            out.push('"');
         } else {
-            out.push_str(attr);
+            out.push_str(raw);
+        }
+        if quoted {
+            out.push('"');
         }
         ensure!(
             out.len() <= MAX_REWRITTEN_PLAYLIST,
             "rewritten playlist exceeds limit"
         );
-        attrs = &attrs[end..];
-        if let Some(rest) = attrs.strip_prefix(',') {
-            out.push(',');
-            attrs = rest;
-        }
+        let Some(rest) = next else { break };
+        out.push(',');
+        attrs = rest;
     }
     Ok(())
 }

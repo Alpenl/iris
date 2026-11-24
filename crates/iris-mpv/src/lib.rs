@@ -146,6 +146,8 @@ pub enum Event {
 pub struct Mpv {
     handle: *mut sys::mpv_handle,
     wait_lock: Mutex<()>,
+    #[cfg(target_os = "windows")]
+    video_recovery: Mutex<render::VideoRecovery>,
 }
 
 // SAFETY: libmpv documents `mpv_handle` as thread-safe across threads.
@@ -167,6 +169,8 @@ impl Mpv {
         Ok(Self {
             handle,
             wait_lock: Mutex::new(()),
+            #[cfg(target_os = "windows")]
+            video_recovery: Mutex::default(),
         })
     }
 
@@ -174,7 +178,7 @@ impl Mpv {
         self.handle
     }
 
-    pub fn set_option(&self, name: &str, value: &str) -> Result<()> {
+    pub fn set_option(&mut self, name: &str, value: &str) -> Result<()> {
         let (n, v) = (cstr(name), cstr(value));
         // SAFETY: `self.handle` is valid and `n`, `v` are NUL-terminated `CString`s.
         check(
@@ -183,7 +187,7 @@ impl Mpv {
         )
     }
 
-    pub fn initialize(&self) -> Result<()> {
+    pub fn initialize(&mut self) -> Result<()> {
         // SAFETY: `self.handle` is a valid `mpv_handle` owned by `self`.
         check(unsafe { sys::mpv_initialize(self.handle) }, || {
             "mpv_initialize".into()
@@ -354,6 +358,27 @@ impl Mpv {
         })
     }
 
+    pub(crate) fn set_property_string_async(&self, name: &str, value: &str) -> Result<()> {
+        with_cstr(name, |n| {
+            with_cstr(value, |mut v| {
+                // SAFETY: The live handle queues a copy of the NUL-terminated value.
+                // MPV_FORMAT_STRING takes the address of the C string pointer.
+                check(
+                    unsafe {
+                        sys::mpv_set_property_async(
+                            self.handle,
+                            0,
+                            n,
+                            sys::MPV_FORMAT_STRING,
+                            (&mut v as *mut *const c_char).cast(),
+                        )
+                    },
+                    || format!("set_property_async {name}"),
+                )
+            })
+        })
+    }
+
     /// Sets a double property asynchronously (no round trip to the core).
     pub fn set_property_f64_async(&self, name: &str, mut value: f64) -> Result<()> {
         with_cstr(name, |n| {
@@ -431,8 +456,14 @@ impl Mpv {
         })
     }
 
-    pub fn continue_hook(&self, id: u64) -> Result<()> {
-        // SAFETY: mpv validates the ID and borrows the live handle.
+    /// Continues playback after handling a hook event.
+    ///
+    /// # Safety
+    /// `id` must be the `id` from an [`Event::Hook`] delivered to this handle.
+    /// Call this exactly once for that event. Using a different handle or ID,
+    /// or calling it again even after an error, is undefined behavior.
+    pub unsafe fn continue_hook(&self, id: u64) -> Result<()> {
+        // SAFETY: The caller guarantees the ID belongs to an uncontinued hook on this handle.
         check(unsafe { sys::mpv_hook_continue(self.handle, id) }, || {
             "continue_hook".into()
         })
@@ -450,7 +481,38 @@ impl Mpv {
         // SAFETY: `mpv_wait_event` always returns a non-null `mpv_event` pointer valid
         // until the next `mpv_wait_event` call on this handle.
         let ev = unsafe { &*sys::mpv_wait_event(self.handle, timeout) };
-        Some(match ev.event_id {
+        #[cfg(target_os = "windows")]
+        if ev.event_id == sys::MPV_EVENT_GET_PROPERTY_REPLY
+            && ev.reply_userdata == render::VideoRecovery::QUERY_VID
+        {
+            let vid = if ev.error >= 0 && !ev.data.is_null() {
+                // SAFETY: A successful GET_PROPERTY_REPLY contains mpv_event_property.
+                let prop = unsafe { &*ev.data.cast::<sys::mpv_event_property>() };
+                if prop.format == sys::MPV_FORMAT_STRING && !prop.data.is_null() {
+                    // SAFETY: STRING data contains a C-string pointer valid for this event.
+                    let value = unsafe { *prop.data.cast::<*const c_char>() };
+                    if value.is_null() {
+                        None
+                    } else {
+                        // SAFETY: libmpv provided a non-null NUL-terminated string.
+                        unsafe { CStr::from_ptr(value) }
+                            .to_str()
+                            .ok()
+                            .and_then(|s| s.parse::<i64>().ok())
+                            .filter(|&id| id > 0)
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            self.video_recovery
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .reply(vid);
+        }
+        let event = match ev.event_id {
             sys::MPV_EVENT_NONE => return None,
             sys::MPV_EVENT_SHUTDOWN => Event::Shutdown,
             sys::MPV_EVENT_LOG_MESSAGE => {
@@ -529,7 +591,21 @@ impl Mpv {
                 }
             }
             other => Event::Other(other),
-        })
+        };
+        #[cfg(target_os = "windows")]
+        match event {
+            Event::StartFile(_)
+            | Event::EndFile { .. }
+            | Event::QueueOverflow
+            | Event::Shutdown => {
+                self.video_recovery
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .on_event(&event);
+            }
+            _ => (),
+        }
+        Some(event)
     }
 }
 
@@ -613,7 +689,7 @@ mod tests {
 
     #[test]
     fn headless_mpv_loadfile_with_options_and_render_handle() -> Result<()> {
-        let mpv = Mpv::create()?;
+        let mut mpv = Mpv::create()?;
         mpv.set_option("vo", "null")?;
         mpv.set_option("ao", "null")?;
         mpv.set_option("idle", "yes")?;

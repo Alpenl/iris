@@ -268,12 +268,8 @@ impl IrisWindow {
         enabled: bool,
         cx: &mut Context<Self>,
     ) {
-        if enabled {
-            self.settings.disabled_plugins.retain(|d| d != id);
-        } else if !self.settings.disabled_plugins.iter().any(|d| d == id) {
-            self.settings.disabled_plugins.push(id.to_string());
-        }
-        self.preset_rt.record_user_edit(&self.settings);
+        self.preset_rt
+            .set_plugin_enabled(&mut self.settings, id, enabled);
         if !enabled && self.catalog.has_remote_work_for(id, None) {
             self.cancel_remote_requests();
         }

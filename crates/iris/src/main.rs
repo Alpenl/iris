@@ -14,6 +14,7 @@ mod video;
 
 use std::borrow::Cow;
 use std::ffi::OsString;
+use std::io::{self, Write as _};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -79,18 +80,26 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Invocation, St
     Ok(Invocation::Open(paths))
 }
 
+fn print_cli_line(line: std::fmt::Arguments<'_>) -> ExitCode {
+    attach_parent_console(false);
+    let mut out = io::stdout().lock();
+    match writeln!(out, "{line}").and_then(|()| out.flush()) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) if e.kind() == io::ErrorKind::BrokenPipe => ExitCode::SUCCESS,
+        Err(e) => {
+            attach_parent_console(true);
+            let _ = writeln!(io::stderr(), "Iris: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 fn main() -> ExitCode {
     let initial = match parse_args(std::env::args_os().skip(1)) {
         Ok(Invocation::Open(paths)) => paths,
-        Ok(Invocation::Help) => {
-            attach_parent_console(false);
-            println!("{HELP}");
-            return ExitCode::SUCCESS;
-        }
+        Ok(Invocation::Help) => return print_cli_line(format_args!("{HELP}")),
         Ok(Invocation::Version) => {
-            attach_parent_console(false);
-            println!("Iris {}", env!("CARGO_PKG_VERSION"));
-            return ExitCode::SUCCESS;
+            return print_cli_line(format_args!("Iris {}", env!("CARGO_PKG_VERSION")));
         }
         Err(message) => {
             attach_parent_console(true);

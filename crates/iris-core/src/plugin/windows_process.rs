@@ -2,8 +2,10 @@
 
 use std::env;
 use std::ffi::{OsStr, OsString};
+use std::fs::OpenOptions;
 use std::io::{self, PipeReader, PipeWriter};
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
+use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::os::windows::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
@@ -15,11 +17,17 @@ use windows_sys::Win32::Foundation::{
     WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Globalization::{CSTR_EQUAL, CompareStringOrdinal};
+use windows_sys::Win32::Storage::FileSystem::{
+    FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT, MAXIMUM_REPARSE_DATA_BUFFER_SIZE,
+};
+use windows_sys::Win32::System::IO::DeviceIoControl;
+use windows_sys::Win32::System::Ioctl::FSCTL_GET_REPARSE_POINT;
 use windows_sys::Win32::System::JobObjects::{
     CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
     JobObjectExtendedLimitInformation, SetInformationJobObject,
 };
 use windows_sys::Win32::System::SystemInformation::{GetSystemDirectoryW, GetWindowsDirectoryW};
+use windows_sys::Win32::System::SystemServices::IO_REPARSE_TAG_APPEXECLINK;
 use windows_sys::Win32::System::Threading::{
     CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DeleteProcThreadAttributeList,
     EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess, InitializeProcThreadAttributeList,
@@ -141,6 +149,93 @@ fn system_dir(get: unsafe extern "system" fn(*mut u16, u32) -> u32) -> Option<Pa
     }
 }
 
+fn usable_app_exec_link(data: &[u8]) -> bool {
+    fn wide_eq(field: &[u8], ascii: &[u8]) -> bool {
+        field.len() == ascii.len() * 2
+            && field
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .zip(ascii)
+                .all(|(pair, ch)| pair[1] == 0 && pair[0].eq_ignore_ascii_case(ch))
+    }
+
+    // The header is followed by a 32-bit version and NUL-terminated UTF-16 fields:
+    // package family, app ID, executable path, and application type.
+    let Some(header) = data.first_chunk::<8>() else {
+        return false;
+    };
+    let tag = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
+    let len = usize::from(u16::from_le_bytes([header[4], header[5]]));
+    if tag != IO_REPARSE_TAG_APPEXECLINK || !len.is_multiple_of(2) {
+        return false;
+    }
+    let Some(mut fields) = data.get(12..8 + len) else {
+        return false;
+    };
+    let mut field = || {
+        let end = fields
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .position(|pair| *pair == [0, 0])?
+            * 2;
+        let value = &fields[..end];
+        fields = &fields[end + 2..];
+        (!value.is_empty()).then_some(value)
+    };
+    let (Some(package), Some(app), Some(target), Some(_)) = (field(), field(), field(), field())
+    else {
+        return false;
+    };
+    let basename = target
+        .rchunks_exact(2)
+        .position(|pair| pair == [b'\\', 0] || pair == [b'/', 0])
+        .map_or(target, |count| &target[target.len() - count * 2..]);
+    !(wide_eq(package, b"Microsoft.DesktopAppInstaller_8wekyb3d8bbwe")
+        && (wide_eq(
+            app,
+            b"Microsoft.DesktopAppInstaller_8wekyb3d8bbwe!PythonRedirector",
+        ) || wide_eq(basename, b"AppInstallerPythonRedirector.exe")))
+}
+
+fn usable_executable(path: &Path) -> bool {
+    if path
+        .metadata()
+        .is_ok_and(|meta| meta.is_file() && meta.len() != 0)
+    {
+        return true;
+    }
+    if !path.symlink_metadata().is_ok_and(|meta| {
+        meta.is_file() && meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    }) {
+        return false;
+    }
+    let Ok(file) = OpenOptions::new()
+        .access_mode(0)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+    else {
+        return false;
+    };
+    let mut data = [0u8; MAXIMUM_REPARSE_DATA_BUFFER_SIZE as usize];
+    let mut read = 0;
+    // Inspect the alias itself. Windows still needs the alias path to activate the package.
+    let result = unsafe {
+        DeviceIoControl(
+            file.as_raw_handle(),
+            FSCTL_GET_REPARSE_POINT,
+            null(),
+            0,
+            data.as_mut_ptr().cast(),
+            MAXIMUM_REPARSE_DATA_BUFFER_SIZE,
+            &mut read,
+            null_mut(),
+        )
+    };
+    result != 0 && usable_app_exec_link(&data[..read as usize])
+}
+
 fn executable(program: &OsStr) -> io::Result<Vec<u16>> {
     let path = Path::new(program);
     if path.is_absolute() {
@@ -158,10 +253,7 @@ fn executable(program: &OsStr) -> io::Result<Vec<u16>> {
         .chain(env::split_paths(&paths).filter(|p| p.is_absolute()));
     for dir in dirs {
         let candidate = dir.join(&filename);
-        if candidate
-            .metadata()
-            .is_ok_and(|meta| meta.is_file() && meta.len() != 0)
-        {
+        if usable_executable(&candidate) {
             return terminate_wide(candidate.as_os_str().encode_wide().collect());
         }
     }
@@ -376,6 +468,47 @@ mod tests {
             String::from_utf16(&unc[..unc.len() - 1]).unwrap(),
             r"\\server\share\plugins"
         );
+    }
+
+    #[test]
+    fn python_app_aliases_skip_only_the_store_redirector() {
+        let alias = |package: &str, entry: &str, executable: &str| {
+            let strings = format!("{package}\0{package}!{entry}\0{executable}\0{}\0", '0');
+            let fields: Vec<_> = strings.encode_utf16().flat_map(u16::to_le_bytes).collect();
+            let mut data = IO_REPARSE_TAG_APPEXECLINK.to_le_bytes().to_vec();
+            data.extend_from_slice(&((4 + fields.len()) as u16).to_le_bytes());
+            data.extend_from_slice(&[0, 0, 3, 0, 0, 0]);
+            data.extend_from_slice(&fields);
+            data
+        };
+        let python = alias(
+            "PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0",
+            "Python",
+            r"C:\Program Files\WindowsApps\PythonSoftwareFoundation.Python.3.13\python.exe",
+        );
+        assert!(usable_app_exec_link(&python));
+        assert!(!usable_app_exec_link(&python[..python.len() - 2]));
+        let installer = "Microsoft.DesktopAppInstaller_8wekyb3d8bbwe";
+        assert!(!usable_app_exec_link(&alias(
+            installer,
+            "PythonRedirector",
+            r"C:\Program Files\WindowsApps\AppInstaller\AppInstallerPythonRedirector.exe",
+        )));
+        assert!(usable_app_exec_link(&alias(
+            installer,
+            "WinGet",
+            r"C:\WindowsApps\winget.exe"
+        )));
+        assert!(!usable_app_exec_link(&[0; 16]));
+    }
+
+    #[test]
+    fn ordinary_empty_executable_is_not_a_candidate() {
+        let path = env::temp_dir().join(format!("iris-empty-exe-{}.exe", std::process::id()));
+        std::fs::File::create_new(&path).unwrap();
+        let usable = usable_executable(&path);
+        std::fs::remove_file(path).unwrap();
+        assert!(!usable);
     }
 
     #[test]

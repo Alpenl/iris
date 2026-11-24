@@ -56,6 +56,7 @@ NSWindow contentView
 - 视频视图用 `addSubview:positioned:NSWindowBelow relativeTo:gpui_view` 插在 GPUI 视图下面。视频帧不经过 GPUI，界面重绘也不影响视频。
 - 视频视图的 frame 等于 GPUI 布局里量出来的视频区矩形（canvas 探针），并设置宽高自动伸缩以跟随实时缩放。字幕和 OSD 因此永远落在画面内。曾试过用 `video-margin-ratio-*` 定位视频，结果字幕跑到目录栏下面，已放弃。
 - mpv 的 render 更新回调通过容量 1 的有界通道唤醒 `iris-video` 渲染线程，绘制循环包在 `autoreleasepool` 中避免 60fps 长期播放泄漏 Objective-C 临时对象；关闭时严格按“释放 render context → join 渲染线程 → 清空 ivar 并移除视图”顺序执行，消除关窗数据竞争。
+- advanced control 模式下，渲染线程在窗口不可绘制时仍服务 mpv 更新。Windows 和 macOS 恢复显示时会重新绘制当前帧。
 - 时间显示按秒变或进度条像素步进触发重绘（短视频上限 4 Hz，长视频降至 1 Hz，全屏隐藏工具栏与空状态为 0 Hz）。
 - GPUI 0.2.2 的 `surface()` 只接受 NV12 的 CVPixelBuffer，所以没有走“把帧交给 GPUI 画”的方案。
 
@@ -135,7 +136,7 @@ NSWindow contentView
 ```
 
 - **绝不接触实时像素，保留高自由度控制面定制**：视频与照片帧始终留在原生视频层；本体默认遵循方向 C 模块面板，同时允许插件通过 `UiTheme` / `ChromeLayoutSpec` 自由定制色板、圆角/栏高度量与 `hide_titlebar` 无标题栏影院窗（宿主强制提供顶缘 `absolute()` 悬浮唤醒标题栏、视口修饰键/阈值拖拽与最低对比度逃生护栏）。
-- **播放传输**：每个 HTTP(S) 播放会话创建一个仅绑定回环地址的转发器。HLS 的播放列表、密钥、分片与独立轨道均由转发器处理，并按源筛选请求头。VFS 在每次连接前检查解析后的地址，局域网或高端口回环源的访问范围限于原始源。宿主单独预取授权字幕，普通媒体和字幕禁用外部引用。
+- **播放传输**：每个 HTTP(S) 播放会话创建一个仅绑定回环地址的转发器。HLS 对带参数的扩展标签使用白名单，要求属性列表使用明确的逗号和引号语法，并把 URI 改写为会话专属路由。转发器按源筛选请求头，VFS 在每次连接前检查解析后的地址，局域网或高端口回环源的访问范围限于原始源。中继满载时短暂等待工作槽释放，超时才返回 `503`。宿主单独预取授权字幕，普通媒体和字幕禁用外部引用。
 - **全协议插件化与分桶凭据托管（`SetState` + `CredentialVault`）**：内核与 UI 零具体网盘/WebDAV 特判（官方 `iris.webdav` 100% 按标准 `iris-api` 协议实现，经 `PluginResponder` 在后台工作线程执行 `PROPFIND`）。敏感凭据按 `builtin.<id>` 与 `ext.<id>` 物理分桶存入系统安全凭据库（单条上限 2048B，失败显式报错，严禁降级写明文文件）。
 - **异步防卡顿与 `DirtySlots` 全屏 `0 Hz` 门控**：外部子进程单行上限提升至 2 MiB，`stderr` 超 100 行后静默 drain 不断管；仅在槽位实际发生值变化且对当前视图可见时才触发 UI 重绘。
 

@@ -159,7 +159,7 @@ pub(super) fn build_modal(existing: Option<&WebDavConnection>, has_secret: bool)
             Widget::Toggle {
                 id: "allow_insecure_auth".into(),
                 label: "允许通过不加密的 HTTP 发送账号和密码或令牌".into(),
-                checked: false,
+                checked: existing.is_some_and(|connection| connection.allow_insecure_auth),
                 action_id: None,
             },
         ],
@@ -363,5 +363,7 @@ mod tests {
             .unwrap();
         assert!(accepted.conn.allow_insecure_auth);
         assert!(accepted.conn.build_url("/", true).is_ok());
+        let edit = build_modal(Some(&accepted.conn), true);
+        assert!(edit.widgets.iter().any(|widget| matches!(widget, Widget::Toggle { id, checked: true, .. } if id == "allow_insecure_auth")));
     }
 }

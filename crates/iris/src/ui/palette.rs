@@ -412,6 +412,11 @@ impl IrisWindow {
             .overlays
             .palette_index
             .min(entries.len().saturating_sub(1));
+        let viewport = window.viewport_size();
+        let margin = 12.;
+        let top = (f32::from(viewport.height) * 0.1).clamp(margin, 64.);
+        let width = (f32::from(viewport.width) - 2. * margin).clamp(0., 540.);
+        let height = (f32::from(viewport.height) - top - margin).clamp(0., 420.);
 
         div()
             .id("palette-backdrop")
@@ -419,8 +424,9 @@ impl IrisWindow {
             .inset_0()
             .flex()
             .justify_center()
-            .pt(px(64.))
+            .pt(px(top))
             .bg(t.scrim)
+            .occlude()
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, w, cx| {
@@ -431,12 +437,13 @@ impl IrisWindow {
                     cx.notify();
                 }),
             )
+            .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
             .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
             .child(
                 div()
                     .id("palette-box")
-                    .w(px(540.))
-                    .max_h(px(420.))
+                    .w(px(width))
+                    .max_h(px(height))
                     .flex()
                     .flex_col()
                     .rounded(t.radius_lg)
@@ -445,6 +452,7 @@ impl IrisWindow {
                     .border_1()
                     .border_color(t.line_strong)
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
                     .child(
                         div()
                             .flex_none()

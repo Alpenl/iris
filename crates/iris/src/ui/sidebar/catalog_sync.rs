@@ -223,7 +223,19 @@ impl IrisWindow {
                 }
             }
         }
-        rows.extend(filtered.iter().cloned().map(DirRow::Item));
+        // Media-open completion also rebuilds these rows, so the counter is
+        // refreshed on both catalog changes and changes to the current item.
+        let current = self.active().session.current_media_uri();
+        let (mut playable_count, mut current_playable_number) = (0, None);
+        rows.extend(filtered.iter().map(|item| {
+            if !item.is_folder() {
+                playable_count += 1;
+                if current_playable_number.is_none() && current.as_ref() == Some(&item.uri) {
+                    current_playable_number = Some(playable_count);
+                }
+            }
+            DirRow::Item(item.clone())
+        }));
         if let ActiveSource::Plugin(ps) = &self.catalog.active_source
             && let Some(np) = &ps.next_page
             && self.catalog.filter != MediaFilter::FavoritesOnly
@@ -236,6 +248,8 @@ impl IrisWindow {
             });
         }
         self.catalog.items = filtered;
+        self.catalog.playable_count = playable_count;
+        self.catalog.current_playable_number = current_playable_number;
         self.catalog.rows = rows;
     }
 }

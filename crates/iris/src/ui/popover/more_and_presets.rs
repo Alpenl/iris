@@ -221,7 +221,8 @@ impl IrisWindow {
     ) -> impl IntoElement {
         let session = &self.active().session;
         let state = session.state();
-        let (aspect, hflip, vflip) = (state.aspect, state.hflip, state.vflip);
+        let aspect = state.aspect;
+        let (hflip, vflip) = session.display_flips();
         let (chapters, current_ch) = (state.chapters.clone(), state.current_chapter);
         let is_video = session.kind() == Some(Kind::Video);
         let is_visual = matches!(session.kind(), Some(Kind::Video | Kind::Photo));

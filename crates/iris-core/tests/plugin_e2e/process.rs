@@ -76,6 +76,123 @@ fn normal_quit_delivers_shutdown_then_eof_and_cleans_up_descendants() {
 }
 
 #[test]
+fn shutdown_disable_and_reload_drain_output_and_preserve_persistence() {
+    assert!(python_available());
+    let producer = r#"import json, pathlib, sys
+def send(*commands):
+    print(json.dumps({'type': 'commands', 'commands': commands}))
+
+for raw in sys.stdin:
+    payload = json.loads(raw)['payload']
+    if payload['event'] == 'init':
+        if payload['state'].get('final'):
+            pathlib.Path('restored').write_text(json.dumps([payload['state'], payload['secrets']]))
+        else:
+            pathlib.Path('ready').touch()
+            send({'command': 'set_state', 'key': 'queued', 'value': 'before shutdown'},
+                 {'command': 'set_secret', 'key': 'queued', 'value': 'before shutdown'})
+            for n in range(40):
+                send({'command': 'show_toast', 'message': 'x' * 4096})
+    if payload['event'] == 'shutdown':
+        send({'command': 'set_state', 'key': 'final', 'value': 'received Shutdown'},
+             {'command': 'set_secret', 'key': 'final', 'value': 'received Shutdown'},
+             {'command': 'show_toast', 'message': 'stale UI'})
+"#;
+    let stubborn = r#"import json, pathlib, sys, time
+pathlib.Path('ready').touch()
+for raw in sys.stdin:
+    if json.loads(raw)['payload']['event'] == 'shutdown':
+        time.sleep(20)
+"#;
+    let expected = serde_json::json!({"queued": "before shutdown", "final": "received Shutdown"});
+    let id = "acme.z-producer";
+
+    for stop in ["shutdown", "disable", "reload"] {
+        let env = TestEnv::new(stop);
+        // This plugin sorts first and spends its whole grace interval stopping.
+        if stop != "disable" {
+            let slow = "acme.a-slow";
+            write_ext_plugin(
+                &env.ext_dir,
+                slow,
+                &manifest_with(slow, Some("main.py"), vec![]),
+                stubborn,
+            );
+        }
+        write_ext_plugin(
+            &env.ext_dir,
+            id,
+            &manifest_with(
+                id,
+                Some("main.py"),
+                vec![Permission::Notifications, Permission::Secrets],
+            ),
+            producer,
+        );
+        let mut mgr = env.manager(&[]);
+        let dir = env.ext_dir.join(id);
+        assert!(wait_for_file(&dir.join("ready")));
+        if stop != "disable" {
+            assert!(wait_for_file(&env.ext_dir.join("acme.a-slow/ready")));
+        }
+        // Leave stdout unpolled. The producer must write more than the bounded queue
+        // and pipe can hold before it can read Shutdown from stdin.
+        let report = match stop {
+            "shutdown" => {
+                mgr.shutdown();
+                PollReport::default()
+            }
+            "disable" => {
+                let report = mgr.set_enabled(id, false);
+                assert_eq!(
+                    mgr.list()
+                        .into_iter()
+                        .find(|p| p.manifest.id == id)
+                        .unwrap()
+                        .status,
+                    PluginStatus::Disabled,
+                );
+                mgr.set_enabled(id, true);
+                report
+            }
+            "reload" => mgr.reload(&[]),
+            _ => unreachable!(),
+        };
+        assert!(report.commands.is_empty());
+        assert_eq!(
+            serde_json::to_value(env.vault.list_scope(&format!("ext.{id}"))).unwrap(),
+            expected
+        );
+        if stop == "shutdown" {
+            let saved = std::fs::read(env.state_dir.join(format!("{id}.json"))).unwrap();
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&saved).unwrap(),
+                expected
+            );
+        } else {
+            let restored = dir.join("restored");
+            // Wait for the write to complete, not just for the file to exist.
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let data = loop {
+                if let Some(data) = std::fs::read(&restored)
+                    .ok()
+                    .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+                {
+                    break data;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "{stop} did not restore final state"
+                );
+                thread::sleep(Duration::from_millis(10));
+            };
+            assert_eq!(data, serde_json::json!([expected, expected]));
+            assert!(mgr.poll().commands.is_empty());
+        }
+    }
+}
+
+#[test]
 fn abrupt_plugin_host_exit_delivers_unix_eof_or_terminates_windows_job() {
     const FIXTURE: &str = "IRIS_E2E_CHILD_PLUGIN_DIR";
     if let Some(dir) = std::env::var_os(FIXTURE) {
