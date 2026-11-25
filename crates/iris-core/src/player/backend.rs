@@ -701,7 +701,7 @@ impl Session {
             let (kind, photo) = (self.kind, self.photo_meta.clone());
             self.load(&path, kind, photo, pos).is_ok()
         } else if let MediaSourceState::DirectRemote { last_remote, .. } = &self.source {
-            let req = last_remote.clone();
+            let req = (**last_remote).clone();
             self.load_remote(req, settings, pos).is_ok()
         } else if let MediaSourceState::PluginScoped { playback, .. } = &self.source {
             let playback = Arc::clone(playback);

@@ -141,25 +141,23 @@ impl Control {
                 HostCommand::SetSources { sources } => {
                     self.sources = sources.clone();
                 }
-                HostCommand::Log { level, message } => {
-                    if self.log_limiter.allow() {
-                        let lvl = match level {
-                            LogLevel::Debug => EventLevel::Debug,
-                            LogLevel::Info => EventLevel::Info,
-                            LogLevel::Warn => EventLevel::Warn,
-                            LogLevel::Error => EventLevel::Error,
-                        };
-                        let redacted = logging::redact_text(message);
-                        logging::event_kv(
-                            lvl,
-                            "plugin",
-                            "log",
-                            &[
-                                ("plugin", self.installed.plugin_id.as_str()),
-                                ("message", redacted.as_str()),
-                            ],
-                        );
-                    }
+                HostCommand::Log { level, message } if self.log_limiter.allow() => {
+                    let lvl = match level {
+                        LogLevel::Debug => EventLevel::Debug,
+                        LogLevel::Info => EventLevel::Info,
+                        LogLevel::Warn => EventLevel::Warn,
+                        LogLevel::Error => EventLevel::Error,
+                    };
+                    let redacted = logging::redact_text(message);
+                    logging::event_kv(
+                        lvl,
+                        "plugin",
+                        "log",
+                        &[
+                            ("plugin", self.installed.plugin_id.as_str()),
+                            ("message", redacted.as_str()),
+                        ],
+                    );
                 }
                 _ => {}
             }

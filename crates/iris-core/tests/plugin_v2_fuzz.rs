@@ -56,14 +56,12 @@ fn seeded_plugin_parser_mutations() {
     let corpus = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/corpus/plugin-v2");
     // Valid seeds must actually reach the renderers; malformed-input-only
     // mutation campaigns would miss most conversion logic.
-    for (name, format) in [("virtual-hls.json", ManifestFormat::VirtualHls)] {
-        manifest::compile(
-            format,
-            &std::fs::read(corpus.join(name)).unwrap(),
-            &|id, _| Ok(format!("http://127.0.0.1:1234/{id}")),
-        )
-        .expect("valid renderer seed");
-    }
+    manifest::compile(
+        ManifestFormat::VirtualHls,
+        &std::fs::read(corpus.join("virtual-hls.json")).unwrap(),
+        &|id, _| Ok(format!("http://127.0.0.1:1234/{id}")),
+    )
+    .expect("valid renderer seed");
     Package::from_zip(
         &std::fs::read(corpus.join("theme.irisplugin")).unwrap(),
         Provenance::User,

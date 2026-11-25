@@ -164,7 +164,8 @@ fn respond(
 fn real_hls_decode_through_scoped_rewritten_manifest() {
     let directory = std::env::var_os("IRIS_V2_ADAPTIVE_FIXTURE").expect("native fixture directory");
     let server = Server::start(Path::new(&directory));
-    for (name, profile) in [("hls.m3u8", Profile::Hls)] {
+    let (name, profile) = ("hls.m3u8", Profile::Hls);
+    {
         let ledger = Ledger::default();
         let grant = NetworkGrant::new(
             "adaptive-native".into(),

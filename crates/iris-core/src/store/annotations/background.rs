@@ -194,7 +194,7 @@ mod tests {
             .transact(
                 Some((&uris, &AnnotationEdit::Rating { rating: 4 })),
                 "one",
-                &reserve,
+                reserve,
                 || Ok(()),
             )
             .unwrap();
@@ -207,7 +207,7 @@ mod tests {
                     },
                 )),
                 "two",
-                &reserve,
+                reserve,
                 || Ok(()),
             )
             .unwrap();
@@ -221,7 +221,7 @@ mod tests {
         let result = target.transact(
             Some((&uris, &AnnotationEdit::Rating { rating: 1 })),
             "one",
-            &reserve,
+            reserve,
             || {
                 checks.set(checks.get() + 1);
                 if checks.get() > 1 {
@@ -236,7 +236,7 @@ mod tests {
             std::fs::read(dir.path().join("annotations.json")).unwrap(),
             previous
         );
-        let reloaded = target.transact(None, "one", &reserve, || Ok(())).unwrap();
+        let reloaded = target.transact(None, "one", reserve, || Ok(())).unwrap();
         let page = reloaded.page(&uris, 0, 0).unwrap();
         assert_eq!(page.rating, 4);
         assert!(reloaded.page(&uris, 1, 0).is_err());

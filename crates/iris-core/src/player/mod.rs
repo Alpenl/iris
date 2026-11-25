@@ -56,7 +56,7 @@ enum MediaSourceState {
     Local,
     DirectRemote {
         relay: PlaybackRelay,
-        last_remote: RemoteMediaRequest,
+        last_remote: Box<RemoteMediaRequest>,
         pending_subs: Vec<String>,
     },
     PluginScoped {
@@ -389,7 +389,7 @@ impl Session {
             &mut self.source,
             MediaSourceState::DirectRemote {
                 relay,
-                last_remote: saved_remote,
+                last_remote: Box::new(saved_remote),
                 pending_subs,
             },
         ) {
@@ -812,7 +812,7 @@ mod tests {
         let relay = PlaybackRelay::start(url, BTreeMap::new()).unwrap();
         session.source = MediaSourceState::DirectRemote {
             relay,
-            last_remote: RemoteMediaRequest {
+            last_remote: Box::new(RemoteMediaRequest {
                 uri: MediaUri::HttpUrl("https://example.invalid/video.mp4".into()),
                 playback_url: "https://example.invalid/video.mp4".into(),
                 title: "video.mp4".into(),
@@ -821,7 +821,7 @@ mod tests {
                 subtitles: Vec::new(),
                 is_live: false,
                 photo: None,
-            },
+            }),
             pending_subs: vec!["memory://WEBVTT\n".into()],
         };
         for event in [
