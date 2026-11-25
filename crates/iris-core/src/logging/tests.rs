@@ -1,21 +1,32 @@
 use super::event::{EventBus, JsonlFileSink};
 use super::writer::{RotatingFile, backup_path};
 use super::*;
+use crate::test_util::TestDir;
 use std::sync::{Arc, Mutex};
 
-fn temp_dir(label: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "iris-log-test-{label}-{}-{}",
-        std::process::id(),
-        crate::plugin_v2::files::random_name().unwrap()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+#[test]
+fn format_log_line_redacts_secrets_and_flushes_on_typed_levels() {
+    let line = format_log_line(
+        "2026-11-26T00:00:00.000Z",
+        log::Level::Info,
+        "iris_core::settings",
+        format_args!(
+            r"loaded C:\Users\alice\AppData\Iris\settings.conf from https://cdn.example/a?token=secret"
+        ),
+    );
+    assert!(!line.contains("alice"), "leaked username: {line}");
+    assert!(!line.contains("token=secret"), "leaked token: {line}");
+    assert!(line.contains("<USER_HOME>"));
+    assert!(line.contains("https://cdn.example/<redacted>"));
+    assert!(!should_flush_level(log::Level::Info));
+    assert!(!should_flush_level(log::Level::Debug));
+    assert!(should_flush_level(log::Level::Warn));
+    assert!(should_flush_level(log::Level::Error));
 }
 
 #[test]
 fn rotating_file_preserves_prior_session_and_bounds_backups() {
-    let dir = temp_dir("rotate");
+    let dir = TestDir::new("log-rotate");
     let path = dir.join("iris.log");
     {
         let first = RotatingFile::open(path.clone(), 1024, 3, true).unwrap();
@@ -37,7 +48,6 @@ fn rotating_file_preserves_prior_session_and_bounds_backups() {
     assert!(backup_path(&path, 2).exists());
     assert!(backup_path(&path, 3).exists());
     assert!(!backup_path(&path, 4).exists());
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -89,7 +99,7 @@ fn structured_event_bus_writes_valid_redacted_jsonl_and_notifies_custom_sinks() 
         }
     }
 
-    let dir = temp_dir("jsonl");
+    let dir = TestDir::new("log-jsonl");
     let events_path = dir.join("events.jsonl");
     let rotating = Arc::new(RotatingFile::open(events_path.clone(), 4096, 2, false).unwrap());
     let bus = EventBus::new();
@@ -136,13 +146,11 @@ fn structured_event_bus_writes_valid_redacted_jsonl_and_notifies_custom_sinks() 
     assert!(!lines[0].to_string().contains("auth_key=leak"));
     assert_eq!(lines[1]["level"], "warn");
     assert_eq!(lines[1]["fields"]["to"], "no");
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn concurrent_event_writes_produce_clean_uncorrupted_jsonl() {
-    let dir = temp_dir("concurrent");
+    let dir = TestDir::new("log-concurrent");
     let events_path = dir.join("events.jsonl");
     let rotating = Arc::new(RotatingFile::open(events_path.clone(), 64 * 1024, 2, false).unwrap());
     let bus = Arc::new(EventBus::new());
@@ -174,5 +182,4 @@ fn concurrent_event_writes_produce_clean_uncorrupted_jsonl() {
         .map(|l| serde_json::from_str::<Value>(l).unwrap())
         .collect();
     assert_eq!(lines.len(), 100);
-    let _ = std::fs::remove_dir_all(&dir);
 }

@@ -186,8 +186,7 @@ mod tests {
 
     #[test]
     fn atomic_write_and_private_mode_roundtrip() {
-        let dir = std::env::temp_dir().join(format!("iris-fs-util-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = crate::test_util::TestDir::new("fs-util");
 
         let pub_file = dir.join("nested/public.txt");
         atomic_write(&pub_file, "hello").unwrap();
@@ -207,8 +206,6 @@ mod tests {
             let mode = std::fs::metadata(&priv_file).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o600);
         }
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

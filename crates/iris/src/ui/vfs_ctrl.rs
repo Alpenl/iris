@@ -346,9 +346,19 @@ impl IrisWindow {
                     request
                 })
         };
-        let Ok(req_id) = issued else {
-            self.show_toast(format!("目录请求未能提交 · {:?}", issued.err()), cx);
-            return;
+        let req_id = match issued {
+            Ok(id) => id,
+            Err(error) => {
+                log::warn!("browse request rejected for {pid}: {error:?}");
+                self.show_error_toast(
+                    format!(
+                        "目录请求未能提交 · {}",
+                        super::plugin_runtime::describe_error_code(error)
+                    ),
+                    cx,
+                );
+                return;
+            }
         };
         self.begin_browse_request(&pid, source_id, append, req_id, cx);
         if append && let ActiveSource::Plugin(ps) = &mut self.catalog.active_source {
@@ -440,7 +450,16 @@ impl IrisWindow {
                 request,
                 cx,
             ),
-            Err(error) => self.show_toast(format!("解析请求未能提交 · {error:?}"), cx),
+            Err(error) => {
+                log::warn!("resolve request rejected for {plugin_id}: {error:?}");
+                self.show_error_toast(
+                    format!(
+                        "解析请求未能提交 · {}",
+                        super::plugin_runtime::describe_error_code(error)
+                    ),
+                    cx,
+                );
+            }
         }
         cx.notify();
     }
@@ -619,9 +638,10 @@ impl IrisWindow {
                         this.finish_media_open(cx);
                     }
                     Err(e) => {
+                        log::warn!("open_remote failed: {e:#}");
                         this.active_mut().pending_subtitles.clear();
                         this.sync_now_playing(true);
-                        this.show_toast(format!("无法打开远程流 · {e}"), cx);
+                        this.show_error_toast("无法打开远程流，请检查地址与网络状态", cx);
                     }
                 }
                 this.active_mut().image.reset();

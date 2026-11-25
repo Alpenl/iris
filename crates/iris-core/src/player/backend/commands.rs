@@ -24,29 +24,29 @@ impl Session {
         }
         match command {
             Command::SetAbLoop { start, end } => {
-                anyhow::ensure!(
-                    self.state.loaded
-                        && !self.state.is_live
-                        && matches!(self.kind, Some(Kind::Video | Kind::Audio))
-                        && start.is_finite()
-                        && end.is_finite()
-                        && start >= 0.
-                        && start < end
-                        && (self.state.duration <= 0. || end <= self.state.duration),
-                    "A-B loop requires a finite range in current seekable media"
-                );
+                if !(self.state.loaded
+                    && !self.state.is_live
+                    && matches!(self.kind, Some(Kind::Video | Kind::Audio))
+                    && start.is_finite()
+                    && end.is_finite()
+                    && start >= 0.
+                    && start < end
+                    && (self.state.duration <= 0. || end <= self.state.duration))
+                {
+                    return Err(PlayerActionError::InvalidAbRange.into());
+                }
                 self.mpv.command_async(&["set", "ab-loop-b", "no"])?;
                 self.mpv.set_property_f64_async("ab-loop-a", start)?;
                 self.mpv.set_property_f64_async("ab-loop-b", end)?;
                 self.mpv.command_async(&["set", "ab-loop-count", "inf"])?;
             }
             Command::CycleAbLoop => {
-                anyhow::ensure!(
-                    self.state.loaded
-                        && !self.state.is_live
-                        && matches!(self.kind, Some(Kind::Video | Kind::Audio)),
-                    "A-B loop requires seekable media"
-                );
+                if !(self.state.loaded
+                    && !self.state.is_live
+                    && matches!(self.kind, Some(Kind::Video | Kind::Audio)))
+                {
+                    return Err(PlayerActionError::NotSeekable.into());
+                }
                 self.mpv.command_async(&["ab-loop"])?;
             }
             Command::ClearAbLoop => {
@@ -137,22 +137,23 @@ impl Session {
             }
             Command::LoadSubtitle(path) => {
                 let raw_in = path.to_string_lossy();
-                anyhow::ensure!(
-                    !raw_in
-                        .split_once("://")
-                        .is_some_and(|(scheme, _)| !scheme.is_empty()
+                if raw_in
+                    .split_once("://")
+                    .is_some_and(|(scheme, _)| {
+                        !scheme.is_empty()
                             && scheme
                                 .bytes()
-                                .all(|b| b.is_ascii_alphanumeric()
-                                    || matches!(b, b'+' | b'-' | b'.'))),
-                    "remote or internal mpv protocols are not allowed in local subtitle path"
-                );
+                                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.'))
+                    })
+                {
+                    return Err(PlayerActionError::InvalidSubtitlePath.into());
+                }
                 let resolved = crate::library::safe_resolve_path(&path);
-                anyhow::ensure!(
-                    resolved.is_absolute()
-                        && std::fs::metadata(&resolved).is_ok_and(|m| m.is_file()),
-                    "subtitle path does not exist or is not a regular file"
-                );
+                if !(resolved.is_absolute()
+                    && std::fs::metadata(&resolved).is_ok_and(|m| m.is_file()))
+                {
+                    return Err(PlayerActionError::SubtitleFileNotFound.into());
+                }
                 if self.scoped_playback.is_none() {
                     let _ = super::references::disable_hls(&self.mpv);
                 }

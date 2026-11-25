@@ -8,7 +8,7 @@ mod redact;
 mod writer;
 
 use std::backtrace::Backtrace;
-use std::io::{self, Write};
+use std::io::Write;
 use std::panic::PanicHookInfo;
 use std::path::PathBuf;
 use std::sync::{Arc, Once, OnceLock};
@@ -23,23 +23,18 @@ use writer::{DEFAULT_MAX_BACKUPS, DEFAULT_MAX_FILE_BYTES, RotatingFile};
 
 static TEXT_LOG: OnceLock<Arc<RotatingFile>> = OnceLock::new();
 
-struct DualLogOutput {
-    file: Arc<RotatingFile>,
+fn should_flush_level(level: log::Level) -> bool {
+    matches!(level, log::Level::Warn | log::Level::Error)
 }
 
-impl Write for DualLogOutput {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        let _ = io::stderr().write_all(bytes);
-        let flush = bytes.windows(5).any(|w| w == b"WARN " || w == b"ERROR");
-        let _ = self.file.write_bytes(bytes, flush);
-        Ok(bytes.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        let _ = io::stderr().flush();
-        self.file.flush();
-        Ok(())
-    }
+fn format_log_line(
+    timestamp: impl std::fmt::Display,
+    level: log::Level,
+    target: &str,
+    args: std::fmt::Arguments<'_>,
+) -> String {
+    let body = redact_text(&args.to_string());
+    format!("[{timestamp} {level:<5} {target}] {body}\n")
 }
 
 /// Ephemeral random 128-bit hex identifier for the current process session.
@@ -87,31 +82,43 @@ pub fn init() {
         let mut builder = env_logger::Builder::from_env(
             env_logger::Env::default().default_filter_or("iris=info,iris_core=info,iris_mpv=info"),
         );
-        builder.format_timestamp_millis();
 
-        let text_log_ready = if let Some(path) = log_path() {
+        let text_file = if let Some(path) = log_path() {
             match RotatingFile::open(
                 path.clone(),
                 DEFAULT_MAX_FILE_BYTES,
                 DEFAULT_MAX_BACKUPS,
-                true,
+                false,
             ) {
                 Ok(rotating) => {
                     let rotating = Arc::new(rotating);
+                    let marker = format!("--- session_start {} ---\n", session_id());
+                    let _ = rotating.write_bytes(marker.as_bytes(), true);
                     let _ = TEXT_LOG.set(rotating.clone());
-                    builder.target(env_logger::Target::Pipe(Box::new(DualLogOutput {
-                        file: rotating,
-                    })));
-                    true
+                    Some(rotating)
                 }
                 Err(e) => {
                     eprintln!("Iris: cannot open log {}: {e}", path.display());
-                    false
+                    None
                 }
             }
         } else {
-            false
+            None
         };
+        let text_log_ready = text_file.is_some();
+
+        builder.format(move |buf, record| {
+            let line = format_log_line(
+                buf.timestamp_millis(),
+                record.level(),
+                record.target(),
+                *record.args(),
+            );
+            if let Some(file) = &text_file {
+                let _ = file.write_bytes(line.as_bytes(), should_flush_level(record.level()));
+            }
+            buf.write_all(line.as_bytes())
+        });
 
         let events_ready = if let Some(events_path) = events_log_path() {
             match RotatingFile::open(
@@ -136,7 +143,8 @@ pub fn init() {
         let _ = builder.try_init();
         install_panic_hook();
 
-        record_info(
+        event(
+            EventLevel::Info,
             "app",
             "session_start",
             json!({
@@ -151,16 +159,11 @@ pub fn init() {
 /// Records a clean process shutdown and flushes all active log & event sinks.
 pub fn shutdown() {
     let uptime_ms = global_bus().uptime_ms();
-    emit_event(
+    event(
         EventLevel::Info,
         "app",
         "session_end",
         json!({ "uptime_ms": uptime_ms }),
-    );
-    log::info!(
-        target: "iris::telemetry",
-        "[app.session_end] session={} uptime_ms={uptime_ms}",
-        session_id()
     );
     flush();
 }
@@ -173,25 +176,15 @@ pub fn flush() {
     }
 }
 
-/// Emits a structured, automatically redacted event to the local JSONL log and any
-/// registered telemetry sinks without emitting a duplicate plain-text log line.
-pub fn emit_event(
+/// Emits a structured, automatically redacted event to `events.jsonl` and any registered
+/// telemetry sinks, and writes a correlated summary line to `log`.
+pub fn event(
     level: EventLevel,
     category: &'static str,
     event: &'static str,
     fields: Value,
 ) -> TelemetryEvent {
-    global_bus().emit(level, category, event, fields)
-}
-
-/// Emits a structured event AND writes a correlated, redacted summary line to `log`.
-pub fn record_event(
-    level: EventLevel,
-    category: &'static str,
-    event: &'static str,
-    fields: Value,
-) -> TelemetryEvent {
-    let emitted = emit_event(level, category, event, fields);
+    let emitted = global_bus().emit(level, category, event, fields);
     let summary = serde_json::to_string(&emitted.fields).unwrap_or_else(|_| "{}".into());
     log::log!(
         target: "iris::event",
@@ -202,30 +195,18 @@ pub fn record_event(
     emitted
 }
 
-pub fn record_info(category: &'static str, event: &'static str, fields: Value) -> TelemetryEvent {
-    record_event(EventLevel::Info, category, event, fields)
-}
-
-pub fn record_warn(category: &'static str, event: &'static str, fields: Value) -> TelemetryEvent {
-    record_event(EventLevel::Warn, category, event, fields)
-}
-
-pub fn record_error(category: &'static str, event: &'static str, fields: Value) -> TelemetryEvent {
-    record_event(EventLevel::Error, category, event, fields)
-}
-
 /// Convenience structured-event helper for callers without a direct `serde_json` dependency.
-pub fn record_kv(
+pub fn event_kv(
     level: EventLevel,
     category: &'static str,
-    event: &'static str,
+    event_name: &'static str,
     fields: &[(&str, &str)],
 ) -> TelemetryEvent {
     let mut map = serde_json::Map::with_capacity(fields.len());
     for &(k, v) in fields {
         map.insert(k.to_owned(), Value::String(v.to_owned()));
     }
-    record_event(level, category, event, Value::Object(map))
+    event(level, category, event_name, Value::Object(map))
 }
 
 fn format_panic_payload(info: &PanicHookInfo<'_>) -> (String, String, String) {
@@ -261,7 +242,7 @@ fn install_panic_hook() {
             backtrace.truncate(end);
             backtrace.push_str("\n<truncated>");
         }
-        emit_event(
+        global_bus().emit(
             EventLevel::Error,
             "app",
             "panic",

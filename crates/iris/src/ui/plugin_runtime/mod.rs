@@ -6,6 +6,7 @@ mod consent;
 mod enhance;
 mod export;
 mod notices;
+pub(in crate::ui) use notices::describe_error_code;
 mod overlay;
 mod sources;
 mod thumbnails;
@@ -115,7 +116,11 @@ impl IrisWindow {
                 true
             }
             Err(error) => {
-                self.show_toast(format!("媒体切换暂未完成 · {error:?}"), cx);
+                log::warn!("advance_plugin_media failed: {error:?}");
+                self.show_error_toast(
+                    format!("媒体切换暂未完成 · {}", describe_error_code(error)),
+                    cx,
+                );
                 false
             }
         }

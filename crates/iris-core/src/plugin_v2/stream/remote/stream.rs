@@ -95,7 +95,8 @@ impl RemoteStream {
             } else {
                 ErrorCode::IoError
             };
-            logging::record_warn(
+            logging::event(
+                logging::EventLevel::Warn,
                 "stream",
                 "upstream_resume_failed",
                 json!({
@@ -124,7 +125,8 @@ impl RemoteStream {
         {
             return Err(ErrorCode::RangeInvalid);
         }
-        logging::record_info(
+        logging::event(
+            logging::EventLevel::Info,
             "stream",
             "upstream_resumed",
             json!({
@@ -191,7 +193,8 @@ impl StreamSlice for RemoteStream {
                     self.resume_upstream(reason)?;
                 }
                 Err(err) => {
-                    logging::record_warn(
+                    logging::event(
+                        logging::EventLevel::Warn,
                         "stream",
                         "upstream_read_failed",
                         json!({
@@ -351,7 +354,8 @@ impl RemoteReader {
             } else {
                 ErrorCode::IoError
             };
-            logging::record_warn(
+            logging::event(
+                logging::EventLevel::Warn,
                 "stream",
                 "upstream_open_failed",
                 json!({

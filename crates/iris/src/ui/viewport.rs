@@ -109,7 +109,8 @@ impl IrisWindow {
     pub(super) fn apply_image_view(&mut self, cx: &mut Context<Self>) {
         let vp = self.active();
         if let Err(e) = vp.session.transform(vp.image.zoom, vp.image.pan) {
-            self.show_toast(format!("缩放失败 · {e}"), cx);
+            log::warn!("image transform failed: {e:#}");
+            self.show_error_toast("画面缩放或平移失败", cx);
         }
         cx.notify();
     }

@@ -124,13 +124,23 @@ impl CurrentContext {
     fn lock(gl: CGLContextObj) -> Option<Self> {
         unsafe {
             if CGLLockContext(gl) != 0 {
-                log::error!("could not lock video CGL context");
+                iris_core::logging::event_kv(
+                    iris_core::logging::EventLevel::Error,
+                    "video",
+                    "cgl_lock_failed",
+                    &[("backend", "cgl")],
+                );
                 return None;
             }
             let previous = CGLGetCurrentContext();
             if CGLSetCurrentContext(gl) != 0 {
                 CGLUnlockContext(gl);
-                log::error!("could not make video CGL context current");
+                iris_core::logging::event_kv(
+                    iris_core::logging::EventLevel::Error,
+                    "video",
+                    "cgl_context_failed",
+                    &[("backend", "cgl")],
+                );
                 return None;
             }
             Some(Self { gl, previous })
@@ -182,7 +192,13 @@ impl LayerState {
             return false;
         }
         if let Err(e) = unsafe { render.skip_frame() } {
-            log::error!("skipping video frame failed: {e}");
+            let err = e.to_string();
+            iris_core::logging::event_kv(
+                iris_core::logging::EventLevel::Error,
+                "video",
+                "skip_frame_error",
+                &[("backend", "cgl"), ("error", &err)],
+            );
             return false;
         }
         render.report_swap();
@@ -336,7 +352,13 @@ extern "C" fn draw(
         let block = unsafe { pthread_main_np() } == 0;
         if let Err(e) = unsafe { render.render_gl(fbo, vp[2], vp[3], true, block) } {
             state.force.store(true, Ordering::Release);
-            log::error!("render failed: {e}");
+            let err = e.to_string();
+            iris_core::logging::event_kv(
+                iris_core::logging::EventLevel::Error,
+                "video",
+                "frame_error",
+                &[("backend", "cgl"), ("error", &err)],
+            );
             return;
         }
         unsafe { glFlush() };

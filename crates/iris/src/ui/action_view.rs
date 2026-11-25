@@ -195,7 +195,8 @@ impl IrisWindow {
             path: out.clone(),
             with_subs,
         }) {
-            self.show_toast(format!("截图失败 · {e}"), cx);
+            log::warn!("screenshot failed: {e:#}");
+            self.show_error_toast("截图失败，请稍后重试", cx);
             return;
         }
         let name = out.file_name().unwrap_or_default().to_string_lossy();
@@ -497,7 +498,8 @@ impl IrisWindow {
             Command::ToggleVFlip
         };
         if let Err(error) = self.active_mut().session.execute(command) {
-            self.show_toast(format!("操作失败 · {error}"), cx);
+            log::warn!("flip display axis failed: {error:#}");
+            self.show_error_toast(super::format_player_error(&error), cx);
             return;
         }
         self.active_mut().image.pan[usize::from(!horizontal)] *= -1.;

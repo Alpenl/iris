@@ -216,7 +216,8 @@ fn serve_listener(bound: &mut BoundRelay, service: &Arc<Service>) {
                                             "plugin stream relay closed (committed={committed}): {error:?}"
                                         );
                                     } else {
-                                        logging::record_warn(
+                                        logging::event(
+                                            logging::EventLevel::Warn,
                                             "stream",
                                             "relay_error",
                                             json!({

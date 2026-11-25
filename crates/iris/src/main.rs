@@ -121,7 +121,7 @@ fn main() -> ExitCode {
                 Ok(receipt) => print_cli_line(format_args!("{receipt}")),
                 Err(error) => {
                     attach_parent_console(true);
-                    let _ = writeln!(io::stderr(), "Plugin runtime check failed: {error:?}");
+                    let _ = writeln!(io::stderr(), "Iris: 内嵌插件运行时校验失败: {error:?}");
                     ExitCode::FAILURE
                 }
             };
@@ -142,7 +142,7 @@ fn main() -> ExitCode {
         if unsafe { SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_DEFAULT_DIRS) } == 0 {
             let error = std::io::Error::last_os_error();
             attach_parent_console(true);
-            let _ = writeln!(io::stderr(), "Iris: initializing DLL search: {error}");
+            let _ = writeln!(io::stderr(), "Iris: 初始化 DLL 搜索路径失败: {error}");
             return ExitCode::FAILURE;
         }
     }

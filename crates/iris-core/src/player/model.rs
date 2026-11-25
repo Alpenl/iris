@@ -56,6 +56,36 @@ pub fn friendly_error(code: i32) -> &'static str {
     }
 }
 
+/// Semantic player command preconditions for clean localized UI presentation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PlayerActionError {
+    NotSeekable,
+    InvalidAbRange,
+    NoVisualMedia,
+    InvalidSubtitlePath,
+    SubtitleFileNotFound,
+}
+
+impl std::fmt::Display for PlayerActionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotSeekable => f.write_str("A-B loop requires seekable media"),
+            Self::InvalidAbRange => {
+                f.write_str("A-B loop requires a finite range in current seekable media")
+            }
+            Self::NoVisualMedia => f.write_str("LUT preview requires loaded visual media"),
+            Self::InvalidSubtitlePath => {
+                f.write_str("remote or internal mpv protocols are not allowed in local subtitle path")
+            }
+            Self::SubtitleFileNotFound => {
+                f.write_str("subtitle path does not exist or is not a regular file")
+            }
+        }
+    }
+}
+
+impl std::error::Error for PlayerActionError {}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AspectMode {

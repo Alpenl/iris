@@ -4,7 +4,7 @@ Iris 是一个以 [mpv](https://mpv.io) 为播放核心的高性能跨平台照�
 
 > **当前版本为 0.0.1。** 项目只构建和打包与工作区版本一致的 `0.0.x`。启用 `0.1.x` 需要项目维护者手动授权并修改版本门禁。正式签名与公证需要发行凭据。
 
-文档：[架构](docs/ARCHITECTURE.md) · [插件开发指南](docs/PLUGINS.md) · [决策与路线图](docs/DECISIONS.md) · [决议讨论录](docs/DISCUSSIONS.md) · [测试与实测记录](docs/TESTING.md)
+文档：[架构](docs/ARCHITECTURE.md) · [插件开发指南](docs/PLUGINS.md) · [Plugin V2 架构](docs/PLUGIN_V2_ARCHITECTURE.md) · [Plugin V2 决议](docs/PLUGIN_V2_DECISIONS.md) · [决策与路线图](docs/DECISIONS.md) · [决议讨论录](docs/DISCUSSIONS.md) · [测试与实测记录](docs/TESTING.md)
 
 ## 核心特性
 
@@ -94,24 +94,30 @@ cargo clippy --locked --workspace --all-targets -- -D warnings
 ```
 crates/
   iris-mpv/            libmpv 手写 Rust FFI（client API + mpv_node 结构化传参 + RenderHandle 窄能力封装）
-  iris-api/            无头插件协议（protocol: 2 / ABI: 2，版本化 v2 与公共 UI 类型）
+  iris-api/            无头插件协议（protocol: 2 / ABI: 2，纯 serde 零重依赖）
+  iris-plugin-sdk/     Wasm Guest 开发 SDK（纯插件侧依赖，宿主零反向依赖）
+  iris-plugin-guides/  官方构图辅助线 Wasm 插件（`iris.guides`）
+  iris-plugin-webdav/  官方 WebDAV 远程数据源 Wasm 插件（`iris.webdav`）
   iris-core/           无头内核（零 GPUI 依赖）
-    src/player/        视口会话状态机、HTTP(S) 会话转发、后台准备器与媒体检查器
+    src/player/        视口会话状态机、媒体检查器与播放命令
     src/photo/         魔数优先单遍照片头解析（JPEG/PNG/WebP/HEIF/TIFF）、EXIF 与 ICC 色彩匹配
-    src/plugin_v2/     Wasm 运行时、安装授权、网络/流、资源账本与官方包自举
+    src/plugin_v2/     Wasmtime 沙箱运行时、安装授权、网络/流与官方包自举
+    src/logging/       单一脱敏轮转文本日志（`iris.log`）与结构化事件流（`events.jsonl`）
     src/keymap/        三方案动作目录、文本输入保护与冲突检测
-    src/vfs/           常驻书签与有界 HTTP 控制面客户端（含跨源凭据剥离与 30x 回环 SSRF 拦截）
-    src/{catalog,media_uri,vault,preset,store,settings,library,geometry,input,logging}.rs
+    src/vfs/           常驻书签与有界 HTTP 控制面客户端（含跨源凭据剥离与 SSRF 拦截）
+    src/{catalog,media_uri,vault,preset,store,settings,library,geometry,input}.rs
   iris/                GPUI 桌面应用
-    src/theme.rs       GPUI Global ThemeTokens 令牌引擎（方向 C 默认 + 插件高自由度度量与对比度兜底）
-    src/ui/kit/        共用基础控件库（唯一 TextInputHub 单行 IME 输入框、表单控件、列表行、模态框壳）
-    src/ui/            瘦 IrisWindow 领域控制器 + sidebar / controls / popover / plugin_ui / settings / dialogs
+    src/theme.rs       GPUI Global ThemeTokens 令牌引擎（方向 C 默认 + 字号缩放 + 对比度兜底）
+    src/ui/kit/        共用基础控件库（TextInputHub、按钮/列表行/表单/卡片/模态框壳）
+    src/ui/            瘦 IrisWindow 领域控制器 + 5 层 Z-Order 渲染栈 + sidebar / controls / popover / plugin_ui / settings / dialogs
     src/video/         macOS CAOpenGLLayer / Windows D3D11 DirectComposition 原生视频合成层
     src/platform/      按 OS 隔离的窗口控制、防休眠、触控板捏合、媒体键、原生缩略图解码与截图
 examples/plugins/
-  cloud-media-demo/    网盘与视频源插件参考实现（扫码/Token 异步校验弹窗 + 目录浏览 + 清晰度切换）
-  cinema-ui/           高自由度 UI 插件参考实现（动态皮肤 + 无标题栏影院窗 + 底栏按钮 + 视口交互 HUD）
-  watch-stats/         观影计时外部进程插件示例
+  cinema-ui/           声明式无边框影院皮肤插件示例
+  watch-stats/         观影计时 Rust Wasm 插件示例
+  virtual-audio/       虚拟音频流 Rust Wasm 插件示例
+  bilibili/            Bilibili 视频源、弹幕与清晰度 Rust Wasm 插件示例
+  baidupan/            百度网盘 HLS 播放源 Rust Wasm 插件示例
 ```
 
 ## 许可

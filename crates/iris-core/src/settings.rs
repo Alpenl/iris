@@ -576,8 +576,7 @@ mod tests {
 
     #[test]
     fn settings_roundtrip_and_clamps_invalid_values() {
-        let dir = std::env::temp_dir().join(format!("iris-settings-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_util::TestDir::new("settings");
         let file = dir.join("settings.conf");
 
         let custom = Settings {
@@ -651,14 +650,11 @@ mod tests {
             json,
             r#"["right","loop","auto_safe","zh_hant","volume","actual"]"#
         );
-
-        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
     fn list_entries_cannot_create_new_ids_or_settings() {
-        let dir =
-            std::env::temp_dir().join(format!("iris-settings-list-test-{}", std::process::id()));
+        let dir = crate::test_util::TestDir::new("settings-list");
         let file = dir.join("settings.conf");
         let settings = Settings {
             disabled_plugins: vec![
@@ -679,6 +675,5 @@ mod tests {
         assert_eq!(loaded.hidden_dock_buttons, ["loop"]);
         assert_eq!(loaded.volume, settings.volume);
         assert_eq!(loaded.always_on_top, settings.always_on_top);
-        std::fs::remove_dir_all(dir).unwrap();
     }
 }

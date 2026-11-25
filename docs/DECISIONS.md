@@ -9,12 +9,12 @@
 | # | 结论 | 状态 |
 |---|---|---|
 | 1.1 | 定位：高性能本地照片 / 视频 / 音频播放器内核 + 高自由度控制面、界面形态与虚拟数据源插件扩展。本体默认保持克制与视觉一致，解码与色彩渲染由内核独占；本地内核只留通用网络流传输与安全凭据底座，所有具体远程存储协议（含官方标配 WebDAV）一律由插件实现。 | 方向已定 |
-| 1.2 | 插件系统演进：MVP 阶段先把播放器本体做扎实；随后从第一性原理出发，统一落地单版本正交插件协议（`iris-api`，`PROTOCOL_VERSION = 1` + `PluginManager` + 异步 `PluginResponder` 内置插件通道 + 外部 JSON-lines stdio 运行时 + 3 个内置官方插件 `iris.guides` / `iris.ab-loop` / `iris.webdav` + 网盘与无边框影院参考插件），在 v0.1 首发前不留任何历史兼容包袱。 | 已完成（`protocol: 1`） |
+| 1.2 | 插件系统演进：MVP 阶段先把播放器本体做扎实；v1 曾验证 JSON-lines stdio 原型，现已由 [PLUGIN_V2_DECISIONS.md](PLUGIN_V2_DECISIONS.md) 取代并统一升级为 **`protocol: 2 / ABI: 2`（Wasmtime 沙箱 + 官方 Wasm 包 `iris.guides` / `iris.webdav` + 宿主单向隔离边界）**，同时 `A-B 循环` 回归播放内核原生能力。 | 已被 `PLUGIN_V2_DECISIONS.md` 取代（现为 `protocol: 2`） |
 | 1.3 | 插件只在控制面、虚拟数据源与参数化工作台工作，**不经手实时像素数据**；像素管线由内核独占。 | 已落实 |
 | 1.4 | 界面的渲染管线与焦点纪律由内核掌握，插件通过统一的 `Widget` 控件树（侧栏面板与异步校验弹窗共用）、`StatusBadge`、`ToolbarButton`、`OverlayNode` 视口叠层、`UiThemeSpec`/`ChromeLayoutSpec`（允许自由定制配色、圆角/栏高与 `hide_titlebar` 无边框影院窗，宿主提供顶缘悬浮唤醒、视口拖拽与对比度逃生护栏）及支持动态多实例管理的 `MediaSource`（`SetSources` / `SourceManage`）契约与宿主通信。 | 已落实 |
 | 1.5 | 不做多轨合成的非线性剪辑；mpv 是单管线前向播放，做不了。 | 方向已定 |
 | 1.6 | UI 发语义化命令 → 会话改状态 → 语义事件 → UI 重绘；UI 不直接使用 mpv 属性（渲染层仅持窄能力 `RenderHandle`）；坐标换算显式建模；机制和策略分开。 | 已收口到 `Session` / `RenderHandle` / `geometry.rs` / `input.rs` / `plugin/` |
-| 1.7 | 当前不做：Wasm/Lua 进程内脚本引擎、SQLite 媒体库、Linux 移植。外部插件采用语言无关的 JSON-lines stdio 子进程协议，零额外脚本运行时依赖。 | 已定 |
+| 1.7 | 当前不做：Lua/JS 脚本引擎、SQLite 媒体库、Linux 移植。外部扩展已演进为受控 Wasmtime 沙箱（详见 [PLUGIN_V2_DECISIONS.md](PLUGIN_V2_DECISIONS.md)），取消旧版无沙箱 Python/stdio 子进程模型。 | 已更新（见 `PLUGIN_V2_DECISIONS.md`） |
 | 1.8 | 本体默认界面保持方向 C 的配色和整体风格（细节参照 Zed 和 Sooty：默认直角、36px 标题栏、44px 单行工具栏、60fps 跟手拖拽时间轴、16px SVG、可调宽虚拟滚动侧栏），但**不以此限制插件的定制自由度**；圆角与栏高经 `ThemeTokens` 统一封装进 `ui/kit/` 原语。照片的缩放比例按原始像素算，1:1 即 100%。 | 已完成（2026-11-23 Windows 11 双屏实机核验通过；macOS 本轮新界面人工走查待补） |
 
 ## 2. 技术栈与依赖
@@ -30,7 +30,7 @@
 | 2.7 | 设置文件继续用手写的 `key = value`（原子替换写回）；插件清单 `plugin.json` 与 stdio 协议使用 `serde` / `serde_json`（已在依赖树中，MIT/Apache-2.0）。 | 已遵守 |
 | 2.8 | 文件对话框用 GPUI 自带的 `prompt_for_paths`。 | 已遵守 |
 | 2.9 | 目录按自然顺序排序（`ep2` 在 `ep10` 前），手写比较器、不加依赖，并支持按修改时间与文件大小升降序切换。 | 已完成（`library.rs`，含单元测试）|
-| 2.10 | 运行日志统一走 `log`，GUI 发布版写入系统应用日志目录，单次启动最多 4 MiB。 | 已完成（`logging.rs`）；控制协议回复仍写 stderr |
+| 2.10 | 运行日志统一走 `log` + 结构化本地 JSONL 事件流（`logging/`），GUI 发布版写入系统应用日志目录（4 MiB × 5 份按大小轮转），全部文本与事件经 `redact_text`/`redact_json` 单一脱敏收口。 | 已完成（`logging/`）；控制协议回复仍写 stderr |
 | 2.11 | 调试控制使用跨平台本地流：macOS Unix socket，Windows 同用户命名管道。 | 已完成；普通 release 忽略 `IRIS_CONTROL`，测试需 `devtools` |
 | 2.12 | `deny.toml` 检查 RustSec 公告、许可证和依赖来源。C 依赖由锁定的 HTTPS 源码、SPDX 许可表和发布清单约束。 | CI `Release recipe policy` 持续检查 |
 

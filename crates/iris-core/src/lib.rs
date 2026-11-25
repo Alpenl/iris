@@ -20,3 +20,6 @@ pub mod settings;
 pub mod store;
 pub mod vault;
 pub mod vfs;
+
+#[cfg(test)]
+mod test_util;

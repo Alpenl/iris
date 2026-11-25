@@ -28,8 +28,8 @@ use serde_json::json;
 
 pub use model::{
     AspectMode, AudioDevice, Chapter, Command, MAX_SPEED, MIN_SPEED, MediaStats, PlaybackState,
-    RemoteMediaRequest, RemoteSubtitle, SPEED_STEPS, SessionEvent, SessionUpdate, Track, TrackKind,
-    format_time, friendly_error, step_speed,
+    PlayerActionError, RemoteMediaRequest, RemoteSubtitle, SPEED_STEPS, SessionEvent,
+    SessionUpdate, Track, TrackKind, format_time, friendly_error, step_speed,
 };
 pub use prepare::{Prepared, PreparedQueue, prepare, prepare_queue};
 
@@ -407,7 +407,8 @@ impl Session {
             req.photo,
         );
         self.last_remote = Some(saved_remote);
-        logging::record_info(
+        logging::event(
+            logging::EventLevel::Info,
             "player",
             "media_open",
             json!({
@@ -459,7 +460,8 @@ impl Session {
             photo,
         );
         self.last_remote = None;
-        logging::record_info(
+        logging::event(
+            logging::EventLevel::Info,
             "player",
             "media_open",
             json!({
@@ -538,7 +540,8 @@ impl Session {
             SessionEvent::Height(v) => self.state.video_size.1 = *v,
             SessionEvent::Hardware(v) => {
                 if self.state.hwdec != *v && self.state.loaded {
-                    logging::record_info(
+                    logging::event(
+                        logging::EventLevel::Info,
                         "player",
                         "hwdec_changed",
                         json!({
@@ -618,7 +621,8 @@ impl Session {
                     .mpv
                     .get_property_string("audio-codec-name")
                     .unwrap_or_default();
-                logging::record_info(
+                logging::event(
+                    logging::EventLevel::Info,
                     "player",
                     "media_loaded",
                     json!({
@@ -636,7 +640,8 @@ impl Session {
             SessionEvent::Reconfigured => self.sync_video_params(),
             SessionEvent::QueueOverflow => self.resync_after_overflow(),
             SessionEvent::Error(code) => {
-                logging::record_error(
+                logging::event(
+                    logging::EventLevel::Error,
                     "player",
                     "media_error",
                     json!({

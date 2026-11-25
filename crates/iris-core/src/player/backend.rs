@@ -17,7 +17,9 @@ use crate::logging::{self, EventLevel};
 use crate::settings::{Hwdec, OnEof, Settings, SubLang};
 
 use super::Session;
-use super::model::{AspectMode, Command, MAX_SPEED, MIN_SPEED, SessionEvent, SessionUpdate};
+use super::model::{
+    AspectMode, Command, MAX_SPEED, MIN_SPEED, PlayerActionError, SessionEvent, SessionUpdate,
+};
 use super::relay::Service;
 mod commands;
 mod references;
@@ -277,9 +279,15 @@ pub(super) fn spawn_event_pump(
                         text,
                     } => {
                         let detail = logging::redact_text(text.trim_end());
-                        log::warn!(target: "iris::mpv", "{prefix}/{level}: {detail}");
+                        let mapped = match level.as_str() {
+                            "fatal" | "error" => log::Level::Error,
+                            "warn" => log::Level::Warn,
+                            "info" => log::Level::Info,
+                            _ => log::Level::Debug,
+                        };
+                        log::log!(target: "iris::mpv", mapped, "{prefix}/{level}: {detail}");
                         if prefix == "vd" && detail.contains("Attempting next decoding method") {
-                            logging::emit_event(
+                            logging::event(
                                 EventLevel::Warn,
                                 "player",
                                 "decode_fallback",
@@ -294,7 +302,7 @@ pub(super) fn spawn_event_pump(
                             if due {
                                 let skipped = std::mem::take(&mut suppressed_decode_errors);
                                 last_decode_burst = Some(now);
-                                logging::emit_event(
+                                logging::event(
                                     EventLevel::Warn,
                                     "player",
                                     "mpv_diagnostic",
@@ -417,23 +425,34 @@ impl Session {
         }
     }
 
+    fn log_mpv_err<T>(context: &str, result: std::result::Result<T, iris_mpv::Error>) {
+        if let Err(error) = result {
+            log::debug!("mpv {context} ignored: {error}");
+        }
+    }
+
     pub fn set_hwdec(&self, hwdec: Hwdec) {
         self.user_hwdec.set(hwdec);
-        let _ = self
-            .mpv
-            .command_async(&["set", "hwdec", self.effective_hwdec_str()]);
+        Self::log_mpv_err(
+            "set hwdec",
+            self.mpv
+                .command_async(&["set", "hwdec", self.effective_hwdec_str()]),
+        );
     }
 
     pub fn set_sub_lang(&self, sub_lang: SubLang) {
-        let _ = self
-            .mpv
-            .command_async(&["set", "slang", sub_lang.mpv_slang()]);
+        Self::log_mpv_err(
+            "set slang",
+            self.mpv.command_async(&["set", "slang", sub_lang.mpv_slang()]),
+        );
     }
 
     pub fn set_sub_scale(&self, scale: f64) {
-        let _ = self
-            .mpv
-            .set_property_f64_async("sub-scale", scale.clamp(0.5, 2.5));
+        Self::log_mpv_err(
+            "set sub-scale",
+            self.mpv
+                .set_property_f64_async("sub-scale", scale.clamp(0.5, 2.5)),
+        );
     }
 
     pub(super) fn loop_value(&self, live: bool) -> &'static str {
@@ -446,9 +465,11 @@ impl Session {
 
     pub fn set_on_eof_loop(&self, on_eof: OnEof) {
         self.on_eof.set(on_eof);
-        let _ = self
-            .mpv
-            .command_async(&["set", "loop-file", self.loop_value(self.state.is_live)]);
+        Self::log_mpv_err(
+            "set loop-file",
+            self.mpv
+                .command_async(&["set", "loop-file", self.loop_value(self.state.is_live)]),
+        );
     }
 
     pub fn apply_settings(&self, settings: &Settings) {
@@ -458,7 +479,10 @@ impl Session {
         self.set_on_eof_loop(settings.on_eof);
         let dev = settings.audio_device.trim();
         if !dev.is_empty() && !dev.chars().any(char::is_control) {
-            let _ = self.mpv.command_async(&["set", "audio-device", dev]);
+            Self::log_mpv_err(
+                "set audio-device",
+                self.mpv.command_async(&["set", "audio-device", dev]),
+            );
         }
     }
 
@@ -466,16 +490,29 @@ impl Session {
         self.mpv.command_async(&["set", "ab-loop-b", "no"])?;
         self.mpv.command_async(&["set", "ab-loop-a", "no"])?;
         self.transform(0., [0., 0.])?;
-        let _ = self.mpv.command_async(&["set", "video-rotate", "0"]);
-        let _ = self
-            .mpv
-            .command_async(&["set", "video-aspect-override", "no"]);
-        let _ = self.mpv.set_property_f64_async("panscan", 0.);
-        let _ = self.mpv.set_property_f64_async("sub-delay", 0.);
-        let _ = self
-            .mpv
-            .command_async(&["set", "hwdec", self.user_hwdec.get().mpv_value()]);
-        let _ = self.mpv.command_async(&["set", "vf", ""]);
+        Self::log_mpv_err(
+            "reset video-rotate",
+            self.mpv.command_async(&["set", "video-rotate", "0"]),
+        );
+        Self::log_mpv_err(
+            "reset video-aspect-override",
+            self.mpv
+                .command_async(&["set", "video-aspect-override", "no"]),
+        );
+        Self::log_mpv_err(
+            "reset panscan",
+            self.mpv.set_property_f64_async("panscan", 0.),
+        );
+        Self::log_mpv_err(
+            "reset sub-delay",
+            self.mpv.set_property_f64_async("sub-delay", 0.),
+        );
+        Self::log_mpv_err(
+            "reset hwdec",
+            self.mpv
+                .command_async(&["set", "hwdec", self.user_hwdec.get().mpv_value()]),
+        );
+        Self::log_mpv_err("reset vf", self.mpv.command_async(&["set", "vf", ""]));
         Ok(())
     }
 
@@ -562,7 +599,7 @@ impl Session {
         if lut.is_some()
             && (!self.state.loaded || !matches!(self.kind, Some(Kind::Photo | Kind::Video)))
         {
-            anyhow::bail!("LUT preview requires loaded visual media");
+            return Err(PlayerActionError::NoVisualMedia.into());
         }
         let previous = std::mem::replace(&mut self.monitor_lut, lut);
         match self.apply_vf_filters_tracked(previous.is_some()) {
@@ -742,10 +779,7 @@ mod tests {
             lut::MonitorLut,
         };
         use crate::vfs::HttpCancel;
-        let parent = std::env::temp_dir().join(format!(
-            "iris-lut-{}-[,;' space",
-            crate::plugin_v2::files::random_name().unwrap()
-        ));
+        let parent = crate::test_util::TestDir::new("lut-[,;' space");
         let ledger = Ledger::default();
         let root = TempRoot::new(&parent, "lut-test".into(), ledger.clone()).unwrap();
         let cancel = HttpCancel::default();
@@ -809,7 +843,6 @@ mod tests {
         drop(root);
         assert_eq!(ledger.used(None, Resource::HostBytes), 0);
         assert_eq!(ledger.used(None, Resource::TempBytes), 0);
-        std::fs::remove_dir(parent).unwrap();
     }
 
     #[test]

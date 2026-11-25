@@ -288,13 +288,19 @@ impl IrisWindow {
         } else {
             "Wasm 沙箱"
         };
-        let (status_text, status_accent) = match &info.status {
+        let (status_text, status_error) = match &info.status {
             PluginStatus::Dormant => ("等待窗口".to_owned(), false),
             PluginStatus::Loading => ("加载中".to_owned(), false),
             PluginStatus::Ready => ("运行中".to_owned(), false),
             PluginStatus::Stopping => ("正在停止".to_owned(), false),
             PluginStatus::Disabled => ("已禁用".to_owned(), false),
-            PluginStatus::Failed(error) => (format!("错误: {error:?}"), true),
+            PluginStatus::Failed(error) => (
+                format!(
+                    "异常：{}",
+                    super::super::plugin_runtime::describe_error_code(*error)
+                ),
+                true,
+            ),
         };
         let provider = manifest.and_then(|m| m.source_provider.clone());
         let name = manifest.map_or_else(|| pid.clone(), |m| m.name.clone());
@@ -352,8 +358,8 @@ impl IrisWindow {
                             .child(
                                 div()
                                     .text_size(px(10.))
-                                    .text_color(if status_accent {
-                                        t.accent
+                                    .text_color(if status_error {
+                                        t.danger
                                     } else {
                                         t.text_faint
                                     })

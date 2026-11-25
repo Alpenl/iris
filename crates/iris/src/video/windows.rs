@@ -172,7 +172,7 @@ impl VideoSurface {
                                     let lost = is_device_lost(&e, &renderer._device);
                                     let err_str = format!("{e:#}");
                                     let count_str = consecutive_frame_errors.to_string();
-                                    logging::record_kv(
+                                    logging::event_kv(
                                         EventLevel::Warn,
                                         "video",
                                         if lost {
@@ -210,7 +210,7 @@ impl VideoSurface {
                                     {
                                         log::warn!("queuing video track recovery: {e}");
                                     }
-                                    logging::record_kv(
+                                    logging::event_kv(
                                         EventLevel::Info,
                                         "video",
                                         "surface_rebuilt",
@@ -226,7 +226,7 @@ impl VideoSurface {
                                 Err(e) => {
                                     if !logged_frame_error {
                                         let err_str = format!("{e:#}");
-                                        logging::record_kv(
+                                        logging::event_kv(
                                             EventLevel::Warn,
                                             "video",
                                             "frame_error",
@@ -490,7 +490,7 @@ impl Renderer {
         render.set_update_callback(move || {
             let _ = wake.try_send(());
         });
-        logging::record_kv(
+        logging::event_kv(
             EventLevel::Info,
             "video",
             "surface_attached",

@@ -189,8 +189,9 @@ impl IrisWindow {
                         self.notify_stream_status(pid, Some(ticket.id), cx);
                     }
                     Err(error) => {
+                        log::warn!("open_scoped failed for {pid}: {error:#}");
                         self.active_mut().pending_subtitles.clear();
-                        self.show_toast(format!("无法打开插件媒体 · {error}"), cx);
+                        self.show_error_toast("无法打开插件媒体，请检查网络或鉴权状态", cx);
                     }
                 }
                 self.active_mut().image.reset();
@@ -301,17 +302,23 @@ impl IrisWindow {
     }
 }
 
-pub(super) fn describe_error_code(code: iris_api::v2::ErrorCode) -> String {
+pub(in crate::ui) fn describe_error_code(code: iris_api::v2::ErrorCode) -> String {
     use iris_api::v2::ErrorCode;
     match code {
-        ErrorCode::AuthFailed => "鉴权失败或播放源拒绝访问 (AuthFailed)".into(),
-        ErrorCode::Denied => "播放地址或权限被策略拒绝 (Denied)".into(),
-        ErrorCode::QuotaExceeded => "插件资源配额不足 (QuotaExceeded)".into(),
-        ErrorCode::Timeout => "请求超时 (Timeout)".into(),
-        ErrorCode::IoError => "网络读取失败 (IoError)".into(),
-        ErrorCode::StaleHandle => "播放会话已过期，请重试 (StaleHandle)".into(),
-        ErrorCode::Unsupported => "不支持的媒体格式 (Unsupported)".into(),
-        ErrorCode::Backpressure => "请求过于频繁，请稍后重试 (Backpressure)".into(),
-        other => format!("{other:?}"),
+        ErrorCode::AuthFailed => "鉴权失败或播放源拒绝访问",
+        ErrorCode::Denied => "播放地址或权限被策略拒绝",
+        ErrorCode::QuotaExceeded => "插件资源配额不足",
+        ErrorCode::Timeout => "请求超时",
+        ErrorCode::IoError => "网络或文件读取失败",
+        ErrorCode::StaleHandle => "会话已过期，请重试",
+        ErrorCode::Unsupported => "不支持的媒体格式或操作",
+        ErrorCode::Backpressure => "请求过于频繁，请稍后重试",
+        ErrorCode::Cancelled => "操作已取消",
+        ErrorCode::InvalidArgument => "参数格式无效",
+        ErrorCode::RangeInvalid => "分片范围无效",
+        ErrorCode::BadState => "插件状态异常，请重试",
+        ErrorCode::OutOfWindow => "请求超出当前播放窗口范围",
+        ErrorCode::Internal => "插件内部错误",
     }
+    .into()
 }

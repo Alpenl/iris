@@ -102,9 +102,7 @@ mod tests {
 
     #[test]
     fn location_store_load_from_roundtrips_and_upgrades_legacy_webdav_bookmarks() {
-        let dir = std::env::temp_dir().join(format!("iris-loc-store-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_util::TestDir::new("loc-store");
         let file = dir.join("locations.json");
 
         // Legacy locations.json containing `webdav://` string URI and retired `webdav_connections`.
@@ -153,7 +151,5 @@ mod tests {
         let mut reloaded = reloaded;
         assert!(reloaded.remove_bookmark("bm-1"));
         assert_eq!(LocationStore::load_from(&file).bookmarks.len(), 1);
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

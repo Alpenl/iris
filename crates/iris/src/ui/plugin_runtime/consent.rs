@@ -29,7 +29,13 @@ impl IrisWindow {
         }
         match self.plugins.client().review(path) {
             Ok(_) => self.show_toast("正在验证插件包…", cx),
-            Err(error) => self.show_toast(format!("无法审核插件包 · {error:?}"), cx),
+            Err(error) => {
+                log::warn!("plugin review rejected: {error:?}");
+                self.show_error_toast(
+                    format!("无法审核插件包 · {}", super::describe_error_code(error)),
+                    cx,
+                );
+            }
         }
     }
     pub(in crate::ui) fn choose_plugin_package(&mut self, cx: &mut Context<Self>) {
@@ -108,7 +114,13 @@ impl IrisWindow {
         };
         match result {
             Ok(()) => self.plugin_view.consent_busy = Some(target_id),
-            Err(error) => self.show_toast(format!("授权未提交 · {error:?}"), cx),
+            Err(error) => {
+                log::warn!("host consent submit failed: {error:?}");
+                self.show_error_toast(
+                    format!("授权未提交 · {}", super::describe_error_code(error)),
+                    cx,
+                );
+            }
         }
         cx.notify();
     }

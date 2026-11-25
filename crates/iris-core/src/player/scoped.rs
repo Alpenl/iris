@@ -124,7 +124,8 @@ impl Session {
         let is_live = playback.is_live;
         self.last_remote = None;
         self.scoped_playback = Some(playback);
-        crate::logging::record_info(
+        crate::logging::event(
+            crate::logging::EventLevel::Info,
             "player",
             "media_open",
             serde_json::json!({
