@@ -109,10 +109,14 @@ impl IrisWindow {
                 else {
                     return;
                 };
-                if (playback.title.trim().is_empty() || playback.title == "插件媒体")
-                    && let Some(fallback) = fallback_title.filter(|t| !t.trim().is_empty())
+                if playback.title.trim().is_empty()
+                    || playback.title == super::super::strings::chrome::DEFAULT_PLUGIN_MEDIA_TITLE
                 {
-                    playback.title = fallback;
+                    playback.title = fallback_title
+                        .filter(|t| !t.trim().is_empty())
+                        .unwrap_or_else(|| {
+                            super::super::strings::chrome::DEFAULT_PLUGIN_MEDIA_TITLE.into()
+                        });
                 }
                 let (uri, private, variant) = match &ticket.target {
                     RequestTarget::Resolve {
@@ -303,22 +307,5 @@ impl IrisWindow {
 }
 
 pub(in crate::ui) fn describe_error_code(code: iris_api::v2::ErrorCode) -> String {
-    use iris_api::v2::ErrorCode;
-    match code {
-        ErrorCode::AuthFailed => "鉴权失败或播放源拒绝访问",
-        ErrorCode::Denied => "播放地址或权限被策略拒绝",
-        ErrorCode::QuotaExceeded => "插件资源配额不足",
-        ErrorCode::Timeout => "请求超时",
-        ErrorCode::IoError => "网络或文件读取失败",
-        ErrorCode::StaleHandle => "会话已过期，请重试",
-        ErrorCode::Unsupported => "不支持的媒体格式或操作",
-        ErrorCode::Backpressure => "请求过于频繁，请稍后重试",
-        ErrorCode::Cancelled => "操作已取消",
-        ErrorCode::InvalidArgument => "参数格式无效",
-        ErrorCode::RangeInvalid => "分片范围无效",
-        ErrorCode::BadState => "插件状态异常，请重试",
-        ErrorCode::OutOfWindow => "请求超出当前播放窗口范围",
-        ErrorCode::Internal => "插件内部错误",
-    }
-    .into()
+    super::super::strings::errors::plugin_error_code(code)
 }

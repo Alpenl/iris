@@ -1,6 +1,6 @@
 # 2026-11-24 · 插件系统 v2 战略转向与决策记录
 
-> **状态：源码已切换 protocol: 2，跨平台发布和性能验收仍有待验证项。** 应用版本保持 `0.0.1`，本轮不发布新版本；已实现产品行为以 [PLUGINS.md](PLUGINS.md) 与 [ARCHITECTURE.md](ARCHITECTURE.md) 为准。
+> **状态：源码已切换 protocol: 2 并于 `0.0.2` 完成精简重构（移除零调用方的外部工具 BYOB、DASH 与受限 HLS 文本通道，收敛为 `VirtualHls`、`PixelGrid` + `ViewTimer`、`SourceDescriptor.badge` 与 `HostCommand::Log`）。** 已实现产品行为以 [PLUGINS.md](PLUGINS.md) 与 [ARCHITECTURE.md](ARCHITECTURE.md) 为准。
 > 本文记录方向、取舍及复审结论；接口、配额、错误语义、迁移顺序与验收矩阵以 [PLUGIN_V2_ARCHITECTURE.md](PLUGIN_V2_ARCHITECTURE.md) 为准。开发入口的实现和验证记录见 [PLUGIN_V2_IMPLEMENTATION.md](PLUGIN_V2_IMPLEMENTATION.md)；未记录通过的契约仍待验收，性能目标不是实测结果。
 
 ## 一、为何提前建设插件 v2

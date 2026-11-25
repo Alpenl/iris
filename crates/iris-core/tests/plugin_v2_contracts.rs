@@ -17,6 +17,8 @@ use std::{
 };
 #[path = "plugin_v2_contracts/runtime.rs"]
 mod runtime;
+#[path = "plugin_v2_contracts/wat_abi.rs"]
+mod wat_abi;
 #[path = "plugin_v2_contracts/windows.rs"]
 mod windows;
 

@@ -206,7 +206,10 @@ impl IrisWindow {
     pub(super) fn cycle_aspect(&mut self, _: &CycleAspect, _: &mut Window, cx: &mut Context<Self>) {
         let next = self.active().session.state().aspect.next();
         self.command(Command::SetAspect(next), cx);
-        self.show_osd(format!("画面比例 · {}", next.label()), cx);
+        self.show_osd(
+            format!("画面比例 · {}", super::strings::chrome::aspect_label(next)),
+            cx,
+        );
     }
 
     pub(super) fn toggle_directory(
@@ -497,7 +500,7 @@ impl IrisWindow {
         };
         if let Err(error) = self.active_mut().session.execute(command) {
             log::warn!("flip display axis failed: {error:#}");
-            self.show_error_toast(super::format_player_error(&error), cx);
+            self.show_error_toast(super::strings::errors::player_action_error(&error), cx);
             return;
         }
         self.active_mut().image.pan[usize::from(!horizontal)] *= -1.;

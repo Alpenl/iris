@@ -59,13 +59,14 @@ impl IrisWindow {
             cx.notify();
             return;
         }
-        if keymap::reserved_shortcut(&spec).is_some_and(|(id, _)| id == "reset_appearance") {
+        if keymap::reserved_shortcut(&spec) == Some("reset_appearance") {
             return;
         }
         let disp = keymap::format_keystroke_display(&spec, IS_MACOS);
         if let Some((target_id, ctx_pred)) = self.overlays.recording_shortcut.as_ref()
-            && let Some(other) = self.keymap.find_conflict(ctx_pred, &spec, target_id)
+            && let Some(conflict) = self.keymap.find_conflict(ctx_pred, &spec, target_id)
         {
+            let other = super::super::strings::actions::describe_conflict(&conflict, &self.presets);
             let warn = format!("无法绑定 {disp}：与「{other}」冲突，请选择其他按键");
             self.overlays.shortcut_conflict = Some(warn.clone());
             self.show_error_toast(warn, cx);
@@ -94,7 +95,8 @@ impl IrisWindow {
             .map(|(id, _)| id.clone());
         let conflict_banner = self.overlays.shortcut_conflict.clone();
 
-        let mut categories: Vec<(&'static str, Vec<&'static keymap::ActionEntry>)> = Vec::new();
+        let mut categories: Vec<(keymap::ActionCategory, Vec<&'static keymap::ActionEntry>)> =
+            Vec::new();
         for entry in keymap::actions() {
             if let Some((_, list)) = categories.iter_mut().find(|(c, _)| *c == entry.category) {
                 list.push(entry);
@@ -110,7 +112,10 @@ impl IrisWindow {
             .map(|p| {
                 (
                     format!("preset:{}", p.id),
-                    format!("切换到预设 · {}", p.name),
+                    format!(
+                        "切换到预设 · {}",
+                        super::super::strings::presets::preset_name(p)
+                    ),
                 )
             })
             .collect();
@@ -160,7 +165,11 @@ impl IrisWindow {
                                         div()
                                             .text_size(t.text_sm)
                                             .text_color(t.text_faint)
-                                            .child(cur_scheme.description()),
+                                            .child(
+                                                super::super::strings::actions::keymap_scheme_description(
+                                                    cur_scheme,
+                                                ),
+                                            ),
                                     ),
                             )
                             .child(
@@ -185,8 +194,15 @@ impl IrisWindow {
                             ),
                     )
                     .child({
-                        let schemes: Vec<_> =
-                            KeymapScheme::ALL.iter().map(|&s| (s.label(), s)).collect();
+                        let schemes: Vec<_> = KeymapScheme::ALL
+                            .iter()
+                            .map(|&s| {
+                                (
+                                    super::super::strings::actions::keymap_scheme_label(s),
+                                    s,
+                                )
+                            })
+                            .collect();
                         segmented(
                             "keymap-scheme",
                             &schemes,
@@ -200,7 +216,10 @@ impl IrisWindow {
                                 this.keymap.save();
                                 rebind_keys(cx, &this.keymap);
                                 this.show_toast(
-                                    format!("已切换快捷键方案 · {}", scheme.label()),
+                                    format!(
+                                        "已切换快捷键方案 · {}",
+                                        super::super::strings::actions::keymap_scheme_label(scheme)
+                                    ),
                                     cx,
                                 );
                                 cx.notify();
@@ -209,6 +228,16 @@ impl IrisWindow {
                     }),
             )
             .when_some(recording_id.clone(), |d, rec| {
+                let rec_label = if keymap::find_action(&rec).is_some() {
+                    super::super::strings::actions::action_title(&rec).to_string()
+                } else if let Some(pid) = rec.strip_prefix("preset:") {
+                    format!(
+                        "切换到预设 · {}",
+                        super::super::strings::presets::preset_name_by_id(&self.presets, pid)
+                    )
+                } else {
+                    rec.clone()
+                };
                 d.child(
                     div()
                         .px(px(10.))
@@ -222,7 +251,7 @@ impl IrisWindow {
                         .justify_between()
                         .gap(px(8.))
                         .child(div().text_size(t.text_sm).text_color(t.text).child(format!(
-                            "正在录制「{rec}」：请直接按下目标按键或组合键，按 Esc 取消"
+                            "正在录制「{rec_label}」：请直接按下目标按键或组合键，按 Esc 取消"
                         )))
                         .child(chip_button("cancel-rec-banner", "取消", false, t).on_click(
                             cx.listener(|this, _, w, cx| {
@@ -260,21 +289,24 @@ impl IrisWindow {
             .children({
                 let cx_ref: &Context<Self> = cx;
                 let rec_str = recording_id.as_deref();
-                categories.into_iter().map(move |(cat_title, entries)| {
+                categories.into_iter().map(move |(cat, entries)| {
                     div()
                         .flex()
                         .flex_col()
                         .gap(px(4.))
                         .child(
-                            section_label(cat_title, t)
-                                .pb(px(4.))
-                                .border_b_1()
-                                .border_color(t.line),
+                            section_label(
+                                super::super::strings::actions::action_category_label(cat),
+                                t,
+                            )
+                            .pb(px(4.))
+                            .border_b_1()
+                            .border_color(t.line),
                         )
                         .children(entries.into_iter().map(move |entry| {
                             self.render_shortcut_recorder_row(
                                 entry.id.to_string(),
-                                entry.title.to_string(),
+                                super::super::strings::actions::action_title(entry.id).to_string(),
                                 Some(scope_short_label(entry)),
                                 entry.context.to_string(),
                                 rec_str,

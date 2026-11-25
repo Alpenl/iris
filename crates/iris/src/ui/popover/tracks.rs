@@ -29,7 +29,7 @@ impl IrisWindow {
         let rows = tracks.into_iter().map(|tr| {
             let active = visible && tr.selected;
             let id = tr.id;
-            let label = tr.label();
+            let label = super::super::strings::chrome::track_label(tr);
             select_row(
                 ("sub-track", id as usize),
                 label.clone(),
@@ -146,7 +146,7 @@ impl IrisWindow {
         let track_rows = tracks.into_iter().map(|tr| {
             let active = tr.selected;
             let id = tr.id;
-            let label = tr.label();
+            let label = super::super::strings::chrome::track_label(tr);
             select_row(
                 ("audio-track", id as usize),
                 label.clone(),
@@ -175,11 +175,7 @@ impl IrisWindow {
             .map(|(i, dev)| {
                 let active = dev.name == cur_dev;
                 let dev_name = dev.name.clone();
-                let dev_label = if dev.name == "auto" {
-                    "自动选择设备".to_string()
-                } else {
-                    dev.description.clone()
-                };
+                let dev_label = super::super::strings::chrome::audio_device_label(&dev, false);
                 let osd_label = dev_label.clone();
                 select_row(("audio-dev", i), dev_label, None, active, false, false, t)
                     .text_size(t.text_sm)

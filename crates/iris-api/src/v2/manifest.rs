@@ -23,29 +23,6 @@ pub enum Capability {
     NetWs,
     NetTcp,
 }
-impl Capability {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::ReadState => "读取播放状态与媒体身份",
-            Self::ControlPlayback => "控制播放",
-            Self::MediaSource => "媒体数据源",
-            Self::UrlResolver => "解析媒体网址",
-            Self::MediaEnhance => "添加媒体增强",
-            Self::Annotations => "编辑已授权的标注",
-            Self::Secrets => "私有凭据",
-            Self::Notifications => "通知",
-            Self::UiSidebar => "侧栏",
-            Self::UiStatus => "状态栏",
-            Self::UiOverlay => "画面叠加",
-            Self::UiToolbar => "工具栏",
-            Self::UiModal => "插件表单",
-            Self::UiTheme => "主题与布局",
-            Self::NetHttp => "HTTP 网络",
-            Self::NetWs => "WebSocket 网络",
-            Self::NetTcp => "TCP 网络",
-        }
-    }
-}
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

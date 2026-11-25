@@ -22,6 +22,7 @@ mod preset_ctrl;
 mod settings;
 mod sidebar;
 mod state;
+pub(crate) mod strings;
 mod titlebar;
 mod vfs_ctrl;
 mod viewport;
@@ -40,7 +41,7 @@ use iris_core::catalog::PlayQueue;
 use iris_core::input::{self, PointerCommand, PointerInput};
 use iris_core::keymap::Keymap;
 use iris_core::library::Kind;
-use iris_core::player::{Command, MAX_SPEED, MIN_SPEED, PlayerActionError, Session};
+use iris_core::player::{Command, MAX_SPEED, MIN_SPEED, Session};
 use iris_core::plugin_v2::ui::PluginManager;
 use iris_core::preset::{PresetManager, PresetRuntime, SidebarMode};
 use iris_core::settings::{Settings, Side};
@@ -90,19 +91,6 @@ pub(crate) struct IrisWindow {
     _quit: Subscription,
     _events: Task<()>,
     _plugin_events: Task<()>,
-}
-
-pub(super) fn format_player_error(err: &anyhow::Error) -> &'static str {
-    if let Some(action) = err.downcast_ref::<PlayerActionError>() {
-        return match action {
-            PlayerActionError::NotSeekable => "当前媒体不支持设置 A-B 循环",
-            PlayerActionError::InvalidAbRange => "A-B 循环区间无效或超出时长范围",
-            PlayerActionError::NoVisualMedia => "LUT 预览仅适用于已加载的视频或图片",
-            PlayerActionError::InvalidSubtitlePath => "本地字幕不支持远程或内部协议路径",
-            PlayerActionError::SubtitleFileNotFound => "字幕文件不存在或不可读取",
-        };
-    }
-    "当前状态无法执行此操作"
 }
 
 impl IrisWindow {
@@ -402,7 +390,7 @@ impl IrisWindow {
     pub(super) fn command(&mut self, command: Command, cx: &mut Context<Self>) {
         if let Err(e) = self.active_mut().session.execute(command) {
             log::warn!("player command failed: {e:#}");
-            self.show_error_toast(format_player_error(&e), cx);
+            self.show_error_toast(strings::errors::player_action_error(&e), cx);
         }
     }
 

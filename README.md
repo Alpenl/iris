@@ -25,8 +25,8 @@ Iris 是一个以 [mpv](https://mpv.io) 为播放核心的高性能跨平台照�
 - **多方案可录制快捷键系统（Keymap）**：
   - 内置 **Iris 默认 / mpv 经典 / PotPlayer 风格** 三套零冲突键位方案一键热切换，内置 `!TextInput` 打字安全防火墙（单键快捷键绝不干扰搜索框与表单输入），全局按钮悬停提示随当前键位方案实时联动。
 - **高自由度主题与正交插件系统（`iris-api`，`protocol: 2`）**：
-  - GPUI 全局 `ThemeTokens` 引擎（内置 **石墨模块 / OLED 纯黑暗房 / 胶片暖灰审片 / 冰川高对比** 四套色板）。
-  - 插件可在受控权限内动态扩展多实例数据源（`SetSources`）、定制配色/圆角/栏高与无标题栏影院窗（`hide_titlebar`，宿主内置顶缘悬浮唤醒、视口拖拽与「恢复默认外观」三重安全护栏）、挂载 13 类同构声明式 `Widget` 侧栏/弹窗以及 7 类视口 `OverlayNode` 交互式矢量 HUD。详见 [插件开发指南](docs/PLUGINS.md)。
+  - GPUI 全局 `ThemeTokens` 引擎（内置 **石墨模块 / OLED 纯黑暗房 / 胶片暖灰审片 / 冰川高对比** 四套色板，支持 `85%–135%` 全局界面字号缩放与防裁切自适应栏高）。
+  - 插件可在受控权限内动态扩展多实例数据源（`SetSources` 含通用 `badge`）、定制配色/圆角/栏高与无标题栏影院窗（`hide_titlebar`，宿主内置顶缘悬浮唤醒、视口拖拽与「恢复默认外观」三重安全护栏）、挂载声明式 `Widget`（含正交 `PixelGrid` + `ViewTimer`）侧栏/弹窗、7 类视口 `OverlayNode` 交互式矢量 HUD，并通过 `HostCommand::Log` 写入经宿主限流脱敏的结构化日志。详见 [插件开发指南](docs/PLUGINS.md)。
 
 ## 默认快捷键（Iris 标准方案，可在设置中切换 mpv / PotPlayer 方案或自由录制）
 
@@ -34,7 +34,7 @@ Iris 是一个以 [mpv](https://mpv.io) 为播放核心的高性能跨平台照�
 |---|---|
 | `⌘P` / `Ctrl+P`（或 `⌘⇧P`） | 打开命令面板（动作、预设、主题、数据源与插件命令） |
 | `⌘O` / `Ctrl+O` | 打开本地文件或文件夹 |
-| `⌘U` / `Ctrl+U` | 打开网络流 / 远程媒体地址 |
+| `⌘U` / `Ctrl+U` | 打开网络流… |
 | `Alt+W` | 循环切换工作区预设 |
 | `⌘F` / `Ctrl+F` | 搜索当前目录（插件源支持回车触发远程搜索） |
 | `⌘R` / `Ctrl+R` | 刷新当前目录 / 远程源 |
@@ -87,7 +87,6 @@ cargo clippy --locked --workspace --all-targets -- -D warnings
 - `plugin-v2-state/`：按安装身份保存非敏感配置；敏感凭据保存在系统凭据库。旧 `plugin_state/` 为官方迁移输入，成功前保留旧资料。
 - `credential_index.json` 仅索引凭据的作用域和键名。密钥正文保存在系统凭据库。
 - `plugins-v2/`：审核后的 Wasm 包与安装授权（支持 `IRIS_PLUGINS_V2` 开发覆盖）；`plugin-v2-temp/` 为有配额的临时产物。
-- `plugin-tool-bindings.json`：用户显式批准的可信原生工具与模型绑定。
 
 ## 代码结构
 
@@ -99,16 +98,18 @@ crates/
   iris-plugin-guides/  官方构图辅助线 Wasm 插件（`iris.guides`）
   iris-plugin-webdav/  官方 WebDAV 远程数据源 Wasm 插件（`iris.webdav`）
   iris-core/           无头内核（零 GPUI 依赖）
+    src/loopback_http.rs 共用回环 HTTP 监听、Range 响应与自适应清单探测原语
     src/player/        视口会话状态机、媒体检查器与播放命令
     src/photo/         魔数优先单遍照片头解析（JPEG/PNG/WebP/HEIF/TIFF）、EXIF 与 ICC 色彩匹配
     src/plugin_v2/     Wasmtime 沙箱运行时、安装授权、网络/流与官方包自举
     src/logging/       单一脱敏轮转文本日志（`iris.log`）与结构化事件流（`events.jsonl`）
-    src/keymap/        三方案动作目录、文本输入保护与冲突检测
+    src/keymap/        三方案动作目录、文本输入保护与结构化冲突检测
     src/vfs/           常驻书签与有界 HTTP 控制面客户端（含跨源凭据剥离与 SSRF 拦截）
     src/{catalog,media_uri,vault,preset,store,settings,library,geometry,input}.rs
   iris/                GPUI 桌面应用
     src/theme.rs       GPUI Global ThemeTokens 令牌引擎（方向 C 默认 + 字号缩放 + 对比度兜底）
-    src/ui/kit/        共用基础控件库（TextInputHub、按钮/列表行/表单/卡片/模态框壳）
+    src/ui/kit/        共用基础控件库（TextInputHub、4×3 按钮、列表行/表单/卡片/模态框壳）
+    src/ui/strings/    按领域归集的中文 UI 文案与统一术语表
     src/ui/            瘦 IrisWindow 领域控制器 + 5 层 Z-Order 渲染栈 + sidebar / controls / popover / plugin_ui / settings / dialogs
     src/video/         macOS CAOpenGLLayer / Windows D3D11 DirectComposition 原生视频合成层
     src/platform/      按 OS 隔离的窗口控制、防休眠、触控板捏合、媒体键、原生缩略图解码与截图

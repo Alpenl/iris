@@ -233,7 +233,10 @@ impl IrisWindow {
                 menu_row(
                     "cm-vp-aspect",
                     Some(Icon::Aspect),
-                    format!("画面比例 · {}", st.aspect.label()),
+                    format!(
+                        "画面比例 · {}",
+                        super::strings::chrome::aspect_label(st.aspect)
+                    ),
                     self.key_hint("cycle_aspect"),
                     false,
                     t,
@@ -282,7 +285,7 @@ impl IrisWindow {
                 menu_row(
                     "cm-vp-info",
                     Some(Icon::Info),
-                    "媒体详情与统计",
+                    super::strings::chrome::MEDIA_INFO_LABEL,
                     self.key_hint("toggle_info"),
                     self.overlays.info_open,
                     t,
@@ -315,7 +318,7 @@ impl IrisWindow {
             menu_row(
                 "cm-vp-url",
                 Some(Icon::Globe),
-                "打开网络流…",
+                super::strings::chrome::OPEN_STREAM_LABEL,
                 self.key_hint("open_url"),
                 false,
                 t,

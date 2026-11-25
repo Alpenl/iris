@@ -23,8 +23,16 @@ impl Session {
             .find(|t| t.kind == kind && t.selected)
     }
 
+    pub fn chapter_index_at(&self, time: f64) -> Option<(usize, &Chapter)> {
+        self.state
+            .chapters
+            .iter()
+            .enumerate()
+            .rfind(|(_, c)| c.time <= time + 0.05)
+    }
+
     pub fn chapter_at(&self, time: f64) -> Option<&Chapter> {
-        self.state.chapters.iter().rfind(|c| c.time <= time + 0.05)
+        self.chapter_index_at(time).map(|(_, c)| c)
     }
 
     /// Queries available audio output devices reported by libmpv.
@@ -38,7 +46,7 @@ impl Session {
         if parsed.is_empty() {
             vec![AudioDevice {
                 name: "auto".into(),
-                description: "自动选择设备".into(),
+                description: String::new(),
             }]
         } else {
             parsed
@@ -204,7 +212,7 @@ pub(super) fn parse_chapter_list_json(raw: &str) -> Vec<Chapter> {
         return Vec::new();
     };
     let mut chapters = Vec::with_capacity(items.len().min(128));
-    for (i, item) in items.iter().take(128).enumerate() {
+    for item in items.iter().take(128) {
         let Some(obj) = item.as_object() else {
             continue;
         };
@@ -216,9 +224,9 @@ pub(super) fn parse_chapter_list_json(raw: &str) -> Vec<Chapter> {
         let title = obj
             .get("title")
             .and_then(|v| v.as_str())
-            .filter(|s| !s.trim().is_empty())
-            .map(String::from)
-            .unwrap_or_else(|| format!("第 {} 章", i + 1));
+            .map(str::trim)
+            .unwrap_or_default()
+            .to_string();
         chapters.push(Chapter { title, time });
     }
     chapters
@@ -299,7 +307,7 @@ mod tests {
         let chapters =
             parse_chapter_list_json(r#"[{"title":"Intro","time":0.0},{"title":"","time":42.5}]"#);
         assert_eq!(chapters.len(), 2);
-        assert_eq!(chapters[1].title, "第 2 章");
+        assert_eq!(chapters[1].title, "");
 
         let devs = parse_audio_device_list_json(
             r#"[{"name":"auto","description":"Autoselect"},{"name":"dac","description":"USB DAC"}]"#,

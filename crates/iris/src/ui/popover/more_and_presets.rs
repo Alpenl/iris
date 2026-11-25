@@ -167,7 +167,7 @@ impl IrisWindow {
                 let active = current_ch == i as i64;
                 select_row(
                     ("ch-row", i),
-                    ch.title,
+                    super::super::strings::chrome::chapter_title(i, &ch.title),
                     Some(format_time(ch.time).into()),
                     active,
                     false,
@@ -263,7 +263,7 @@ impl IrisWindow {
             .child(
                 act(
                     "more-info",
-                    "媒体详情与统计",
+                    super::super::strings::chrome::MEDIA_INFO_LABEL,
                     "toggle_info",
                     self.overlays.info_open,
                 )
@@ -294,7 +294,13 @@ impl IrisWindow {
                     cx,
                     |this, m, cx| {
                         this.command(Command::SetAspect(m), cx);
-                        this.show_osd(format!("画面比例 · {}", m.label()), cx);
+                        this.show_osd(
+                            format!(
+                                "画面比例 · {}",
+                                super::super::strings::chrome::aspect_label(m)
+                            ),
+                            cx,
+                        );
                     },
                 ))
         });
@@ -339,6 +345,8 @@ impl IrisWindow {
             .enumerate()
             .map(|(i, p)| {
                 let active = p.id == active_id;
+                let name = super::super::strings::presets::preset_name(&p).to_string();
+                let desc = super::super::strings::presets::preset_description(&p).to_string();
                 let (pid, builtin) = (p.id, p.builtin);
                 let title_col = if active { t.text } else { t.text_muted };
                 div()
@@ -365,7 +373,7 @@ impl IrisWindow {
                                             .truncate()
                                             .text_size(t.text_md)
                                             .text_color(title_col)
-                                            .child(p.name),
+                                            .child(name),
                                     )
                                     .child(badge_pill(
                                         if builtin { "内置" } else { "自定义" },
@@ -373,13 +381,13 @@ impl IrisWindow {
                                         t,
                                     )),
                             )
-                            .when(!p.description.is_empty(), |d| {
+                            .when(!desc.is_empty(), |d| {
                                 d.child(
                                     div()
                                         .truncate()
                                         .text_size(t.text_xs)
                                         .text_color(t.text_dim)
-                                        .child(p.description),
+                                        .child(desc),
                                 )
                             }),
                     )

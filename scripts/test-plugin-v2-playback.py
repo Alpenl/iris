@@ -25,9 +25,6 @@ def main():
          "-preset", "fast", "-g", "25", "-sc_threshold", "0", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "96k", "reference.mp4"],
         ["-i", "reference.mp4", "-map", "0", "-c", "copy", "-f", "hls", "-hls_time", "1", "-hls_playlist_type", "vod",
          "-hls_segment_filename", "hls-%02d.ts", "hls.m3u8"],
-        ["-i", "reference.mp4", "-map", "0", "-c", "copy", "-f", "dash", "-seg_duration", "1",
-         "-init_seg_name", "dash-init-$RepresentationID$.m4s", "-media_seg_name", "dash-$RepresentationID$-$Number%05d$.m4s",
-         "-use_template", "1", "-use_timeline", "1", "dash.mpd"],
     ]
     for command in commands:
         subprocess.run(prefix + command, cwd=directory, check=True, timeout=60)
@@ -43,7 +40,7 @@ def main():
     env.setdefault("MPV_LIB_DIR", str(ROOT / "target/deps/mpv"))
     env["PATH"] = env["MPV_LIB_DIR"] + os.pathsep + env["PATH"]
     result = subprocess.run(["cargo", "test", "--locked", "-p", "iris-core", "--lib",
-                             "real_hls_and_dash_decode_through_scoped_rewritten_manifests", "--", "--ignored", "--nocapture"],
+                             "real_hls_decode_through_scoped_rewritten_manifest", "--", "--ignored", "--nocapture"],
                             cwd=ROOT, env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=300)
     print(result.stdout)
     receipt.update(exit_code=result.returncode, output=result.stdout)

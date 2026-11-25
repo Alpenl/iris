@@ -33,6 +33,8 @@ fn render_preset_card(
     cx: &Context<IrisWindow>,
 ) -> AnyElement {
     let is_builtin = preset.builtin;
+    let display_name = super::super::strings::presets::preset_name(&preset).to_string();
+    let display_desc = super::super::strings::presets::preset_description(&preset).to_string();
     let (pid_apply, pid_update, pid_delete) = (preset.id.clone(), preset.id.clone(), preset.id);
     let del_key = format!("del-preset:{pid_delete}");
     let (has_layout, has_playback, has_plugins) = (
@@ -112,7 +114,7 @@ fn render_preset_card(
                                 .font_weight(FontWeight::MEDIUM)
                                 .text_color(t.text)
                                 .truncate()
-                                .child(preset.name),
+                                .child(display_name),
                         )
                         .child(badge_pill(
                             if is_builtin { "内置" } else { "自定义" },
@@ -124,12 +126,12 @@ fn render_preset_card(
                 )
                 .child(buttons),
         )
-        .when(!preset.description.is_empty(), |d| {
+        .when(!display_desc.is_empty(), |d| {
             d.child(
                 div()
                     .text_size(t.text_sm)
                     .text_color(t.text_dim)
-                    .child(preset.description),
+                    .child(display_desc),
             )
         })
         .child(
@@ -342,7 +344,7 @@ impl IrisWindow {
                     perm,
                     Capability::UiTheme | Capability::MediaSource | Capability::Secrets
                 );
-                badge_pill(perm.label(), hi, t)
+                badge_pill(super::super::strings::chrome::capability_label(perm), hi, t)
             });
 
         surface_card(6., t)

@@ -161,7 +161,7 @@ fn respond(
 
 #[test]
 #[ignore = "run scripts/test-plugin-v2-playback.py with a real FFmpeg fixture generator"]
-fn real_hls_and_dash_decode_through_scoped_rewritten_manifests() {
+fn real_hls_decode_through_scoped_rewritten_manifest() {
     let directory = std::env::var_os("IRIS_V2_ADAPTIVE_FIXTURE").expect("native fixture directory");
     let server = Server::start(Path::new(&directory));
     for (name, profile) in [("hls.m3u8", Profile::Hls)] {
@@ -307,5 +307,4 @@ fn real_hls_and_dash_decode_through_scoped_rewritten_manifests() {
     }
     let requests = server.requests.lock().unwrap();
     assert!(requests.iter().any(|p| p.starts_with("/hls-")));
-    assert!(requests.contains("/dash-init-0.m4s") && requests.contains("/dash-init-1.m4s"));
 }

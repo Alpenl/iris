@@ -156,7 +156,7 @@ impl IrisWindow {
                 0,
                 AudioDevice {
                     name: "auto".into(),
-                    description: "自动跟随系统默认输出设备".into(),
+                    description: String::new(),
                 },
             );
         }
@@ -273,18 +273,10 @@ impl IrisWindow {
                         devices.into_iter().enumerate().map(|(di, dev)| {
                             let active = dev.name == cur_dev;
                             let dev_name = dev.name.clone();
-                            let desc_toast = if dev.description.trim().is_empty() {
-                                dev.name.clone()
-                            } else {
-                                dev.description.clone()
-                            };
-                            let label_txt = if dev.name == "auto" {
-                                "自动选择（跟随系统默认）".to_string()
-                            } else if dev.description.trim().is_empty() {
-                                dev.name.clone()
-                            } else {
-                                dev.description
-                            };
+                            let desc_toast =
+                                super::super::strings::chrome::audio_device_label(&dev, false);
+                            let label_txt =
+                                super::super::strings::chrome::audio_device_label(&dev, true);
                             div()
                                 .id(("audio-dev-row", di))
                                 .px(px(10.))

@@ -1,23 +1,25 @@
 # Iris 插件开发指南（protocol: 2 / ABI: 2）
 
-当前源码使用 Wasm 插件协议 2，应用版本仍为 `0.0.1`。旧 Python/stdio 插件和 `BuiltinPlugin` 已退役；不自动执行旧插件目录中的程序。完整契约、配额与验收项见 [架构规范](PLUGIN_V2_ARCHITECTURE.md)，实际测试和未验证范围见 [实施证据](PLUGIN_V2_IMPLEMENTATION.md)。协议切换不代表已完成跨平台发布或性能验收。
+当前源码使用 Wasm 插件协议 2。旧 Python/stdio 插件和 `BuiltinPlugin` 已退役；零调用方的外部工具（BYOB `external_tool` / `export_files`）、DASH 与受限 HLS 文本通道已于 `0.0.2` 精简移除。完整契约、配额与验收项见 [架构规范](PLUGIN_V2_ARCHITECTURE.md)，实际测试和未验证范围见 [实施证据](PLUGIN_V2_IMPLEMENTATION.md)。
 
 ## 1. 安装与官方插件
 
-在「设置 → 插件 → 安装」选择 `.irisplugin`，审核宿主显示的身份、摘要、能力和网络范围后安装。宿主先校验不可变包快照和 Wasm，不在批准前执行模块。更新增加能力需重新授权；失败保留已安装版本。禁用/卸载撤销该安装的窗口、流、网络、工具和 UI 贡献，后台资源结束后释放配额。
+在「设置 → 插件 → 安装插件包」选择 `.irisplugin`，审核宿主显示的身份、摘要、能力和网络范围后安装。宿主先校验不可变包快照和 Wasm，不在批准前执行模块。更新增加能力需重新授权；失败保留已安装版本。禁用/卸载撤销该安装的窗口、流、网络和 UI 贡献，后台资源结束后释放配额。
 
 | 包/功能 | 实现 |
 |---|---|
 | `iris.guides` | 官方 Rust/SDK Wasm：构图参考线与交互叠层 |
-| `iris.webdav` | 官方 Rust/SDK Wasm：多连接、授权 Origin、凭据、分页目录、播放与外挂字幕 |
+| `iris.webdav` | 官方 Rust/SDK Wasm：多连接、授权 Origin、凭据、分页目录、播放与外挂字幕（经 `SourceDescriptor.badge` 声明 `"WebDAV"` 徽标，宿主零硬编码） |
 | A-B 循环 | 原生 Session 能力；不再依赖计时插件 |
 | `example.watch-stats` | 窗口计时、状态栏和右键重置；不持久化 |
 | `example.virtual-audio` | 独立 StreamStore 的 RandomAccess PCM 示例，无外网请求 |
 | `example.cinema-ui` | 纯声明式主题，无 Wasm 实例 |
+| `example.bilibili` | 视频源、弹幕、清晰度与 `PixelGrid` + `ViewTimer` 扫码登录示例 |
+| `example.baidupan` | 网盘目录与结构化 `VirtualHls` 播放源示例 |
 
 官方包来自 `crates/iris-plugin-guides`、`crates/iris-plugin-webdav`，在构建前生成到 `Resources/Plugins/` 并嵌入宿主。宿主使用编译时摘要验证身份；第三方包不能自称 `iris.*`。官方包遵守同样的能力与资源检查。
 
-用户包存放于应用数据目录 `plugins-v2/`（开发时可用 `IRIS_PLUGINS_V2` 指定受管安装目录）；不要手工修改其中的安装授权记录。状态位于 `plugin-v2-state/`，临时产物位于 `plugin-v2-temp/`，可信工具绑定位于 `plugin-tool-bindings.json`。敏感凭据按安装身份保存在系统凭据库，不降级写明文。旧 `plugin_state/` 仅作为官方迁移输入，成功前保留旧资料和凭据；第三方插件不能借同 ID 领取旧凭据。
+用户包存放于应用数据目录 `plugins-v2/`（开发时可用 `IRIS_PLUGINS_V2` 指定受管安装目录）；不要手工修改其中的安装授权记录。状态位于 `plugin-v2-state/`，临时产物位于 `plugin-v2-temp/`。敏感凭据按安装身份保存在系统凭据库，不降级写明文。旧 `plugin_state/` 仅作为官方迁移输入，成功前保留旧资料和凭据；第三方插件不能借同 ID 领取旧凭据。
 
 ## 2. 从公开 SDK 开始
 
@@ -44,7 +46,7 @@ python -B scripts/test-plugin-v2-examples.py
 }
 ```
 
-命令面板、快捷键与当前视口右键共用声明的命令；每插件最多 16 个右键项，菜单总共最多 32 个。右键命令不自动获得文件列表选择或额外权限。没有 `read_state` 时，命令事件的播放快照仍为空。声明式 UI 使用 `Widget`、`OverlayNode`、`UiThemeSpec` 和 `ChromeLayoutSpec`；宿主保留对比度、恢复默认外观和无边框逃生入口。
+命令面板、快捷键与当前视口右键共用声明的命令；每插件最多 16 个右键项，菜单总共最多 32 个。右键命令不自动获得文件列表选择或额外权限。没有 `read_state` 时，命令事件的播放快照仍为空。声明式 UI 使用 `Widget`（含通用 `PixelGrid` 矩阵网格）、`ViewTimer`（`1_000..=300_000 ms` 视图级定时回调，适用于二维码状态轮询或看板刷新）、`OverlayNode`、`UiThemeSpec` 和 `ChromeLayoutSpec`；宿主保留对比度、恢复默认外观和无边框逃生入口。插件可无需额外权限发送 `HostCommand::Log { level, message }`，由宿主统一 20 条/秒限流、脱敏并写入结构化日志。
 
 ## 3. 运行时、ABI 与异步生命周期
 
@@ -62,33 +64,27 @@ Guest 输出和 Blob 需遵循转移/关闭约定；任何跨 Guest 调用保存
 
 NAS 等私有服务经宿主确认具体 Origin 与地址集合。HTTP 明文凭据另行确认，DNS 改变不能悄悄扩大授权。跨源时剥离敏感头；凭据、Cookie、OAuth state/PKCE 均受各自作用域、配额和期限约束。插件表单和域名匹配声明本身不算授权。
 
-`read_state` 仅授予播放快照及当前授权媒体指纹，不授予任意文件读取。annotations 仅操作用户选定媒体的应用标记。导出需用户在宿主选择目标，宿主负责受控临时文件与不覆盖源文件的提交；路径文本不能代替能力句柄。
+`read_state` 仅授予播放快照及当前授权媒体指纹（`HashCurrentMedia`），不授予任意文件读取。`annotations` 仅操作用户选定媒体的应用标记；私有临时产物（`ArtifactBegin` / `ArtifactWrite` / `ArtifactRead`）受配额目录隔离，仅作为惰性数据句柄使用。
 
 ## 5. 三种流源与媒体增强
 
 | 流源 | 约定 |
 |---|---|
-| DirectHttp | 宿主拉取授权 HTTP 流，校验备用表示与范围语义，可附独立音轨 |
+| DirectHttp | 宿主拉取授权 HTTP 流（含远端 HLS 自动重写），校验备用表示与范围语义，可附独立音轨 |
 | RandomAccess | Guest 根据 offset/len 提供有界字节，宿主处理 Range/HEAD/EOF |
-| VirtualManifest | 结构化 VirtualHls/VirtualDash 或受限 HLS；宿主生成仅含本会话能力 URL 的清单 |
+| VirtualManifest | 结构化 `VirtualHls`；宿主生成仅含本会话能力 URL 的清单 |
 
-原始 `.m3u8`/`.mpd` 不能直接交给 libmpv；不支持的标签/格式明确失败，不回退未经清洗文本。会话令牌支持合法的重复 Range，不能跨会话复用。插件只负责字节和元数据，实际解复用、解码和硬件加速依赖媒体库与驱动。
+原始 `.m3u8` 不能直接交给 libmpv；不支持的标签/格式明确失败，不回退未经清洗文本。会话令牌支持合法的重复 Range，不能跨会话复用。插件只负责字节和元数据，实际解复用、解码和硬件加速依赖媒体库与驱动。
 
 `media_enhance` 允许受限字幕、音轨、监看 LUT 与时间轴元数据。时间轴包含最多 1,000 个章节、256 个热力区间、64 个跳过区间；区间有序、不重叠，最多覆盖 7 天。跳过是用户点击操作，不会因提交元数据自动 seek。
 
 TimedOverlayTrack 使用宿主播放时钟和驻留窗口，默认过去 30 秒至未来 120 秒；每插件至多 10,000 条/4 MiB，窗口外提交返回明确错误。长节目通过窗口分页加载；暂停/空轨道不持续驱动自身动画。标记、评分和颜色写应用数据库，不修改媒体文件。60/120Hz 与 4K 吞吐需另有实测报告。
 
-## 6. 外部工具
-
-在设置中显式绑定可信原生程序/模型，宿主核对支持版本、文件摘要及辅助程序。`external_tool` 仅提供四种固定语义任务：无损切片、提取音轨、Whisper 转写、yt-dlp 元数据解析。插件不能传自由 argv、配置路径、shell、滤镜或任意输出。`QueryTools` 返回当前已绑定能力；读取当前本地媒体须另经 `RequestMediaInput` 的宿主确认，导出另需 ExportGrant。
-
-原生工具以当前用户权限运行；JobObject/进程组负责退出与回收，不构成 OS 文件/网络沙箱。固定语义适配器、受控代理和输入输出检查约束插件请求，不证明第三方工具二进制安全。支持版本、摘要、格式与实测限制见 [工具适配器](PLUGIN_V2_TOOLS.md)。
-
-## 7. 验证与贡献
+## 6. 验证与贡献
 
 ```text
 python -B scripts/check-project.py
-cargo test --locked --workspace --future-incompat-report
+cargo test --locked --workspace --future-incompat-report   # 含默认启用的纯 WAT ABI v2 契约测试
 cargo clippy --locked --workspace --all-targets -- -D warnings
 python -B scripts/test-plugin-v2.py --zig <Zig-0.14.1可执行文件>
 python -B scripts/test-plugin-v2-official.py

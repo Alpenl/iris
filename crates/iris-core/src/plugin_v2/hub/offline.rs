@@ -44,7 +44,7 @@ impl Client {
                 plugin: None,
                 request: None,
                 code,
-                message: Some("插件运行时不可用".into()),
+                message: None,
             }])),
             closed: AtomicBool::new(false),
             wake_pending: AtomicBool::new(false),

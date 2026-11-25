@@ -108,7 +108,7 @@ impl IrisWindow {
             })
             .collect();
         let open_local_key = self.key_hint("open_file");
-        let open_url_key = self.key_hint("open_stream_url");
+        let open_url_key = self.key_hint("open_url");
         let confirm_recent = self.is_confirming("clear-recent");
 
         let cta_btn = |id: &'static str,
@@ -186,7 +186,7 @@ impl IrisWindow {
                             "open-remote-stream",
                             Icon::Globe,
                             true,
-                            "打开网络流…",
+                            super::strings::chrome::OPEN_STREAM_LABEL,
                             open_url_key,
                         )
                         .on_click(cx.listener(|this, _, w, cx| {

@@ -305,7 +305,10 @@ impl IrisWindow {
         let state = session.state();
         let subs = state.subs_visible;
         let aspect_on = state.aspect != AspectMode::Original;
-        let aspect_tip = format!("画面比例 · {}", state.aspect.label());
+        let aspect_tip = format!(
+            "画面比例 · {}",
+            super::super::strings::chrome::aspect_label(state.aspect)
+        );
         let audio = session.selected_track(TrackKind::Audio).map_or_else(
             || match state.audio.as_str() {
                 "" | "no" => "—".to_string(),

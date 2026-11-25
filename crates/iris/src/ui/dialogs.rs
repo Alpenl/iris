@@ -211,7 +211,12 @@ impl IrisWindow {
                     .child(inp)
                     .child(self.render_url_resolver_choice(cx))
                     .into_any_element();
-                ("打开网络流 / 远程媒体", "打开播放", content, submit)
+                (
+                    super::strings::chrome::OPEN_STREAM_DIALOG_TITLE,
+                    "打开播放",
+                    content,
+                    submit,
+                )
             }
             BuiltinDialog::SavePreset { scope } => {
                 let submit: ModalCallback = Rc::new(move |this, w, cx| {

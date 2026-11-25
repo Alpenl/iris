@@ -161,10 +161,7 @@ impl IrisWindow {
             self.show_toast(format!("未找到预设 · {id}"), cx);
             return;
         }
-        let preset_name = self
-            .presets
-            .get(id)
-            .map_or_else(|| "默认工作区".into(), |p| p.name.clone());
+        let preset_name = super::strings::presets::preset_name_by_id(&self.presets, id).to_string();
         let prev_disabled = self.settings.disabled_plugins.clone();
         let layout = self.current_preset_layout(window);
         let trans = self
@@ -246,7 +243,7 @@ impl IrisWindow {
         let preset = PresetManager::capture_from_current(
             String::new(),
             if name.trim().is_empty() {
-                "自定义预设".into()
+                super::strings::presets::DEFAULT_CUSTOM_PRESET_NAME.into()
             } else {
                 name.trim().to_string()
             },
@@ -259,7 +256,7 @@ impl IrisWindow {
             st.speed,
             st.aspect,
         );
-        let label = preset.name.clone();
+        let label = super::strings::presets::preset_name(&preset).to_string();
         let saved_id = self.presets.save_custom(preset);
         self.activate_preset(&saved_id, window, cx);
         self.show_toast(format!("已保存预设 · {label}"), cx);

@@ -1,7 +1,8 @@
 # Iris 插件系统 v2 架构规范与演进路线图（protocol: 2）
 
-> **状态：源码已完成协议 2 切换；跨平台发布和性能验收仍有待验证项；修订日期：2026-11-24。**
-> 决策依据见 [PLUGIN_V2_DECISIONS.md](PLUGIN_V2_DECISIONS.md)。当前源码为 `0.0.1 / protocol: 2`，未发布新版本；[PLUGINS.md](PLUGINS.md)、[ARCHITECTURE.md](ARCHITECTURE.md) 记录现状。[PLUGIN_V2_IMPLEMENTATION.md](PLUGIN_V2_IMPLEMENTATION.md) 记录分阶段实现与实际验收证据。
+> **状态：源码已完成协议 2 切换并于 `0.0.2` 完成极简收敛；跨平台发布和性能验收仍有待验证项；修订日期：2026-11-26。**
+> **0.0.2 收敛说明**：遵循「极简、高效、自由」原则，已移除零调用方的 BYOB 外部工具（`external_tool` / `export_files` / `process_tree`）、DASH 与受限 HLS 文本通道（保留结构化 `VirtualHls` 与远端 HLS 转换，及轻量 `FileExecutor` 私有产物/当前媒体哈希）；用正交的 `Widget::PixelGrid` + `ViewTimer` 取代特化的 `Widget::QrCode` 轮询器；新增 `SourceDescriptor.badge` 与无特权 `HostCommand::Log`（20 条/秒限流 + 自动脱敏）。
+> 决策依据见 [PLUGIN_V2_DECISIONS.md](PLUGIN_V2_DECISIONS.md)；当前产品行为以 [PLUGINS.md](PLUGINS.md) 与 [ARCHITECTURE.md](ARCHITECTURE.md) 为准，[PLUGIN_V2_IMPLEMENTATION.md](PLUGIN_V2_IMPLEMENTATION.md) 保留分阶段实现与验收证据。
 > 下文“必须”“禁止”是实现要求；配额是首版策略基线，性能项目是待测目标，均不表示已通过验收。
 
 ## 1. 目标、分层与信任模型

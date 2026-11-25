@@ -65,7 +65,7 @@ impl IrisWindow {
                 target: PaletteTarget::Host("open"),
             },
             PaletteEntry {
-                title: "打开网络流 / 远程媒体地址…".into(),
+                title: super::strings::chrome::OPEN_STREAM_LABEL.into(),
                 subtitle: Some("原生直连播放 HTTP / HTTPS 视频、HLS 或远程照片".into()),
                 badge: "网络".into(),
                 shortcut: live_key("open_url"),
@@ -135,7 +135,7 @@ impl IrisWindow {
                 target: PaletteTarget::Host("screenshot"),
             },
             PaletteEntry {
-                title: "媒体详情与统计".into(),
+                title: super::strings::chrome::MEDIA_INFO_LABEL.into(),
                 subtitle: None,
                 badge: "内核".into(),
                 shortcut: live_key("toggle_info"),
@@ -145,7 +145,7 @@ impl IrisWindow {
                 title: "切换侧栏视图（目录 / 数据源 / 队列 / 插件）".into(),
                 subtitle: Some(format!(
                     "当前侧栏视图：{}",
-                    self.catalog.sidebar_mode.label()
+                    super::strings::presets::sidebar_mode_label(self.catalog.sidebar_mode)
                 )),
                 badge: "工作区".into(),
                 shortcut: None,
@@ -235,9 +235,13 @@ impl IrisWindow {
             } else {
                 ""
             };
+            let desc = super::strings::presets::preset_description(preset);
             entries.push(PaletteEntry {
-                title: format!("预设：切换到 {}{cur}", preset.name),
-                subtitle: (!preset.description.is_empty()).then(|| preset.description.clone()),
+                title: format!(
+                    "预设：切换到 {}{cur}",
+                    super::strings::presets::preset_name(preset)
+                ),
+                subtitle: (!desc.is_empty()).then(|| desc.to_string()),
                 badge: "预设".into(),
                 shortcut: live_key(&format!("preset:{}", preset.id)),
                 target: PaletteTarget::Preset(preset.id.clone()),

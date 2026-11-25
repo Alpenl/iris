@@ -32,7 +32,7 @@ pub use enhance::ExternalTrack;
 pub use model::{
     AspectMode, AudioDevice, Chapter, Command, MAX_SPEED, MIN_SPEED, MediaStats, PlaybackState,
     PlayerActionError, RemoteMediaRequest, RemoteSubtitle, SPEED_STEPS, SessionEvent,
-    SessionUpdate, Track, TrackKind, format_time, friendly_error, step_speed,
+    SessionUpdate, Track, TrackKind, format_time, step_speed,
 };
 pub use prepare::{Prepared, PreparedQueue, prepare, prepare_queue};
 pub use scoped::{ScopedAttachment, ScopedPlayback, ScopedStream, StreamProfile};

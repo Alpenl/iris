@@ -194,7 +194,7 @@ fn platform_primary_workspace_keys_preserve_text_editing() {
         );
     }
     assert_eq!(
-        reserved_shortcut("secondary-alt-shift-r").map(|(id, _)| id),
+        reserved_shortcut("secondary-alt-shift-r"),
         Some("reset_appearance")
     );
 

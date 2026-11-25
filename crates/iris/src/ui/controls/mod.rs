@@ -332,7 +332,10 @@ impl IrisWindow {
                             self.overlays.info_open,
                             t,
                         )
-                        .tooltip(tip("媒体详情", self.key_hint("toggle_info")))
+                        .tooltip(tip(
+                            super::strings::chrome::MEDIA_INFO_LABEL,
+                            self.key_hint("toggle_info"),
+                        ))
                         .on_click(
                             cx.listener(|this, _, w, cx| this.toggle_info(&ToggleInfo, w, cx)),
                         ),

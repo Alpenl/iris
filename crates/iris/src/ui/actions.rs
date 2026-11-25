@@ -173,7 +173,7 @@ pub(super) fn runtime_bindings(keymap: &Keymap) -> Vec<KeyBinding> {
         }
     }
 
-    for (key, action, _) in keymap::RESERVED_SHORTCUTS {
+    for (key, action) in keymap::RESERVED_SHORTCUTS {
         let context = match action {
             "exit_fullscreen" => "Workspace && !TextInput",
             "reset_appearance" => "Workspace || ShortcutRecorder",

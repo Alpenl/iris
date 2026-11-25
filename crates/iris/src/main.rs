@@ -350,7 +350,7 @@ fn app_menus() -> Vec<Menu> {
             name: "文件".into(),
             items: vec![
                 MenuItem::action("打开本地文件…", ui::OpenFile),
-                MenuItem::action("打开网络流 / 远程地址…", ui::OpenStreamUrl),
+                MenuItem::action(ui::strings::chrome::OPEN_STREAM_LABEL, ui::OpenStreamUrl),
                 MenuItem::separator(),
                 MenuItem::action("搜索目录", ui::ToggleSearch),
                 MenuItem::action("刷新目录", ui::RefreshDirectory),
@@ -380,7 +380,7 @@ fn app_menus() -> Vec<Menu> {
                 MenuItem::action("恢复默认外观", ui::ResetAppearance),
                 MenuItem::separator(),
                 MenuItem::action("展开 / 收起侧栏", ui::ToggleDirectory),
-                MenuItem::action("媒体详情", ui::ToggleInfo),
+                MenuItem::action(ui::strings::chrome::MEDIA_INFO_LABEL, ui::ToggleInfo),
                 MenuItem::action("窗口置顶", ui::ToggleAlwaysOnTop),
                 MenuItem::action("切换画面比例", ui::CycleAspect),
                 MenuItem::separator(),

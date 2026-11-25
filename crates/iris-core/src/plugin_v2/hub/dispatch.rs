@@ -123,13 +123,7 @@ impl Worker {
                 keep_data,
             } => {
                 if self.config.installer.is_bundled(&plugin) {
-                    self.error(
-                        window,
-                        Some(plugin),
-                        None,
-                        ErrorCode::Denied,
-                        Some("官方内置插件不可删除".into()),
-                    );
+                    self.error(window, Some(plugin), None, ErrorCode::Denied, None);
                     return;
                 }
                 if self.uninstalling.contains(&plugin) {

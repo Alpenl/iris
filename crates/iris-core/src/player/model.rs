@@ -45,17 +45,6 @@ pub fn format_time(t: f64) -> String {
     }
 }
 
-pub fn friendly_error(code: i32) -> &'static str {
-    match code {
-        -13 => "无法打开或读取文件",
-        -14 => "未识别的媒体格式",
-        -9 | -10 => "不支持的解码格式或操作",
-        -1 => "事件队列溢出",
-        -2 => "内存不足",
-        _ => "解码或播放失败",
-    }
-}
-
 /// Semantic player command preconditions for clean localized UI presentation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PlayerActionError {
@@ -98,16 +87,6 @@ pub enum AspectMode {
 }
 
 impl AspectMode {
-    pub fn label(self) -> &'static str {
-        match self {
-            AspectMode::Original => "原始比例",
-            AspectMode::Ratio16x9 => "16:9",
-            AspectMode::Ratio4x3 => "4:3",
-            AspectMode::Ratio21x9 => "21:9",
-            AspectMode::FillCrop => "铺满裁剪",
-        }
-    }
-
     pub fn next(self) -> Self {
         match self {
             AspectMode::Original => AspectMode::Ratio16x9,
@@ -134,34 +113,6 @@ pub struct Track {
     pub codec: String,
     pub selected: bool,
     pub external: bool,
-}
-
-impl Track {
-    pub fn label(&self) -> String {
-        let mut parts = Vec::new();
-        if !self.title.is_empty() {
-            parts.push(self.title.clone());
-        }
-        if !self.lang.is_empty()
-            && !self
-                .title
-                .to_ascii_lowercase()
-                .contains(&self.lang.to_ascii_lowercase())
-        {
-            parts.push(self.lang.clone());
-        }
-        if !self.codec.is_empty() {
-            parts.push(self.codec.to_ascii_uppercase());
-        }
-        if parts.is_empty() {
-            parts.push(format!("轨道 {}", self.id));
-        }
-        let mut text = parts.join(" · ");
-        if self.external {
-            text.push_str(" [外挂]");
-        }
-        text
-    }
 }
 
 #[derive(Clone, Debug, PartialEq)]

@@ -180,7 +180,10 @@ impl IrisWindow {
                 )))
                 .child(line("安装将授予以下能力：".into()));
             for cap in &review.manifest.permissions {
-                body = body.child(line(format!("• {}", cap.label())));
+                body = body.child(line(format!(
+                    "• {}",
+                    super::super::strings::chrome::capability_label(*cap)
+                )));
             }
             for rule in network_lines(&review.manifest.network) {
                 body = body.child(line(rule));

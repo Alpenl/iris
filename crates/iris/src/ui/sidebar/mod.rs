@@ -90,7 +90,10 @@ impl IrisWindow {
                 ),
             SidebarMode::Sources => div().flex().items_center().gap(px(2.)).child(
                 icon_button("sb-open-url", Icon::Link, false, t)
-                    .tooltip(tip("打开网络流地址…", self.key_hint("open_stream_url")))
+                    .tooltip(tip(
+                        super::strings::chrome::OPEN_STREAM_LABEL,
+                        self.key_hint("open_url"),
+                    ))
                     .on_click(cx.listener(|this, _, w, cx| {
                         this.open_builtin_dialog(BuiltinDialog::OpenUrl, w, cx);
                     })),
@@ -155,10 +158,10 @@ impl IrisWindow {
         };
 
         let modes = [
-            (SidebarMode::Files, "目录"),
-            (SidebarMode::Sources, "数据源"),
-            (SidebarMode::Queue, "队列"),
-            (SidebarMode::Plugins, "插件"),
+            SidebarMode::Files,
+            SidebarMode::Sources,
+            SidebarMode::Queue,
+            SidebarMode::Plugins,
         ];
 
         let body = match mode {
@@ -203,16 +206,21 @@ impl IrisWindow {
                     .child(header_actions),
             )
             .child(
-                tab_strip(t).children(modes.into_iter().enumerate().map(|(i, (m, label))| {
+                tab_strip(t).children(modes.into_iter().enumerate().map(|(i, m)| {
                     let active = m == mode;
                     let badge = (m == SidebarMode::Queue && queue_len > 0)
                         .then(|| queue_len.to_string().into());
-                    tab_strip_item(("sb-mode", i), label, badge, active, t).on_click(cx.listener(
-                        move |this, _, _, cx| {
-                            this.catalog.sidebar_mode = m;
-                            cx.notify();
-                        },
-                    ))
+                    tab_strip_item(
+                        ("sb-mode", i),
+                        super::strings::presets::sidebar_mode_label(m),
+                        badge,
+                        active,
+                        t,
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.catalog.sidebar_mode = m;
+                        cx.notify();
+                    }))
                 })),
             )
             .child(body)

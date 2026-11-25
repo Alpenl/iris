@@ -43,17 +43,6 @@ pub enum SidebarMode {
     Plugins,
 }
 
-impl SidebarMode {
-    pub fn label(self) -> &'static str {
-        match self {
-            SidebarMode::Files => "目录",
-            SidebarMode::Sources => "数据源",
-            SidebarMode::Queue => "队列",
-            SidebarMode::Plugins => "插件",
-        }
-    }
-}
-
 /// Sparse layout, window geometry, theme, and control-bar chrome patch.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -203,12 +192,7 @@ fn clamp_opt(v: Option<f64>, min: f64, max: f64) -> Option<f64> {
 
 fn sanitize_preset(preset: &mut WorkspacePreset) {
     preset.builtin = false;
-    let name = preset.name.trim();
-    preset.name = if name.is_empty() {
-        "自定义工作区".into()
-    } else {
-        name.to_string()
-    };
+    preset.name = preset.name.trim().to_string();
     preset.description = preset.description.trim().to_string();
     if let Some(l) = &mut preset.layout {
         l.directory_width = l.directory_width.map(|w| {
@@ -249,9 +233,9 @@ impl Default for PresetManager {
 }
 
 macro_rules! builtin_list {
-    ($(($id:expr, $name:expr, $desc:expr, $l:expr, $pb:expr, $pl:expr)),+ $(,)?) => {
+    ($(($id:expr, $l:expr, $pb:expr, $pl:expr)),+ $(,)?) => {
         vec![$(WorkspacePreset {
-            id: $id.into(), name: $name.into(), description: $desc.into(),
+            id: $id.into(), name: String::new(), description: String::new(),
             builtin: true, layout: $l, playback: $pb, plugins: $pl,
         }),+]
     };
@@ -264,18 +248,18 @@ impl PresetManager {
             .map(String::from)
             .collect();
         builtin_list! {
-            ("default", "默认工作区", "回到个人日常基线布局与播放偏好", None, None, None),
-            ("cinema", "沉浸观影", "收起侧栏、悬浮控制栏、OLED 暗房主题并自动连播下一集",
+            ("default", None, None, None),
+            ("cinema",
                 Some(LayoutPatch { theme_id: Some("oled".into()), directory_open: Some(false), floating_dock: Some(true), ..Default::default() }),
                 Some(PlaybackPatch { on_eof: Some(OnEof::Next), ..Default::default() }), None),
-            ("review", "审片与选片", "右侧宽目录、开启照片缩略图条、胶片暖灰主题并开启三分构图线",
+            ("review",
                 Some(LayoutPatch { theme_id: Some("studio".into()), directory_side: Some(Side::Right), directory_width: Some(360.0), directory_open: Some(true), photo_filmstrip: Some(true), ..Default::default() }),
                 Some(PlaybackPatch { on_eof: Some(OnEof::Pause), ..Default::default() }),
                 Some(PluginPatch { plugin_commands: vec![("iris.guides".into(), "thirds".into())], on_exit_commands: vec![("iris.guides".into(), "off".into())], ..Default::default() })),
-            ("study", "精听与学习", "左侧插件面板就绪、3 秒精细回退、1.25× 大字幕",
+            ("study",
                 Some(LayoutPatch { directory_side: Some(Side::Left), directory_open: Some(true), sidebar_mode: Some(SidebarMode::Plugins), ..Default::default() }),
                 Some(PlaybackPatch { seek_step: Some(3.0), sub_scale: Some(1.25), ..Default::default() }), None),
-            ("pip", "小窗置顶", "560×320 迷你窗口、自动置顶、隐藏冗余按钮与目录栏",
+            ("pip",
                 Some(LayoutPatch { window_size: Some((560.0, 320.0)), always_on_top: Some(true), directory_open: Some(false), show_titlebar_meta: Some(false), compact_controls: Some(true), hidden_dock_buttons: Some(pip_hidden), ..Default::default() }),
                 None, None),
         }

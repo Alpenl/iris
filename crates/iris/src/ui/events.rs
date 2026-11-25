@@ -290,7 +290,7 @@ impl IrisWindow {
                 .active()
                 .session
                 .selected_track(TrackKind::Audio)
-                .map_or_else(|| "无音轨".into(), |t| t.label());
+                .map_or_else(|| "无音轨".into(), super::strings::chrome::track_label);
             self.show_osd(format!("音轨 · {label}"), cx);
             need_notify = false;
         }
@@ -301,7 +301,7 @@ impl IrisWindow {
                 .active()
                 .session
                 .selected_track(TrackKind::Sub)
-                .map_or_else(|| "无字幕".into(), |t| t.label());
+                .map_or_else(|| "无字幕".into(), super::strings::chrome::track_label);
             self.show_osd(format!("字幕 · {label}"), cx);
             need_notify = false;
         }
@@ -324,7 +324,7 @@ impl IrisWindow {
             }
             self.sync_now_playing(true);
             self.show_toast(
-                format!("{}（错误 {code}）", player::friendly_error(code)),
+                format!("{}（错误 {code}）", super::strings::errors::mpv_error(code)),
                 cx,
             );
             need_notify = false;
@@ -388,7 +388,10 @@ impl IrisWindow {
                         .session
                         .current_title()
                         .map(str::trim)
-                        .filter(|t| !t.is_empty() && *t != "插件媒体")
+                        .filter(|t| {
+                            !t.is_empty()
+                                && *t != super::strings::chrome::DEFAULT_PLUGIN_MEDIA_TITLE
+                        })
                         .map(str::to_owned),
                 };
                 self.store.push_recent_with_title(&uri, title.as_deref());
@@ -479,8 +482,12 @@ impl IrisWindow {
             }
         }
         if let Some(error) = last_error {
+            log::warn!("subtitle load failed: {error:#}");
             self.show_toast(
-                format!("{count} 个字幕文件中有 {failed} 个加载失败 · {error}"),
+                format!(
+                    "{count} 个字幕文件中有 {failed} 个加载失败 · {}",
+                    super::strings::errors::player_action_error(&error)
+                ),
                 cx,
             );
         } else {

@@ -188,26 +188,52 @@ fn redact_secret_assignments(input: &str) -> String {
     let mut i = 0;
     let lower = input.to_ascii_lowercase();
     while i < input.len() {
+        let at_word_boundary = i == 0
+            || !(input.as_bytes()[i - 1].is_ascii_alphanumeric()
+                || input.as_bytes()[i - 1] == b'_');
         let mut matched = None;
-        for key in SENSITIVE_KEYS {
-            if lower[i..].starts_with(key)
-                && (i == 0
-                    || !(input.as_bytes()[i - 1].is_ascii_alphanumeric()
-                        || input.as_bytes()[i - 1] == b'_'))
-            {
-                let after = i + key.len();
-                let tail = &input[after..];
-                let sep_len = if tail.starts_with('=') {
-                    Some(1)
-                } else if let Some(after_colon) = tail.strip_prefix(':') {
-                    let spaces = after_colon.bytes().take_while(|&b| b == b' ').count();
-                    Some(1 + spaces)
-                } else {
-                    None
-                };
-                if let Some(sep_len) = sep_len {
-                    matched = Some((after + sep_len, &input[i..after + sep_len]));
+        if at_word_boundary {
+            for scheme in ["bearer ", "basic "] {
+                if lower[i..].starts_with(scheme) {
+                    let after_scheme = i + scheme.len();
+                    let extra_spaces = input[after_scheme..]
+                        .bytes()
+                        .take_while(|&b| b == b' ')
+                        .count();
+                    let val_start = after_scheme + extra_spaces;
+                    matched = Some((val_start, &input[i..val_start]));
                     break;
+                }
+            }
+        }
+        if matched.is_none() && at_word_boundary {
+            for key in SENSITIVE_KEYS {
+                if lower[i..].starts_with(key) {
+                    let after = i + key.len();
+                    let tail = &input[after..];
+                    let sep_len = if tail.starts_with('=') {
+                        Some(1)
+                    } else if let Some(after_colon) = tail.strip_prefix(':') {
+                        let spaces = after_colon.bytes().take_while(|&b| b == b' ').count();
+                        Some(1 + spaces)
+                    } else {
+                        None
+                    };
+                    if let Some(sep_len) = sep_len {
+                        let mut val_start = after + sep_len;
+                        for scheme in ["bearer ", "basic "] {
+                            if lower[val_start..].starts_with(scheme) {
+                                val_start += scheme.len();
+                                val_start += input[val_start..]
+                                    .bytes()
+                                    .take_while(|&b| b == b' ')
+                                    .count();
+                                break;
+                            }
+                        }
+                        matched = Some((val_start, &input[i..val_start]));
+                        break;
+                    }
                 }
             }
         }

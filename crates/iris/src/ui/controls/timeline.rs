@@ -155,7 +155,9 @@ impl IrisWindow {
                 }
                 let x = f32::from(p.x - b.origin.x).clamp(0., width);
                 let hover_t = x as f64 / width as f64 * duration;
-                let chapter_title = session.chapter_at(hover_t).map(|c| c.title.clone());
+                let chapter_title = session
+                    .chapter_index_at(hover_t)
+                    .map(|(ix, c)| super::super::strings::chrome::chapter_title(ix, &c.title));
                 let max_box: f32 = if chapter_title.is_some() { 220. } else { 84. };
                 let box_w = max_box.min((width - 8.).max(64.));
                 let left = (x - box_w / 2.).clamp(0., (width - box_w).max(0.));

@@ -10,23 +10,25 @@ use serde::{Deserialize, Serialize};
 
 use crate::fs_util;
 
-pub use catalog::{ACTIONS, ActionEntry, KeymapScheme, actions, find_action};
+pub use catalog::{ACTIONS, ActionCategory, ActionEntry, KeymapScheme, actions, find_action};
 
 /// Fixed application shortcuts shared by runtime registration and conflict detection.
-pub const RESERVED_SHORTCUTS: [(&str, &str, &str); 4] = [
-    ("secondary-i", "toggle_info", "媒体信息（固定快捷键）"),
-    (
-        "secondary-shift-p",
-        "open_palette",
-        "命令面板（固定快捷键）",
-    ),
-    ("escape", "exit_fullscreen", "退出全屏（固定快捷键）"),
-    (
-        "secondary-alt-shift-r",
-        "reset_appearance",
-        "恢复外观（固定快捷键）",
-    ),
+pub const RESERVED_SHORTCUTS: [(&str, &str); 4] = [
+    ("secondary-i", "toggle_info"),
+    ("secondary-shift-p", "open_palette"),
+    ("escape", "exit_fullscreen"),
+    ("secondary-alt-shift-r", "reset_appearance"),
 ];
+
+/// Semantic owner of an existing conflicting shortcut binding.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ConflictTarget {
+    Reserved(&'static str),
+    Action(&'static str),
+    Preset(String),
+    Plugin(String),
+    Other(String),
+}
 
 /// Returns the user keymap JSON path (`IRIS_KEYMAP` override or `<data_dir>/keymap.json`).
 pub fn keymap_path() -> Option<PathBuf> {
@@ -234,14 +236,14 @@ pub fn gpui_binding(spec: &str) -> Option<String> {
 }
 
 /// Whether a chord is owned by an invariant application shortcut on this platform.
-pub fn reserved_shortcut(keystroke: &str) -> Option<(&'static str, &'static str)> {
+pub fn reserved_shortcut(keystroke: &str) -> Option<&'static str> {
     reserved_for_os(keystroke, cfg!(target_os = "macos"))
 }
 
-fn reserved_for_os(keystroke: &str, is_macos: bool) -> Option<(&'static str, &'static str)> {
+fn reserved_for_os(keystroke: &str, is_macos: bool) -> Option<&'static str> {
     let needle = canonicalize_for_host(keystroke, is_macos)?;
-    RESERVED_SHORTCUTS.into_iter().find_map(|(key, id, title)| {
-        (canonicalize_for_host(key, is_macos).as_ref() == Some(&needle)).then_some((id, title))
+    RESERVED_SHORTCUTS.into_iter().find_map(|(key, id)| {
+        (canonicalize_for_host(key, is_macos).as_ref() == Some(&needle)).then_some(id)
     })
 }
 
@@ -510,7 +512,12 @@ impl Keymap {
             .collect()
     }
 
-    pub fn find_conflict(&self, context: &str, keystroke: &str, ignore_id: &str) -> Option<String> {
+    pub fn find_conflict(
+        &self,
+        context: &str,
+        keystroke: &str,
+        ignore_id: &str,
+    ) -> Option<ConflictTarget> {
         self.find_conflict_for_os(context, keystroke, ignore_id, cfg!(target_os = "macos"))
     }
 
@@ -520,10 +527,10 @@ impl Keymap {
         keystroke: &str,
         ignore_id: &str,
         is_macos: bool,
-    ) -> Option<String> {
+    ) -> Option<ConflictTarget> {
         let needle = canonicalize_for_host(keystroke, is_macos)?;
-        if let Some((_, title)) = reserved_for_os(keystroke, is_macos) {
-            return Some(title.into());
+        if let Some(id) = reserved_for_os(keystroke, is_macos) {
+            return Some(ConflictTarget::Reserved(id));
         }
         let target_mask = if let Some(entry) = find_action(ignore_id) {
             if context.trim().is_empty() {
@@ -541,7 +548,7 @@ impl Keymap {
             }
             let effective = self.effective_key(entry.id);
             if canonicalize_for_host(&effective, is_macos).as_ref() == Some(&needle) {
-                return Some(entry.title.to_string());
+                return Some(ConflictTarget::Action(entry.id));
             }
         }
 
@@ -551,12 +558,12 @@ impl Keymap {
             }
             if canonicalize_for_host(spec, is_macos).as_ref() == Some(&needle) {
                 if let Some(preset_id) = id.strip_prefix("preset:") {
-                    return Some(format!("工作区预设 ({preset_id})"));
+                    return Some(ConflictTarget::Preset(preset_id.to_string()));
                 }
                 if let Some(plugin_ref) = id.strip_prefix("plugin:") {
-                    return Some(format!("插件命令 ({plugin_ref})"));
+                    return Some(ConflictTarget::Plugin(plugin_ref.to_string()));
                 }
-                return Some(id.clone());
+                return Some(ConflictTarget::Other(id.clone()));
             }
         }
         None
@@ -641,15 +648,12 @@ mod tests {
         assert_eq!(canonical_binding("ctrl---"), None);
         assert_eq!(canonical_binding("control--").as_deref(), Some("ctrl--"));
         for (is_macos, primary) in [(true, "cmd"), (false, "ctrl")] {
-            for (key, action, _) in RESERVED_SHORTCUTS {
+            for (key, action) in RESERVED_SHORTCUTS {
                 let physical = key.replace("secondary", primary);
+                assert_eq!(reserved_for_os(&physical, is_macos), Some(action));
                 assert_eq!(
-                    reserved_for_os(&physical, is_macos).map(|(id, _)| id),
-                    Some(action)
-                );
-                assert!(
-                    km.find_conflict_for_os("Viewport", &physical, "zoom_in", is_macos)
-                        .is_some()
+                    km.find_conflict_for_os("Viewport", &physical, "zoom_in", is_macos),
+                    Some(ConflictTarget::Reserved(action)),
                 );
             }
             assert_eq!(
@@ -661,9 +665,8 @@ mod tests {
                 .insert("take_screenshot".into(), "secondary-?".into());
             let query = format!("{primary}-shift-/");
             assert_eq!(
-                km.find_conflict_for_os("Workspace", &query, "preset:review", is_macos)
-                    .as_deref(),
-                Some(find_action("take_screenshot").unwrap().title),
+                km.find_conflict_for_os("Workspace", &query, "preset:review", is_macos),
+                Some(ConflictTarget::Action("take_screenshot")),
             );
             assert!(
                 km.find_conflict_for_os(
@@ -723,9 +726,8 @@ mod tests {
         let mut km = Keymap::load_from(&file);
         // Photo left/right navigation participates in conflict detection against image actions.
         assert_eq!(
-            km.find_conflict("Viewport && media == image", "left", "zoom_in")
-                .as_deref(),
-            Some("上一张照片")
+            km.find_conflict("Viewport && media == image", "left", "zoom_in"),
+            Some(ConflictTarget::Action("photo_prev"))
         );
         // Video `left` does not conflict with photo `left` (disjoint media scopes).
         assert!(

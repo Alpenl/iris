@@ -325,7 +325,7 @@ impl Preparation {
             url,
             profile,
             kind,
-            title: spec.title.clone().unwrap_or_else(|| "插件媒体".into()),
+            title: spec.title.clone().unwrap_or_default(),
             is_live,
             attachments,
             variants: spec.variants.clone(),

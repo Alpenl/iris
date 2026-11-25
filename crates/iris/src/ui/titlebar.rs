@@ -55,10 +55,8 @@ impl IrisWindow {
             !self.settings.active_preset.is_empty() && self.settings.active_preset != "default";
         let preset_modified = self.preset_rt.is_modified(&self.settings);
         let preset_hi = preset_open || non_default;
-        let base_name = self
-            .presets
-            .get(&self.settings.active_preset)
-            .map_or("默认工作区", |p| p.name.as_str());
+        let base_name =
+            super::strings::presets::preset_name_by_id(&self.presets, &self.settings.active_preset);
         let preset_label = if preset_modified {
             format!("{base_name} · 已微调")
         } else {

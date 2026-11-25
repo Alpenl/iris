@@ -155,7 +155,12 @@ impl IrisWindow {
             .border_color(t.line_strong)
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
-            .child(panel_header("媒体详情", None, Some(close_btn), t))
+            .child(panel_header(
+                super::strings::chrome::MEDIA_INFO_LABEL,
+                None,
+                Some(close_btn),
+                t,
+            ))
             .child(
                 div()
                     .id("media-info-scroll")

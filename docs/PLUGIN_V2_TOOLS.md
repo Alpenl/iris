@@ -1,6 +1,8 @@
-# v2 外部工具适配器
+# v2 外部工具适配器（历史归档 · 已于 0.0.2 移除）
 
-本文记录已实现的宿主服务与兼容范围；设置中的可信工具绑定、当前媒体输入确认与导出选择器已接入。运行时不会查找 PATH、下载或自动启用工具。
+> **状态：零调用方的 BYOB 外部工具适配器（`external_tool`、`export_files`、`tools/`、`process_tree/` 与 `scripts/test-plugin-v2-tools.py`）已于 `0.0.2` 极简重构中移除，当前宿主仅保留轻量 `FileExecutor`（私有惰性产物 `ArtifactBegin/Write/Read` 与 `HashCurrentMedia`）。** 以下内容仅作为历史设计及 2026-11-24 验收记录归档保留。
+
+本文记录当时实现的宿主服务与兼容范围。运行时不会查找 PATH、下载或自动启用工具。
 
 ## 支持配置
 
