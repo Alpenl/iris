@@ -7,8 +7,11 @@ use crate::{
         ledger::{Ledger, Resource},
         network::NetworkGrant,
         stream::{
-            prepare::AttachmentView, reader::MemoryReader, relay::BoundRelay,
-            remote::RemoteFactory, session::new_session_id,
+            prepare::{AttachmentView, Playback},
+            reader::MemoryReader,
+            relay::BoundRelay,
+            remote::RemoteFactory,
+            session::{StreamSession, new_session_id},
         },
     },
 };
@@ -111,7 +114,7 @@ fn actual_mpv_opens_scoped_video_audio_and_subtitles_then_restores_reference_pol
     let mut events = player.events().unwrap();
     player
         .open_scoped(
-            playback.clone(),
+            playback.clone().into_scoped(),
             MediaUri::Plugin {
                 plugin_id: "fixture".into(),
                 source_id: "source".into(),
@@ -344,7 +347,7 @@ fn live_bilibili_popular_video_plays_in_libmpv() {
     let mut events = player.events().unwrap();
     player
         .open_scoped(
-            playback.clone(),
+            playback.clone().into_scoped(),
             MediaUri::Plugin {
                 plugin_id: "community.bilibili".into(),
                 source_id: "popular".into(),
@@ -432,7 +435,7 @@ fn live_bilibili_popular_video_plays_in_libmpv() {
     let playback2 = resolve_video(&mut manager, &second_id, &second_name);
     player
         .open_scoped(
-            playback2.clone(),
+            playback2.clone().into_scoped(),
             MediaUri::Plugin {
                 plugin_id: "community.bilibili".into(),
                 source_id: "popular".into(),

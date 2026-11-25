@@ -291,7 +291,7 @@ impl IrisWindow {
         if self.active().pending_path.is_some() {
             return;
         }
-        let Some(folder) = self.active().session.folder().map(Path::to_path_buf) else {
+        let Some(folder) = self.catalog.local_dir.folder().map(Path::to_path_buf) else {
             return;
         };
         let generation = self.active().load_generation;
@@ -305,15 +305,13 @@ impl IrisWindow {
                 if this.active().load_generation != generation
                     || this.active().pending_path.is_some()
                     || !this.catalog.active_source.is_local()
-                    || this.active().session.folder() != Some(folder.as_path())
+                    || this.catalog.local_dir.folder() != Some(folder.as_path())
                 {
                     return;
                 }
-                this.active_mut().session.set_directory(
-                    Some(folder),
-                    scan.entries,
-                    scan.subfolders,
-                );
+                this.catalog
+                    .local_dir
+                    .set(Some(folder), scan.entries, scan.subfolders);
                 this.rebuild_directory_rows();
                 this.scroll_directory_to_current();
                 this.ensure_filmstrip_thumbnails(cx);

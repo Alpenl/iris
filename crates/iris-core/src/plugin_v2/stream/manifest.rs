@@ -38,19 +38,19 @@ pub fn compile(
     }
     let mut build = match format {
         ManifestFormat::VirtualHls => {
-            let input: VirtualHls = iris_plugin_sdk::json::decode_exact(bytes, INPUT_LIMIT)?;
+            let input: VirtualHls = crate::plugin_v2::json::decode_exact(bytes, INPUT_LIMIT)?;
             let mut build = Build::new(input.resources.clone(), Profile::Hls, local)?;
             hls::render(input, &mut build)?;
             build
         }
         ManifestFormat::VirtualDash => {
-            let input: VirtualDash = iris_plugin_sdk::json::decode_exact(bytes, INPUT_LIMIT)?;
+            let input: VirtualDash = crate::plugin_v2::json::decode_exact(bytes, INPUT_LIMIT)?;
             let mut build = Build::new(input.resources.clone(), Profile::Dash, local)?;
             dash::render(input, &mut build)?;
             build
         }
         ManifestFormat::RestrictedHls => {
-            let input: RestrictedHls = iris_plugin_sdk::json::decode_exact(bytes, INPUT_LIMIT)?;
+            let input: RestrictedHls = crate::plugin_v2::json::decode_exact(bytes, INPUT_LIMIT)?;
             let mut build = Build::new(input.resources, Profile::Hls, local)?;
             restricted::render(&input.text, &mut build)?;
             build

@@ -147,7 +147,7 @@ impl IrisWindow {
                 let settings = self.settings.clone();
                 self.active_mut().loading_visible = false;
                 match self.active_mut().session.open_scoped(
-                    Arc::new(playback),
+                    Arc::new(playback).into_scoped(),
                     uri.clone(),
                     &settings,
                     resume,

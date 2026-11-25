@@ -4,9 +4,9 @@ use super::{
     actor::{Completion, Executor, IoOutcome, Operation, TaskContext},
     instance::{Blob, next_id},
     ledger::{Activity, Ledger, Reservation, Resource},
-    network::{NetworkGrant, TransportKind, normalize_url},
+    network::{NetworkGrant, TransportKind, duplex, normalize_url},
 };
-use crate::vfs::{HttpCancel, http_client::duplex};
+use crate::vfs::HttpCancel;
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use iris_api::v2::{ErrorCode, Generation, Id, Role, task::Task};
 use mio::{Interest, Poll, Token, Waker};

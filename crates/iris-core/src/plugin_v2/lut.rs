@@ -62,6 +62,13 @@ impl MonitorLut {
         ))
     }
 }
+
+impl crate::player::MonitorLutFilter for MonitorLut {
+    fn filter_spec(&self) -> anyhow::Result<String> {
+        self.filter()
+            .map_err(|e| anyhow::anyhow!("invalid LUT preview: {e:?}"))
+    }
+}
 fn escape(value: &str, special: &str) -> String {
     let mut out = String::new();
     for ch in value.chars() {

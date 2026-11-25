@@ -31,7 +31,7 @@ fn remote_hls_resolves_audio_groups_keys_relative_signed_urls_and_emits_only_loc
     let converted = convert(&factory, &resource(&grant, &url), &HttpCancel::default()).unwrap();
     assert!(!converted.live);
     let input: VirtualHls =
-        iris_plugin_sdk::json::decode_exact(&converted.bytes, manifest::INPUT_LIMIT).unwrap();
+        crate::plugin_v2::json::decode_exact(&converted.bytes, manifest::INPUT_LIMIT).unwrap();
     assert_eq!(input.tracks.len(), 3);
     assert_eq!(input.resources.len(), 4);
     let audio: Vec<_> = input
@@ -67,7 +67,7 @@ fn remote_dash_expands_number_time_and_finite_negative_repeat_without_exposing_b
     let (url, rx, thread) = server(vec![response(xml)]);
     let converted = convert(&factory, &resource(&grant, &url), &HttpCancel::default()).unwrap();
     let parsed: VirtualDash =
-        iris_plugin_sdk::json::decode_exact(&converted.bytes, manifest::INPUT_LIMIT).unwrap();
+        crate::plugin_v2::json::decode_exact(&converted.bytes, manifest::INPUT_LIMIT).unwrap();
     assert_eq!(parsed.tracks.len(), 2);
     assert!(parsed.resources.iter().any(|r|matches!(&r.source,ResourceSource::Remote {request} if request.url.ends_with("/video/s-00005-0.m4s"))));
     assert!(parsed.resources.iter().any(|r|matches!(&r.source,ResourceSource::Remote {request} if request.url.ends_with("/video/s-00006-2000.m4s"))));

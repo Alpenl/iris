@@ -88,7 +88,7 @@ impl ToolCatalog {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
                 Err(_) => return Err(ErrorCode::IoError),
             };
-            let receipts: Vec<Receipt> = iris_plugin_sdk::json::decode(&bytes, 512 << 10)?;
+            let receipts: Vec<Receipt> = crate::plugin_v2::json::decode(&bytes, 512 << 10)?;
             if receipts.len() > 5 {
                 return Err(ErrorCode::QuotaExceeded);
             }
@@ -201,7 +201,7 @@ impl ToolCatalog {
     }
     fn save(&self, receipts: &[Receipt]) -> Result<(), ErrorCode> {
         if let Some(path) = &self.0.path {
-            let bytes = iris_plugin_sdk::json::encode(&receipts, 512 << 10)?;
+            let bytes = crate::plugin_v2::json::encode(&receipts, 512 << 10)?;
             fs_util::atomic_write_private(path, bytes).map_err(|_| ErrorCode::IoError)?;
         }
         Ok(())

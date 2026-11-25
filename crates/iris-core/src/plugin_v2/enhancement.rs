@@ -39,11 +39,32 @@ pub struct Attachment {
     _lease: Reservation,
 }
 impl Attachment {
-    pub(crate) fn url(&self) -> &str {
-        &self.url
-    }
     pub fn is_live(&self) -> bool {
         !self.relay.session().cancellation().is_cancelled()
+    }
+}
+
+impl crate::player::ExternalTrack for Attachment {
+    fn owner(&self) -> &str {
+        &self.owner
+    }
+    fn id(&self) -> &str {
+        &self.id
+    }
+    fn label(&self) -> &str {
+        &self.label
+    }
+    fn lang(&self) -> Option<&str> {
+        self.lang.as_deref()
+    }
+    fn is_audio(&self) -> bool {
+        self.audio
+    }
+    fn url(&self) -> &str {
+        &self.url
+    }
+    fn is_live(&self) -> bool {
+        Attachment::is_live(self)
     }
 }
 impl Drop for Attachment {

@@ -3,6 +3,7 @@
 //! unified media URIs, credential vault, catalog & play queue, workspace presets,
 //! keymaps, settings, and URI-keyed records. No GPUI or native windowing types.
 
+pub mod bounded_json;
 pub mod catalog;
 pub(crate) mod fs_util;
 pub mod geometry;
@@ -10,6 +11,7 @@ pub mod input;
 pub mod keymap;
 pub mod library;
 pub mod logging;
+pub(crate) mod loopback_http;
 pub mod media_uri;
 pub mod photo;
 pub mod player;

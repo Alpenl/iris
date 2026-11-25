@@ -13,7 +13,7 @@ use crate::{
     vfs::HttpCancel,
 };
 use iris_api::v2::{ErrorCode, Id, task_result::OriginResult};
-use iris_plugin_sdk::json;
+use crate::plugin_v2::json;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},

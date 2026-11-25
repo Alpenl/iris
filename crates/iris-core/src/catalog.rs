@@ -1,13 +1,82 @@
-//! Unified directory catalog model (`CatalogItem`) and decoupled playback queue (`PlayQueue`).
+//! Unified directory catalog model (`CatalogItem`), local directory view (`LocalDirectory`),
+//! and decoupled playback queue (`PlayQueue`).
 
 use std::cmp::Ordering;
 use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 
-use iris_api::{SourceEntry, SourceEntryKind, StreamVariant};
 use serde::{Deserialize, Serialize};
 
-use crate::library::{Entry, FolderEntry, Kind, ScanResult, SortBy, SortOrder, natural_cmp};
+use crate::library::{self, Entry, FolderEntry, Kind, ScanResult, SortBy, SortOrder, natural_cmp};
 use crate::media_uri::MediaUri;
+
+/// Playable quality/variant descriptor independent of plugin transport schemas.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CatalogVariant {
+    pub id: String,
+    pub label: String,
+}
+
+/// Active local folder browsing state, decoupled from playback [`crate::player::Session`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LocalDirectory {
+    pub folder: Option<PathBuf>,
+    pub entries: Vec<Entry>,
+    pub subfolders: Vec<FolderEntry>,
+}
+
+impl LocalDirectory {
+    pub fn folder(&self) -> Option<&Path> {
+        self.folder.as_deref()
+    }
+
+    pub fn entries(&self) -> &[Entry] {
+        &self.entries
+    }
+
+    pub fn subfolders(&self) -> &[FolderEntry] {
+        &self.subfolders
+    }
+
+    pub fn set(&mut self, folder: Option<PathBuf>, entries: Vec<Entry>, subfolders: Vec<FolderEntry>) {
+        self.folder = folder;
+        self.entries = entries;
+        self.subfolders = subfolders;
+    }
+
+    pub fn sort(&mut self, by: SortBy, order: SortOrder) {
+        library::sort_entries(&mut self.entries, by, order);
+    }
+
+    pub fn enqueue(&mut self, extra: Vec<Entry>) {
+        for entry in extra {
+            if !self.entries.iter().any(|e| e.path == entry.path) {
+                self.entries.push(entry);
+            }
+        }
+    }
+
+    pub fn remove_entry(&mut self, path: &Path) -> bool {
+        if let Some(ix) = self.entries.iter().position(|e| e.path == path) {
+            self.entries.remove(ix);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn clear_entries(&mut self) {
+        self.entries.clear();
+    }
+
+    pub fn to_catalog_items(&self) -> Vec<CatalogItem> {
+        self.subfolders
+            .iter()
+            .map(CatalogItem::from_local_folder)
+            .chain(self.entries.iter().map(CatalogItem::from_local_entry))
+            .collect()
+    }
+}
 
 /// Distinguishes navigable folders from playable/viewable media items.
 #[derive(Clone, Debug, PartialEq)]
@@ -27,7 +96,7 @@ pub struct CatalogItem {
     pub duration: Option<f64>,
     pub subtitle: Option<String>,
     pub is_live: bool,
-    pub variants: Vec<StreamVariant>,
+    pub variants: Vec<CatalogVariant>,
 }
 
 impl CatalogItem {
@@ -64,36 +133,6 @@ impl CatalogItem {
         out.extend(scan.subfolders.iter().map(Self::from_local_folder));
         out.extend(scan.entries.iter().map(Self::from_local_entry));
         out
-    }
-
-    pub fn from_source_entry(plugin_id: &str, source_id: &str, entry: &SourceEntry) -> Self {
-        let (kind, is_live) = match entry.kind {
-            SourceEntryKind::Folder => (
-                CatalogItemKind::Folder {
-                    folder_id: Some(entry.id.clone()),
-                },
-                false,
-            ),
-            SourceEntryKind::Video => (CatalogItemKind::Media(Kind::Video), false),
-            SourceEntryKind::Photo => (CatalogItemKind::Media(Kind::Photo), false),
-            SourceEntryKind::Audio => (CatalogItemKind::Media(Kind::Audio), false),
-            SourceEntryKind::Live => (CatalogItemKind::Media(Kind::Video), true),
-        };
-        Self {
-            uri: MediaUri::Plugin {
-                plugin_id: plugin_id.to_string(),
-                source_id: source_id.to_string(),
-                entry_id: entry.id.clone(),
-            },
-            name: entry.name.clone(),
-            kind,
-            size: entry.size.unwrap_or(0),
-            modified_secs: entry.modified_secs.unwrap_or(0),
-            duration: entry.duration,
-            subtitle: entry.subtitle.clone(),
-            is_live,
-            variants: entry.variants.clone(),
-        }
     }
 
     pub fn is_folder(&self) -> bool {
@@ -448,20 +487,21 @@ mod tests {
                 size: 100,
                 modified_secs: 50,
             }),
-            CatalogItem::from_source_entry(
-                "acme.cloud",
-                "drive",
-                &SourceEntry {
-                    id: "ost-1".into(),
-                    name: "OST Track 1.flac".into(),
-                    subtitle: Some("Lossless".into()),
-                    kind: SourceEntryKind::Audio,
-                    size: Some(300),
-                    modified_secs: Some(15),
-                    duration: Some(210.0),
-                    variants: Vec::new(),
+            CatalogItem {
+                uri: MediaUri::Plugin {
+                    plugin_id: "acme.cloud".into(),
+                    source_id: "drive".into(),
+                    entry_id: "ost-1".into(),
                 },
-            ),
+                name: "OST Track 1.flac".into(),
+                kind: CatalogItemKind::Media(Kind::Audio),
+                size: 300,
+                modified_secs: 15,
+                duration: Some(210.0),
+                subtitle: Some("Lossless".into()),
+                is_live: false,
+                variants: Vec::new(),
+            },
         ];
 
         sort_catalog_items(&mut items, SortBy::Name, true);

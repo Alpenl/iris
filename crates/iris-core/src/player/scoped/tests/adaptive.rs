@@ -1,3 +1,4 @@
+use crate::plugin_v2::stream::manifest::Profile;
 use super::*;
 mod transport;
 use crate::{
@@ -223,7 +224,7 @@ fn real_hls_and_dash_decode_through_scoped_rewritten_manifests() {
         let mut events = player.events().unwrap();
         player
             .open_scoped(
-                playback.clone(),
+                playback.clone().into_scoped(),
                 MediaUri::Plugin {
                     plugin_id: "fixture".into(),
                     source_id: "adaptive".into(),

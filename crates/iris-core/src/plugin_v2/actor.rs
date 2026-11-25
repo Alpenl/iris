@@ -241,7 +241,7 @@ impl Actor {
         let id = Id(next_id()?);
         let blob = DetachedBlob::reserve(&self.shared.ledger, &self.shared.owner, blob)?;
         object.insert("context_blob".into(), serde_json::json!(id));
-        let bytes = iris_plugin_sdk::json::encode(&event, MESSAGE_LIMIT)?;
+        let bytes = crate::plugin_v2::json::encode(&event, MESSAGE_LIMIT)?;
         self.shared.send(bytes, Some((id, blob)))
     }
     pub fn poll(&self) -> Option<Update> {
@@ -267,7 +267,7 @@ impl Actor {
         }
         let id = Id(next_id()?);
         let blob = DetachedBlob::reserve(&self.shared.ledger, &self.shared.owner, blob)?;
-        let bytes = iris_plugin_sdk::json::encode(
+        let bytes = crate::plugin_v2::json::encode(
             &serde_json::json!({"event":"stream_context_changed","session":session,"generation":generation,"context_blob":id}),
             MESSAGE_LIMIT,
         )?;
@@ -452,7 +452,7 @@ fn run(
                 let result = match result {
                     Ok(outcome) => {
                         let mut value = outcome.value.clone();
-                        let size = iris_plugin_sdk::json::encode(&value, MESSAGE_LIMIT - 1024);
+                        let size = crate::plugin_v2::json::encode(&value, MESSAGE_LIMIT - 1024);
                         let delivered = if let Err(error) = size {
                             Err(error)
                         } else if let Some(blob) = &outcome.blob {
@@ -480,8 +480,8 @@ fn run(
             }
         };
         let bytes = if let Some(window) = window {
-            let body: serde_json::Value = iris_plugin_sdk::json::decode(&bytes, MESSAGE_LIMIT)?;
-            iris_plugin_sdk::json::encode(
+            let body: serde_json::Value = crate::plugin_v2::json::decode(&bytes, MESSAGE_LIMIT)?;
+            crate::plugin_v2::json::encode(
                 &serde_json::json!({"event":"window", "window":window,"generation":generation,"body":body}),
                 MESSAGE_LIMIT,
             )?

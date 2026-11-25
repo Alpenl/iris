@@ -16,7 +16,6 @@ devtools = []
 anyhow.workspace = true
 iris-mpv = { path = "../iris-mpv" }
 iris-api = { path = "../iris-api" }
-iris-plugin-sdk = { path = "../iris-plugin-sdk" }
 wasmtime = { version = "=51.0.0", default-features = false, features = ["runtime", "cranelift", "std"] }
 zip = { version = "=9.8.2", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 cap-std = "4.0.3"

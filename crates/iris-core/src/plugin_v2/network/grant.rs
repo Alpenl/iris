@@ -491,6 +491,22 @@ impl RequestGrant {
     }
 }
 
+impl crate::vfs::http_client::ConnectionPolicy for RequestGrant {
+    fn check_url(&self, url: &Url) -> anyhow::Result<()> {
+        RequestGrant::check_url(self, url).map_err(anyhow::Error::new)
+    }
+    fn check_address(&self, url: &Url, addr: SocketAddr) -> anyhow::Result<()> {
+        RequestGrant::check_address(self, url, addr).map_err(anyhow::Error::new)
+    }
+    fn cancel(&self) -> &HttpCancel {
+        RequestGrant::cancel(self)
+    }
+    fn reserve_dns(&self) -> anyhow::Result<Box<dyn std::any::Any + Send + Sync>> {
+        let lease = RequestGrant::reserve_dns(self).map_err(anyhow::Error::new)?;
+        Ok(Box::new(lease))
+    }
+}
+
 pub fn normalize_url(raw: &str, kind: TransportKind) -> Result<Url, ErrorCode> {
     if raw.len() > 8192
         || raw.trim() != raw

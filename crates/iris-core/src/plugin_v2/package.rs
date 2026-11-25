@@ -170,7 +170,7 @@ impl Package {
                 return Err(ErrorCode::Unsupported);
             }
         }
-        let manifest: Manifest = iris_plugin_sdk::json::decode_exact(
+        let manifest: Manifest = crate::plugin_v2::json::decode_exact(
             files.get("plugin.json").ok_or(ErrorCode::InvalidArgument)?,
             MESSAGE_LIMIT,
         )?;

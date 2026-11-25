@@ -216,7 +216,7 @@ impl Mailbox {
             &self.owner,
             &[(Resource::HostBytes, (MESSAGE_LIMIT * 32) as u64)],
         )?;
-        let value: serde_json::Value = iris_plugin_sdk::json::decode(&bytes, MESSAGE_LIMIT)?;
+        let value: serde_json::Value = crate::plugin_v2::json::decode(&bytes, MESSAGE_LIMIT)?;
         let initialization = value.get("event").and_then(|v| v.as_str()) == Some("init");
         let mut state = self.lock();
         if self.cancel.load(Ordering::Acquire) {

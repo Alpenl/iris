@@ -174,7 +174,7 @@ fn variants(values: &[iris_api::StreamVariant]) -> Result<(), ErrorCode> {
 }
 pub fn remote(resource: &iris_api::v2::stream::RemoteResource) -> Result<(), ErrorCode> {
     super::network::normalize_url(&resource.url, super::network::TransportKind::Http)?;
-    crate::vfs::http_client::raw::validate_headers(&resource.headers)
+    super::network::raw::validate_headers(&resource.headers)
 }
 pub fn command(command: &HostCommand) -> Result<(), ErrorCode> {
     use HostCommand::*;

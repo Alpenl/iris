@@ -1,4 +1,9 @@
-use super::*;
+use anyhow::Result;
+
+use crate::library::Kind;
+
+use super::super::MediaSourceState;
+use super::{AspectMode, Command, MAX_SPEED, MIN_SPEED, PlayerActionError, Session};
 
 impl Session {
     pub fn execute(&mut self, command: Command) -> Result<()> {
@@ -18,9 +23,9 @@ impl Session {
                 | Command::NextChapter
                 | Command::PrevChapter
                 | Command::SelectChapter(_)
-        ) && let Some(playback) = &self.scoped_playback
+        ) && let MediaSourceState::PluginScoped { playback, .. } = &self.source
         {
-            playback.relay.session().advance_seek()?;
+            playback.stream.advance_seek()?;
         }
         match command {
             Command::SetAbLoop { start, end } => {
@@ -154,7 +159,7 @@ impl Session {
                 {
                     return Err(PlayerActionError::SubtitleFileNotFound.into());
                 }
-                if self.scoped_playback.is_none() {
+                if !matches!(self.source, MediaSourceState::PluginScoped { .. }) {
                     let _ = super::references::disable_hls(&self.mpv);
                 }
                 let target = resolved.to_string_lossy();
@@ -233,14 +238,15 @@ impl Session {
                 if !matches!(self.kind, Some(Kind::Photo | Kind::Video)) {
                     return Ok(());
                 }
-                self.extra_rotate = ((self.extra_rotate as i64 + delta_deg).rem_euclid(360)) as u16;
+                self.visual.extra_rotate =
+                    ((self.visual.extra_rotate as i64 + delta_deg).rem_euclid(360)) as u16;
                 if self.uses_filter_orientation() {
                     self.apply_vf_filters()?;
                 } else {
                     self.mpv.command_async(&[
                         "set",
                         "video-rotate",
-                        &self.extra_rotate.to_string(),
+                        &self.visual.extra_rotate.to_string(),
                     ])?;
                 }
             }

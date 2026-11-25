@@ -143,9 +143,62 @@ assert mpv_normal == [], f"iris-mpv must stay zero-dependency, got {mpv_normal}"
 api_normal = [d["name"] for d in pkgs["iris-api"]["dependencies"] if d["kind"] is None]
 assert api_normal == ["serde"], f"iris-api normal deps must be ['serde'] only, got {api_normal}"
 
-forbidden_core = {"gpui", "cocoa", "objc", "objc2", "raw-window-handle", "winit", "windows", "image"}
+forbidden_core = {
+    "gpui",
+    "cocoa",
+    "objc",
+    "objc2",
+    "raw-window-handle",
+    "winit",
+    "windows",
+    "image",
+    "iris-plugin-sdk",
+}
 core_deps = {d["name"] for d in pkgs["iris-core"]["dependencies"]}
-assert not (core_deps & forbidden_core), f"iris-core must stay headless, found {core_deps & forbidden_core}"
+assert not (core_deps & forbidden_core), f"iris-core must stay headless and SDK-free, found {core_deps & forbidden_core}"
+
+# 3b. Headless core domain dependency direction & wildcard-super ban (non-test code)
+core_src = ROOT / "crates/iris-core/src"
+isolated_core_domains = {
+    "bounded_json",
+    "catalog",
+    "fs_util",
+    "geometry",
+    "input",
+    "keymap",
+    "library",
+    "logging",
+    "loopback_http",
+    "media_uri",
+    "photo",
+    "player",
+    "preset",
+    "settings",
+    "store",
+    "vault",
+    "vfs",
+}
+core_forbidden_plugin_refs = ("crate::plugin_v2", "crate::plugin::", "iris_api", "iris_plugin_sdk")
+for path in sorted(core_src.rglob("*.rs")):
+    rel = path.relative_to(ROOT)
+    rel_core = path.relative_to(core_src)
+    parts = rel_core.parts
+    # Skip standalone test-only submodules (`tests.rs`, `tests/...`, `photo/fixtures.rs`).
+    if "tests" in parts or path.name in ("tests.rs", "test_util.rs", "fixtures.rs"):
+        continue
+    text = path.read_text(encoding="utf-8")
+    test_mod = re.search(
+        r"(?m)^[ \t]*#\[cfg\(test\)\]\s*(?:#\[[^\]]+\]\s*)*mod\s+\w+\s*(?:\{|;)",
+        text,
+    )
+    prod_code = strip_line_comments(text[: test_mod.start()] if test_mod else text)
+    top_domain = parts[0].removesuffix(".rs")
+    if top_domain in isolated_core_domains:
+        assert "use super::*;" not in prod_code, f"{rel} uses forbidden wildcard `use super::*;`"
+        for needle in core_forbidden_plugin_refs:
+            assert needle not in prod_code, (
+                f"{rel} breaks core->plugin dependency direction via `{needle}`"
+            )
 
 # 4. File line-count budgets (prevent monolith regressions)
 soft_warnings = []

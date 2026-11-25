@@ -19,7 +19,7 @@ fn blob(ledger: &Ledger, owner: &str, cues: &[TimedCue]) -> Arc<Blob> {
         Blob::new(
             ledger,
             owner,
-            iris_plugin_sdk::json::encode(&cues, iris_api::v2::CHUNK_LIMIT).unwrap(),
+            crate::plugin_v2::json::encode(&cues, iris_api::v2::CHUNK_LIMIT).unwrap(),
         )
         .unwrap(),
     )

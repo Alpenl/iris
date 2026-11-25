@@ -1,7 +1,7 @@
 //! Resolution, connection setup and cancellation shared by VFS and authenticated playback.
 pub(crate) mod doh;
-pub(crate) mod duplex;
 
+use std::any::Any;
 use std::collections::BTreeMap;
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, Shutdown, SocketAddr, TcpStream, ToSocketAddrs};
@@ -13,15 +13,42 @@ use mio::{Events, Interest, Poll, Token, Waker};
 use rustls_pki_types::ServerName;
 use url::{Host, Url};
 
+use super::address::{AddressKind, address_kind};
 use super::{CONNECT_TIMEOUT, IO_TIMEOUT};
-use crate::plugin_v2::network::{AddressKind, address_kind};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HttpClientError {
+    Cancelled,
+    Timeout,
+    Denied,
+}
+
+impl std::fmt::Display for HttpClientError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Cancelled => f.write_str("HTTP request cancelled"),
+            Self::Timeout => f.write_str("HTTP request deadline exceeded"),
+            Self::Denied => f.write_str("HTTP destination denied"),
+        }
+    }
+}
+
+impl std::error::Error for HttpClientError {}
+
+/// Optional per-connection authorization hook implemented by higher layers (e.g. plugin grants).
+pub(crate) trait ConnectionPolicy: Send + Sync {
+    fn check_url(&self, url: &Url) -> Result<()>;
+    fn check_address(&self, url: &Url, addr: SocketAddr) -> Result<()>;
+    fn cancel(&self) -> &HttpCancel;
+    fn reserve_dns(&self) -> Result<Box<dyn Any + Send + Sync>>;
+}
 
 /// Private destinations are limited to the selected host's original addresses.
 /// Public origins never acquire permission for a private destination via redirect or DNS.
 pub(crate) struct NetworkScope {
     pub(super) source: Url,
     private_peers: OnceLock<Vec<IpAddr>>,
-    policy: Option<Arc<crate::plugin_v2::network::RequestGrant>>,
+    policy: Option<Arc<dyn ConnectionPolicy>>,
 }
 
 impl NetworkScope {
@@ -39,7 +66,7 @@ impl NetworkScope {
 
     pub(crate) fn authorized(
         source: Url,
-        policy: Arc<crate::plugin_v2::network::RequestGrant>,
+        policy: Arc<dyn ConnectionPolicy>,
     ) -> Result<Self> {
         policy.check_url(&source)?;
         Ok(Self {
@@ -240,13 +267,17 @@ fn tls_config() -> Result<Arc<rustls::ClientConfig>> {
     CONFIG.clone().map_err(|e| anyhow!("{e}"))
 }
 
-pub(super) struct TimedSocket {
+pub(crate) struct TimedSocket {
     tcp: TcpStream,
     deadline: Option<Instant>,
     idle_timeout: Duration,
 }
 
 impl TimedSocket {
+    pub(crate) fn into_tcp(self) -> TcpStream {
+        self.tcp
+    }
+
     fn remaining(&self) -> io::Result<Option<Duration>> {
         self.deadline
             .map(|d| {
@@ -283,13 +314,13 @@ impl Write for TimedSocket {
     }
 }
 
-pub(super) enum Transport {
+pub(crate) enum Transport {
     Plain(TimedSocket),
     Tls(Box<rustls::StreamOwned<rustls::ClientConnection, TimedSocket>>),
 }
 
 impl Transport {
-    pub(super) fn set_body_deadline(&mut self, deadline: Option<Instant>) -> io::Result<()> {
+    pub(crate) fn set_body_deadline(&mut self, deadline: Option<Instant>) -> io::Result<()> {
         let socket = match self {
             Self::Plain(s) => s,
             Self::Tls(s) => &mut s.sock,
@@ -329,14 +360,14 @@ pub(super) fn remaining_timeout(
     limit: Duration,
 ) -> Result<Duration> {
     if cancel.is_cancelled() {
-        return Err(anyhow::Error::new(iris_api::v2::ErrorCode::Cancelled)
+        return Err(anyhow::Error::new(HttpClientError::Cancelled)
             .context("HTTP request cancelled"));
     }
     let left = deadline.map_or(limit, |d| {
         d.saturating_duration_since(Instant::now()).min(limit)
     });
     if left.is_zero() {
-        return Err(anyhow::Error::new(iris_api::v2::ErrorCode::Timeout)
+        return Err(anyhow::Error::new(HttpClientError::Timeout)
             .context("HTTP request deadline exceeded"));
     }
     Ok(left)
@@ -450,7 +481,7 @@ fn filter_resolved_ips(ips: impl IntoIterator<Item = IpAddr>) -> Vec<IpAddr> {
         .collect()
 }
 
-pub(super) fn connect_transport(
+pub(crate) fn connect_transport(
     url: &Url,
     scope: &NetworkScope,
     cancel: &HttpCancel,
@@ -461,7 +492,7 @@ pub(super) fn connect_transport(
 
 // A trusted HTTP proxy CONNECT keeps TLS end-to-end with the native tool. The
 // original https Origin still drives DNS and peer authorization.
-fn connect_authorized(
+pub(crate) fn connect_authorized(
     url: &Url,
     scope: &NetworkScope,
     cancel: &HttpCancel,
@@ -493,7 +524,7 @@ fn connect_authorized(
             .collect()
     };
     if addrs.is_empty() || !addrs.iter().all(|&addr| scope.permits(url, addr)) {
-        return Err(anyhow::Error::new(iris_api::v2::ErrorCode::Denied)
+        return Err(anyhow::Error::new(HttpClientError::Denied)
             .context("blocked disallowed or empty HTTP destination"));
     }
     let mut connected = None;

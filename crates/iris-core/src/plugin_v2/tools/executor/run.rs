@@ -270,7 +270,7 @@ fn wav_header(bytes: u32, rate: u32) -> Vec<u8> {
 }
 fn metadata(bytes: &[u8], network: &NetworkGrant) -> Result<Vec<u8>, ErrorCode> {
     use serde_json::{Value, json};
-    let value: Value = iris_plugin_sdk::json::decode_exact(bytes, 8 << 20)?;
+    let value: Value = crate::plugin_v2::json::decode_exact(bytes, 8 << 20)?;
     let object = value.as_object().ok_or(ErrorCode::InvalidArgument)?;
     if object.contains_key("entries") {
         return Err(ErrorCode::Unsupported);
@@ -315,7 +315,7 @@ fn metadata(bytes: &[u8], network: &NetworkGrant) -> Result<Vec<u8>, ErrorCode> 
             })
             .transpose()?
             .unwrap_or_default();
-        if crate::vfs::http_client::raw::validate_headers(&headers).is_err()
+        if crate::plugin_v2::network::raw::validate_headers(&headers).is_err()
             || grant.check_credentials(&parsed, &headers).is_err()
         {
             continue;
@@ -357,7 +357,7 @@ fn metadata(bytes: &[u8], network: &NetworkGrant) -> Result<Vec<u8>, ErrorCode> 
     if title.len() > 1024 || title.chars().any(char::is_control) {
         return Err(ErrorCode::InvalidArgument);
     }
-    iris_plugin_sdk::json::encode(
+    crate::plugin_v2::json::encode(
         &json!({"schema":1, "title":title, "formats":clean}),
         8 << 20,
     )

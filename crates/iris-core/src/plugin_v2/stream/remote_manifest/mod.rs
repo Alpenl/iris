@@ -50,7 +50,7 @@ pub fn convert(
             .unwrap_or(2000);
         (
             ManifestFormat::VirtualHls,
-            iris_plugin_sdk::json::encode(&document, manifest::INPUT_LIMIT)?,
+            crate::plugin_v2::json::encode(&document, manifest::INPUT_LIMIT)?,
             live,
             (target / 2).clamp(250, 5000),
         )
@@ -58,7 +58,7 @@ pub fn convert(
         let document = dash::parse(&fetched, &mut build)?;
         (
             ManifestFormat::VirtualDash,
-            iris_plugin_sdk::json::encode(&document, manifest::INPUT_LIMIT)?,
+            crate::plugin_v2::json::encode(&document, manifest::INPUT_LIMIT)?,
             false,
             5000,
         )

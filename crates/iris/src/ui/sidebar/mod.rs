@@ -235,8 +235,8 @@ impl IrisWindow {
         match self.catalog.sidebar_mode {
             SidebarMode::Files => match &self.catalog.active_source {
                 super::state::ActiveSource::Local => self
-                    .active()
-                    .session
+                    .catalog
+                    .local_dir
                     .folder()
                     .and_then(|f| f.file_name())
                     .map(|n| n.to_string_lossy().into_owned())

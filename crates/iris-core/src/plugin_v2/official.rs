@@ -56,7 +56,7 @@ pub struct Bootstrap {
 impl Bootstrap {
     /// Only parses a small embedded index; no filesystem, hashing, or compilation.
     pub fn embedded(legacy_root: PathBuf) -> Result<Self, ErrorCode> {
-        let index: Index = iris_plugin_sdk::json::decode(INDEX, 16 * 1024)?;
+        let index: Index = crate::plugin_v2::json::decode(INDEX, 16 * 1024)?;
         if index.schema != 1 || index.packages.len() != 2 || hex(&index.source_sha256).is_err() {
             return Err(ErrorCode::InvalidArgument);
         }

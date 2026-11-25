@@ -3,8 +3,101 @@ use super::{
     instance::next_id,
     ledger::{Ledger, Reservation, Resource},
 };
-use crate::{media_uri::MediaUri, store::Store};
-use iris_api::v2::{Capability, ErrorCode, Id, enhance::AnnotationEdit};
+use crate::{
+    media_uri::MediaUri,
+    store::{self, AnnotationError, Store},
+};
+use iris_api::v2::{
+    Capability, ErrorCode, Id,
+    enhance::{AnnotationEdit, AnnotationPage, ColorLabel, TimeMarker},
+};
+
+pub fn annotation_error_code(error: AnnotationError) -> ErrorCode {
+    match error {
+        AnnotationError::InvalidArgument => ErrorCode::InvalidArgument,
+        AnnotationError::Denied => ErrorCode::Denied,
+        AnnotationError::QuotaExceeded => ErrorCode::QuotaExceeded,
+        AnnotationError::Backpressure => ErrorCode::Backpressure,
+        AnnotationError::RangeInvalid => ErrorCode::RangeInvalid,
+        AnnotationError::Cancelled => ErrorCode::Cancelled,
+        AnnotationError::Io => ErrorCode::IoError,
+    }
+}
+
+pub fn error_code_to_annotation(code: ErrorCode) -> AnnotationError {
+    match code {
+        ErrorCode::InvalidArgument => AnnotationError::InvalidArgument,
+        ErrorCode::Denied => AnnotationError::Denied,
+        ErrorCode::QuotaExceeded => AnnotationError::QuotaExceeded,
+        ErrorCode::Backpressure => AnnotationError::Backpressure,
+        ErrorCode::RangeInvalid => AnnotationError::RangeInvalid,
+        ErrorCode::Cancelled => AnnotationError::Cancelled,
+        _ => AnnotationError::Io,
+    }
+}
+
+fn color_to_store(c: ColorLabel) -> store::ColorLabel {
+    match c {
+        ColorLabel::Red => store::ColorLabel::Red,
+        ColorLabel::Orange => store::ColorLabel::Orange,
+        ColorLabel::Yellow => store::ColorLabel::Yellow,
+        ColorLabel::Green => store::ColorLabel::Green,
+        ColorLabel::Blue => store::ColorLabel::Blue,
+        ColorLabel::Purple => store::ColorLabel::Purple,
+        ColorLabel::Gray => store::ColorLabel::Gray,
+    }
+}
+
+fn color_to_api(c: store::ColorLabel) -> ColorLabel {
+    match c {
+        store::ColorLabel::Red => ColorLabel::Red,
+        store::ColorLabel::Orange => ColorLabel::Orange,
+        store::ColorLabel::Yellow => ColorLabel::Yellow,
+        store::ColorLabel::Green => ColorLabel::Green,
+        store::ColorLabel::Blue => ColorLabel::Blue,
+        store::ColorLabel::Purple => ColorLabel::Purple,
+        store::ColorLabel::Gray => ColorLabel::Gray,
+    }
+}
+
+pub fn edit_to_store(edit: &AnnotationEdit) -> store::AnnotationEdit {
+    match edit {
+        AnnotationEdit::Rating { rating } => store::AnnotationEdit::Rating { rating: *rating },
+        AnnotationEdit::Color { color } => store::AnnotationEdit::Color {
+            color: color.map(color_to_store),
+        },
+        AnnotationEdit::UpsertMarker { marker } => store::AnnotationEdit::UpsertMarker {
+            marker: store::TimeMarker {
+                id: marker.id.clone(),
+                position_ms: marker.position_ms.0,
+                label: marker.label.clone(),
+                color: marker.color.map(color_to_store),
+            },
+        },
+        AnnotationEdit::RemoveMarker { id } => {
+            store::AnnotationEdit::RemoveMarker { id: id.clone() }
+        }
+    }
+}
+
+pub fn page_to_api(page: store::AnnotationPage) -> AnnotationPage {
+    AnnotationPage {
+        index: page.index,
+        rating: page.rating,
+        color: page.color.map(color_to_api),
+        markers: page
+            .markers
+            .into_iter()
+            .map(|m| TimeMarker {
+                id: m.id,
+                position_ms: Id(m.position_ms),
+                label: m.label,
+                color: m.color.map(color_to_api),
+            })
+            .collect(),
+        next_marker: page.next_marker,
+    }
+}
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::Arc,
@@ -138,7 +231,9 @@ impl SelectionGrants {
         let _scratch = self
             .ledger
             .reserve(owner, &[(Resource::HostBytes, 64 << 20)])?;
-        store.edit_annotations(&selected.uris, edit)
+        store
+            .edit_annotations(&selected.uris, &edit_to_store(edit))
+            .map_err(annotation_error_code)
     }
     pub fn snapshot(
         &self,
@@ -160,7 +255,7 @@ impl SelectionGrants {
             .iter()
             .map(|uri| store.annotations(uri).unwrap_or(&empty))
             .collect();
-        let bytes = iris_plugin_sdk::json::encode(&values, iris_api::v2::CHUNK_LIMIT)?;
+        let bytes = crate::plugin_v2::json::encode(&values, iris_api::v2::CHUNK_LIMIT)?;
         Ok(std::sync::Arc::new(super::instance::Blob::new(
             &self.ledger,
             owner,

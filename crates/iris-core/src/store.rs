@@ -10,7 +10,10 @@ use crate::fs_util;
 use crate::media_uri::MediaUri;
 mod annotations;
 mod recent;
-pub use annotations::{AnnotationSnapshot, AnnotationTarget, Annotations};
+pub use annotations::{
+    AnnotationEdit, AnnotationError, AnnotationPage, AnnotationSnapshot, AnnotationTarget,
+    Annotations, ColorLabel, TimeMarker,
+};
 use recent::read_recent;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -156,23 +159,23 @@ impl Store {
     pub fn annotations(&self, uri: &MediaUri) -> Option<&Annotations> {
         self.annotations.get(uri)
     }
-    pub fn annotation_target(&self) -> Result<AnnotationTarget, iris_api::v2::ErrorCode> {
+    pub fn annotation_target(&self) -> Result<AnnotationTarget, AnnotationError> {
         Ok(AnnotationTarget::new(
-            self.target_dir().ok_or(iris_api::v2::ErrorCode::IoError)?,
+            self.target_dir().ok_or(AnnotationError::Io)?,
         ))
     }
     pub fn apply_annotation_snapshot(
         &mut self,
         snapshot: AnnotationSnapshot,
-    ) -> Result<(), iris_api::v2::ErrorCode> {
+    ) -> Result<(), AnnotationError> {
         self.annotations.accept(snapshot)
     }
     /// The plugin manager must first resolve an explicit host selection grant.
     pub fn edit_annotations(
         &mut self,
         uris: &[MediaUri],
-        edit: &iris_api::v2::enhance::AnnotationEdit,
-    ) -> Result<(), iris_api::v2::ErrorCode> {
+        edit: &AnnotationEdit,
+    ) -> Result<(), AnnotationError> {
         self.annotations.edit(uris, edit)
     }
 

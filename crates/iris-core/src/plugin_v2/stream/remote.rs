@@ -8,12 +8,14 @@ use crate::{
         actor::ReadResult,
         instance::Blob,
         ledger::{Activity, Ledger, Reservation, Resource},
-        network::{NetworkGrant, RequestGrant, TransportKind, cookies::CookieJar, normalize_url},
+        network::{
+            NetworkGrant, RequestGrant, TransportKind,
+            cookies::CookieJar,
+            normalize_url,
+            raw::{self, RawRequest, RawState},
+        },
     },
-    vfs::{
-        HttpCancel,
-        http_client::raw::{self, RawRequest, RawState},
-    },
+    vfs::HttpCancel,
 };
 pub(crate) use document::Fetched;
 pub use document::Thumbnail;

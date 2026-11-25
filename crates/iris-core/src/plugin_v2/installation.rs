@@ -6,7 +6,7 @@ use super::{
     package::{PACKAGE_LIMIT, Package, Provenance},
 };
 use iris_api::v2::{Capability, ErrorCode, MESSAGE_LIMIT, Manifest, NetworkDeclaration};
-use iris_plugin_sdk::json::decode;
+use crate::plugin_v2::json::decode;
 pub use review::Review;
 use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};

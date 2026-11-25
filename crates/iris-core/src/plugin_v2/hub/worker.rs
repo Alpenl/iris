@@ -464,7 +464,7 @@ impl Worker {
         {
             return Ok(());
         }
-        let bytes = iris_plugin_sdk::json::encode(&sources, iris_api::v2::MESSAGE_LIMIT)?;
+        let bytes = crate::plugin_v2::json::encode(&sources, iris_api::v2::MESSAGE_LIMIT)?;
         let lease = self.shared.ledger.reserve(
             &control.installed().installation_id,
             &[(Resource::HostBytes, bytes.len() as u64 * 32 + 4096)],

@@ -40,7 +40,7 @@ impl StreamStore {
         spawn.generation.context = context.version;
         let generation = spawn.generation;
         let actor = Actor::spawn(spawn)?;
-        actor.send(iris_plugin_sdk::json::encode(&serde_json::json!({
+        actor.send(crate::plugin_v2::json::encode(&serde_json::json!({
             "event":"init", "protocol":2, "abi":2, "host_version":env!("CARGO_PKG_VERSION"),
             "role":"stream", "generation":generation, "capabilities":transports, "features":["stream_read","stream_context_changed"],
             "snapshot":null

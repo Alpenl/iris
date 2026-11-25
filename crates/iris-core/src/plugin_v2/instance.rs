@@ -7,7 +7,7 @@ use iris_api::v2::{
     CHUNK_LIMIT, COMMAND_LIMIT, Capability, ErrorCode, HostCommand, Id, MESSAGE_LIMIT, Reply, Role,
     task::Task, unpack,
 };
-use iris_plugin_sdk::json::decode;
+use crate::plugin_v2::json::decode;
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::{
@@ -376,7 +376,7 @@ impl Instance {
                 return Ok(Reply::Ok { ok: Vec::new() });
             }
             let reply: Reply<HostCommand> =
-                iris_plugin_sdk::json::decode_exact(&bytes, MESSAGE_LIMIT)?;
+                crate::plugin_v2::json::decode_exact(&bytes, MESSAGE_LIMIT)?;
             match &reply {
                 Reply::Ok { ok } if ok.len() > COMMAND_LIMIT => {
                     return Err(ErrorCode::QuotaExceeded);

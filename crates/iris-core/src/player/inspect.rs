@@ -142,7 +142,7 @@ impl Session {
     }
 
     pub(super) fn refresh_chapters(&mut self) {
-        if self.plugin_timeline.is_some() {
+        if self.enhancements.timeline_owner.is_some() {
             return;
         }
         let Ok(raw) = self.mpv.get_property_string("chapter-list") else {
@@ -274,7 +274,7 @@ mod tests {
         let mut stats = session.media_stats();
         assert_eq!(stats.resolution, Some((800, 1200)));
 
-        session.extra_rotate = 90;
+        session.visual.extra_rotate = 90;
         assert_eq!(session.display_flips(), (false, true));
         session.refresh_dynamic_stats(&mut stats);
         assert_eq!(stats.resolution, Some((1200, 800)));

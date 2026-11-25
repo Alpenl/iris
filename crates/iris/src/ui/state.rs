@@ -8,7 +8,7 @@ use std::time::Instant;
 
 use gpui::{RenderImage, ScrollHandle, SharedString, UniformListScrollHandle};
 use iris_api::{PluginModal, SourceEntry, StreamVariant};
-use iris_core::catalog::{CatalogItem, MediaFilter};
+use iris_core::catalog::{CatalogItem, LocalDirectory, MediaFilter};
 use iris_core::preset::{PresetCaptureScope, SidebarMode};
 
 use super::chrome::DirectoryPopup;
@@ -177,6 +177,7 @@ impl Drop for RemoteLoad {
 pub(super) struct CatalogState {
     pub(super) sidebar_mode: SidebarMode,
     pub(super) active_source: ActiveSource,
+    pub(super) local_dir: LocalDirectory,
     pub(super) active_stream_meta: Option<ActiveStreamMeta>,
     pub(super) filter: MediaFilter,
     pub(super) rows: Vec<DirRow>,
@@ -301,6 +302,7 @@ impl Default for CatalogState {
         Self {
             sidebar_mode: SidebarMode::Files,
             active_source: ActiveSource::Local,
+            local_dir: LocalDirectory::default(),
             active_stream_meta: None,
             filter: MediaFilter::All,
             rows: Vec::new(),

@@ -292,7 +292,7 @@ impl Hub {
         snapshot: Option<PlaybackSnapshot>,
     ) -> Result<(Client, UnboundedReceiver<()>), ErrorCode> {
         if let Some(snapshot) = &snapshot {
-            iris_plugin_sdk::json::encode(snapshot, iris_api::v2::MESSAGE_LIMIT - 1024)?;
+            crate::plugin_v2::json::encode(snapshot, iris_api::v2::MESSAGE_LIMIT - 1024)?;
         }
         let shared = &self.0.0;
         let id = Control::new_window_id()?;

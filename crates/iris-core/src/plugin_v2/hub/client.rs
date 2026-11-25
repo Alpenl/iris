@@ -13,7 +13,7 @@ impl Client {
         self.inbox.generation()
     }
     pub fn update_snapshot(&self, snapshot: PlaybackSnapshot) -> Result<(), ErrorCode> {
-        iris_plugin_sdk::json::encode(&snapshot, iris_api::v2::MESSAGE_LIMIT - 1024)?;
+        crate::plugin_v2::json::encode(&snapshot, iris_api::v2::MESSAGE_LIMIT - 1024)?;
         self.queue(Command::Snapshot {
             window: self.inbox.id,
             snapshot,
@@ -141,7 +141,7 @@ impl Client {
         request: Option<Arc<RequestTicket>>,
     ) -> Result<(), ErrorCode> {
         super::super::validation::identifier(plugin)?;
-        iris_plugin_sdk::json::encode(&event, iris_api::v2::MESSAGE_LIMIT - 1024)?;
+        crate::plugin_v2::json::encode(&event, iris_api::v2::MESSAGE_LIMIT - 1024)?;
         self.queue(Command::Send {
             window: self.inbox.id,
             plugin: plugin.into(),

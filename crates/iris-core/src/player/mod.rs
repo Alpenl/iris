@@ -12,56 +12,93 @@ mod scoped;
 use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use futures::channel::mpsc::UnboundedReceiver;
 use iris_mpv::{Mpv, RenderHandle};
 use relay::PlaybackRelay;
+use serde_json::json;
 
-use crate::library::{self, Entry, FolderEntry, Kind, SortBy, SortOrder};
+use crate::catalog::LocalDirectory;
+use crate::library::Kind;
 use crate::logging;
 use crate::media_uri::MediaUri;
 use crate::photo::Photo;
 use crate::settings::{Hwdec, OnEof, Settings};
 use crate::vfs::{self, http_client::origin_headers};
-use serde_json::json;
 
+pub use enhance::ExternalTrack;
 pub use model::{
     AspectMode, AudioDevice, Chapter, Command, MAX_SPEED, MIN_SPEED, MediaStats, PlaybackState,
     PlayerActionError, RemoteMediaRequest, RemoteSubtitle, SPEED_STEPS, SessionEvent,
     SessionUpdate, Track, TrackKind, format_time, friendly_error, step_speed,
 };
 pub use prepare::{Prepared, PreparedQueue, prepare, prepare_queue};
+pub use scoped::{ScopedAttachment, ScopedPlayback, ScopedStream, StreamProfile};
+
+/// Validated CPU preview LUT filter provider (decoupled from plugin file/artifact internals).
+pub trait MonitorLutFilter: Send + Sync {
+    fn filter_spec(&self) -> Result<String>;
+}
+
+static NEXT_COMMAND_RECEIPT: AtomicU64 = AtomicU64::new(1);
+
+pub(super) fn next_command_receipt() -> Result<u64> {
+    NEXT_COMMAND_RECEIPT
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
+        .map_err(|_| anyhow!("exhausted mpv command receipt identifiers"))
+}
+
+/// Active media transport state; mutually exclusive across local, direct remote, and plugin-scoped loads.
+enum MediaSourceState {
+    Idle,
+    Local,
+    DirectRemote {
+        relay: PlaybackRelay,
+        last_remote: RemoteMediaRequest,
+        pending_subs: Vec<String>,
+    },
+    PluginScoped {
+        playback: Arc<ScopedPlayback>,
+        pending_tracks: Vec<ScopedAttachment>,
+    },
+}
+
+/// Active plugin-attached enhancements owned for the current media lifecycle.
+#[derive(Default)]
+struct PluginEnhancements {
+    tracks: enhance::TrackState,
+    timeline_owner: Option<String>,
+    monitor_lut: Option<Arc<dyn MonitorLutFilter>>,
+    retired_lut: Option<(u64, Arc<dyn MonitorLutFilter>)>,
+}
+
+/// Visual orientation and subtitle safe-area state for the active viewport.
+#[derive(Default)]
+struct VisualTransform {
+    extra_rotate: u16,
+    source_rotation: u16,
+    subtitle_inset: f64,
+}
 
 pub struct Session {
     pub(super) mpv: Arc<Mpv>,
     event_pump: backend::EventPump,
     event_rx: RefCell<Option<UnboundedReceiver<SessionUpdate>>>,
     pub(super) state: PlaybackState,
-    folder: Option<PathBuf>,
-    entries: Vec<Entry>,
-    subfolders: Vec<FolderEntry>,
     pub(super) current: Option<PathBuf>,
     pub(super) current_uri: Option<String>,
     pub(super) current_title: Option<String>,
     pub(super) private_identity: bool,
     pub(super) kind: Option<Kind>,
     pub(super) photo_meta: Option<Photo>,
-    pub(super) last_remote: Option<RemoteMediaRequest>,
     playlist_entry_id: Option<i64>,
-    pending_remote_subs: Vec<String>,
-    playback_relay: Option<PlaybackRelay>,
-    scoped_playback: Option<Arc<crate::plugin_v2::stream::prepare::Playback>>,
-    pending_scoped_tracks: Vec<crate::plugin_v2::stream::prepare::AttachmentView>,
-    plugin_tracks: enhance::TrackState,
-    plugin_timeline: Option<String>,
-    monitor_lut: Option<Arc<crate::plugin_v2::lut::MonitorLut>>,
-    retired_lut: Option<(u64, Arc<crate::plugin_v2::lut::MonitorLut>)>,
-    pub(super) extra_rotate: u16,
-    source_rotation: u16,
+    source: MediaSourceState,
+    enhancements: PluginEnhancements,
+    visual: VisualTransform,
     pub(super) user_hwdec: Cell<Hwdec>,
     on_eof: Cell<OnEof>,
-    pub(super) subtitle_inset: f64,
     pub(super) tracks_dirty: bool,
     pub(super) chapters_dirty: bool,
 }
@@ -75,30 +112,18 @@ impl Session {
             event_pump,
             event_rx: RefCell::new(Some(event_rx)),
             state: PlaybackState::default(),
-            folder: None,
-            entries: Vec::new(),
-            subfolders: Vec::new(),
             current: None,
             current_uri: None,
             current_title: None,
             private_identity: false,
             kind: None,
             photo_meta: None,
-            last_remote: None,
             playlist_entry_id: None,
-            pending_remote_subs: Vec::new(),
-            playback_relay: None,
-            scoped_playback: None,
-            pending_scoped_tracks: Vec::new(),
-            monitor_lut: None,
-            retired_lut: None,
-            plugin_tracks: enhance::TrackState::default(),
-            plugin_timeline: None,
-            extra_rotate: 0,
-            source_rotation: 0,
+            source: MediaSourceState::Idle,
+            enhancements: PluginEnhancements::default(),
+            visual: VisualTransform::default(),
             user_hwdec: Cell::new(Hwdec::AutoSafe),
             on_eof: Cell::new(OnEof::Pause),
-            subtitle_inset: 0.,
             tracks_dirty: false,
             chapters_dirty: false,
         })
@@ -115,18 +140,6 @@ impl Session {
 
     pub fn state(&self) -> &PlaybackState {
         &self.state
-    }
-
-    pub fn folder(&self) -> Option<&Path> {
-        self.folder.as_deref()
-    }
-
-    pub fn entries(&self) -> &[Entry] {
-        &self.entries
-    }
-
-    pub fn subfolders(&self) -> &[FolderEntry] {
-        &self.subfolders
     }
 
     pub fn current(&self) -> Option<&Path> {
@@ -171,61 +184,21 @@ impl Session {
             && !self.state.ended
     }
 
-    pub fn set_directory(
-        &mut self,
-        folder: Option<PathBuf>,
-        entries: Vec<Entry>,
-        subfolders: Vec<FolderEntry>,
-    ) {
-        self.folder = folder;
-        self.entries = entries;
-        self.subfolders = subfolders;
-    }
-
-    pub fn sort_directory(&mut self, by: SortBy, order: SortOrder) {
-        library::sort_entries(&mut self.entries, by, order);
-    }
-
-    pub fn enqueue_entries(&mut self, extra: Vec<Entry>) {
-        for entry in extra {
-            if !self.entries.iter().any(|e| e.path == entry.path) {
-                self.entries.push(entry);
-            }
-        }
-    }
-
-    pub fn remove_entry(&mut self, path: &Path) -> bool {
-        if let Some(ix) = self.entries.iter().position(|e| e.path == path) {
-            self.entries.remove(ix);
-            true
-        } else {
-            false
-        }
-    }
-
-    pub fn clear_entries(&mut self) {
-        self.entries.clear();
-    }
-
     pub fn stop(&mut self) -> Result<()> {
         self.execute(Command::ClearAbLoop)?;
         self.set_monitor_lut(None)?;
         self.mpv.command_async(&["stop"])?;
-        self.discard_scoped();
-        self.plugin_tracks.clear();
-        self.plugin_timeline = None;
+        self.clear_media_source();
+        self.enhancements.tracks.clear();
+        self.enhancements.timeline_owner = None;
         self.current = None;
         self.current_uri = None;
         self.current_title = None;
         self.private_identity = false;
         self.playlist_entry_id = None;
-        self.pending_remote_subs.clear();
-        self.playback_relay = None;
-        self.event_pump.set_relay(Default::default());
         self.kind = None;
         self.photo_meta = None;
-        self.last_remote = None;
-        self.extra_rotate = 0;
+        self.visual.extra_rotate = 0;
         self.state.photo_colour = None;
         self.state.photo_exif = None;
         self.state.tracks.clear();
@@ -240,7 +213,17 @@ impl Session {
         Ok(())
     }
 
-    pub fn open(&mut self, prepared: Prepared, resume: f64) -> Result<()> {
+    fn clear_media_source(&mut self) {
+        match std::mem::replace(&mut self.source, MediaSourceState::Idle) {
+            MediaSourceState::PluginScoped { playback, .. } => playback.stream.stop(),
+            MediaSourceState::DirectRemote { relay, .. } => relay.cancel(),
+            MediaSourceState::Idle | MediaSourceState::Local => {}
+        }
+        self.event_pump.set_relay(Default::default());
+        self.event_pump.set_scoped(scoped::empty_scoped());
+    }
+
+    pub fn open(&mut self, prepared: Prepared, resume: f64) -> Result<LocalDirectory> {
         let Prepared {
             folder,
             entries,
@@ -249,40 +232,47 @@ impl Session {
             kind,
             photo,
         } = prepared;
-        self.entries = entries;
-        self.subfolders = subfolders;
-        self.folder = Some(folder);
+        let dir = LocalDirectory {
+            folder: Some(folder),
+            entries,
+            subfolders,
+        };
         match target {
-            Some(path) => self.load(&path, kind, photo, resume),
-            None => self.stop(),
+            Some(path) => self.load(&path, kind, photo, resume)?,
+            None => self.stop()?,
         }
+        Ok(dir)
     }
 
-    pub fn open_prepared_queue(&mut self, prepared: PreparedQueue, resume: f64) -> Result<()> {
+    pub fn open_prepared_queue(
+        &mut self,
+        prepared: PreparedQueue,
+        resume: f64,
+    ) -> Result<LocalDirectory> {
         let PreparedQueue {
             folder,
             entries,
             photo,
         } = prepared;
-        let Some(first) = entries.first() else {
-            return Ok(());
+        let first = entries.first().map(|e| (e.path.clone(), e.kind));
+        let dir = LocalDirectory {
+            folder: Some(folder),
+            entries,
+            subfolders: Vec::new(),
         };
-        let first_path = first.path.clone();
-        let first_kind = first.kind;
-        self.folder = Some(folder);
-        self.entries = entries;
-        self.subfolders.clear();
-        self.load(&first_path, Some(first_kind), photo, resume)
+        if let Some((first_path, first_kind)) = first {
+            self.load(&first_path, Some(first_kind), photo, resume)?;
+        }
+        Ok(dir)
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn reset_for_load(
+    pub(super) fn reset_for_load(
         &mut self,
         current: Option<PathBuf>,
         current_uri: String,
         current_title: Option<String>,
         playlist_entry_id: i64,
-        pending_remote_subs: Vec<String>,
         kind: Kind,
         is_live: bool,
         photo: Option<Photo>,
@@ -292,15 +282,14 @@ impl Session {
         self.current_title = current_title;
         self.private_identity = false;
         self.playlist_entry_id = Some(playlist_entry_id);
-        self.pending_remote_subs = pending_remote_subs;
         self.kind = Some(kind);
         self.state.is_live = is_live;
         self.state.ab_start = None;
         self.state.ab_end = None;
-        self.monitor_lut = None;
-        self.retired_lut = None;
-        self.plugin_tracks.loading();
-        self.plugin_timeline = None;
+        self.enhancements.monitor_lut = None;
+        self.enhancements.retired_lut = None;
+        self.enhancements.tracks.loading();
+        self.enhancements.timeline_owner = None;
         self.state.buffering = false;
         self.state.cache_duration = 0.;
         self.state.photo_colour = photo
@@ -309,8 +298,8 @@ impl Session {
             .map(|c| c.display_name());
         self.state.photo_exif = photo.as_ref().and_then(|p| p.exif.clone());
         self.photo_meta = photo;
-        self.extra_rotate = 0;
-        self.source_rotation = 0;
+        self.visual.extra_rotate = 0;
+        self.visual.source_rotation = 0;
         self.state.aspect = AspectMode::Original;
         self.state.hflip = false;
         self.state.vflip = false;
@@ -342,7 +331,7 @@ impl Session {
         )
     }
 
-    fn load_remote(
+    pub(super) fn load_remote(
         &mut self,
         req: RemoteMediaRequest,
         settings: &Settings,
@@ -384,6 +373,7 @@ impl Session {
         owned_opts.push(("loop-file", self.loop_value(req.is_live).into()));
         let opt_refs: Vec<_> = owned_opts.iter().map(|(k, v)| (*k, v.as_str())).collect();
         let previous = self.event_pump.set_relay(Arc::downgrade(&relay.service()));
+        let previous_scoped = self.event_pump.set_scoped(scoped::empty_scoped());
         let entry_id = match self
             .mpv
             .loadfile_with_options(&playback_url, "replace", &opt_refs)
@@ -391,22 +381,31 @@ impl Session {
             Ok(id) => id,
             Err(err) => {
                 self.event_pump.set_relay(previous);
+                self.event_pump.set_scoped(previous_scoped);
                 return Err(err.into());
             }
         };
-        self.playback_relay = Some(relay);
-        self.discard_scoped();
+        if let MediaSourceState::PluginScoped { playback, .. } =
+            std::mem::replace(
+                &mut self.source,
+                MediaSourceState::DirectRemote {
+                    relay,
+                    last_remote: saved_remote,
+                    pending_subs,
+                },
+            )
+        {
+            playback.stream.stop();
+        }
         self.reset_for_load(
             None,
             req.uri.to_uri_string(),
             Some(req.title),
             entry_id,
-            pending_subs,
             req.kind,
             req.is_live,
             req.photo,
         );
-        self.last_remote = Some(saved_remote);
         logging::event(
             logging::EventLevel::Info,
             "player",
@@ -446,20 +445,17 @@ impl Session {
         let entry_id = self
             .mpv
             .loadfile_with_options(&mpv_path, "replace", &opt_refs)?;
-        self.playback_relay = None;
-        self.event_pump.set_relay(Default::default());
-        self.discard_scoped();
+        self.clear_media_source();
+        self.source = MediaSourceState::Local;
         self.reset_for_load(
             Some(path.to_path_buf()),
             canonical_uri,
             None,
             entry_id,
-            Vec::new(),
             kind,
             false,
             photo,
         );
-        self.last_remote = None;
         logging::event(
             logging::EventLevel::Info,
             "player",
@@ -510,21 +506,28 @@ impl Session {
         Some(&update.event)
     }
 
+    fn attach_pending_remote_subs(&mut self) {
+        let MediaSourceState::DirectRemote { pending_subs, .. } = &mut self.source else {
+            return;
+        };
+        for sub_mem in std::mem::take(pending_subs) {
+            let _ = self.mpv.command_async(&["sub-add", &sub_mem, "auto"]);
+        }
+    }
+
     pub fn apply(&mut self, event: &SessionEvent) {
         match event {
-            SessionEvent::Seek => {
-                // Explicit seek commands already advance the stream generation synchronously;
-                // advancing again on delayed MPV_EVENT_SEEK would cancel the post-seek Range read.
-            }
+            SessionEvent::Seek => {}
             SessionEvent::CommandReply { id, error } => {
                 if self
+                    .enhancements
                     .retired_lut
                     .as_ref()
                     .is_some_and(|(rid, _)| *rid == *id)
                 {
-                    self.retired_lut = None;
+                    self.enhancements.retired_lut = None;
                 }
-                self.plugin_tracks.reply(&self.mpv, *id, *error);
+                self.enhancements.tracks.reply(&self.mpv, *id, *error);
                 self.tracks_dirty = true;
             }
             SessionEvent::Position(v) => {
@@ -581,12 +584,14 @@ impl Session {
                 }
             }
             SessionEvent::Rotation(v) => self.state.rotation = *v,
-            SessionEvent::SourceRotation(v) => self.source_rotation = v.rem_euclid(360) as u16,
+            SessionEvent::SourceRotation(v) => {
+                self.visual.source_rotation = v.rem_euclid(360) as u16;
+            }
             SessionEvent::LoopFile(v) => self.state.loop_file = *v,
             SessionEvent::AbStart(v) => self.state.ab_start = *v,
             SessionEvent::AbEnd(v) => self.state.ab_end = *v,
             SessionEvent::Chapter(v) => {
-                if self.plugin_timeline.is_none() {
+                if self.enhancements.timeline_owner.is_none() {
                     self.state.current_chapter = *v;
                 }
             }
@@ -597,7 +602,7 @@ impl Session {
                 self.state.cache_duration = if v.is_finite() { v.max(0.) } else { 0. };
             }
             SessionEvent::Loaded => {
-                self.plugin_tracks.loaded();
+                self.enhancements.tracks.loaded();
                 self.state.loaded = true;
                 self.sync_video_params();
                 if self.state.duration <= 0.
@@ -608,9 +613,7 @@ impl Session {
                     self.state.duration = v;
                 }
                 self.attach_scoped_tracks();
-                for sub_mem in std::mem::take(&mut self.pending_remote_subs) {
-                    let _ = self.mpv.command_async(&["sub-add", &sub_mem, "auto"]);
-                }
+                self.attach_pending_remote_subs();
                 self.tracks_dirty = true;
                 self.chapters_dirty = true;
                 let video_codec = self
@@ -653,13 +656,10 @@ impl Session {
                         "is_live": self.state.is_live,
                     }),
                 );
-                self.discard_scoped();
-                self.plugin_tracks.clear();
-                self.plugin_timeline = None;
-                self.retired_lut = None;
-                self.pending_remote_subs.clear();
-                self.playback_relay = None;
-                self.event_pump.set_relay(Default::default());
+                self.clear_media_source();
+                self.enhancements.tracks.clear();
+                self.enhancements.timeline_owner = None;
+                self.enhancements.retired_lut = None;
                 self.state.loaded = false;
             }
         }
@@ -686,7 +686,7 @@ impl Session {
             self.state.rotation = r;
         }
         if let Some(r) = i64_prop("video-dec-params/rotate") {
-            self.source_rotation = r.rem_euclid(360) as u16;
+            self.visual.source_rotation = r.rem_euclid(360) as u16;
         }
         if let Ok(hw) = self.mpv.get_property_string("hwdec-current") {
             self.state.hwdec = hw;
@@ -701,8 +701,8 @@ impl Session {
                 .get_property_string("idle-active")
                 .is_ok_and(|s| s == "yes")
             {
-                self.plugin_tracks.clear();
-                self.plugin_timeline = None;
+                self.enhancements.tracks.clear();
+                self.enhancements.timeline_owner = None;
                 self.state.loaded = false;
             }
             return;
@@ -755,12 +755,10 @@ impl Session {
                 || self.state.video_size.0 > 0
                 || flag_prop("seeking") == Some(false))
         {
-            self.plugin_tracks.loaded();
+            self.enhancements.tracks.loaded();
             self.state.loaded = true;
             self.attach_scoped_tracks();
-            for sub_mem in std::mem::take(&mut self.pending_remote_subs) {
-                let _ = self.mpv.command_async(&["sub-add", &sub_mem, "auto"]);
-            }
+            self.attach_pending_remote_subs();
         }
         self.tracks_dirty = true;
         self.chapters_dirty = true;
@@ -788,11 +786,10 @@ impl Session {
     }
 
     pub fn shutdown(&self) {
-        if let Some(playback) = &self.scoped_playback {
-            playback.relay.stop();
-        }
-        if let Some(relay) = &self.playback_relay {
-            relay.cancel();
+        match &self.source {
+            MediaSourceState::PluginScoped { playback, .. } => playback.stream.stop(),
+            MediaSourceState::DirectRemote { relay, .. } => relay.cancel(),
+            MediaSourceState::Idle | MediaSourceState::Local => {}
         }
         self.event_pump.stop(&self.mpv);
     }
@@ -807,12 +804,28 @@ impl Drop for Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
 
     #[test]
     fn stale_playback_updates_do_not_change_state_or_consume_subtitles() {
         let mut session = Session::new().unwrap();
         session.playlist_entry_id = Some(2);
-        session.pending_remote_subs.push("memory://WEBVTT\n".into());
+        let url = url::Url::parse("https://example.invalid/video.mp4").unwrap();
+        let relay = PlaybackRelay::start(url, BTreeMap::new()).unwrap();
+        session.source = MediaSourceState::DirectRemote {
+            relay,
+            last_remote: RemoteMediaRequest {
+                uri: MediaUri::HttpUrl("https://example.invalid/video.mp4".into()),
+                playback_url: "https://example.invalid/video.mp4".into(),
+                title: "video.mp4".into(),
+                kind: Kind::Video,
+                headers: BTreeMap::new(),
+                subtitles: Vec::new(),
+                is_live: false,
+                photo: None,
+            },
+            pending_subs: vec!["memory://WEBVTT\n".into()],
+        };
         for event in [
             SessionEvent::Ended(true),
             SessionEvent::Loaded,
@@ -829,7 +842,10 @@ mod tests {
         }
         assert!(!session.state.ended);
         assert!(!session.state.loaded);
-        assert_eq!(session.pending_remote_subs.len(), 1);
+        assert!(matches!(
+            &session.source,
+            MediaSourceState::DirectRemote { pending_subs, .. } if pending_subs.len() == 1
+        ));
         let update = SessionUpdate {
             playlist_entry_id: Some(2),
             event: SessionEvent::Loaded,
@@ -839,7 +855,10 @@ mod tests {
             Some(SessionEvent::Loaded)
         ));
         assert!(session.state.loaded);
-        assert!(session.pending_remote_subs.is_empty());
+        assert!(matches!(
+            &session.source,
+            MediaSourceState::DirectRemote { pending_subs, .. } if pending_subs.is_empty()
+        ));
     }
 
     #[test]
@@ -864,7 +883,6 @@ mod tests {
                 format!("https://example.invalid/clip-{attempt}"),
                 None,
                 entry_id,
-                Vec::new(),
                 Kind::Video,
                 false,
                 None,

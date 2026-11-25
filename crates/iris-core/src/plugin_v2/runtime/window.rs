@@ -58,7 +58,7 @@ impl Control {
                 .grants
                 .contains(&iris_api::v2::Capability::ReadState)
         });
-        let event = iris_plugin_sdk::json::encode(
+        let event = crate::plugin_v2::json::encode(
             &HostEvent::<serde_json::Value>::WindowOpened { snapshot },
             iris_api::v2::MESSAGE_LIMIT - 512,
         )?;

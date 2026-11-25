@@ -4,7 +4,7 @@ use crate::{
     plugin_v2::{
         actor::{Executor, Operation, TaskContext},
         enhancement::{AttachmentRegistry, AttachmentSpec},
-        instance::Blob,
+        instance::{Blob, next_id},
         ledger::Resource,
         network::NetworkGrant,
         runtime::{Resources, WindowAccess},
@@ -177,9 +177,9 @@ fn native_receipts_hold_revoked_attachments_and_release_accounting() {
             player.apply_update(&update);
         }
         player.flush_deferred();
-        !player.plugin_tracks.active.is_empty()
+        !player.enhancements.tracks.active.is_empty()
     });
-    let first_id = native_track(&player.mpv, &track).expect("attached subtitle track");
+    let first_id = native_track(&player.mpv, track.as_ref()).expect("attached subtitle track");
     wait(|| {
         while let Ok(update) = events.try_recv() {
             player.apply_update(&update);
@@ -205,9 +205,9 @@ fn native_receipts_hold_revoked_attachments_and_release_accounting() {
             player.apply_update(&update);
         }
         player.flush_deferred();
-        player.plugin_tracks.active.len() == 2
+        player.enhancements.tracks.active.len() == 2
     });
-    assert!(native_track(&player.mpv, &second).is_some());
+    assert!(native_track(&player.mpv, second.as_ref()).is_some());
     assert_eq!(
         player
             .selected_track(super::super::TrackKind::Sub)
@@ -216,13 +216,13 @@ fn native_receipts_hold_revoked_attachments_and_release_accounting() {
     );
     drop(second);
     player.revoke_plugin_tracks(&access.owner);
-    assert!(!player.plugin_tracks.pending.is_empty());
+    assert!(!player.enhancements.tracks.pending.is_empty());
     drop(track);
     wait(|| {
         while let Ok(update) = events.try_recv() {
             player.apply_update(&update);
         }
-        player.plugin_tracks.pending.is_empty()
+        player.enhancements.tracks.pending.is_empty()
             && ledger.used(None, Resource::EnhancementTrack) == 0
     });
 
@@ -235,7 +235,7 @@ fn native_receipts_hold_revoked_attachments_and_release_accounting() {
         while let Ok(update) = events.try_recv() {
             player.apply_update(&update);
         }
-        player.plugin_tracks.pending.is_empty()
+        player.enhancements.tracks.pending.is_empty()
             && ledger.used(None, Resource::EnhancementTrack) == 0
     });
     player.shutdown();

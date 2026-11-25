@@ -145,7 +145,9 @@ impl IrisWindow {
             .enhance
             .pending
             .retain(|(_, key), _| !key.starts_with("overlay:"));
-        if let Some(session) = self.active().session.plugin_session() {
+        if let Some(session) =
+            iris_core::plugin_v2::stream::prepare::stream_session(&self.active().session)
+        {
             let plugin = self
                 .plugins
                 .list()

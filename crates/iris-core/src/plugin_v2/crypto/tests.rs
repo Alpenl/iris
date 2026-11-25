@@ -161,20 +161,17 @@ fn aes256_ctr_vector_and_sdk_unaligned_windows() {
     );
     let input: Vec<u8> = (0..256).map(|n| n as u8).collect();
     let cipher = ctr::<aes::Aes256>(&key, &iv, &input).unwrap();
-    for offset in 0..64 {
-        for len in 1..33 {
-            let window =
-                iris_plugin_sdk::crypto::ctr_window(iv.clone().try_into().unwrap(), offset, len)
-                    .unwrap();
-            let start = window.ciphertext_offset as usize;
-            let decoded = ctr::<aes::Aes256>(
-                &key,
-                &window.counter,
-                &cipher[start..start + window.fetch_len],
-            )
-            .unwrap();
+    let iv_arr: [u8; 16] = iv.clone().try_into().unwrap();
+    for offset in 0u64..64 {
+        for len in 1usize..33 {
+            let discard = (offset % 16) as usize;
+            let start = (offset - offset % 16) as usize;
+            let fetch_len = len + discard;
+            let counter = (u128::from_be_bytes(iv_arr) + u128::from(offset / 16)).to_be_bytes();
+            let decoded =
+                ctr::<aes::Aes256>(&key, &counter, &cipher[start..start + fetch_len]).unwrap();
             assert_eq!(
-                &decoded[window.discard..],
+                &decoded[discard..],
                 &input[offset as usize..offset as usize + len]
             );
         }

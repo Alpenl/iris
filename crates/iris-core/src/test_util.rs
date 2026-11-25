@@ -14,6 +14,10 @@ impl TestDir {
         std::fs::create_dir_all(&dir).expect("create test temp dir");
         Self(dir)
     }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.0
+    }
 }
 
 impl Deref for TestDir {

@@ -180,7 +180,7 @@ impl Control {
                 features: BTreeSet::from(["window_scope".into(), "async_storage".into()]),
                 snapshot: None,
             };
-            actor.send(iris_plugin_sdk::json::encode(
+            actor.send(crate::plugin_v2::json::encode(
                 &event,
                 iris_api::v2::MESSAGE_LIMIT,
             )?)?;

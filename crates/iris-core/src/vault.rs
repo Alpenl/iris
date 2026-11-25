@@ -67,25 +67,6 @@ fn vault_err(kind: VaultErrorKind, message: impl Into<String>) -> anyhow::Error 
     })
 }
 
-pub fn vault_error_code(error: &anyhow::Error) -> iris_api::v2::ErrorCode {
-    if let Some(typed) = error.downcast_ref::<VaultError>() {
-        return match typed.kind {
-            VaultErrorKind::QuotaExceeded => iris_api::v2::ErrorCode::QuotaExceeded,
-            VaultErrorKind::Busy => iris_api::v2::ErrorCode::Backpressure,
-            VaultErrorKind::InvalidArgument => iris_api::v2::ErrorCode::InvalidArgument,
-            VaultErrorKind::Backend => iris_api::v2::ErrorCode::IoError,
-        };
-    }
-    if error
-        .chain()
-        .filter_map(|cause| cause.downcast_ref::<io::Error>())
-        .any(|io_err| io_err.kind() == io::ErrorKind::WouldBlock)
-    {
-        return iris_api::v2::ErrorCode::Backpressure;
-    }
-    iris_api::v2::ErrorCode::IoError
-}
-
 fn validate_id_part<'a>(label: &str, val: &'a str) -> Result<&'a str> {
     let trimmed = val.trim();
     if trimmed.is_empty() || trimmed.len() > MAX_KEY_BYTES {

@@ -1,4 +1,9 @@
-use super::{NetworkGrant, TransportKind, cookies::CookieJar, normalize_url};
+use super::{
+    NetworkGrant, TransportKind,
+    cookies::CookieJar,
+    normalize_url,
+    raw::{self, RawRequest, RawState},
+};
 mod socket_tasks;
 use crate::{
     plugin_v2::{
@@ -6,10 +11,7 @@ use crate::{
         instance::{Blob, next_id},
         ledger::{Activity, Ledger, Reservation, Resource},
     },
-    vfs::{
-        HttpCancel,
-        http_client::raw::{self, RawRequest, RawState},
-    },
+    vfs::HttpCancel,
 };
 use iris_api::v2::{CHUNK_LIMIT, ErrorCode, Generation, Id, Role, task::Task};
 use std::{
@@ -408,6 +410,6 @@ fn metadata(id: u64, state: &RawState) -> Result<serde_json::Value, ErrorCode> {
         ),
         RawState::Closed => Err(ErrorCode::BadState),
     }?;
-    iris_plugin_sdk::json::encode(&value, iris_api::v2::MESSAGE_LIMIT - 1024)?;
+    crate::plugin_v2::json::encode(&value, iris_api::v2::MESSAGE_LIMIT - 1024)?;
     Ok(value)
 }

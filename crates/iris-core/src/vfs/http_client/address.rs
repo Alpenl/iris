@@ -1,3 +1,5 @@
+//! Conservative IP address classification based on IANA special-purpose registries.
+
 use std::net::IpAddr;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

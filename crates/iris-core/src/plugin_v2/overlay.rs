@@ -145,7 +145,7 @@ impl OverlayBank {
             .ledger
             .reserve(owner, &[(Resource::HostBytes, scratch_bytes)])?;
         let values: Vec<TimedCue> =
-            iris_plugin_sdk::json::decode_exact(&blob.bytes, iris_api::v2::CHUNK_LIMIT)?;
+            crate::plugin_v2::json::decode_exact(&blob.bytes, iris_api::v2::CHUNK_LIMIT)?;
         if values.is_empty() {
             if !append {
                 self.tracks.remove(&(owner.into(), name.into()));
@@ -168,7 +168,7 @@ impl OverlayBank {
             if !ids.insert(value.id.clone()) {
                 return Err(ErrorCode::InvalidArgument);
             }
-            let size = iris_plugin_sdk::json::encode(&value, 16_384)?.len() as u64;
+            let size = crate::plugin_v2::json::encode(&value, 16_384)?.len() as u64;
             bytes += size;
             added.insert(
                 (value.start_ms.0, value.id.clone()),

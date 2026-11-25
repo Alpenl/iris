@@ -6,7 +6,7 @@ use iris_core::plugin_v2::{
     stream::manifest,
     validation,
 };
-use iris_plugin_sdk::json::decode_exact;
+use iris_core::plugin_v2::json::decode_exact;
 use std::{path::PathBuf, time::Instant};
 
 fn exercise(input: &[u8]) {

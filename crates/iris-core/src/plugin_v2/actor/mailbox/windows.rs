@@ -177,7 +177,7 @@ impl Mailbox {
             &[(Resource::HostBytes, (MESSAGE_LIMIT * 32) as u64)],
         )?;
         let body: iris_api::v2::HostEvent<serde_json::Value> =
-            iris_plugin_sdk::json::decode(&bytes, MESSAGE_LIMIT - 512)?;
+            crate::plugin_v2::json::decode(&bytes, MESSAGE_LIMIT - 512)?;
         if matches!(
             body,
             iris_api::v2::HostEvent::Window { .. }

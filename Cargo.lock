@@ -2832,7 +2832,6 @@ dependencies = [
  "httpdate",
  "iris-api",
  "iris-mpv",
- "iris-plugin-sdk",
  "libc",
  "log",
  "md-5",

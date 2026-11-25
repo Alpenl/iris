@@ -31,7 +31,7 @@ pub(super) fn migrate(root: &Path, installed: &Installed, setup: &Setup) -> Resu
     )
     .map_err(|_| ErrorCode::Backpressure)?;
     if let Some(bytes) = read_bounded(&complete, 4096)? {
-        let record: Complete = iris_plugin_sdk::json::decode(&bytes, 4096)?;
+        let record: Complete = crate::plugin_v2::json::decode(&bytes, 4096)?;
         if record.schema != 1
             || record.plugin != installed.plugin_id
             || record.installation != installed.installation_id

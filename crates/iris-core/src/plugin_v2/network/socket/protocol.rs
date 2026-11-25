@@ -1,4 +1,4 @@
-use crate::vfs::http_client::{duplex::Wire, raw};
+use super::super::{duplex::Wire, raw};
 use iris_api::v2::{CHUNK_LIMIT, ErrorCode};
 use std::io::{self, Read, Write};
 use tungstenite::{Message, WebSocket, client::IntoClientRequest, protocol::WebSocketConfig};

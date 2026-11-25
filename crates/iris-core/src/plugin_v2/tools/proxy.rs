@@ -5,15 +5,14 @@ use crate::{
     plugin_v2::{
         files::random_name,
         ledger::{Activity, Ledger, Resource},
-        network::{NetworkGrant, Origin, TransportKind, normalize_url},
-    },
-    vfs::{
-        HttpCancel,
-        http_client::{
+        network::{
+            NetworkGrant, Origin, TransportKind,
             duplex::{self, Wire},
+            normalize_url,
             raw::{self, RawRequest, RawState},
         },
     },
+    vfs::HttpCancel,
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
 use iris_api::v2::ErrorCode;

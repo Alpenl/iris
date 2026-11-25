@@ -131,13 +131,13 @@ impl IrisWindow {
             .and_then(|uri| self.store.annotations(&uri))
             .into_iter()
             .flat_map(|a| a.markers.values())
-            .filter(|m| m.position_ms.0 as f64 / 1000. <= duration)
+            .filter(|m| m.position_ms as f64 / 1000. <= duration)
             .map(|marker| {
                 div()
                     .absolute()
                     .top(px(SEAM_ABOVE - 2.))
                     .left(relative(
-                        (marker.position_ms.0 as f64 / 1000. / duration) as f32,
+                        (marker.position_ms as f64 / 1000. / duration) as f32,
                     ))
                     .w(px(2.))
                     .h(px(track + 4.))

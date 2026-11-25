@@ -104,9 +104,16 @@ impl IrisWindow {
                 ..
             } => {
                 self.check_enhancement_media(media, generation)?;
+                let core_chapters: Vec<_> = chapters
+                    .iter()
+                    .map(|c| iris_core::player::Chapter {
+                        time: c.start_ms.0 as f64 / 1000.,
+                        title: c.title.clone(),
+                    })
+                    .collect();
                 self.active_mut()
                     .session
-                    .set_plugin_timeline(owner.clone(), &chapters)
+                    .set_plugin_timeline(owner.clone(), &core_chapters)
                     .map_err(|_| ErrorCode::BadState)?;
                 self.plugin_view.enhance.timeline =
                     Some((owner, action.update.clone(), action.index));
@@ -285,16 +292,14 @@ impl IrisWindow {
                 format,
                 document,
             } => {
-                let current = self
-                    .active()
-                    .session
-                    .plugin_session()
-                    .filter(|s| {
-                        s.id == session
-                            && s.factory.owner() == owner
-                            && s.allows_guest_manifest_updates()
-                    })
-                    .ok_or(ErrorCode::Denied)?;
+                let current =
+                    iris_core::plugin_v2::stream::prepare::stream_session(&self.active().session)
+                        .filter(|s| {
+                            s.id == session
+                                && s.factory.owner() == owner
+                                && s.allows_guest_manifest_updates()
+                        })
+                        .ok_or(ErrorCode::Denied)?;
                 let blob = action
                     .update
                     .blobs
@@ -322,12 +327,10 @@ impl IrisWindow {
                 expected_version,
                 context,
             } => {
-                let current = self
-                    .active()
-                    .session
-                    .plugin_session()
-                    .filter(|s| s.id == session && s.factory.owner() == owner)
-                    .ok_or(ErrorCode::Denied)?;
+                let current =
+                    iris_core::plugin_v2::stream::prepare::stream_session(&self.active().session)
+                        .filter(|s| s.id == session && s.factory.owner() == owner)
+                        .ok_or(ErrorCode::Denied)?;
                 let blob = action
                     .update
                     .blobs
@@ -513,7 +516,9 @@ impl IrisWindow {
         request_id: Option<Id>,
         cx: &mut Context<Self>,
     ) {
-        if let Some(session) = self.active().session.plugin_session() {
+        if let Some(session) =
+            iris_core::plugin_v2::stream::prepare::stream_session(&self.active().session)
+        {
             let generation = session.generation();
             let event = HostEvent::StreamStatus {
                 request_id,

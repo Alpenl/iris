@@ -4,21 +4,24 @@ use crate::{
     ui::kit::{form::chip_button, hstack, vstack},
 };
 use gpui::{Context, IntoElement, ParentElement, StatefulInteractiveElement, Styled, div, px};
-use iris_api::v2::{
-    Capability, ErrorCode, GuestError, HostEvent, Id, Reply,
-    enhance::{AnnotationEdit, ColorLabel, TimeMarker},
-};
+use iris_api::v2::{Capability, ErrorCode, GuestError, HostEvent, Id, Reply, enhance::AnnotationEdit};
 use iris_core::{
     media_uri::MediaUri,
     plugin_v2::{
         ledger::Resource,
         runtime::{Resources, WindowAccess},
-        selection::SelectionGrants,
+        selection::{
+            SelectionGrants, annotation_error_code, edit_to_store, error_code_to_annotation,
+            page_to_api,
+        },
         ui::Action,
     },
+    store::{AnnotationEdit as StoreAnnotationEdit, AnnotationError, ColorLabel, TimeMarker},
     vfs::HttpCancel,
 };
+use std::any::Any;
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 #[derive(Default)]
 pub(super) struct AnnotationView {
@@ -154,7 +157,11 @@ impl IrisWindow {
                 access.generation.media,
                 selection,
             )?;
-        let target = self.store.annotation_target()?;
+        let target = self
+            .store
+            .annotation_target()
+            .map_err(annotation_error_code)?;
+        let store_edit = edit.as_ref().map(edit_to_store);
         let binding = action.binding.clone();
         self.enhancement_job(
             action,
@@ -163,23 +170,35 @@ impl IrisWindow {
             move |access| {
                 let result: Result<_, ErrorCode> = (|| {
                     let uris = permit.uris()?;
-                    let snapshot = target.transact(
-                        edit.as_ref().map(|edit| (uris, edit)),
-                        &access.resources.ledger,
-                        &access.owner,
-                        || {
-                            permit.check()?;
-                            if !binding.is_live() || access.cancel.is_cancelled() {
-                                Err(ErrorCode::Cancelled)
-                            } else {
-                                Ok(())
-                            }
-                        },
-                    )?;
-                    let values = if edit.is_some() {
+                    let ledger = access.resources.ledger.clone();
+                    let snapshot = target
+                        .transact(
+                            store_edit.as_ref().map(|edit| (uris, edit)),
+                            &access.owner,
+                            |owner, bytes| {
+                                ledger
+                                    .reserve(owner, &[(Resource::HostBytes, bytes)])
+                                    .map(|lease| Arc::new(lease) as Arc<dyn Any + Send + Sync>)
+                                    .map_err(error_code_to_annotation)
+                            },
+                            || {
+                                permit.check().map_err(error_code_to_annotation)?;
+                                if !binding.is_live() || access.cancel.is_cancelled() {
+                                    Err(AnnotationError::Cancelled)
+                                } else {
+                                    Ok(())
+                                }
+                            },
+                        )
+                        .map_err(annotation_error_code)?;
+                    let values = if store_edit.is_some() {
                         Vec::new()
                     } else {
-                        vec![snapshot.page(uris, page.0, page.1)?]
+                        vec![page_to_api(
+                            snapshot
+                                .page(uris, page.0, page.1)
+                                .map_err(annotation_error_code)?,
+                        )]
                     };
                     Ok((snapshot, values))
                 })();
@@ -210,7 +229,7 @@ impl IrisWindow {
     pub(in crate::ui) fn refresh_annotations(&mut self, cx: &mut Context<Self>) {
         self.native_annotation(None, cx);
     }
-    fn native_annotation(&mut self, edit: Option<AnnotationEdit>, cx: &mut Context<Self>) {
+    fn native_annotation(&mut self, edit: Option<StoreAnnotationEdit>, cx: &mut Context<Self>) {
         let Some(uri) = self.annotation_uri() else {
             return;
         };
@@ -223,7 +242,10 @@ impl IrisWindow {
             return;
         }
         let setup = (|| {
-            let target = self.store.annotation_target()?;
+            let target = self
+                .store
+                .annotation_target()
+                .map_err(annotation_error_code)?;
             let resources = Resources::global()?;
             let lease = resources
                 .ledger
@@ -233,7 +255,10 @@ impl IrisWindow {
         let (target, resources, lease) = match setup {
             Ok(value) => value,
             Err(error) => {
-                self.show_toast(format!("个人标记不可用 · {error:?}"), cx);
+                self.show_toast(
+                    format!("个人标记不可用 · {}", super::notices::describe_error_code(error)),
+                    cx,
+                );
                 return;
             }
         };
@@ -241,18 +266,26 @@ impl IrisWindow {
         let cancel = self.plugin_view.enhance.annotations.cancel.clone();
         let saving = edit.is_some();
         let job = cx.background_executor().spawn(async move {
-            let result = target.transact(
-                edit.as_ref().map(|edit| (std::slice::from_ref(&uri), edit)),
-                &resources.ledger,
-                "host.annotation-job",
-                || {
-                    if cancel.is_cancelled() {
-                        Err(ErrorCode::Cancelled)
-                    } else {
-                        Ok(())
-                    }
-                },
-            );
+            let ledger = resources.ledger.clone();
+            let result = target
+                .transact(
+                    edit.as_ref().map(|edit| (std::slice::from_ref(&uri), edit)),
+                    "host.annotation-job",
+                    |owner, bytes| {
+                        ledger
+                            .reserve(owner, &[(Resource::HostBytes, bytes)])
+                            .map(|lease| Arc::new(lease) as Arc<dyn Any + Send + Sync>)
+                            .map_err(error_code_to_annotation)
+                    },
+                    || {
+                        if cancel.is_cancelled() {
+                            Err(AnnotationError::Cancelled)
+                        } else {
+                            Ok(())
+                        }
+                    },
+                )
+                .map_err(annotation_error_code);
             (result, lease)
         });
         cx.spawn(async move |this, cx| {
@@ -267,7 +300,10 @@ impl IrisWindow {
                         }
                     }
                     Err(ErrorCode::Cancelled) => {}
-                    Err(error) => this.show_toast(format!("个人标记未更新 · {error:?}"), cx),
+                    Err(error) => this.show_toast(
+                        format!("个人标记未更新 · {}", super::notices::describe_error_code(error)),
+                        cx,
+                    ),
                 }
                 if std::mem::take(&mut this.plugin_view.enhance.annotations.refresh_pending) {
                     this.refresh_annotations(cx);
@@ -297,7 +333,7 @@ impl IrisWindow {
                 t,
             )
             .on_click(cx.listener(move |this, _, _, cx| {
-                this.native_annotation(Some(AnnotationEdit::Rating { rating }), cx)
+                this.native_annotation(Some(StoreAnnotationEdit::Rating { rating }), cx)
             }))
         });
         let colors = [
@@ -315,7 +351,7 @@ impl IrisWindow {
         .map(|(i, (color, name))| {
             chip_button(("color-label", i), name, value.color == color, t).on_click(cx.listener(
                 move |this, _, _, cx| {
-                    this.native_annotation(Some(AnnotationEdit::Color { color }), cx)
+                    this.native_annotation(Some(StoreAnnotationEdit::Color { color }), cx)
                 },
             ))
         });
@@ -333,7 +369,7 @@ impl IrisWindow {
             .take(8)
             .enumerate()
             .map(|(i, marker)| {
-                let time = marker.position_ms.0 as f64 / 1000.;
+                let time = marker.position_ms as f64 / 1000.;
                 let id = marker.id.clone();
                 hstack(4.)
                     .child(
@@ -355,7 +391,7 @@ impl IrisWindow {
                         chip_button(("marker-remove", i), "移除", false, t).on_click(cx.listener(
                             move |this, _, _, cx| {
                                 this.native_annotation(
-                                    Some(AnnotationEdit::RemoveMarker { id: id.clone() }),
+                                    Some(StoreAnnotationEdit::RemoveMarker { id: id.clone() }),
                                     cx,
                                 )
                             },
@@ -381,10 +417,10 @@ impl IrisWindow {
                             let position =
                                 (this.active().session.state().time_pos.max(0.) * 1000.) as u64;
                             this.native_annotation(
-                                Some(AnnotationEdit::UpsertMarker {
+                                Some(StoreAnnotationEdit::UpsertMarker {
                                     marker: TimeMarker {
                                         id: format!("mark-{position}"),
-                                        position_ms: Id(position),
+                                        position_ms: position,
                                         label: iris_core::player::format_time(
                                             position as f64 / 1000.,
                                         ),

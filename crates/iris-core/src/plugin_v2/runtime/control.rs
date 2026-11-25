@@ -77,7 +77,7 @@ impl Control {
             return Ok(());
         };
         let actor = self.actor.as_ref().ok_or(ErrorCode::Unsupported)?;
-        let bytes = iris_plugin_sdk::json::encode(&event, iris_api::v2::MESSAGE_LIMIT - 512)?;
+        let bytes = crate::plugin_v2::json::encode(&event, iris_api::v2::MESSAGE_LIMIT - 512)?;
         if let Some(cancel) = cancel {
             actor.send_cancellable(window, state.generation, bytes, cancel)
         } else {

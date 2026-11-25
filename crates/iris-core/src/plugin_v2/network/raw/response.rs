@@ -1,6 +1,10 @@
-use super::*;
-use crate::vfs::http_client::ChunkedReader;
-use std::io::{BufReader, Cursor};
+use std::io::{Cursor, Read};
+use std::time::Instant;
+
+use iris_api::v2::ErrorCode;
+
+use super::{Connection, Headers, RawRequest, Response, io_error, unique_header};
+use crate::vfs::http_client::{ChunkedReader, HttpBody, parse_decimal_u64};
 
 pub(super) fn receive(
     mut connection: Connection,
@@ -12,7 +16,7 @@ pub(super) fn receive(
         jar.receive(&request.url, &headers)?;
     }
     let content_len = unique_header(&headers, "content-length")?
-        .map(|v| super::super::parse_decimal_u64(v).ok_or(ErrorCode::InvalidArgument))
+        .map(|v| parse_decimal_u64(v).ok_or(ErrorCode::InvalidArgument))
         .transpose()?;
     let transfer = unique_header(&headers, "transfer-encoding")?;
     if transfer.is_some() && content_len.is_some() {
@@ -25,12 +29,7 @@ pub(super) fn receive(
     let body = if request.method == "HEAD" || matches!(status, 204 | 304) {
         HttpBody::Empty
     } else if transfer.is_some() {
-        HttpBody::Chunked(Box::new(ChunkedReader {
-            inner: BufReader::new(chained),
-            remaining: 0,
-            need_crlf: false,
-            eof: false,
-        }))
+        HttpBody::Chunked(Box::new(ChunkedReader::new(chained)))
     } else if let Some(len) = content_len {
         HttpBody::Fixed(chained, len)
     } else {
@@ -109,8 +108,6 @@ fn head(conn: &mut Connection, deadline: Instant) -> Result<(u16, Headers, Vec<u
             {
                 return Err(ErrorCode::InvalidArgument);
             }
-            // HTTP field octets use ISO-8859-1 in the JSON string representation;
-            // duplicate fields (notably Set-Cookie) remain distinct.
             let value: String = header.value.iter().map(|&b| char::from(b)).collect();
             headers.push((header.name.to_ascii_lowercase(), value));
         }

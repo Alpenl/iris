@@ -5,7 +5,7 @@
 mod playlist;
 mod transfer;
 
-use transfer::{copy_stream, ensure_identity, read_request, valid_range};
+use transfer::{copy_stream, ensure_identity, valid_range};
 
 use std::collections::BTreeMap;
 use std::io::{self, Read, Write};
@@ -23,6 +23,9 @@ use ring::aead::{Aad, CHACHA20_POLY1305, LessSafeKey, Nonce, UnboundKey};
 use ring::rand::{SecureRandom, SystemRandom};
 use url::Url;
 
+use crate::loopback_http::{
+    ClientHub, is_adaptive_manifest, is_adaptive_prefix_undecided, read_request,
+};
 use crate::vfs::http_client::{
     HttpCancel, NetworkScope, Request, open_stream, validate_stream_url,
 };
@@ -149,90 +152,14 @@ impl Routes {
     }
 }
 
-struct ClientState {
-    cancel: HttpCancel,
-    writable: Arc<(Mutex<u64>, Condvar)>,
-}
-
 pub(super) struct Service {
     routes: Routes,
     scope: NetworkScope,
     headers: BTreeMap<String, String>,
     cancel: HttpCancel,
     workers: AtomicUsize,
-    registry: mio::Registry,
+    hub: Arc<ClientHub>,
     wake: Waker,
-    next_token: AtomicUsize,
-    clients: Mutex<BTreeMap<usize, ClientState>>,
-}
-
-struct ClientWatch<'a> {
-    service: &'a Service,
-    token: usize,
-    stream: mio::net::TcpStream,
-    writable: Arc<(Mutex<u64>, Condvar)>,
-    armed_writable: bool,
-}
-
-impl ClientWatch<'_> {
-    fn writable_gen(&self) -> u64 {
-        *self.writable.0.lock().unwrap_or_else(|e| e.into_inner())
-    }
-
-    fn wait_writable(&mut self, seen_gen: u64, cancel: &HttpCancel) -> io::Result<()> {
-        if cancel.is_cancelled() {
-            return Err(io::Error::new(
-                io::ErrorKind::ConnectionAborted,
-                "relay cancelled",
-            ));
-        }
-        if let Err(err) = self.service.registry.reregister(
-            &mut self.stream,
-            Token(self.token),
-            Interest::READABLE | Interest::WRITABLE,
-        ) {
-            if cancel.is_cancelled() {
-                return Err(io::Error::new(
-                    io::ErrorKind::ConnectionAborted,
-                    "relay cancelled",
-                ));
-            }
-            return Err(err);
-        }
-        self.armed_writable = true;
-        let guard = self.writable.0.lock().unwrap_or_else(|e| e.into_inner());
-        if *guard == seen_gen {
-            let _ = self
-                .writable
-                .1
-                .wait_timeout(guard, Duration::from_millis(100));
-        }
-        if cancel.is_cancelled() {
-            return Err(io::Error::new(
-                io::ErrorKind::ConnectionAborted,
-                "relay cancelled",
-            ));
-        }
-        Ok(())
-    }
-
-    fn disarm_writable(&mut self) {
-        if self.armed_writable {
-            self.armed_writable = false;
-            let _ = self.service.registry.reregister(
-                &mut self.stream,
-                Token(self.token),
-                Interest::READABLE,
-            );
-        }
-    }
-}
-
-impl Drop for ClientWatch<'_> {
-    fn drop(&mut self) {
-        self.service.clients.lock().unwrap().remove(&self.token);
-        let _ = self.service.registry.deregister(&mut self.stream);
-    }
 }
 
 pub(super) struct PlaybackRelay {
@@ -257,10 +184,8 @@ impl PlaybackRelay {
             headers,
             cancel: HttpCancel::default(),
             workers: AtomicUsize::new(0),
-            registry,
+            hub: Arc::new(ClientHub::new(registry, 2)),
             wake,
-            next_token: AtomicUsize::new(2),
-            clients: Mutex::new(BTreeMap::new()),
         });
         let server = Arc::clone(&service);
         let listener = thread::Builder::new()
@@ -339,35 +264,7 @@ impl PlaybackRelay {
                         match event.token() {
                             LISTENER => accept_ready = true,
                             WAKE => (),
-                            Token(id)
-                                if event.is_readable()
-                                    || event.is_read_closed()
-                                    || event.is_write_closed()
-                                    || event.is_error() =>
-                            {
-                                if let Some(client) = server.clients.lock().unwrap().remove(&id) {
-                                    client.cancel.cancel();
-                                    let mut epoch =
-                                        client.writable.0.lock().unwrap_or_else(|e| e.into_inner());
-                                    *epoch = epoch.wrapping_add(1);
-                                    client.writable.1.notify_all();
-                                }
-                            }
-                            Token(id) if event.is_writable() => {
-                                let writable = server
-                                    .clients
-                                    .lock()
-                                    .unwrap()
-                                    .get(&id)
-                                    .map(|c| c.writable.clone());
-                                if let Some(writable) = writable {
-                                    let mut epoch =
-                                        writable.0.lock().unwrap_or_else(|e| e.into_inner());
-                                    *epoch = epoch.wrapping_add(1);
-                                    writable.1.notify_all();
-                                }
-                            }
-                            _ => (),
+                            _ => server.hub.dispatch_event(event),
                         }
                     }
                 }
@@ -447,7 +344,7 @@ impl Drop for Worker {
 fn reject_busy(mut socket: TcpStream) {
     // Drain the ordinary small request before replying so closing the
     // socket does not discard the response as an unread-data reset.
-    let _ = read_request(&mut socket, Duration::from_millis(100));
+    let _ = read_request(&mut socket, Duration::from_millis(100), MAX_REQUEST);
     let _ = socket.set_write_timeout(Some(Duration::from_millis(100)));
     let _ = socket.write_all(
         b"HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
@@ -483,37 +380,9 @@ impl Service {
         }).ok()
     }
 
-    fn watch_client(&self, socket: &TcpStream, req_cancel: HttpCancel) -> Result<ClientWatch<'_>> {
-        let cloned = socket.try_clone()?;
-        let mut stream = mio::net::TcpStream::from_std(cloned);
-        let token = self.next_token.fetch_add(1, Ordering::Relaxed);
-        let writable = Arc::new((Mutex::new(0u64), Condvar::new()));
-        self.clients.lock().unwrap().insert(
-            token,
-            ClientState {
-                cancel: req_cancel,
-                writable: writable.clone(),
-            },
-        );
-        if let Err(err) = self
-            .registry
-            .register(&mut stream, Token(token), Interest::READABLE)
-        {
-            self.clients.lock().unwrap().remove(&token);
-            return Err(err.into());
-        }
-        Ok(ClientWatch {
-            service: self,
-            token,
-            stream,
-            writable,
-            armed_writable: false,
-        })
-    }
-
     fn serve(&self, socket: &mut TcpStream, committed: &mut bool) -> Result<()> {
         socket.set_write_timeout(Some(CLIENT_TIMEOUT))?;
-        let raw = read_request(socket, CLIENT_TIMEOUT)?;
+        let raw = read_request(socket, CLIENT_TIMEOUT, MAX_REQUEST)?;
         let mut slots = [httparse::EMPTY_HEADER; 64];
         let mut request = httparse::Request::new(&mut slots);
         ensure!(
@@ -547,7 +416,7 @@ impl Service {
             .routes
             .open(request.path.context("missing playback route")?)?;
         let req_cancel = self.cancel.child()?;
-        let mut client_watch = self.watch_client(socket, req_cancel.clone())?;
+        let mut client_watch = self.hub.watch(socket, req_cancel.clone())?;
         if kind == RouteKind::Subtitle {
             // Remote attachments share the media's address policy even when
             // their origin has no access to the media request headers.
@@ -625,9 +494,7 @@ impl Service {
         if !playlist && method == "GET" && range.is_none_or(|r| r.starts_with("bytes=0-")) {
             let mut buf = [0u8; 64];
             let mut used = 0;
-            while used < buf.len()
-                && crate::plugin_v2::stream::prepare::adaptive_prefix_undecided(&buf[..used])
-            {
+            while used < buf.len() && is_adaptive_prefix_undecided(&buf[..used]) {
                 match response.body().read(&mut buf[used..]) {
                     Ok(0) => break,
                     Ok(n) => used += n,
@@ -640,7 +507,7 @@ impl Service {
                 }
             }
             ensure!(
-                !crate::plugin_v2::stream::prepare::adaptive(&buf[..used]),
+                !is_adaptive_manifest(&buf[..used]),
                 "unexpected adaptive manifest on media route"
             );
             sniffed.extend_from_slice(&buf[..used]);

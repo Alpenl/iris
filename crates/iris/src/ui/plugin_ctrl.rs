@@ -365,7 +365,9 @@ impl IrisWindow {
             self.persist_user_settings();
             self.sync_theme_tokens(cx);
         }
-        if let Some(session) = self.active().session.plugin_session() {
+        if let Some(session) =
+            iris_core::plugin_v2::stream::prepare::stream_session(&self.active().session)
+        {
             let owner_matches = self
                 .plugins
                 .list()

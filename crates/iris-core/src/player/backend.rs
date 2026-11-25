@@ -16,7 +16,7 @@ use crate::library::Kind;
 use crate::logging::{self, EventLevel};
 use crate::settings::{Hwdec, OnEof, Settings, SubLang};
 
-use super::Session;
+use super::{MediaSourceState, MonitorLutFilter, ScopedStream, Session, next_command_receipt};
 use super::model::{
     AspectMode, Command, MAX_SPEED, MIN_SPEED, PlayerActionError, SessionEvent, SessionUpdate,
 };
@@ -142,15 +142,15 @@ pub(super) fn create() -> Result<Arc<Mpv>> {
 pub(super) struct EventPump {
     done: Arc<AtomicBool>,
     relay: Arc<Mutex<Weak<Service>>>,
-    scoped: Arc<Mutex<Weak<crate::plugin_v2::stream::session::StreamSession>>>,
+    scoped: Arc<Mutex<Weak<dyn ScopedStream>>>,
     thread: Cell<Option<JoinHandle<()>>>,
 }
 
 impl EventPump {
     pub(super) fn set_scoped(
         &self,
-        scoped: Weak<crate::plugin_v2::stream::session::StreamSession>,
-    ) -> Weak<crate::plugin_v2::stream::session::StreamSession> {
+        scoped: Weak<dyn ScopedStream>,
+    ) -> Weak<dyn ScopedStream> {
         std::mem::replace(&mut *self.scoped.lock().unwrap(), scoped)
     }
     pub(super) fn set_relay(&self, relay: Weak<Service>) -> Weak<Service> {
@@ -191,9 +191,7 @@ pub(super) fn spawn_event_pump(
     let stopped = done.clone();
     let relay = Arc::new(Mutex::new(Weak::<Service>::new()));
     let source = relay.clone();
-    let scoped = Arc::new(Mutex::new(Weak::<
-        crate::plugin_v2::stream::session::StreamSession,
-    >::new()));
+    let scoped = Arc::new(Mutex::new(super::scoped::empty_scoped()));
     let scoped_source = scoped.clone();
     let thread = thread::Builder::new()
         .name("iris-mpv-events".into())
@@ -415,7 +413,7 @@ impl Session {
             Hwdec::AutoSafe => {
                 if (self.kind == Some(Kind::Video) && (self.state.hflip || self.state.vflip))
                     || (matches!(self.kind, Some(Kind::Video | Kind::Photo))
-                        && self.monitor_lut.is_some())
+                        && self.enhancements.monitor_lut.is_some())
                 {
                     "auto-copy"
                 } else {
@@ -529,10 +527,10 @@ impl Session {
         } else {
             0.
         };
-        if (offset - self.subtitle_inset).abs() < 0.1 {
+        if (offset - self.visual.subtitle_inset).abs() < 0.1 {
             return;
         }
-        self.subtitle_inset = offset;
+        self.visual.subtitle_inset = offset;
         if let Err(e) =
             self.mpv
                 .command_async(&["set", "sub-margin-y-offset", &offset.round().to_string()])
@@ -558,12 +556,12 @@ impl Session {
             {
                 r
             } else {
-                self.source_rotation
+                self.visual.source_rotation
             }
         } else {
-            self.source_rotation
+            self.visual.source_rotation
         };
-        (base + self.extra_rotate) % 360
+        (base + self.visual.extra_rotate) % 360
     }
 
     pub fn display_size(&self) -> (i64, i64) {
@@ -592,26 +590,23 @@ impl Session {
 
     /// Accepts only a background-validated data artifact, never a guest filter.
     /// This is a CPU preview transform; color-managed output is a separate stage.
-    pub fn set_monitor_lut(
-        &mut self,
-        lut: Option<Arc<crate::plugin_v2::lut::MonitorLut>>,
-    ) -> Result<()> {
+    pub fn set_monitor_lut(&mut self, lut: Option<Arc<dyn MonitorLutFilter>>) -> Result<()> {
         if lut.is_some()
             && (!self.state.loaded || !matches!(self.kind, Some(Kind::Photo | Kind::Video)))
         {
             return Err(PlayerActionError::NoVisualMedia.into());
         }
-        let previous = std::mem::replace(&mut self.monitor_lut, lut);
+        let previous = std::mem::replace(&mut self.enhancements.monitor_lut, lut);
         match self.apply_vf_filters_tracked(previous.is_some()) {
             Ok(Some(receipt)) => {
                 if let Some(old) = previous {
-                    self.retired_lut = Some((receipt, old));
+                    self.enhancements.retired_lut = Some((receipt, old));
                 }
                 Ok(())
             }
             Ok(None) => Ok(()),
             Err(error) => {
-                self.monitor_lut = previous;
+                self.enhancements.monitor_lut = previous;
                 let _ = self.apply_vf_filters();
                 Err(error)
             }
@@ -633,7 +628,7 @@ impl Session {
             let fallback = crate::photo::Photo::default();
             let meta = self.photo_meta.as_ref().unwrap_or(&fallback);
             meta.vf_chain_with_transforms(
-                self.extra_rotate,
+                self.visual.extra_rotate,
                 self.state.hflip,
                 self.state.vflip,
                 filter_rot,
@@ -649,16 +644,13 @@ impl Session {
             }
             chain.join(",")
         };
-        if let Some(lut) = &self.monitor_lut {
+        if let Some(lut) = &self.enhancements.monitor_lut {
             if !vf.is_empty() {
                 vf.push(',');
             }
-            vf.push_str(
-                &lut.filter()
-                    .map_err(|e| anyhow::anyhow!("invalid LUT preview: {e:?}"))?,
-            );
+            vf.push_str(&lut.filter_spec()?);
         }
-        if track_reply && let Ok(receipt) = crate::plugin_v2::instance::next_id() {
+        if track_reply && let Ok(receipt) = next_command_receipt() {
             self.mpv.command_with_reply(receipt, &["set", "vf", &vf])?;
             return Ok(Some(receipt));
         }
@@ -695,13 +687,13 @@ impl Session {
                 return;
             }
         }
-        let monitor_lut = self.monitor_lut.clone();
+        let monitor_lut = self.enhancements.monitor_lut.clone();
         let private_identity = self.private_identity;
         let (ab_start, ab_end) = (self.state.ab_start, self.state.ab_end);
         let (hflip, vflip, extra_rotate, aspect, sub_delay, paused, pos) = (
             self.state.hflip,
             self.state.vflip,
-            self.extra_rotate,
+            self.visual.extra_rotate,
             self.state.aspect,
             self.state.sub_delay,
             self.state.paused,
@@ -710,9 +702,11 @@ impl Session {
         let reloaded = if let Some(path) = self.current.clone() {
             let (kind, photo) = (self.kind, self.photo_meta.clone());
             self.load(&path, kind, photo, pos).is_ok()
-        } else if let Some(req) = self.last_remote.clone() {
+        } else if let MediaSourceState::DirectRemote { last_remote, .. } = &self.source {
+            let req = last_remote.clone();
             self.load_remote(req, settings, pos).is_ok()
-        } else if let Some(playback) = self.scoped_playback.clone() {
+        } else if let MediaSourceState::PluginScoped { playback, .. } = &self.source {
+            let playback = Arc::clone(playback);
             self.current_media_uri()
                 .is_some_and(|uri| self.open_scoped(playback, uri, settings, pos).is_ok())
         } else {
@@ -724,11 +718,11 @@ impl Session {
         self.private_identity = private_identity;
         self.state.hflip = hflip;
         self.state.vflip = vflip;
-        self.extra_rotate = extra_rotate;
-        self.monitor_lut = monitor_lut;
+        self.visual.extra_rotate = extra_rotate;
+        self.enhancements.monitor_lut = monitor_lut;
         if hflip
             || vflip
-            || self.monitor_lut.is_some()
+            || self.enhancements.monitor_lut.is_some()
             || (self.uses_filter_orientation() && extra_rotate != 0)
         {
             let _ = self.apply_vf_filters();

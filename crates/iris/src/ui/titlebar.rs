@@ -34,7 +34,8 @@ impl IrisWindow {
                 .display_badge()
                 .unwrap_or_else(|| "远程数据源".into())
         } else {
-            session
+            self.catalog
+                .local_dir
                 .folder()
                 .and_then(|f| f.file_name())
                 .map(|n| n.to_string_lossy().into_owned())

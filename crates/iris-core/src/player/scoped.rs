@@ -1,24 +1,86 @@
-//! Ready protocol-2 media admission. No plugin arguments become mpv options.
-use super::Session;
-use crate::{
-    media_uri::MediaUri,
-    plugin_v2::stream::{manifest::Profile, prepare::Playback, session::StreamSession},
-    settings::Settings,
-};
-use anyhow::{Result, ensure};
-use iris_mpv::Mpv;
+//! Ready externally-scoped media admission. No plugin arguments become mpv options.
+
+use std::any::Any;
 use std::sync::Arc;
 
+use anyhow::{Result, ensure};
+use iris_mpv::Mpv;
+
+use super::{MediaSourceState, Session};
+use crate::library::Kind;
+use crate::media_uri::MediaUri;
+use crate::settings::Settings;
+
+/// Demuxer profile admitted for an externally-scoped media stream.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StreamProfile {
+    Hls,
+    Dash,
+}
+
+/// Sealed loopback attachment prepared alongside a [`ScopedPlayback`].
+#[derive(Clone, Debug)]
+pub struct ScopedAttachment {
+    pub id: String,
+    pub url: String,
+    pub label: String,
+    pub lang: Option<String>,
+    pub default: bool,
+    pub audio: bool,
+}
+
+/// Host-side handle to an externally-scoped media relay (e.g. protocol-2 plugin stream).
+pub trait ScopedStream: Send + Sync {
+    fn root_url(&self) -> Result<String>;
+    fn is_cancelled(&self) -> bool;
+    fn advance_seek(&self) -> Result<()>;
+    fn stop(&self);
+    fn as_any(&self) -> &(dyn Any + Send + Sync);
+}
+
+struct EmptyScoped;
+impl ScopedStream for EmptyScoped {
+    fn root_url(&self) -> Result<String> {
+        anyhow::bail!("no scoped stream")
+    }
+    fn is_cancelled(&self) -> bool {
+        true
+    }
+    fn advance_seek(&self) -> Result<()> {
+        Ok(())
+    }
+    fn stop(&self) {}
+    fn as_any(&self) -> &(dyn Any + Send + Sync) {
+        self
+    }
+}
+
+pub(super) fn empty_scoped() -> std::sync::Weak<dyn ScopedStream> {
+    std::sync::Weak::<EmptyScoped>::new()
+}
+
+/// Ready-to-open scoped media playback descriptor admitted by [`Session::open_scoped`].
+pub struct ScopedPlayback {
+    pub url: String,
+    pub profile: Option<StreamProfile>,
+    pub kind: Kind,
+    pub title: String,
+    pub is_live: bool,
+    pub attachments: Vec<ScopedAttachment>,
+    pub stream: Arc<dyn ScopedStream>,
+}
+
 const OPAQUE_FORMATS: &str = "mov,matroska,mpegts,mpeg,mpegvideo,avi,flv,ogg,mp3,aac,ac3,eac3,flac,wav,aiff,webvtt,srt,ass,yuv4mpegpipe,jpeg_pipe,png_pipe,webp_pipe,bmp_pipe,tiff_pipe,gif,ico,avif";
-fn options(profile: Option<Profile>) -> Vec<(&'static str, String)> {
+
+fn options(profile: Option<StreamProfile>) -> Vec<(&'static str, String)> {
     let (format, protocols, formats, references) = match profile {
-        Some(Profile::Hls) => (
+        Some(StreamProfile::Hls) => (
             "hls",
             "http,tcp,crypto",
             "hls,mpegts,mov,aac,ac3,eac3,mp3,webvtt",
             true,
         ),
-        Some(Profile::Dash) => ("dash", "http,tcp", "dash,mov,matroska,webvtt", true),
+        Some(StreamProfile::Dash) => ("dash", "http,tcp", "dash,mov,matroska,webvtt", true),
         None => ("", "http,tcp", OPAQUE_FORMATS, false),
     };
     vec![
@@ -45,16 +107,18 @@ fn options(profile: Option<Profile>) -> Vec<(&'static str, String)> {
         ),
     ]
 }
+
 pub(super) fn restore_attachment_policy(mpv: &Mpv) -> Result<()> {
     for (key, value) in options(None) {
         mpv.set_property_string(&format!("file-local-options/{key}"), &value)?;
     }
     Ok(())
 }
+
 impl Session {
     pub fn open_scoped(
         &mut self,
-        playback: Arc<Playback>,
+        playback: Arc<ScopedPlayback>,
         uri: MediaUri,
         settings: &Settings,
         resume: f64,
@@ -63,16 +127,13 @@ impl Session {
             !matches!(uri, MediaUri::Local(_)),
             "plugin media cannot adopt a local identity"
         );
-        ensure!(
-            !playback.relay.session().cancellation().is_cancelled(),
-            "playback session expired"
+        ensure!(!playback.stream.is_cancelled(), "playback session expired");
+        let same_stream = matches!(
+            &self.source,
+            MediaSourceState::PluginScoped { playback: old, .. } if Arc::ptr_eq(old, &playback)
         );
-        if self
-            .scoped_playback
-            .as_ref()
-            .is_some_and(|old| Arc::ptr_eq(old, &playback))
-        {
-            playback.relay.session().advance_seek()?;
+        if same_stream {
+            playback.stream.advance_seek()?;
         }
         self.reset_backend_for_load()?;
         self.on_eof.set(settings.on_eof);
@@ -85,7 +146,7 @@ impl Session {
         let old_relay = self.event_pump.set_relay(Default::default());
         let old_scope = self
             .event_pump
-            .set_scoped(Arc::downgrade(playback.relay.session()));
+            .set_scoped(Arc::downgrade(&playback.stream));
         let id = match self
             .mpv
             .loadfile_with_options(&playback.url, "replace", &opts)
@@ -97,33 +158,34 @@ impl Session {
                 return Err(error.into());
             }
         };
-        if let Some(old) = &self.scoped_playback
+        if let MediaSourceState::PluginScoped { playback: old, .. } = &self.source
             && !Arc::ptr_eq(old, &playback)
         {
-            old.relay.stop();
+            old.stream.stop();
         }
-        self.playback_relay = None;
-        self.pending_scoped_tracks = playback.attachments.clone();
-        self.reset_for_load(
-            None,
-            uri.to_uri_string(),
-            Some(playback.title.clone()),
-            id,
-            Vec::new(),
-            playback.kind,
-            playback.is_live,
-            None,
-        );
+        let pending_tracks = playback.attachments.clone();
         let profile_label = match playback.profile {
-            Some(Profile::Hls) => "hls",
-            Some(Profile::Dash) => "dash",
+            Some(StreamProfile::Hls) => "hls",
+            Some(StreamProfile::Dash) => "dash",
             None => "direct",
         };
         let attachment_count = playback.attachments.len();
         let kind = playback.kind;
         let is_live = playback.is_live;
-        self.last_remote = None;
-        self.scoped_playback = Some(playback);
+        let title = playback.title.clone();
+        self.source = MediaSourceState::PluginScoped {
+            playback,
+            pending_tracks,
+        };
+        self.reset_for_load(
+            None,
+            uri.to_uri_string(),
+            Some(title),
+            id,
+            kind,
+            is_live,
+            None,
+        );
         crate::logging::event(
             crate::logging::EventLevel::Info,
             "player",
@@ -139,23 +201,32 @@ impl Session {
         );
         Ok(())
     }
-    pub fn plugin_session(&self) -> Option<Arc<StreamSession>> {
-        self.scoped_playback
-            .as_ref()
-            .map(|p| p.relay.session().clone())
+
+    pub fn scoped_stream(&self) -> Option<Arc<dyn ScopedStream>> {
+        match &self.source {
+            MediaSourceState::PluginScoped { playback, .. } => Some(Arc::clone(&playback.stream)),
+            _ => None,
+        }
     }
+
     pub fn release_scoped(&mut self) {
         self.discard_scoped();
     }
+
     pub(super) fn discard_scoped(&mut self) {
-        self.pending_scoped_tracks.clear();
-        if let Some(playback) = self.scoped_playback.take() {
-            playback.relay.stop();
+        if let MediaSourceState::PluginScoped { playback, .. } =
+            std::mem::replace(&mut self.source, MediaSourceState::Idle)
+        {
+            playback.stream.stop();
         }
-        self.event_pump.set_scoped(Default::default());
+        self.event_pump.set_scoped(empty_scoped());
     }
+
     pub(super) fn attach_scoped_tracks(&mut self) {
-        for track in std::mem::take(&mut self.pending_scoped_tracks) {
+        let MediaSourceState::PluginScoped { pending_tracks, .. } = &mut self.source else {
+            return;
+        };
+        for track in std::mem::take(pending_tracks) {
             let command = if track.audio { "audio-add" } else { "sub-add" };
             let flags = if track.default { "select" } else { "auto" };
             if self

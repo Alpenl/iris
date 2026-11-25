@@ -1,13 +1,13 @@
 mod protocol;
 mod pump;
-use super::RequestGrant;
+use super::{RequestGrant, duplex};
 use crate::{
     plugin_v2::{
         actor::{Completion, IoOutcome, Operation, TaskContext},
         instance::Blob,
         ledger::Reservation,
     },
-    vfs::{HttpCancel, http_client::duplex},
+    vfs::HttpCancel,
 };
 use iris_api::v2::{CHUNK_LIMIT, ErrorCode};
 use mio::{Poll, Token, Waker};

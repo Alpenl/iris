@@ -160,7 +160,7 @@ impl IrisWindow {
     pub(super) fn pin_current_location(&mut self, cx: &mut Context<Self>) {
         let (name, uri, folder_id) = match &self.catalog.active_source {
             ActiveSource::Local => {
-                let Some(folder) = self.active().session.folder().map(Path::to_path_buf) else {
+                let Some(folder) = self.catalog.local_dir.folder().map(Path::to_path_buf) else {
                     self.show_toast("当前未打开本地文件夹", cx);
                     return;
                 };

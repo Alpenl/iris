@@ -1,7 +1,9 @@
 use super::Origin;
 use crate::{
-    plugin_v2::ledger::{Ledger, Reservation, Resource},
-    vfs::http_client::raw::{Cookies, Headers},
+    plugin_v2::{
+        ledger::{Ledger, Reservation, Resource},
+        network::raw::{Cookies, Headers},
+    },
 };
 use iris_api::v2::ErrorCode;
 use std::{

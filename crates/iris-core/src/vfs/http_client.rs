@@ -3,14 +3,17 @@
 
 use std::collections::BTreeMap;
 use std::io::{self, BufRead, BufReader, Cursor, Read, Write};
+pub(crate) mod address;
 mod connection;
-pub(crate) mod raw;
 
-pub(crate) use connection::NetworkScope;
+pub use address::{AddressKind, address_kind};
 pub(crate) use connection::doh;
-pub(crate) use connection::duplex;
+pub(crate) use connection::{
+    ConnectRegistration, ConnectionPolicy, HttpClientError, NetworkScope, SocketRegistration,
+    Transport, connect_authorized, connect_transport,
+};
 pub use connection::{HttpCancel, validate_stream_url};
-use connection::{SocketRegistration, connect_transport, remaining_timeout};
+use connection::remaining_timeout;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -22,7 +25,7 @@ const MAX_REDIRECTS: usize = 5;
 const MAX_RESPONSE_HEADER_BYTES: usize = 64 * 1024;
 const MAX_CHUNK_LINE_BYTES: usize = 4 * 1024;
 
-fn is_tchar(b: u8) -> bool {
+pub(crate) fn is_tchar(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b)
 }
 
@@ -83,7 +86,7 @@ fn header_ci<'a>(headers: &'a BTreeMap<String, String>, name: &str) -> Option<&'
         .map(|(_, v)| v.as_str())
 }
 
-fn parse_decimal_u64(raw: &str) -> Option<u64> {
+pub(crate) fn parse_decimal_u64(raw: &str) -> Option<u64> {
     (!raw.is_empty() && raw.bytes().all(|b| b.is_ascii_digit()))
         .then(|| raw.parse::<u64>().ok())
         .flatten()
@@ -99,9 +102,9 @@ fn ensure_identity_headers(headers: &BTreeMap<String, String>) -> Result<()> {
     Ok(())
 }
 
-type ResponseReader = io::Chain<Cursor<Vec<u8>>, connection::Transport>;
+pub(crate) type ResponseReader = io::Chain<Cursor<Vec<u8>>, connection::Transport>;
 
-struct ChunkedReader {
+pub(crate) struct ChunkedReader {
     inner: BufReader<ResponseReader>,
     remaining: u64,
     need_crlf: bool,
@@ -109,6 +112,19 @@ struct ChunkedReader {
 }
 
 impl ChunkedReader {
+    pub(crate) fn new(inner: ResponseReader) -> Self {
+        Self {
+            inner: BufReader::new(inner),
+            remaining: 0,
+            need_crlf: false,
+            eof: false,
+        }
+    }
+
+    pub(crate) fn transport_mut(&mut self) -> &mut connection::Transport {
+        self.inner.get_mut().get_mut().1
+    }
+
     fn read_line_capped(&mut self) -> io::Result<Vec<u8>> {
         let mut line = Vec::with_capacity(64);
         loop {
@@ -199,11 +215,22 @@ impl Read for ChunkedReader {
     }
 }
 
-enum HttpBody {
+pub(crate) enum HttpBody {
     Empty,
     Chunked(Box<ChunkedReader>),
     Fixed(ResponseReader, u64),
     CloseDelimited(ResponseReader),
+}
+
+impl HttpBody {
+    pub(crate) fn set_body_deadline(&mut self, deadline: Option<Instant>) -> io::Result<()> {
+        let transport = match self {
+            Self::Empty => return Ok(()),
+            Self::Chunked(body) => body.transport_mut(),
+            Self::Fixed(body, _) | Self::CloseDelimited(body) => body.get_mut().1,
+        };
+        transport.set_body_deadline(deadline)
+    }
 }
 
 impl Read for HttpBody {

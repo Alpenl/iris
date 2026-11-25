@@ -63,6 +63,71 @@ pub struct Playback {
     pub variants: Vec<iris_api::StreamVariant>,
     pub active_variant: Option<String>,
 }
+
+impl crate::player::ScopedStream for Playback {
+    fn root_url(&self) -> anyhow::Result<String> {
+        self.relay
+            .session()
+            .root_url()
+            .map_err(|e| anyhow::anyhow!("scoped stream root url failed: {e:?}"))
+    }
+    fn is_cancelled(&self) -> bool {
+        self.relay.session().cancellation().is_cancelled()
+    }
+    fn advance_seek(&self) -> anyhow::Result<()> {
+        self.relay
+            .session()
+            .advance_seek()
+            .map(|_| ())
+            .map_err(|e| anyhow::anyhow!("scoped stream seek failed: {e:?}"))
+    }
+    fn stop(&self) {
+        self.relay.stop();
+    }
+    fn as_any(&self) -> &(dyn std::any::Any + Send + Sync) {
+        self
+    }
+}
+
+impl Playback {
+    /// Adapts a prepared protocol-2 playback into a decoupled [`crate::player::ScopedPlayback`].
+    pub fn into_scoped(self: Arc<Self>) -> Arc<crate::player::ScopedPlayback> {
+        let profile = self.profile.map(|p| match p {
+            Profile::Hls => crate::player::StreamProfile::Hls,
+            Profile::Dash => crate::player::StreamProfile::Dash,
+        });
+        let attachments = self
+            .attachments
+            .iter()
+            .map(|a| crate::player::ScopedAttachment {
+                id: a.id.clone(),
+                url: a.url.clone(),
+                label: a.label.clone(),
+                lang: a.lang.clone(),
+                default: a.default,
+                audio: a.audio,
+            })
+            .collect();
+        Arc::new(crate::player::ScopedPlayback {
+            url: self.url.clone(),
+            profile,
+            kind: self.kind,
+            title: self.title.clone(),
+            is_live: self.is_live,
+            attachments,
+            stream: self,
+        })
+    }
+}
+
+/// Extracts the underlying protocol-2 [`StreamSession`] if `session` is playing a plugin stream.
+pub fn stream_session(session: &crate::player::Session) -> Option<Arc<StreamSession>> {
+    session
+        .scoped_stream()?
+        .as_any()
+        .downcast_ref::<Playback>()
+        .map(|p| p.relay.session().clone())
+}
 impl Preparation {
     pub fn prepare(
         self,
@@ -288,25 +353,7 @@ pub(crate) fn probe_prefix<R: Reader + ?Sized>(
     Ok(out)
 }
 pub(crate) fn adaptive(bytes: &[u8]) -> bool {
-    let bytes = bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(bytes);
-    let trimmed = bytes.trim_ascii_start();
-    trimmed.starts_with(b"#EXTM3U")
-        || trimmed == b"<"
-        || (trimmed.len() >= 2
-            && trimmed[0] == b'<'
-            && matches!(trimmed[1], b'?' | b'!' | b'a'..=b'z' | b'A'..=b'Z' | b'/'))
-}
-pub(crate) fn adaptive_prefix_undecided(bytes: &[u8]) -> bool {
-    if bytes.is_empty() || bytes == b"\xef" || bytes == b"\xef\xbb" {
-        return true;
-    }
-    let trimmed = bytes
-        .strip_prefix(b"\xef\xbb\xbf")
-        .unwrap_or(bytes)
-        .trim_ascii_start();
-    trimmed.is_empty()
-        || (trimmed.len() < 7 && b"#EXTM3U".starts_with(trimmed))
-        || (trimmed.len() < 2 && trimmed[0] == b'<')
+    crate::loopback_http::is_adaptive_manifest(bytes)
 }
 pub(crate) fn subtitle_format(bytes: &[u8]) -> Result<&'static str, ErrorCode> {
     if bytes.len() > 10 << 20 {

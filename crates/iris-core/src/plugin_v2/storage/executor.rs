@@ -78,7 +78,7 @@ impl StorageExecutor {
                 let value = store
                     .vault
                     .try_get_secret(&store.scope(), &key)
-                    .map_err(|e| crate::vault::vault_error_code(&e))?;
+                    .map_err(|e| vault_error_code(&e))?;
                 // Revocation while waiting on the OS vault must not deliver data.
                 self.credential_key(&bucket, "check")?;
                 check(&context.cancel)?;
@@ -93,13 +93,32 @@ impl StorageExecutor {
                 store
                     .vault
                     .set_secret(&store.scope(), &key, value.as_deref())
-                    .map_err(|e| crate::vault::vault_error_code(&e))?;
+                    .map_err(|e| vault_error_code(&e))?;
                 serde_json::json!({"stored":true,"revision":null})
             }
             _ => return Err(ErrorCode::Unsupported),
         };
         Ok(IoOutcome::new(value, None))
     }
+}
+
+fn vault_error_code(error: &anyhow::Error) -> ErrorCode {
+    if let Some(typed) = error.downcast_ref::<crate::vault::VaultError>() {
+        return match typed.kind {
+            crate::vault::VaultErrorKind::QuotaExceeded => ErrorCode::QuotaExceeded,
+            crate::vault::VaultErrorKind::Busy => ErrorCode::Backpressure,
+            crate::vault::VaultErrorKind::InvalidArgument => ErrorCode::InvalidArgument,
+            crate::vault::VaultErrorKind::Backend => ErrorCode::IoError,
+        };
+    }
+    if error
+        .chain()
+        .filter_map(|cause| cause.downcast_ref::<std::io::Error>())
+        .any(|io_err| io_err.kind() == std::io::ErrorKind::WouldBlock)
+    {
+        return ErrorCode::Backpressure;
+    }
+    ErrorCode::IoError
 }
 impl Executor for StorageExecutor {
     fn prepare(

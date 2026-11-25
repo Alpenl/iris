@@ -393,7 +393,7 @@ impl IrisWindow {
                 };
                 self.store.push_recent_with_title(&uri, title.as_deref());
             }
-        } else if let Some(dir) = self.active().session.folder().map(Path::to_path_buf)
+        } else if let Some(dir) = self.catalog.local_dir.folder().map(Path::to_path_buf)
             && self.catalog.active_source.is_local()
         {
             self.store.push_recent_path(&dir);
@@ -499,16 +499,16 @@ impl IrisWindow {
         self.catalog.active_source = ActiveSource::Local;
         self.catalog.active_stream_meta = None;
         let cached = {
-            let session = &self.active().session;
-            session
+            let local_dir = &self.catalog.local_dir;
+            local_dir
                 .folder()
                 .filter(|folder| path.parent() == Some(*folder))
                 .map(|folder| {
                     (
                         folder.to_path_buf(),
                         ScanResult {
-                            entries: session.entries().to_vec(),
-                            subfolders: session.subfolders().to_vec(),
+                            entries: local_dir.entries().to_vec(),
+                            subfolders: local_dir.subfolders().to_vec(),
                         },
                     )
                 })
@@ -556,7 +556,9 @@ impl IrisWindow {
                     } else {
                         0.
                     };
-                    this.active_mut().session.open(prepared, resume)
+                    let dir = this.active_mut().session.open(prepared, resume)?;
+                    this.catalog.local_dir = dir;
+                    Ok(())
                 });
                 match result {
                     Ok(()) => {
@@ -629,7 +631,8 @@ impl IrisWindow {
                     .session
                     .open_prepared_queue(prepared, resume)
                 {
-                    Ok(()) => {
+                    Ok(dir) => {
+                        this.catalog.local_dir = dir;
                         this.finish_media_open(cx);
                         this.show_toast(format!("已加入播放队列 · {count} 个文件"), cx);
                     }

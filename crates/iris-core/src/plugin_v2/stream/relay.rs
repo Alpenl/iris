@@ -6,6 +6,9 @@ use super::{
 };
 use crate::{
     logging,
+    loopback_http::{
+        ClientHub, ClientWatch, read_request, write_all_cancellable, write_chunk_cancellable,
+    },
     plugin_v2::{
         actor::ReadResult,
         ledger::{Reservation, Resource},
@@ -16,14 +19,13 @@ use iris_api::v2::{CHUNK_LIMIT, ErrorCode};
 use mio::{Events, Interest, Poll, Token, Waker};
 use serde_json::json;
 use std::{
-    collections::BTreeMap,
-    io::{Read, Write},
+    io::Write,
     net::{Ipv4Addr, SocketAddr, TcpStream},
     sync::{
-        Arc, Condvar, Mutex,
+        Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
 const LISTENER: Token = Token(0);
 const WAKE: Token = Token(1);
@@ -60,9 +62,10 @@ impl BoundRelay {
             .map_err(|_| ErrorCode::Cancelled)?;
         let service = Arc::new(Service {
             session,
-            registry: self.poll.registry().try_clone().map_err(io)?,
-            next: AtomicUsize::new(2),
-            clients: Mutex::new(BTreeMap::new()),
+            hub: Arc::new(ClientHub::new(
+                self.poll.registry().try_clone().map_err(io)?,
+                2,
+            )),
             active: AtomicUsize::new(0),
             done: AtomicBool::new(false),
             wake,
@@ -105,15 +108,9 @@ impl Drop for Relay {
         self.stop();
     }
 }
-struct ClientState {
-    cancel: HttpCancel,
-    writable: Arc<(Mutex<u64>, Condvar)>,
-}
 struct Service {
     session: Arc<StreamSession>,
-    registry: mio::Registry,
-    next: AtomicUsize,
-    clients: Mutex<BTreeMap<usize, ClientState>>,
+    hub: Arc<ClientHub>,
     active: AtomicUsize,
     done: AtomicBool,
     wake: Arc<Waker>,
@@ -126,68 +123,6 @@ impl Drop for Worker {
     fn drop(&mut self) {
         self.reservation.take();
         self.service.active.fetch_sub(1, Ordering::AcqRel);
-    }
-}
-struct Watch {
-    service: Arc<Service>,
-    stream: mio::net::TcpStream,
-    token: usize,
-    writable: Arc<(Mutex<u64>, Condvar)>,
-    armed_writable: bool,
-}
-impl Watch {
-    fn writable_gen(&self) -> u64 {
-        *self.writable.0.lock().unwrap_or_else(|e| e.into_inner())
-    }
-    fn wait_writable(&mut self, seen_gen: u64, cancel: &HttpCancel) -> Result<(), ErrorCode> {
-        if cancel.is_cancelled() {
-            return Err(ErrorCode::Cancelled);
-        }
-        if let Err(err) = self.service.registry.reregister(
-            &mut self.stream,
-            Token(self.token),
-            Interest::READABLE | Interest::WRITABLE,
-        ) {
-            if cancel.is_cancelled() {
-                return Err(ErrorCode::Cancelled);
-            }
-            return Err(io(err));
-        }
-        self.armed_writable = true;
-        if cancel.is_cancelled() {
-            return Err(ErrorCode::Cancelled);
-        }
-        let guard = self.writable.0.lock().unwrap_or_else(|e| e.into_inner());
-        if *guard == seen_gen {
-            let _ = self
-                .writable
-                .1
-                .wait_timeout(guard, Duration::from_millis(100));
-        }
-        if cancel.is_cancelled() {
-            return Err(ErrorCode::Cancelled);
-        }
-        Ok(())
-    }
-    fn disarm_writable(&mut self) {
-        if self.armed_writable {
-            self.armed_writable = false;
-            let _ = self.service.registry.reregister(
-                &mut self.stream,
-                Token(self.token),
-                Interest::READABLE,
-            );
-        }
-    }
-}
-impl Drop for Watch {
-    fn drop(&mut self) {
-        self.service
-            .clients
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&self.token);
-        let _ = self.service.registry.deregister(&mut self.stream);
     }
 }
 fn serve_listener(bound: &mut BoundRelay, service: &Arc<Service>) {
@@ -282,38 +217,7 @@ fn serve_listener(bound: &mut BoundRelay, service: &Arc<Service>) {
             match event.token() {
                 LISTENER => ready = true,
                 WAKE => (),
-                Token(id)
-                    if event.is_readable()
-                        || event.is_read_closed()
-                        || event.is_write_closed()
-                        || event.is_error() =>
-                {
-                    let client = service
-                        .clients
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .remove(&id);
-                    if let Some(client) = client {
-                        client.cancel.cancel();
-                        let mut epoch = client.writable.0.lock().unwrap_or_else(|e| e.into_inner());
-                        *epoch = epoch.wrapping_add(1);
-                        client.writable.1.notify_all();
-                    }
-                }
-                Token(id) if event.is_writable() => {
-                    let writable = service
-                        .clients
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .get(&id)
-                        .map(|c| c.writable.clone());
-                    if let Some(writable) = writable {
-                        let mut epoch = writable.0.lock().unwrap_or_else(|e| e.into_inner());
-                        *epoch = epoch.wrapping_add(1);
-                        writable.1.notify_all();
-                    }
-                }
-                _ => (),
+                _ => service.hub.dispatch_event(event),
             }
         }
     }
@@ -338,67 +242,13 @@ fn reserve_worker(service: &Arc<Service>) -> Result<Worker, ErrorCode> {
         reservation: Some(reservation),
     })
 }
-fn watch(
-    service: &Arc<Service>,
-    socket: &TcpStream,
-    cancel: &HttpCancel,
-) -> Result<Watch, ErrorCode> {
-    let token = service
-        .next
-        .try_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_add(1))
-        .map_err(|_| ErrorCode::QuotaExceeded)?;
-    let cloned = socket.try_clone().map_err(io)?;
-    let mut stream = mio::net::TcpStream::from_std(cloned);
-    let writable = Arc::new((Mutex::new(0u64), Condvar::new()));
-    service
-        .clients
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert(
-            token,
-            ClientState {
-                cancel: cancel.clone(),
-                writable: writable.clone(),
-            },
-        );
-    if let Err(error) = service
-        .registry
-        .register(&mut stream, Token(token), Interest::READABLE)
-    {
-        service
-            .clients
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&token);
-        return Err(io(error));
-    }
-    Ok(Watch {
-        service: service.clone(),
-        stream,
-        token,
-        writable,
-        armed_writable: false,
-    })
-}
-fn request(socket: &mut TcpStream) -> Result<Vec<u8>, ErrorCode> {
-    socket.set_nonblocking(false).map_err(io)?;
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let mut data = Vec::with_capacity(2048);
-    let mut chunk = [0; 2048];
-    loop {
-        let left = deadline
-            .checked_duration_since(Instant::now())
-            .ok_or(ErrorCode::Timeout)?;
-        socket.set_read_timeout(Some(left)).map_err(io)?;
-        let n = socket.read(&mut chunk).map_err(io)?;
-        if n == 0 || data.len() + n > HEADER_LIMIT {
-            return Err(ErrorCode::InvalidArgument);
-        }
-        let previous = data.len().saturating_sub(3);
-        data.extend_from_slice(&chunk[..n]);
-        if data[previous..].windows(4).any(|p| p == b"\r\n\r\n") {
-            return Ok(data);
-        }
+fn map_watch_io(error: std::io::Error, cancel: &HttpCancel) -> ErrorCode {
+    if cancel.is_cancelled() || error.kind() == std::io::ErrorKind::ConnectionAborted {
+        ErrorCode::Cancelled
+    } else if error.kind() == std::io::ErrorKind::InvalidData {
+        ErrorCode::InvalidArgument
+    } else {
+        io(error)
     }
 }
 fn serve(
@@ -410,7 +260,8 @@ fn serve(
     socket
         .set_write_timeout(Some(Duration::from_secs(30)))
         .map_err(io)?;
-    let bytes = request(socket)?;
+    let bytes = read_request(socket, Duration::from_secs(5), HEADER_LIMIT)
+        .map_err(|e| map_watch_io(e, cancel))?;
     let mut slots = [httparse::EMPTY_HEADER; 32];
     let mut request = httparse::Request::new(&mut slots);
     let used = match request
@@ -457,7 +308,7 @@ fn serve(
     socket.set_write_timeout(None).map_err(io)?;
     socket.set_read_timeout(None).map_err(io)?;
     socket.set_nonblocking(true).map_err(io)?;
-    let mut watch = watch(service, socket, cancel)?;
+    let mut watch = service.hub.watch(socket, cancel.clone()).map_err(io)?;
     let access = service
         .session
         .open(request.path.ok_or(ErrorCode::InvalidArgument)?, cancel)?;
@@ -474,7 +325,8 @@ fn serve(
             } else {
                 reply.push_str("Content-Range: bytes */*\r\n\r\n");
             }
-            write_all_cancellable(socket, reply.as_bytes(), &mut watch, cancel)?;
+            write_all_cancellable(socket, reply.as_bytes(), &mut watch, cancel)
+                .map_err(|e| map_watch_io(e, cancel))?;
             return Err(error);
         }
     };
@@ -595,7 +447,7 @@ fn write_response_headers(
     accept_ranges: bool,
     head: bool,
     profile: Option<super::manifest::Profile>,
-    watch: &mut Watch,
+    watch: &mut ClientWatch,
     cancel: &HttpCancel,
 ) -> Result<(), ErrorCode> {
     let mut header = format!(
@@ -624,67 +476,24 @@ fn write_response_headers(
     };
     header.push_str(&format!("Content-Type: {mime}\r\n\r\n"));
     write_all_cancellable(socket, header.as_bytes(), watch, cancel)
-}
-fn write_all_cancellable(
-    socket: &mut TcpStream,
-    mut bytes: &[u8],
-    watch: &mut Watch,
-    cancel: &HttpCancel,
-) -> Result<(), ErrorCode> {
-    while !bytes.is_empty() {
-        if cancel.is_cancelled() {
-            watch.disarm_writable();
-            return Err(ErrorCode::Cancelled);
-        }
-        let epoch = watch.writable_gen();
-        match socket.write(bytes) {
-            Ok(0) => {
-                watch.disarm_writable();
-                return Err(ErrorCode::IoError);
-            }
-            Ok(n) => bytes = &bytes[n..],
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                if let Err(err) = watch.wait_writable(epoch, cancel) {
-                    watch.disarm_writable();
-                    return Err(err);
-                }
-            }
-            Err(e) => {
-                watch.disarm_writable();
-                return Err(io(e));
-            }
-        }
-    }
-    watch.disarm_writable();
-    Ok(())
+        .map_err(|e| map_watch_io(e, cancel))
 }
 fn write_chunk(
     socket: &mut TcpStream,
     bytes: &[u8],
     chunked: bool,
-    watch: &mut Watch,
+    watch: &mut ClientWatch,
     cancel: &HttpCancel,
 ) -> Result<(), ErrorCode> {
-    if bytes.is_empty() {
-        return Ok(());
-    }
-    if chunked {
-        let header = format!("{:x}\r\n", bytes.len());
-        write_all_cancellable(socket, header.as_bytes(), watch, cancel)?;
-    }
-    write_all_cancellable(socket, bytes, watch, cancel)?;
-    if chunked {
-        write_all_cancellable(socket, b"\r\n", watch, cancel)?;
-    }
-    Ok(())
+    write_chunk_cancellable(socket, bytes, chunked, watch, cancel)
+        .map_err(|e| map_watch_io(e, cancel))
 }
 fn write_stream_body(
     socket: &mut TcpStream,
     access: &Access,
     range: Range,
     stream: &mut super::reader::OpenedStream,
-    watch: &mut Watch,
+    watch: &mut ClientWatch,
 ) -> Result<(), ErrorCode> {
     let chunked = range.len.is_none();
     let mut left = range.len;
@@ -721,7 +530,8 @@ fn write_stream_body(
         }
     }
     if chunked {
-        write_all_cancellable(socket, b"0\r\n\r\n", watch, &access.cancel)?;
+        write_all_cancellable(socket, b"0\r\n\r\n", watch, &access.cancel)
+            .map_err(|e| map_watch_io(e, &access.cancel))?;
     }
     Ok(())
 }
@@ -743,7 +553,7 @@ fn write_body(
     access: Access,
     range: Range,
     mut next: Option<ReadResult>,
-    watch: &mut Watch,
+    watch: &mut ClientWatch,
 ) -> Result<(), ErrorCode> {
     let chunked = range.len.is_none();
     let mut offset = range.offset;
@@ -771,7 +581,8 @@ fn write_body(
         }
     }
     if chunked {
-        write_all_cancellable(socket, b"0\r\n\r\n", watch, &access.cancel)?;
+        write_all_cancellable(socket, b"0\r\n\r\n", watch, &access.cancel)
+            .map_err(|e| map_watch_io(e, &access.cancel))?;
     }
     Ok(())
 }

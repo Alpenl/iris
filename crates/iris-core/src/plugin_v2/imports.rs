@@ -3,7 +3,7 @@ use super::{
     ledger::Resource,
 };
 use iris_api::v2::{CHUNK_LIMIT, ErrorCode, MESSAGE_LIMIT, Role, crypto::CryptoSpec, task::Task};
-use iris_plugin_sdk::json::decode;
+use crate::plugin_v2::json::decode;
 use ring::rand::{SecureRandom, SystemRandom};
 use std::{
     sync::Arc,

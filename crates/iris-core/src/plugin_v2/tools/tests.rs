@@ -21,7 +21,7 @@ use std::{
 
 #[test]
 fn typed_arguments_and_output_parsers_cannot_expand_operations() {
-    assert!(iris_plugin_sdk::json::decode_exact::<Task>(br#"{"operation":"invoke_tool","task":{"kind":"resolve_metadata","url":"https://example.com","origin_grant":null,"extra_args":"--exec whoami"}}"#, 65536).is_err());
+    assert!(crate::plugin_v2::json::decode_exact::<Task>(br#"{"operation":"invoke_tool","task":{"kind":"resolve_metadata","url":"https://example.com","origin_grant":null,"extra_args":"--exec whoami"}}"#, 65536).is_err());
     assert!(
         arguments::whisper(
             std::path::Path::new("audio.wav"),

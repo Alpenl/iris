@@ -121,7 +121,7 @@ impl Fixture {
                     thread::park_timeout(Duration::from_millis(5));
                     continue;
                 };
-                let Ok(raw) = read_request(&mut socket, CLIENT_TIMEOUT) else {
+                let Ok(raw) = read_request(&mut socket, CLIENT_TIMEOUT, MAX_REQUEST) else {
                     continue;
                 };
                 let req = String::from_utf8(raw).unwrap();
@@ -249,7 +249,7 @@ fn playback_seek_preserves_range_and_representation_length() {
     let upstream = thread::spawn(move || {
         let (mut socket, _) = origin.accept().unwrap();
         let request =
-            String::from_utf8(read_request(&mut socket, CLIENT_TIMEOUT).unwrap()).unwrap();
+            String::from_utf8(read_request(&mut socket, CLIENT_TIMEOUT, MAX_REQUEST).unwrap()).unwrap();
         assert!(request.lines().any(|line| line == "Range: bytes=10-13"));
         assert!(request.lines().any(|line| line == "X-Media-Key: fixture"));
         socket.write_all(b"HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 10-13/100\r\nContent-Length: 4\r\nAccept-Ranges: bytes\r\n\r\nabcd").unwrap();
@@ -329,7 +329,7 @@ fn relay_terminates_clean_chunks_only() {
         let url = Url::parse(&format!("http://{}/audio", origin.local_addr().unwrap())).unwrap();
         let upstream = thread::spawn(move || {
             let (mut socket, _) = origin.accept().unwrap();
-            read_request(&mut socket, CLIENT_TIMEOUT).unwrap();
+            read_request(&mut socket, CLIENT_TIMEOUT, MAX_REQUEST).unwrap();
             socket
                 .write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n")
                 .unwrap();
@@ -369,7 +369,7 @@ fn abandoned_slow_seeks_release_slots_and_keep_listener_alive() {
                 continue;
             };
             thread::spawn(move || {
-                let Ok(raw) = read_request(&mut socket, Duration::from_secs(2)) else {
+                let Ok(raw) = read_request(&mut socket, Duration::from_secs(2), MAX_REQUEST) else {
                     return;
                 };
                 let req = String::from_utf8(raw).unwrap();
@@ -439,7 +439,7 @@ fn playlist_probe_falls_back_when_range_rejected_and_subtitle_keeps_explicit_aut
     let upstream = thread::spawn(move || {
         for _ in 0..2 {
             let (mut sock, _) = no_range.accept().unwrap();
-            let req = String::from_utf8(read_request(&mut sock, CLIENT_TIMEOUT).unwrap()).unwrap();
+            let req = String::from_utf8(read_request(&mut sock, CLIENT_TIMEOUT, MAX_REQUEST).unwrap()).unwrap();
             if req.lines().any(|l| l.starts_with("Range:")) {
                 sock.write_all(
                     b"HTTP/1.1 416 Range Not Satisfiable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
@@ -468,7 +468,7 @@ fn playlist_probe_falls_back_when_range_rejected_and_subtitle_keeps_explicit_aut
     let auth_addr = auth_srv.local_addr().unwrap();
     let sub_upstream = thread::spawn(move || {
         let (mut sock, _) = auth_srv.accept().unwrap();
-        let req = String::from_utf8(read_request(&mut sock, CLIENT_TIMEOUT).unwrap()).unwrap();
+        let req = String::from_utf8(read_request(&mut sock, CLIENT_TIMEOUT, MAX_REQUEST).unwrap()).unwrap();
         assert!(
             req.lines()
                 .any(|l| l.eq_ignore_ascii_case("authorization: basic c3VidXNlcjpzdWJwYXNz")),

@@ -113,7 +113,7 @@ fn run(operation: crate::plugin_v2::actor::Operation) -> Result<IoOutcome, Error
         .map_err(|_| ErrorCode::Timeout)?
 }
 fn handle(outcome: &IoOutcome) -> Id {
-    iris_plugin_sdk::serde_json::from_value(outcome.value["stream_handle"].clone()).unwrap()
+    serde_json::from_value(outcome.value["stream_handle"].clone()).unwrap()
 }
 
 #[test]

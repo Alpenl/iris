@@ -1,11 +1,12 @@
 //! Protocol-2 HTTP: exact header pairs, explicit redirect policy, streaming
 //! uploads, and request authority retained through every body read.
 mod response;
-use super::{
-    HttpBody, HttpCancel, NetworkScope,
-    connection::{SocketRegistration, Transport, connect_transport},
+
+use super::{Origin, RequestGrant, TransportKind, normalize_url};
+use crate::vfs::http_client::{
+    HttpBody, HttpCancel, HttpClientError, NetworkScope, SocketRegistration, Transport,
+    connect_transport, is_tchar,
 };
-use crate::plugin_v2::network::{Origin, RequestGrant, TransportKind, normalize_url};
 use iris_api::v2::ErrorCode;
 use std::{
     io::{self, Read, Write},
@@ -64,7 +65,7 @@ pub(crate) fn validate_headers(headers: &Headers) -> Result<(), ErrorCode> {
     for (name, value) in headers {
         total = total.saturating_add(name.len() + value.len() + 4);
         if name.is_empty()
-            || !name.bytes().all(super::is_tchar)
+            || !name.bytes().all(is_tchar)
             || value.bytes().any(|b| b == 0x7f || (b < 0x20 && b != b'\t'))
             || value.chars().any(|c| u32::from(c) > 255)
         {
@@ -102,7 +103,7 @@ pub(crate) fn open(
     validate_headers(&request.headers)?;
     if request.method.is_empty()
         || request.method.len() > 32
-        || !request.method.bytes().all(super::is_tchar)
+        || !request.method.bytes().all(is_tchar)
         || (streaming && body.is_some())
     {
         return Err(ErrorCode::InvalidArgument);
@@ -200,7 +201,6 @@ fn begin(
     if wire.len() > 80 * 1024 {
         return Err(ErrorCode::QuotaExceeded);
     }
-    // Header strings map ISO-8859-1 code points to exact HTTP octets in both directions.
     let wire: Vec<u8> = wire.chars().map(|c| c as u8).collect();
     transport
         .write_all(&wire)
@@ -271,9 +271,6 @@ fn follow(
             if body.is_some_and(|b| !b.is_empty()) {
                 return Err(ErrorCode::Denied);
             }
-            // Do not forward arbitrary custom headers or credentials to a CDN.
-            // Preserve only an origin-only Referer (strict-origin-when-cross-origin,
-            // never downgrading HTTPS Referer to HTTP) so CDN hotlink checks succeed.
             request.cookies = None;
             let mut kept = Vec::with_capacity(request.headers.len());
             for (name, value) in std::mem::take(&mut request.headers) {
@@ -330,7 +327,6 @@ impl RawState {
                 return Err(ErrorCode::BadState);
             };
             let response = response::receive(upload.connection, &upload.request, upload.deadline)?;
-            // A streamed request body is not implicitly buffered/replayed.
             if upload.request.follow_redirects
                 && matches!(response.status, 301 | 302 | 303 | 307 | 308)
             {
@@ -349,16 +345,10 @@ impl RawState {
         if response.cancel.is_cancelled() {
             return Err(ErrorCode::Cancelled);
         }
-        let transport = match &mut response.body {
-            HttpBody::Empty => None,
-            HttpBody::Chunked(body) => Some(body.inner.get_mut().get_mut().1),
-            HttpBody::Fixed(body, _) | HttpBody::CloseDelimited(body) => Some(body.get_mut().1),
-        };
-        if let Some(transport) = transport {
-            transport
-                .set_body_deadline(Some(deadline))
-                .map_err(|e| io_error(e, &response.grant, &response.cancel))?;
-        }
+        response
+            .body
+            .set_body_deadline(Some(deadline))
+            .map_err(|e| io_error(e, &response.grant, &response.cancel))?;
         let n = response
             .body
             .read(out)
@@ -419,6 +409,13 @@ pub(crate) fn transport_error(
 ) -> ErrorCode {
     if let Some(code) = error.downcast_ref::<ErrorCode>() {
         return *code;
+    }
+    if let Some(http_err) = error.downcast_ref::<HttpClientError>() {
+        return match http_err {
+            HttpClientError::Cancelled => ErrorCode::Cancelled,
+            HttpClientError::Timeout => ErrorCode::Timeout,
+            HttpClientError::Denied => ErrorCode::Denied,
+        };
     }
     if let Err(error) = grant.check_live() {
         return error;

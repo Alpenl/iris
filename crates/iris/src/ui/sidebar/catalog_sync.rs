@@ -107,20 +107,16 @@ impl IrisWindow {
         }
 
         let mut source_items: Vec<_> = match &self.catalog.active_source {
-            ActiveSource::Local => {
-                let session = &self.active().session;
-                session
-                    .subfolders()
-                    .iter()
-                    .map(CatalogItem::from_local_folder)
-                    .chain(session.entries().iter().map(CatalogItem::from_local_entry))
-                    .collect()
-            }
+            ActiveSource::Local => self.catalog.local_dir.to_catalog_items(),
             ActiveSource::Plugin(view) => view
                 .entries
                 .iter()
                 .map(|entry| {
-                    CatalogItem::from_source_entry(&view.plugin_id, &view.source_id, entry)
+                    iris_core::plugin_v2::catalog_item_from_source_entry(
+                        &view.plugin_id,
+                        &view.source_id,
+                        entry,
+                    )
                 })
                 .collect(),
         };
@@ -206,7 +202,7 @@ impl IrisWindow {
         if query.trim().is_empty() && self.catalog.filter == MediaFilter::All {
             match &self.catalog.active_source {
                 ActiveSource::Local => {
-                    if let Some(parent) = self.active().session.folder().and_then(Path::parent) {
+                    if let Some(parent) = self.catalog.local_dir.folder().and_then(Path::parent) {
                         rows.push(DirRow::Up {
                             parent_local: Some(parent.to_path_buf()),
                             parent_plugin: None,
