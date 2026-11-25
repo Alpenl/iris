@@ -27,24 +27,9 @@ pub enum TaskValue {
     AuthRejected(AuthRejected),
     Artifact(ArtifactResult),
     ArtifactWriter(ArtifactWriterResult),
-    Export(ExportResult),
     Hash(HashResult),
-    Tools(ToolsResult),
     StoreRead(StoreRead),
     StoreWrite(StoreWrite),
-}
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ToolInfo {
-    pub kind: String,
-    pub version: String,
-}
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ToolsResult {
-    pub tasks: Vec<String>,
-    pub models: Vec<Id>,
-    pub tools: Vec<ToolInfo>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -126,24 +111,11 @@ pub struct ArtifactResult {
     pub artifact: Id,
     pub bytes: Id,
     pub format: String,
-    /// Signed canonical decimal milliseconds in the original media timeline.
-    pub actual_start_ms: Option<String>,
-    pub actual_end_ms: Option<String>,
-    pub requested_start_ms: Option<Id>,
-    pub requested_end_ms: Option<Id>,
-    #[serde(default)]
-    pub exported: bool,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ArtifactWriterResult {
     pub artifact_writer: Id,
-}
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ExportResult {
-    pub exported: bool,
-    pub bytes: Id,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

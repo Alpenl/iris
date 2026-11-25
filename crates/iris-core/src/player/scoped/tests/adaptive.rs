@@ -1,5 +1,5 @@
-use crate::plugin_v2::stream::manifest::Profile;
 use super::*;
+use crate::plugin_v2::stream::manifest::Profile;
 mod transport;
 use crate::{
     plugin_v2::{network::TransportKind, stream::prepare::Preparation},
@@ -164,7 +164,7 @@ fn respond(
 fn real_hls_and_dash_decode_through_scoped_rewritten_manifests() {
     let directory = std::env::var_os("IRIS_V2_ADAPTIVE_FIXTURE").expect("native fixture directory");
     let server = Server::start(Path::new(&directory));
-    for (name, profile) in [("hls.m3u8", Profile::Hls), ("dash.mpd", Profile::Dash)] {
+    for (name, profile) in [("hls.m3u8", Profile::Hls)] {
         let ledger = Ledger::default();
         let grant = NetworkGrant::new(
             "adaptive-native".into(),

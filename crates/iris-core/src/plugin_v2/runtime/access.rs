@@ -1,9 +1,18 @@
 //! Trusted UI capabilities for one installation/window/media. No guest path or
 //! authority is promoted through this interface; callers retain Binding checks.
-use super::*;
-use crate::plugin_v2::ledger::Resource;
+use super::{Control, Resources};
+use crate::{
+    plugin_v2::{
+        enhancement::AttachmentRegistry,
+        files::FileExecutor,
+        ledger::{Reservation, Resource},
+        network::NetworkGrant,
+    },
+    vfs::HttpCancel,
+};
 use futures::channel::oneshot;
-use iris_api::v2::Capability;
+use iris_api::v2::{Capability, ErrorCode, Generation, Id, Role};
+use std::{collections::BTreeSet, sync::Arc};
 
 #[derive(Clone)]
 pub struct WindowAccess {
@@ -13,10 +22,10 @@ pub struct WindowAccess {
     pub owner: String,
     pub capabilities: BTreeSet<Capability>,
     pub network: NetworkGrant,
-    pub files: ToolExecutor,
+    pub files: FileExecutor,
     pub resources: Resources,
     pub cancel: HttpCancel,
-    pub attachments: Arc<crate::plugin_v2::enhancement::AttachmentRegistry>,
+    pub attachments: Arc<AttachmentRegistry>,
 }
 pub struct BackgroundResult<T> {
     pub value: T,

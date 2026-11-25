@@ -1,7 +1,7 @@
-//! Remote HLS/DASH are converted to the same validated structured model as
+//! Remote HLS playlists are converted to the same validated structured model as
 //! guest manifests. Network URLs remain only in authorized resource bindings.
-mod dash;
 mod hls;
+mod hls_parse;
 pub mod live;
 use super::{
     manifest,
@@ -53,14 +53,6 @@ pub fn convert(
             crate::plugin_v2::json::encode(&document, manifest::INPUT_LIMIT)?,
             live,
             (target / 2).clamp(250, 5000),
-        )
-    } else if text.trim_ascii_start().starts_with('<') {
-        let document = dash::parse(&fetched, &mut build)?;
-        (
-            ManifestFormat::VirtualDash,
-            crate::plugin_v2::json::encode(&document, manifest::INPUT_LIMIT)?,
-            false,
-            5000,
         )
     } else {
         return Err(ErrorCode::Unsupported);

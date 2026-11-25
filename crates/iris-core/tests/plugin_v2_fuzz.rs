@@ -1,12 +1,12 @@
 //! Seeded mutation regression for host-facing parsers. This is bounded mutation
 //! fuzzing, not coverage-guided fuzzing or a substitute for sanitizer campaigns.
 use iris_api::v2::{HostCommand, MESSAGE_LIMIT, Manifest, stream::ManifestFormat, task::Task};
+use iris_core::plugin_v2::json::decode_exact;
 use iris_core::plugin_v2::{
     package::{Package, Provenance},
     stream::manifest,
     validation,
 };
-use iris_core::plugin_v2::json::decode_exact;
 use std::{path::PathBuf, time::Instant};
 
 fn exercise(input: &[u8]) {
@@ -39,11 +39,7 @@ fn exercise(input: &[u8]) {
         let _ = manifest.validate();
     }
     let _ = Package::from_zip(input, Provenance::User);
-    for format in [
-        ManifestFormat::VirtualHls,
-        ManifestFormat::VirtualDash,
-        ManifestFormat::RestrictedHls,
-    ] {
+    for format in [ManifestFormat::VirtualHls] {
         if let Ok(value) = manifest::compile(format, input, &|id, _| {
             Ok(format!("http://127.0.0.1:1234/{id}"))
         }) {
@@ -60,11 +56,7 @@ fn seeded_plugin_parser_mutations() {
     let corpus = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/corpus/plugin-v2");
     // Valid seeds must actually reach the renderers; malformed-input-only
     // mutation campaigns would miss most conversion logic.
-    for (name, format) in [
-        ("virtual-hls.json", ManifestFormat::VirtualHls),
-        ("virtual-dash.json", ManifestFormat::VirtualDash),
-        ("restricted-hls.json", ManifestFormat::RestrictedHls),
-    ] {
+    for (name, format) in [("virtual-hls.json", ManifestFormat::VirtualHls)] {
         manifest::compile(
             format,
             &std::fs::read(corpus.join(name)).unwrap(),

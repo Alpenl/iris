@@ -586,6 +586,7 @@ mod tests {
             subtitle: None,
             submit_label: None,
             cancel_label: None,
+            timer: None,
             widgets: vec![Widget::Input {
                 id: "password".into(),
                 label: None,

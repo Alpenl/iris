@@ -660,7 +660,10 @@ mod tests {
         assert_eq!(clamped.ui_font_scale, MAX_UI_FONT_SCALE);
 
         std::fs::write(&file, "ui_font_scale = NaN\n").unwrap();
-        assert_eq!(Settings::load_from(&file).ui_font_scale, DEFAULT_UI_FONT_SCALE);
+        assert_eq!(
+            Settings::load_from(&file).ui_font_scale,
+            DEFAULT_UI_FONT_SCALE
+        );
 
         // Verify serde snake_case serialization for preset-shared enums.
         let json = serde_json::to_string(&(

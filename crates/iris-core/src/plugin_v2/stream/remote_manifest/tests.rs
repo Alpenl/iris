@@ -61,49 +61,12 @@ fn remote_hls_resolves_audio_groups_keys_relative_signed_urls_and_emits_only_loc
     assert_eq!(ledger.used(None, Resource::HostBytes), 0);
 }
 #[test]
-fn remote_dash_expands_number_time_and_finite_negative_repeat_without_exposing_baseurl() {
-    let xml = r#"<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="static" mediaPresentationDuration="PT4S" minBufferTime="PT1S"><BaseURL>video/</BaseURL><Period><AdaptationSet mimeType="video/mp4" codecs="avc1.640028"><SegmentTemplate timescale="1000" initialization="init-$RepresentationID$.mp4" media="s-$Number%05d$-$Time$.m4s" startNumber="5"><SegmentTimeline><S t="0" d="2000" r="-1"/></SegmentTimeline></SegmentTemplate><Representation id="v1" bandwidth="8000000" width="3840" height="2160"/></AdaptationSet><AdaptationSet mimeType="audio/mp4" codecs="mp4a.40.2" lang="en"><Representation id="a" bandwidth="128000"><BaseURL>audio.mp4</BaseURL><SegmentBase timescale="1000" indexRange="32-95"><Initialization range="0-31"/></SegmentBase></Representation></AdaptationSet></Period></MPD>"#;
-    let (factory, grant, _) = factory();
-    let (url, rx, thread) = server(vec![response(xml)]);
-    let converted = convert(&factory, &resource(&grant, &url), &HttpCancel::default()).unwrap();
-    let parsed: VirtualDash =
-        crate::plugin_v2::json::decode_exact(&converted.bytes, manifest::INPUT_LIMIT).unwrap();
-    assert_eq!(parsed.tracks.len(), 2);
-    assert!(parsed.resources.iter().any(|r|matches!(&r.source,ResourceSource::Remote {request} if request.url.ends_with("/video/s-00005-0.m4s"))));
-    assert!(parsed.resources.iter().any(|r|matches!(&r.source,ResourceSource::Remote {request} if request.url.ends_with("/video/s-00006-2000.m4s"))));
-    let output = render(&converted).unwrap();
-    let text = std::str::from_utf8(&output.documents[0].bytes).unwrap();
-    let xml = roxmltree::Document::parse(text).unwrap();
-    for node in xml.descendants().filter(roxmltree::Node::is_element) {
-        if node.has_tag_name("BaseURL") {
-            assert!(
-                node.text()
-                    .unwrap()
-                    .starts_with("http://127.0.0.1:50123/token/")
-            );
-        }
-        for attr in node
-            .attributes()
-            .filter(|a| matches!(a.name(), "media" | "sourceURL"))
-        {
-            assert!(attr.value().starts_with("http://127.0.0.1:50123/token/"));
-        }
-    }
-    assert!(!text.contains('$'));
-    assert!(text.contains("indexRange=\"32-95\""));
-    assert!(roxmltree::Document::parse(text).is_ok());
-    rx.recv().unwrap();
-    thread.join().unwrap();
-}
-#[test]
-fn remote_parsers_reject_private_origin_escape_external_xml_and_unknown_semantics() {
+fn remote_parsers_reject_private_origin_escape_xml_and_unknown_semantics() {
     let bodies = [
         "#EXTM3U\n#EXT-X-TARGETDURATION:1\n#EXTINF:1,\nhttp://127.0.0.1:9/internal\n#EXT-X-ENDLIST\n",
         "#EXTM3U\n#EXT-X-TARGETDURATION:1\n#EXT-X-CONTENT-STEERING:SERVER-URI=\"file:///secret\"\n#EXTINF:1,\nsegment.ts\n",
         "<!DOCTYPE MPD [<!ENTITY external SYSTEM 'file:///secret'>]><MPD xmlns=\"urn:mpeg:dash:schema:mpd:2011\">&external;</MPD>",
-        "<MPD xmlns=\"urn:mpeg:dash:schema:mpd:2011\" type=\"dynamic\" mediaPresentationDuration=\"PT1S\"><Period/></MPD>",
-        "<MPD xmlns=\"urn:mpeg:dash:schema:mpd:2011\" mediaPresentationDuration=\"PT1S\"><BaseURL>file:///secret</BaseURL><Period/></MPD>",
-        "<MPD xmlns=\"urn:mpeg:dash:schema:mpd:2011\" mediaPresentationDuration=\"PT1S\"><Period/><Period/></MPD>",
+        "<MPD xmlns=\"urn:mpeg:dash:schema:mpd:2011\" type=\"static\" mediaPresentationDuration=\"PT1S\"><Period/></MPD>",
     ];
     for body in bodies {
         let (factory, grant, _) = factory();
@@ -118,29 +81,19 @@ fn remote_parsers_reject_private_origin_escape_external_xml_and_unknown_semantic
 }
 
 #[test]
-fn encoder_metadata_is_inert_but_links_service_extensions_and_fractional_precision_fail_closed() {
-    let xml = r#"<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="urn:mpeg:dash:schema:mpd:2011 file:///must-not-read" type="static" mediaPresentationDuration="PT1S"><ProgramInformation><Title>Local fixture</Title></ProgramInformation><ServiceDescription id="0"/><Period><AdaptationSet mimeType="audio/mp4" codecs="mp4a.40.2" bitstreamSwitching="true"><Representation id="a" bandwidth="128000"><AudioChannelConfiguration schemeIdUri="urn:mpeg:dash:23003:3:audio_channel_configuration:2011" value="2"/><BaseURL>audio.mp4</BaseURL><SegmentBase timescale="1000" indexRange="32-95"><Initialization range="0-31"/></SegmentBase></Representation></AdaptationSet></Period></MPD>"#;
+fn remote_hls_accepts_zero_padded_durations_and_rejects_submillisecond_precision() {
     let hls = "#EXTM3U\n#EXT-X-TARGETDURATION:1\n#EXTINF:1.000000,\nsegment.ts\n#EXT-X-ENDLIST\n";
-    let cases = [(xml.to_string(), true), (hls.into(),true),
-        (xml.replace("<ServiceDescription id=\"0\"/>","<ServiceDescription><Latency target=\"10\"/></ServiceDescription>"),false),
-        (xml.replace("<Title>","<Title xmlns:xlink=\"http://www.w3.org/1999/xlink\" xlink:href=\"file:///secret\">"),false),
-        (xml.replace("bitstreamSwitching=\"true\"","bitstreamSwitching=\"invalid\""),false),
-        (xml.replace("value=\"2\"","value=\"256\""),false),
-        (hls.replace("1.000000","0.999999"),false)];
+    let cases = [
+        (hls.to_string(), true),
+        (hls.replace("1.000000", "0.999999"), false),
+    ];
     for (body, accepted) in cases {
         let (factory, grant, _) = factory();
         let (url, rx, thread) = server(vec![response(&body)]);
         let result = convert(&factory, &resource(&grant, &url), &HttpCancel::default());
         assert_eq!(result.is_ok(), accepted);
         if let Ok(converted) = result {
-            let output = render(&converted).unwrap();
-            for doc in output.documents {
-                assert!(
-                    !String::from_utf8(doc.bytes)
-                        .unwrap()
-                        .contains("must-not-read")
-                );
-            }
+            assert!(render(&converted).is_ok());
         }
         rx.recv().unwrap();
         thread.join().unwrap();

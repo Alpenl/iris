@@ -392,7 +392,12 @@ impl IrisWindow {
                             cx.notify();
                         }),
                     ))
-                    .child(div().text_size(t.text_sm).text_color(t.text_dim).child(desc))
+                    .child(
+                        div()
+                            .text_size(t.text_sm)
+                            .text_color(t.text_dim)
+                            .child(desc),
+                    )
                     .into_any_element();
                 ("删除插件", "确认删除", content, submit)
             }

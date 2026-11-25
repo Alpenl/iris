@@ -7,7 +7,10 @@ use crate::{
     },
     vault::CredentialVault,
 };
-use std::io::{Cursor, Write};
+use std::{
+    io::{Cursor, Write},
+    time::{Duration, Instant},
+};
 
 fn package(id: &str) -> Vec<u8> {
     let reply = r#"{"ok":[{"command":"show_toast","message":"window"}]}"#;
@@ -81,9 +84,6 @@ impl Fixture {
             state_directory: root.join("state"),
             temporary_directory: root.join("temp"),
             vault: CredentialVault::in_memory(),
-            tools: BTreeMap::new(),
-            models: BTreeMap::new(),
-            tool_catalog: Default::default(),
             wake: Arc::new(|| {}),
         };
         Self {

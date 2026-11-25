@@ -28,6 +28,7 @@ fn sample_plugin_modal() -> PluginModal {
         subtitle: None,
         submit_label: Some("连接".into()),
         cancel_label: Some("取消".into()),
+        timer: None,
         widgets: vec![
             Widget::Input {
                 id: "url".into(),
@@ -391,7 +392,11 @@ fn plugin_modal_async_submit_retains_inputs_until_close_or_cancel() {
     );
     assert_eq!(vals.get("pass").map(String::as_str), Some("bad-pass"));
     assert_eq!(vals.get("ro").map(String::as_str), Some("true"));
-    assert!(modal_state.begin_submit(&buf, "iris.webdav", &modal).is_none());
+    assert!(
+        modal_state
+            .begin_submit(&buf, "iris.webdav", &modal)
+            .is_none()
+    );
 
     // Validation error (Toast or re-sent same-id OpenModal): user's inputs stay intact!
     modal_state.clear_submitting_for("iris.webdav");
@@ -406,7 +411,11 @@ fn plugin_modal_async_submit_retains_inputs_until_close_or_cancel() {
     );
 
     // 2. Retry succeeds and plugin emits `CloseModal` -> cleans `modal:*`, keeps `sb:*`.
-    assert!(modal_state.begin_submit(&buf, "iris.webdav", &modal).is_some());
+    assert!(
+        modal_state
+            .begin_submit(&buf, "iris.webdav", &modal)
+            .is_some()
+    );
     modal_state.cancel(&mut buf);
     assert!(modal_state.submitting.is_none());
     assert!(!buf.form_fields.keys().any(|k| k.starts_with("modal:")));
@@ -414,7 +423,11 @@ fn plugin_modal_async_submit_retains_inputs_until_close_or_cancel() {
 
     // 3. Re-open, submit (simulating hung plugin), then `ModalCancel` -> cleans `modal:*`.
     assert!(buf.sync_plugin_modal(Some(("iris.webdav", &modal))));
-    assert!(modal_state.begin_submit(&buf, "iris.webdav", &modal).is_some());
+    assert!(
+        modal_state
+            .begin_submit(&buf, "iris.webdav", &modal)
+            .is_some()
+    );
     modal_state.cancel(&mut buf);
     assert!(modal_state.submitting.is_none());
     assert!(buf.active_form_key.is_none());

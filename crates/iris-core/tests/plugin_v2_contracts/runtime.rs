@@ -33,9 +33,6 @@ impl Fixture {
             state_directory: root.join("state"),
             temporary_directory: root.join("temp"),
             vault: CredentialVault::in_memory(),
-            tools: BTreeMap::new(),
-            models: BTreeMap::new(),
-            tool_catalog: Default::default(),
             wake: Arc::new(|| {}),
         };
         let mut zip = ZipWriter::new(Cursor::new(Vec::new()));

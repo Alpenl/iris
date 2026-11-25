@@ -4,11 +4,11 @@ use crate::{
     plugin_v2::{
         actor::{Executor, Operation, TaskContext},
         enhancement::{AttachmentRegistry, AttachmentSpec},
+        files::{FileExecutor, FileSetup},
         instance::{Blob, next_id},
         ledger::Resource,
         network::NetworkGrant,
         runtime::{Resources, WindowAccess},
-        tools::{ToolExecutor, ToolSetup},
     },
     vfs::HttpCancel,
 };
@@ -48,14 +48,11 @@ fn native_receipts_hold_revoked_attachments_and_release_accounting() {
         &ledger,
     )
     .unwrap();
-    let files = ToolExecutor::new(ToolSetup {
+    let files = FileExecutor::new(FileSetup {
         network: network.clone(),
         ledger: ledger.clone(),
         capabilities: capabilities.clone(),
         temporary_directory: root.clone(),
-        tools: BTreeMap::new(),
-        models: BTreeMap::new(),
-        catalog: Default::default(),
     })
     .unwrap();
     let access = WindowAccess {

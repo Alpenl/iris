@@ -13,8 +13,8 @@ use super::super::actions::{
     ToggleLoop, TogglePause, ZoomIn, ZoomOut,
 };
 use super::super::kit::{
-    badge_pill, ghost, hstack, icon, icon_button, icon_button_disabled, icon_on_ghost,
-    text_button, tip,
+    badge_pill, ghost, hstack, icon, icon_button, icon_button_disabled, icon_on_ghost, text_button,
+    tip,
 };
 use super::super::state::PopoverKind;
 use super::{anchor_wrap, dock_sep};
@@ -331,7 +331,12 @@ impl IrisWindow {
             .gap(px(5.))
             .child(icon_on_ghost(Icon::Audio, audio_col, t))
             .when(!narrow && !compact, |d| {
-                d.child(div().font_family(FONT_MONO).text_size(t.text_sm).child(audio))
+                d.child(
+                    div()
+                        .font_family(FONT_MONO)
+                        .text_size(t.text_sm)
+                        .child(audio),
+                )
             })
             .tooltip(self.act_tip("音轨与输出设备 · 点击选择", "cycle_audio"))
             .on_click(cx.listener(|this, _, _, cx| this.toggle_popover(PopoverKind::Audio, cx)));

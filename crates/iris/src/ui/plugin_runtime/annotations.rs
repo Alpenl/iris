@@ -4,7 +4,9 @@ use crate::{
     ui::kit::{form::chip_button, hstack, vstack},
 };
 use gpui::{Context, IntoElement, ParentElement, StatefulInteractiveElement, Styled, div, px};
-use iris_api::v2::{Capability, ErrorCode, GuestError, HostEvent, Id, Reply, enhance::AnnotationEdit};
+use iris_api::v2::{
+    Capability, ErrorCode, GuestError, HostEvent, Id, Reply, enhance::AnnotationEdit,
+};
 use iris_core::{
     media_uri::MediaUri,
     plugin_v2::{
@@ -256,7 +258,10 @@ impl IrisWindow {
             Ok(value) => value,
             Err(error) => {
                 self.show_toast(
-                    format!("个人标记不可用 · {}", super::notices::describe_error_code(error)),
+                    format!(
+                        "个人标记不可用 · {}",
+                        super::notices::describe_error_code(error)
+                    ),
                     cx,
                 );
                 return;
@@ -301,7 +306,10 @@ impl IrisWindow {
                     }
                     Err(ErrorCode::Cancelled) => {}
                     Err(error) => this.show_toast(
-                        format!("个人标记未更新 · {}", super::notices::describe_error_code(error)),
+                        format!(
+                            "个人标记未更新 · {}",
+                            super::notices::describe_error_code(error)
+                        ),
                         cx,
                     ),
                 }

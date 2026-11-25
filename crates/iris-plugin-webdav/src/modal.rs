@@ -162,6 +162,7 @@ pub(super) fn build_modal(existing: Option<&WebDavConnection>, has_secret: bool)
         ],
         submit_label: Some("保存".into()),
         cancel_label: Some("取消".into()),
+        timer: None,
     }
 }
 

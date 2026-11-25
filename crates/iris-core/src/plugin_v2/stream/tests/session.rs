@@ -9,7 +9,22 @@ use crate::{
 use iris_api::v2::{ErrorCode, stream::ManifestFormat};
 use serde_json::json;
 fn manifest(url: &RemoteResource) -> Vec<u8> {
-    serde_json::to_vec(&json!({"resources":[{"id":"media","kind":"media","extension":"ts","size":"4","source":{"transport":"remote","request":url}}], "text":"#EXTM3U\n#EXT-X-TARGETDURATION:1\n#EXT-X-MEDIA-SEQUENCE:1\n#EXTINF:1,\nmedia\n"})).unwrap()
+    serde_json::to_vec(&json!({
+        "resources":[{"id":"media","kind":"media","extension":"ts","size":"4","source":{"transport":"remote","request":url}}],
+        "tracks":[{
+            "id":"video",
+            "kind":"video",
+            "label":"Video",
+            "lang":null,
+            "codec":null,
+            "default":true,
+            "sequence":"1",
+            "segments":[{"resource":{"resource_id":"media","range":null},"duration_ms":"1000","init":null,"key":null}]
+        }],
+        "variants":[],
+        "live":true
+    }))
+    .unwrap()
 }
 fn child(session: &StreamSession) -> String {
     let cancel = HttpCancel::default();
@@ -33,17 +48,17 @@ fn refresh_preserves_unchanged_routes_and_revokes_rebound_or_removed_resources()
     session
         .commit(
             session
-                .prepare_manifest(Id(0), ManifestFormat::RestrictedHls, &input)
+                .prepare_manifest(Id(0), ManifestFormat::VirtualHls, &input)
                 .unwrap(),
         )
         .unwrap();
     let root = session.root_url().unwrap();
     let old_child = child(&session);
     let prepared = session
-        .prepare_manifest(Id(1), ManifestFormat::RestrictedHls, &input)
+        .prepare_manifest(Id(1), ManifestFormat::VirtualHls, &input)
         .unwrap();
     let racing = session
-        .prepare_manifest(Id(1), ManifestFormat::RestrictedHls, &input)
+        .prepare_manifest(Id(1), ManifestFormat::VirtualHls, &input)
         .unwrap();
     session.commit(prepared).unwrap();
     assert_eq!(session.commit(racing).unwrap_err(), ErrorCode::StaleHandle);
@@ -58,7 +73,7 @@ fn refresh_preserves_unchanged_routes_and_revokes_rebound_or_removed_resources()
     session
         .commit(
             session
-                .prepare_manifest(Id(2), ManifestFormat::RestrictedHls, &input)
+                .prepare_manifest(Id(2), ManifestFormat::VirtualHls, &input)
                 .unwrap(),
         )
         .unwrap();
@@ -71,7 +86,7 @@ fn refresh_preserves_unchanged_routes_and_revokes_rebound_or_removed_resources()
     );
     assert!(
         session
-            .prepare_manifest(Id(3), ManifestFormat::VirtualDash, b"<MPD/>")
+            .prepare_manifest(Id(3), ManifestFormat::VirtualHls, b"<MPD/>")
             .is_err()
     );
     assert_eq!(session.root_url().unwrap(), root);

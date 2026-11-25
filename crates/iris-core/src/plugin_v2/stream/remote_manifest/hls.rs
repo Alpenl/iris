@@ -1,6 +1,11 @@
-use super::*;
-use crate::plugin_v2::stream::{manifest::restricted, range::decimal};
-use iris_api::v2::Id;
+use super::{Build, hls_parse, stable_id};
+use crate::plugin_v2::stream::{manifest, range::decimal, remote::Fetched};
+use iris_api::v2::{
+    ErrorCode, Id,
+    stream::{HlsTrack, HlsVariant, ResourceExtension, ResourceKind, TrackKind, VirtualHls},
+};
+use std::collections::BTreeMap;
+use url::Url;
 type Attrs = BTreeMap<String, (String, bool)>;
 
 pub(super) fn parse(fetched: &Fetched, build: &mut Build<'_>) -> Result<VirtualHls, ErrorCode> {
@@ -36,7 +41,7 @@ pub(super) fn parse(fetched: &Fetched, build: &mut Build<'_>) -> Result<VirtualH
             if tracks.len() >= 32 {
                 return Err(ErrorCode::QuotaExceeded);
             }
-            let mut attrs = restricted::attributes(value)?;
+            let mut attrs = hls_parse::attributes(value)?;
             let kind = take(&mut attrs, "TYPE", false)?;
             let group = take(&mut attrs, "GROUP-ID", true)?;
             let label = take(&mut attrs, "NAME", true)?;
@@ -98,7 +103,7 @@ pub(super) fn parse(fetched: &Fetched, build: &mut Build<'_>) -> Result<VirtualH
             if variant_attrs.is_some() {
                 return Err(ErrorCode::InvalidArgument);
             }
-            variant_attrs = Some(restricted::attributes(value)?);
+            variant_attrs = Some(hls_parse::attributes(value)?);
         } else if !line.starts_with('#') {
             if pending.len() >= 64 {
                 return Err(ErrorCode::QuotaExceeded);
@@ -224,7 +229,7 @@ fn media(
             .split_once(':')
             .filter(|(t, _)| matches!(*t, "#EXT-X-KEY" | "#EXT-X-MAP"))
         {
-            let mut attrs = restricted::attributes(attrs)?;
+            let mut attrs = hls_parse::attributes(attrs)?;
             if let Some((uri, quoted)) = attrs.get_mut("URI") {
                 if !*quoted {
                     return Err(ErrorCode::InvalidArgument);
@@ -257,7 +262,7 @@ fn media(
         rewritten.push_str(&new);
         rewritten.push('\n');
     }
-    let (mut track, live) = restricted::parse(&rewritten, &build.resources)?;
+    let (mut track, live) = hls_parse::parse(&rewritten, &build.resources)?;
     track.id = stable_id("track", id_key);
     track.kind = kind;
     track.default = false;

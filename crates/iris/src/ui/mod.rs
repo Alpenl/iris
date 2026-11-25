@@ -368,7 +368,11 @@ impl IrisWindow {
     }
 
     /// Two-click inline confirmation guard for destructive actions (3s auto-reset).
-    pub(super) fn confirm_destructive(&mut self, key: impl Into<String>, cx: &mut Context<Self>) -> bool {
+    pub(super) fn confirm_destructive(
+        &mut self,
+        key: impl Into<String>,
+        cx: &mut Context<Self>,
+    ) -> bool {
         let key = key.into();
         let now = Instant::now();
         let ttl = Duration::from_secs(3);

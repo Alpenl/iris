@@ -1,19 +1,18 @@
-mod run;
+//! Scoped inert artifact staging and current-media hashing executor.
 mod writer;
-use super::binding::{ToolKind, TrustedModel, TrustedTool};
+use super::{Artifact, TempRoot, hash_media, identity::PinnedFile};
 use crate::{
     plugin_v2::{
         actor::{Executor, IoOutcome, Operation, TaskContext},
-        files::{Artifact, ExportGrant, FileGrants, TempRoot, hash_media, identity::PinnedFile},
-        instance::{Blob, next_id},
+        instance::Blob,
         ledger::{Activity, Ledger, Resource},
         network::NetworkGrant,
     },
     vfs::HttpCancel,
 };
 use iris_api::v2::{
-    CHUNK_LIMIT, Capability, ErrorCode, Generation, Id, Role,
-    task::{Task, ToolTask},
+    CHUNK_LIMIT, Capability, ErrorCode, Generation, Id, Role, task::Task,
+    task_result::ArtifactResult,
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -21,65 +20,59 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-pub struct ToolSetup {
+pub struct FileSetup {
     pub network: NetworkGrant,
     pub ledger: Ledger,
     pub capabilities: BTreeSet<Capability>,
     pub temporary_directory: PathBuf,
-    pub tools: BTreeMap<ToolKind, Arc<TrustedTool>>,
-    pub models: BTreeMap<Id, Arc<TrustedModel>>,
-    pub catalog: super::catalog::ToolCatalog,
 }
+
 struct ArtifactEntry {
     generation: Generation,
     artifact: Arc<Artifact>,
 }
+
 struct State {
     stopped: bool,
     instance: Option<Id>,
     generation: Option<Generation>,
     artifacts: BTreeMap<Id, ArtifactEntry>,
     writers: BTreeMap<Id, writer::WriterEntry>,
-    exports: BTreeMap<Id, ExportGrant>,
     current: Option<(Id, Generation, CurrentFile)>,
 }
+
 #[derive(Clone)]
 enum CurrentFile {
     Pinned(Arc<PinnedFile>),
     Path(PathBuf),
 }
+
 struct Inner {
     network: NetworkGrant,
     ledger: Ledger,
     capabilities: BTreeSet<Capability>,
     root: Arc<TempRoot>,
-    tools: BTreeMap<ToolKind, Arc<TrustedTool>>,
-    models: BTreeMap<Id, Arc<TrustedModel>>,
-    catalog: super::catalog::ToolCatalog,
-    files: FileGrants,
     state: Mutex<State>,
     activity: Activity,
     cancel: HttpCancel,
 }
+
 #[derive(Clone)]
-pub struct ToolExecutor(Arc<Inner>);
-impl ToolExecutor {
+pub struct FileExecutor(Arc<Inner>);
+
+impl FileExecutor {
     /// Create on a host background worker; directory I/O is never done by an import.
-    pub fn new(setup: ToolSetup) -> Result<Self, ErrorCode> {
+    pub fn new(setup: FileSetup) -> Result<Self, ErrorCode> {
         let root = TempRoot::new(
             &setup.temporary_directory,
             setup.network.owner().into(),
             setup.ledger.clone(),
         )?;
         Ok(Self(Arc::new(Inner {
-            files: FileGrants::new(setup.network.owner().into(), setup.ledger.clone()),
             network: setup.network,
             ledger: setup.ledger,
             capabilities: setup.capabilities,
             root,
-            tools: setup.tools,
-            models: setup.models,
-            catalog: setup.catalog,
             activity: Activity::default(),
             cancel: HttpCancel::default(),
             state: Mutex::new(State {
@@ -88,27 +81,11 @@ impl ToolExecutor {
                 generation: None,
                 artifacts: BTreeMap::new(),
                 writers: BTreeMap::new(),
-                exports: BTreeMap::new(),
                 current: None,
             }),
         })))
     }
-    pub fn input_grants(&self) -> &FileGrants {
-        &self.0.files
-    }
-    /// The host save dialog creates this grant; guest requests alone never do.
-    pub fn add_export(&self, grant: ExportGrant) -> Result<Id, ErrorCode> {
-        if !self.0.capabilities.contains(&Capability::ExportFiles) {
-            return Err(ErrorCode::Denied);
-        }
-        let mut state = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
-        if state.stopped {
-            return Err(ErrorCode::Cancelled);
-        }
-        let id = Id(next_id()?);
-        state.exports.insert(id, grant);
-        Ok(id)
-    }
+
     /// Only the actual current local media selected by the host is admitted.
     pub fn set_current_media(
         &self,
@@ -126,6 +103,7 @@ impl ToolExecutor {
         state.current = Some((media, generation, CurrentFile::Pinned(file)));
         Ok(())
     }
+
     /// The native player supplies its current local path; it is never serialized
     /// to the guest. Opening, identity checks and hashing run on the I/O pool.
     pub fn set_current_path(
@@ -147,6 +125,7 @@ impl ToolExecutor {
         state.current = path.map(|p| (media, generation, CurrentFile::Path(p)));
         Ok(())
     }
+
     fn bind(&self, context: &TaskContext) -> Result<(), ErrorCode> {
         if context.role != Role::Control || context.owner != self.0.network.owner() {
             return Err(ErrorCode::Denied);
@@ -168,15 +147,7 @@ impl ToolExecutor {
             .link(&context.cancel)
             .map_err(|_| ErrorCode::Cancelled)
     }
-    fn tool(&self, kind: ToolKind, cancel: &HttpCancel) -> Result<Arc<TrustedTool>, ErrorCode> {
-        self.0
-            .tools
-            .get(&kind)
-            .cloned()
-            .filter(|tool| tool.kind == kind)
-            .map(Ok)
-            .unwrap_or_else(|| self.0.catalog.tool(kind, cancel))
-    }
+
     fn artifact(&self, id: Id, generation: Generation) -> Result<Arc<Artifact>, ErrorCode> {
         let state = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
         let entry = state.artifacts.get(&id).ok_or(ErrorCode::StaleHandle)?;
@@ -185,6 +156,7 @@ impl ToolExecutor {
         }
         Ok(entry.artifact.clone())
     }
+
     pub fn approved_artifact(
         &self,
         owner: &str,
@@ -196,10 +168,11 @@ impl ToolExecutor {
         }
         self.artifact(id, generation)
     }
+
     fn publish(
         &self,
         artifact: Arc<Artifact>,
-        result: iris_api::v2::task_result::ArtifactResult,
+        result: ArtifactResult,
         context: &TaskContext,
     ) -> Result<IoOutcome, ErrorCode> {
         self.bind(context)?;
@@ -233,7 +206,8 @@ impl ToolExecutor {
         }))
     }
 }
-impl Executor for ToolExecutor {
+
+impl Executor for FileExecutor {
     fn prepare(
         &self,
         task: Task,
@@ -247,72 +221,12 @@ impl Executor for ToolExecutor {
         let this = self.clone();
         let activity = self.0.activity.start();
         match task {
-            Task::QueryTools => {
-                let (mut kinds, mut models) = self.0.catalog.availability();
-                kinds.extend(self.0.tools.keys().copied());
-                models.extend(self.0.models.keys().copied());
-                kinds.sort();
-                kinds.dedup();
-                models.sort();
-                models.dedup();
-                let versions: Vec<_> = kinds
-                    .iter()
-                    .map(|kind| serde_json::json!({"kind":kind,"version":kind.supported_version()}))
-                    .collect();
-                let mut tasks = Vec::new();
-                if kinds.contains(&ToolKind::Ffmpeg) {
-                    tasks.push("extract_audio");
-                    if kinds.contains(&ToolKind::Ffprobe) {
-                        tasks.push("lossless_slice");
-                    }
-                }
-                if kinds.contains(&ToolKind::WhisperCpp) && !models.is_empty() {
-                    tasks.push("transcribe");
-                }
-                if kinds.contains(&ToolKind::YtDlp) {
-                    tasks.push("resolve_metadata");
-                }
-                Ok(Operation::blocking(move || {
-                    let _activity = activity;
-                    this.bind(&context)?;
-                    Ok(IoOutcome::new(
-                        serde_json::json!({"tasks":tasks,"models":models,"tools":versions}),
-                        None,
-                    ))
-                }))
-            }
             Task::ArtifactBegin { format } => self.begin_artifact(format, context),
             Task::ArtifactWrite {
                 handle,
                 blob,
                 finish,
             } => self.write_artifact(handle, blob, finish, blobs, context),
-            Task::ExportArtifact { artifact, export } => {
-                let artifact = self.artifact(artifact, context.generation)?;
-                let export = self
-                    .0
-                    .state
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .exports
-                    .remove(&export)
-                    .ok_or(ErrorCode::StaleHandle)?;
-                Ok(Operation::blocking(move || {
-                    let _activity = activity;
-                    this.bind(&context)?;
-                    export.commit(
-                        &artifact,
-                        &context.owner,
-                        context.generation,
-                        &context.ledger,
-                        &context.cancel,
-                    )?;
-                    Ok(IoOutcome::new(
-                        serde_json::json!({"exported":true,"bytes":Id(artifact.size())}),
-                        None,
-                    ))
-                }))
-            }
             Task::HashCurrentMedia { media, algorithm } => {
                 let file = {
                     let state = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -385,44 +299,25 @@ impl Executor for ToolExecutor {
                     ))
                 }))
             }
-            Task::InvokeTool { task } => {
-                validate(&task)?;
-                if matches!(task, ToolTask::LosslessSlice { .. })
-                    && !self.0.capabilities.contains(&Capability::ExportFiles)
-                {
-                    return Err(ErrorCode::Denied);
-                }
-                let lease = self.0.ledger.reserve(
-                    &context.owner,
-                    &[(Resource::Tool, 1), (Resource::HostBytes, 32 << 20)],
-                )?;
-                Ok(Operation::blocking(move || {
-                    let _activity = activity;
-                    let _lease = lease;
-                    this.bind(&context)?;
-                    this.run(task, &context)
-                }))
-            }
             _ => Err(ErrorCode::Unsupported),
         }
     }
+
     fn close(&self, handle: u64) -> Result<(), ErrorCode> {
         let mut state = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(writer) = state.writers.remove(&Id(handle)) {
             writer.cancel.cancel();
             return Ok(());
         }
-        if state.artifacts.remove(&Id(handle)).is_some()
-            || state.exports.remove(&Id(handle)).is_some()
-        {
+        if state.artifacts.remove(&Id(handle)).is_some() {
             Ok(())
         } else {
             Err(ErrorCode::StaleHandle)
         }
     }
+
     fn stop(&self) {
         self.0.cancel.cancel();
-        self.0.files.revoke();
         let mut state = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
         state.stopped = true;
         state.artifacts.clear();
@@ -430,11 +325,10 @@ impl Executor for ToolExecutor {
             writer.cancel.cancel();
         }
         state.writers.clear();
-        state.exports.clear();
         state.current = None;
     }
+
     fn generation_changed(&self, generation: Generation) {
-        self.0.files.revoke();
         let mut state = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
         state.generation = Some(generation);
         state.artifacts.clear();
@@ -442,38 +336,10 @@ impl Executor for ToolExecutor {
             writer.cancel.cancel();
         }
         state.writers.clear();
-        state.exports.clear();
         state.current = None;
     }
+
     fn is_quiescent(&self) -> bool {
         self.0.activity.is_idle() && self.0.root.is_quiescent()
-    }
-}
-fn validate(task: &ToolTask) -> Result<(), ErrorCode> {
-    match task {
-        ToolTask::LosslessSlice {
-            start_ms, end_ms, ..
-        } if start_ms >= end_ms || end_ms.0 > 7 * 86400 * 1000 => Err(ErrorCode::InvalidArgument),
-        ToolTask::ExtractAudio { track, .. } if *track > 63 => Err(ErrorCode::InvalidArgument),
-        ToolTask::Transcribe {
-            language: Some(language),
-            ..
-        } if language != "auto"
-            && (!(language.len() == 2 || language.len() == 3)
-                || !language.bytes().all(|b| b.is_ascii_lowercase())) =>
-        {
-            Err(ErrorCode::InvalidArgument)
-        }
-        ToolTask::ResolveMetadata { url, origin_grant } => {
-            if origin_grant.is_some() {
-                return Err(ErrorCode::Unsupported);
-            }
-            crate::plugin_v2::network::normalize_url(
-                url,
-                crate::plugin_v2::network::TransportKind::Http,
-            )
-            .map(|_| ())
-        }
-        _ => Ok(()),
     }
 }

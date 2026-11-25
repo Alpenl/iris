@@ -1,5 +1,23 @@
-use super::jobs::{Completed, Work};
-use super::*;
+use super::{
+    Binding, Catalog, Config, Inbox, Notice, PluginInfo, PluginStatus, Shared, SourceSnapshot,
+    jobs::{Completed, Work},
+};
+use crate::plugin_v2::{
+    actor::Status,
+    installation::{Installed, Review},
+    ledger::Resource,
+    pool::WorkPool,
+    runtime::Control,
+};
+use iris_api::v2::{ErrorCode, Generation, Id, source::PlaybackSnapshot};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::{Duration, Instant},
+};
 
 pub(super) struct Plugin {
     pub record: Result<Installed, ErrorCode>,
@@ -314,14 +332,9 @@ impl Worker {
             let setup = self.config.runtime.clone();
             if self
                 .submit(false, "scan", move || {
-                    Work::Scanned(super::jobs::guarded(|| {
-                        let _ = setup
-                            .tool_catalog
-                            .restore(&setup.temporary_directory.join("tool-check"));
-                        match bootstrap {
-                            Some(bootstrap) => bootstrap.entries(installer, &setup),
-                            None => installer.entries(),
-                        }
+                    Work::Scanned(super::jobs::guarded(|| match bootstrap {
+                        Some(bootstrap) => bootstrap.entries(installer, &setup),
+                        None => installer.entries(),
                     }))
                 })
                 .is_ok()

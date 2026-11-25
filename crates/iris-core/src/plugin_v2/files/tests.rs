@@ -1,13 +1,30 @@
-use super::*;
-use crate::vfs::HttpCancel;
-use iris_api::v2::{enhance::ExportFormat, task::FileHash};
-use std::time::Instant;
+use super::{FileExecutor, FileSetup, TempRoot, hash_media, identity::PinnedFile, random_name};
+use crate::{
+    plugin_v2::{
+        actor::{Executor, IoOutcome, Operation, TaskContext},
+        instance::Blob,
+        ledger::{Ledger, Resource},
+        network::NetworkGrant,
+    },
+    vfs::HttpCancel,
+};
+use iris_api::v2::{
+    Capability, ErrorCode, Generation, Id, NetworkDeclaration, Role,
+    task::{ArtifactFormat, FileHash, Task},
+};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::PathBuf,
+    sync::Arc,
+    time::{Duration, Instant},
+};
+
 fn directory() -> PathBuf {
     let path = std::env::temp_dir().join(format!("iris-files-{}", random_name().unwrap()));
     std::fs::create_dir(&path).unwrap();
     path
 }
-use std::path::PathBuf;
+
 fn idle(root: &TempRoot) {
     let end = Instant::now() + Duration::from_secs(3);
     while !root.is_quiescent() {
@@ -15,48 +32,21 @@ fn idle(root: &TempRoot) {
         std::thread::sleep(Duration::from_millis(10));
     }
 }
+
+fn execute(operation: Operation) -> Result<IoOutcome, ErrorCode> {
+    if let Operation::Blocking(run) = operation {
+        run()
+    } else {
+        panic!("blocking artifact job")
+    }
+}
+
 #[test]
-fn input_is_single_use_owner_action_and_generation_bound_and_pins_identity() {
+fn pinned_file_hashes_and_rejects_hardlink_aliases() {
     let dir = directory();
     let path = dir.join("input.bin");
     std::fs::write(&path, b"abc").unwrap();
-    let ledger = Ledger::default();
-    let grants = FileGrants::new("one".into(), ledger.clone());
-    let generation = Generation::default();
-    let id = grants
-        .approve_input(&path, Id(9), generation, InputAction::ExtractAudio)
-        .unwrap();
-    assert!(
-        grants
-            .consume_input("two", id, generation, InputAction::ExtractAudio)
-            .is_err()
-    );
-    assert!(
-        grants
-            .consume_input("one", id, generation, InputAction::Slice)
-            .is_err()
-    );
-    assert!(
-        grants
-            .consume_input(
-                "one",
-                id,
-                Generation {
-                    seek: Id(1),
-                    ..generation
-                },
-                InputAction::ExtractAudio
-            )
-            .is_err()
-    );
-    let input = grants
-        .consume_input("one", id, generation, InputAction::ExtractAudio)
-        .unwrap();
-    assert!(
-        grants
-            .consume_input("one", id, generation, InputAction::ExtractAudio)
-            .is_err()
-    );
+    let pinned = PinnedFile::open(&path).unwrap();
     #[cfg(windows)]
     {
         assert!(std::fs::write(&path, b"tampered").is_err());
@@ -64,7 +54,7 @@ fn input_is_single_use_owner_action_and_generation_bound_and_pins_identity() {
     }
     assert_eq!(
         hash_media(
-            &input.file,
+            &pinned,
             FileHash::FullMd5,
             &HttpCancel::default(),
             |_, _| {}
@@ -75,7 +65,7 @@ fn input_is_single_use_owner_action_and_generation_bound_and_pins_identity() {
     );
     assert_eq!(
         hash_media(
-            &input.file,
+            &pinned,
             FileHash::FullSha256,
             &HttpCancel::default(),
             |_, _| {}
@@ -85,7 +75,7 @@ fn input_is_single_use_owner_action_and_generation_bound_and_pins_identity() {
         "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
     );
     let sparse = hash_media(
-        &input.file,
+        &pinned,
         FileHash::SparseSha256V1,
         &HttpCancel::default(),
         |_, _| {},
@@ -105,92 +95,27 @@ fn input_is_single_use_owner_action_and_generation_bound_and_pins_identity() {
     let cancel = HttpCancel::default();
     cancel.cancel();
     assert!(matches!(
-        hash_media(&input.file, FileHash::FullSha256, &cancel, |_, _| {}),
+        hash_media(&pinned, FileHash::FullSha256, &cancel, |_, _| {}),
         Err(ErrorCode::Cancelled)
     ));
-    drop(input);
-    assert_eq!(ledger.used(None, Resource::Handle), 0);
+    drop(pinned);
     std::fs::hard_link(&path, dir.join("alias.bin")).unwrap();
     assert!(PinnedFile::open(&path).is_err());
     std::fs::remove_file(dir.join("alias.bin")).unwrap();
     std::fs::remove_file(&path).unwrap();
     std::fs::remove_dir(dir).unwrap();
 }
+
 #[test]
-fn artifacts_keep_disk_quota_until_cleanup_and_export_never_overwrites_a_racing_target() {
+fn artifacts_keep_disk_quota_until_cleanup() {
     let dir = directory();
     let ledger = Ledger::default();
     let root = TempRoot::new(&dir, "one".into(), ledger.clone()).unwrap();
     let cancel = HttpCancel::default();
-    let generation = Generation::default();
     let mut writer = root.writer("txt").unwrap();
     writer.write(b"result", &cancel).unwrap();
     let artifact = writer.finish(&cancel).unwrap();
     assert_eq!(ledger.used(Some("one"), Resource::TempBytes), 6);
-    let target = dir.join("result.txt");
-    let export = ExportGrant::approve(
-        &target,
-        ExportFormat::Text,
-        "one".into(),
-        generation,
-        &ledger,
-    )
-    .unwrap();
-    std::fs::write(&target, b"racing user data").unwrap();
-    assert!(
-        export
-            .commit(&artifact, "one", generation, &ledger, &cancel)
-            .is_err()
-    );
-    assert_eq!(std::fs::read(&target).unwrap(), b"racing user data");
-    assert!(
-        ExportGrant::approve(
-            &target,
-            ExportFormat::Text,
-            "one".into(),
-            generation,
-            &ledger
-        )
-        .is_err()
-    );
-    let output = dir.join("new.txt");
-    ExportGrant::approve(
-        &output,
-        ExportFormat::Text,
-        "one".into(),
-        generation,
-        &ledger,
-    )
-    .unwrap()
-    .commit(&artifact, "one", generation, &ledger, &cancel)
-    .unwrap();
-    assert_eq!(std::fs::read(&output).unwrap(), b"result");
-    for name in [
-        "bad.exe",
-        "bad.txt:stream",
-        "CON.txt",
-        "trailing.txt ",
-        "..txt",
-    ] {
-        assert!(
-            ExportGrant::approve(
-                &dir.join(name),
-                ExportFormat::Text,
-                "one".into(),
-                generation,
-                &ledger
-            )
-            .is_err()
-        );
-    }
-    let deadline = std::time::Instant::now() + Duration::from_secs(3);
-    while ledger.used(Some("one"), Resource::TempBytes) != 6 {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "export staging cleanup"
-        );
-        std::thread::sleep(Duration::from_millis(5));
-    }
     let hold = ledger
         .reserve("one", &[(Resource::TempBytes, (1 << 30) - 6)])
         .unwrap();
@@ -206,7 +131,137 @@ fn artifacts_keep_disk_quota_until_cleanup_and_export_never_overwrites_a_racing_
     assert_eq!(ledger.used(None, Resource::TempBytes), 0);
     assert_eq!(ledger.used(None, Resource::Handle), 0);
     drop(root);
-    std::fs::remove_file(target).unwrap();
-    std::fs::remove_file(output).unwrap();
+    std::fs::remove_dir(dir).unwrap();
+}
+
+#[test]
+fn inert_artifacts_keep_writes_serial_and_cancellable() {
+    let ledger = Ledger::default();
+    let owner = "artifact-test";
+    let dir = directory();
+    let capabilities = BTreeSet::from([Capability::MediaEnhance]);
+    let executor = FileExecutor::new(FileSetup {
+        network: NetworkGrant::new(
+            owner.into(),
+            capabilities.clone(),
+            NetworkDeclaration::default(),
+            &ledger,
+        )
+        .unwrap(),
+        ledger: ledger.clone(),
+        capabilities,
+        temporary_directory: dir.clone(),
+    })
+    .unwrap();
+    let context = || TaskContext {
+        instance_id: Id(4),
+        window: None,
+        owner: owner.into(),
+        role: Role::Control,
+        generation: Generation::default(),
+        cancel: HttpCancel::default(),
+        ledger: ledger.clone(),
+    };
+    let created = execute(
+        executor
+            .prepare(
+                Task::ArtifactBegin {
+                    format: ArtifactFormat::WebVtt,
+                },
+                &BTreeMap::new(),
+                context(),
+            )
+            .unwrap(),
+    )
+    .unwrap();
+    let id = Id(created.value["artifact_writer"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap());
+    let blobs = BTreeMap::from([(
+        9,
+        Arc::new(Blob::new(&ledger, owner, b"WEBVTT\n\n".to_vec()).unwrap()),
+    )]);
+    let task = || Task::ArtifactWrite {
+        handle: id,
+        blob: Id(9),
+        finish: false,
+    };
+    let pending = executor.prepare(task(), &blobs, context()).unwrap();
+    assert!(matches!(
+        executor.prepare(task(), &blobs, context()),
+        Err(ErrorCode::Backpressure)
+    ));
+    let written = execute(pending).unwrap();
+    assert_eq!(written.value["written"], "8");
+    let finish = execute(
+        executor
+            .prepare(
+                Task::ArtifactWrite {
+                    handle: id,
+                    blob: Id(9),
+                    finish: true,
+                },
+                &blobs,
+                context(),
+            )
+            .unwrap(),
+    )
+    .unwrap();
+    let artifact = Id(finish.value["artifact"].as_str().unwrap().parse().unwrap());
+    let output = executor
+        .approved_artifact(owner, artifact, Generation::default())
+        .unwrap();
+    assert_eq!(output.size(), 16);
+    assert!(
+        executor
+            .approved_artifact("another", artifact, Generation::default())
+            .is_err()
+    );
+    assert_eq!(executor.close(id.0), Err(ErrorCode::StaleHandle));
+    drop((created, written, finish, output));
+
+    let created = execute(
+        executor
+            .prepare(
+                Task::ArtifactBegin {
+                    format: ArtifactFormat::Text,
+                },
+                &BTreeMap::new(),
+                context(),
+            )
+            .unwrap(),
+    )
+    .unwrap();
+    let id = Id(created.value["artifact_writer"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap());
+    let pending = executor
+        .prepare(
+            Task::ArtifactWrite {
+                handle: id,
+                blob: Id(9),
+                finish: false,
+            },
+            &blobs,
+            context(),
+        )
+        .unwrap();
+    executor.close(id.0).unwrap();
+    assert!(matches!(execute(pending), Err(ErrorCode::Cancelled)));
+    drop((created, blobs));
+    executor.stop();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !executor.is_quiescent() {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(ledger.used(None, Resource::TempBytes), 0);
+    assert_eq!(ledger.used(None, Resource::Handle), 0);
+    drop(executor);
+    assert_eq!(ledger.used(None, Resource::HostBytes), 0);
     std::fs::remove_dir(dir).unwrap();
 }

@@ -1,5 +1,11 @@
-use super::*;
-use crate::plugin_v2::requests::{BrowseTarget, RequestTarget};
+use super::{Binding, Catalog, Command, Hub, Inbox, Notice, PluginStatus};
+use crate::plugin_v2::requests::{BrowseTarget, RequestTarget, RequestTicket};
+use iris_api::v2::{Capability, ErrorCode, Generation, HostEvent, Id, source::PlaybackSnapshot};
+use std::{
+    collections::BTreeSet,
+    path::PathBuf,
+    sync::{Arc, atomic::Ordering},
+};
 
 pub struct Client {
     pub(super) hub: Hub,

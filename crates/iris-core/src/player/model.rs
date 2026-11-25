@@ -74,9 +74,9 @@ impl std::fmt::Display for PlayerActionError {
                 f.write_str("A-B loop requires a finite range in current seekable media")
             }
             Self::NoVisualMedia => f.write_str("LUT preview requires loaded visual media"),
-            Self::InvalidSubtitlePath => {
-                f.write_str("remote or internal mpv protocols are not allowed in local subtitle path")
-            }
+            Self::InvalidSubtitlePath => f.write_str(
+                "remote or internal mpv protocols are not allowed in local subtitle path",
+            ),
             Self::SubtitleFileNotFound => {
                 f.write_str("subtitle path does not exist or is not a regular file")
             }

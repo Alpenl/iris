@@ -1,4 +1,11 @@
-use super::*;
+use super::{Catalog, Client, Connection, Gate, Hub, Inbox, Notice, Shared};
+use crate::plugin_v2::{ledger::Resource, requests::SourceRequests};
+use futures::channel::mpsc::{UnboundedReceiver, unbounded};
+use iris_api::v2::{ErrorCode, Generation, Id};
+use std::{
+    collections::{BTreeMap, BTreeSet, VecDeque},
+    sync::{Arc, Condvar, Mutex, atomic::AtomicBool},
+};
 
 impl Client {
     /// A bounded error-only client, without workers, engines or disk access.

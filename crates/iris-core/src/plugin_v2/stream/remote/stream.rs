@@ -1,10 +1,20 @@
 //! Continuous single-connection upstream streaming for unverified direct HTTP
 //! playback, with verified exact-offset upstream resume if a CDN closes an idle
 //! connection while the player pauses or plays from demuxer cache.
-use super::*;
-use crate::logging;
-use crate::plugin_v2::stream::reader::{OpenedStream, StreamSlice};
+use super::{
+    Metadata, RemoteReader, RemoteTarget, Response, content_range, identity_encoding, unique,
+};
+use crate::{
+    logging,
+    plugin_v2::{
+        network::raw::RawState,
+        stream::reader::{OpenedStream, StreamSlice},
+    },
+    vfs::HttpCancel,
+};
+use iris_api::v2::ErrorCode;
 use serde_json::json;
+use std::time::{Duration, Instant};
 
 const STREAM_CHUNK: usize = 64 << 10;
 const STREAM_RESERVATION: u64 = 256 << 10;

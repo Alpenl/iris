@@ -7,7 +7,7 @@ use super::{
     hub::{Binding, Catalog, Client, Notice, PluginInfo, PluginStatus},
 };
 use iris_api::v2::{
-    Capability, ErrorCode, Generation, HostCommand, HostEvent, Id,
+    Capability, ErrorCode, Generation, HostCommand, HostEvent,
     source::{PlaybackSnapshot, SourceDescriptor},
 };
 use iris_api::{

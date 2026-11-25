@@ -125,7 +125,7 @@ impl IrisWindow {
                 self.sync_plugin_modal_focus(window);
             }
         }
-        self.sync_qr_poll_timer(cx);
+        self.sync_view_timer(cx);
         should_notify
     }
 
@@ -211,7 +211,8 @@ impl IrisWindow {
             | HostCommand::OpenModal { .. }
             | HostCommand::CloseModal { .. }
             | HostCommand::SetTheme { .. }
-            | HostCommand::SetSources { .. } => {}
+            | HostCommand::SetSources { .. }
+            | HostCommand::Log { .. } => {}
             _ => self.apply_plugin_enhancement(action, cx),
         }
     }
@@ -233,10 +234,10 @@ impl IrisWindow {
         else {
             return;
         };
-        let Some(values) =
-            self.plugin_view
-                .modal
-                .begin_submit(&self.text_inputs, &pid, &modal)
+        let Some(values) = self
+            .plugin_view
+            .modal
+            .begin_submit(&self.text_inputs, &pid, &modal)
         else {
             return;
         };
@@ -269,7 +270,8 @@ impl IrisWindow {
         let report = self
             .plugins
             .send_to(&pid, HostEvent::ModalCancel { id: modal_id });
-        self.plugin_view.modal.on_dirty();
+        self.plugin_view.modal.cancel(&mut self.text_inputs);
+        self.plugin_view.modal.focus_pending = true;
         // A dismissed front modal can reveal another queued modal without a dirty slot.
         self.apply_poll_report(report, window, cx);
         self.bump_activity(cx);

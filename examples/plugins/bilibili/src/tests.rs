@@ -208,17 +208,16 @@ fn qr_login_dash_upos_selection_danmaku_and_bcc_subtitles_work_end_to_end() {
     );
     assert!(plugin.windows[&Id(1)].qr.as_ref().unwrap().matrix.len() >= 29);
     let has_auto_poll = qr_cmds.iter().any(|c| match c {
-        HostCommand::SetSidebar { panel: Some(p) } => p.sections.iter().any(|s| {
-            s.widgets.iter().any(|w| {
-                matches!(
-                    w,
-                    iris_plugin_sdk::api::Widget::QrCode {
-                        poll_action_id: Some(act),
-                        ..
-                    } if act == "auto_poll_qr"
-                )
-            })
-        }),
+        HostCommand::SetSidebar { panel: Some(p) } => {
+            p.timer
+                .as_ref()
+                .is_some_and(|t| t.action_id == "auto_poll_qr" && t.interval_ms == 2_000)
+                && p.sections.iter().any(|s| {
+                    s.widgets
+                        .iter()
+                        .any(|w| matches!(w, iris_plugin_sdk::api::Widget::PixelGrid { .. }))
+                })
+        }
         _ => false,
     });
     assert!(has_auto_poll);

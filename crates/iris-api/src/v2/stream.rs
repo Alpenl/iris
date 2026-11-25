@@ -60,8 +60,6 @@ pub enum StreamSource {
 #[serde(rename_all = "snake_case")]
 pub enum ManifestFormat {
     VirtualHls,
-    VirtualDash,
-    RestrictedHls,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -144,7 +142,6 @@ pub enum ResourceExtension {
     Ass,
     Key,
     M3u8,
-    Mpd,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -207,68 +204,4 @@ pub struct VirtualHls {
     pub variants: Vec<HlsVariant>,
     #[serde(default)]
     pub live: bool,
-}
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RestrictedHls {
-    pub resources: Vec<ResourceBinding>,
-    pub text: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct DashSegment {
-    pub resource: ResourceSpan,
-    pub time: Id,
-    pub duration: Id,
-}
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct DashTimeline {
-    pub time: Option<Id>,
-    pub duration: Id,
-    #[serde(default)]
-    pub repeat: u32,
-}
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "addressing", rename_all = "snake_case", deny_unknown_fields)]
-pub enum DashAddressing {
-    SegmentBase {
-        media: ResourceSpan,
-        index: ByteRange,
-    },
-    SegmentList {
-        segments: Vec<DashSegment>,
-    },
-    /// Only $Number$ or $Time$ in a logical resource ID; no remote URL syntax.
-    SegmentTemplate {
-        resource_template: String,
-        start_number: Id,
-        timeline: Vec<DashTimeline>,
-    },
-}
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct DashTrack {
-    pub id: String,
-    pub kind: TrackKind,
-    pub codec: String,
-    pub mime_type: String,
-    pub bandwidth: Id,
-    pub width: Option<u32>,
-    pub height: Option<u32>,
-    pub sample_rate: Option<u32>,
-    pub lang: Option<String>,
-    pub timescale: u32,
-    #[serde(default)]
-    pub presentation_time_offset: Id,
-    pub init: Option<ResourceSpan>,
-    pub segments: DashAddressing,
-}
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct VirtualDash {
-    pub resources: Vec<ResourceBinding>,
-    pub duration_ms: Id,
-    pub tracks: Vec<DashTrack>,
 }

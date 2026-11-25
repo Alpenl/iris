@@ -1,8 +1,14 @@
 //! Multiplex one installation's ControlStore without mixing window resources.
-use super::*;
-use crate::plugin_v2::ledger::{Ledger, Reservation, Resource};
-use iris_api::v2::{Id, Role};
-use std::sync::Mutex;
+use crate::plugin_v2::{
+    actor::{Executor, Operation, TaskContext},
+    instance::Blob,
+    ledger::{Ledger, Reservation, Resource},
+};
+use iris_api::v2::{ErrorCode, Generation, Id, Role, task::Task};
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, Mutex},
+};
 
 struct Scope {
     executor: Arc<dyn Executor>,

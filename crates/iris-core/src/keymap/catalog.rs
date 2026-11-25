@@ -78,9 +78,7 @@ impl ActionEntry {
             }
             "quit" | "open_settings" => match effective_gpui_context(self.context, keystroke) {
                 Some("Workspace && !Modal") => &["Workspace"],
-                Some("Workspace && !TextInput && !Modal") => {
-                    &["Workspace && !TextInput && !Modal"]
-                }
+                Some("Workspace && !TextInput && !Modal") => &["Workspace && !TextInput && !Modal"],
                 _ => &[],
             },
             _ => match effective_gpui_context(self.context, keystroke) {

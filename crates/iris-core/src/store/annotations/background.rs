@@ -182,10 +182,11 @@ mod tests {
         let dir = TestDir::new("annotation-worker");
         let target = AnnotationTarget::new(dir.path().to_path_buf());
         let used = Arc::new(AtomicU64::new(0));
-        let reserve = |_: &str, bytes: u64| -> Result<Arc<dyn Any + Send + Sync>, AnnotationError> {
-            used.fetch_add(bytes, Ordering::Relaxed);
-            Ok(Arc::new(ByteLease(Arc::clone(&used), bytes)))
-        };
+        let reserve =
+            |_: &str, bytes: u64| -> Result<Arc<dyn Any + Send + Sync>, AnnotationError> {
+                used.fetch_add(bytes, Ordering::Relaxed);
+                Ok(Arc::new(ByteLease(Arc::clone(&used), bytes)))
+            };
         let media = dir.path().join("source.mp4");
         std::fs::write(&media, b"untouched source").unwrap();
         let uris = [MediaUri::Local(media.clone())];

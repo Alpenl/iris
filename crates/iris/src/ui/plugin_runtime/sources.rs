@@ -87,21 +87,18 @@ impl IrisWindow {
                             .text_color(t.text_dim)
                             .child(filter.label.clone()),
                     )
-                    .child(
-                        div()
-                            .flex()
-                            .flex_wrap()
-                            .gap(px(4.))
-                            .children(options.into_iter().enumerate().map(|(oi, (val, label))| {
-                                let active = selected == val;
-                                let filter_id = id.clone();
-                                chip_button(
-                                    SharedString::from(format!("source-filter-{filter_id}-{oi}")),
-                                    label,
-                                    active,
-                                    t,
-                                )
-                                .on_click(cx.listener(move |this, _, _, cx| {
+                    .child(div().flex().flex_wrap().gap(px(4.)).children(
+                        options.into_iter().enumerate().map(|(oi, (val, label))| {
+                            let active = selected == val;
+                            let filter_id = id.clone();
+                            chip_button(
+                                SharedString::from(format!("source-filter-{filter_id}-{oi}")),
+                                label,
+                                active,
+                                t,
+                            )
+                            .on_click(cx.listener(
+                                move |this, _, _, cx| {
                                     let ActiveSource::Plugin(view) = &this.catalog.active_source
                                     else {
                                         return;
@@ -118,14 +115,15 @@ impl IrisWindow {
                                     } else {
                                         this.plugin_view.filter_values.remove(&filter_id);
                                     }
-                                    let query = (!this.text_inputs.search_input.is_empty())
-                                        .then(|| {
+                                    let query =
+                                        (!this.text_inputs.search_input.is_empty()).then(|| {
                                             this.text_inputs.search_input.text().trim().to_owned()
                                         });
                                     this.browse_plugin_source(&pid, &sid, folder, None, query, cx);
-                                }))
-                            })),
-                    )
+                                },
+                            ))
+                        }),
+                    ))
             }))
     }
     pub(in crate::ui) fn render_url_resolver_choice(
@@ -155,21 +153,17 @@ impl IrisWindow {
                     .text_color(t.text_muted)
                     .child("打开方式"),
             )
-            .child(
-                div()
-                    .flex()
-                    .flex_wrap()
-                    .gap(px(4.))
-                    .children(choices.into_iter().enumerate().map(|(i, (id, label))| {
-                        let active = id == active_id;
-                        chip_button(("url-resolver-choice", i), label, active, t).on_click(
-                            cx.listener(move |this, _, _, cx| {
-                                this.set_form_value("url-resolver", &id);
-                                cx.notify();
-                            }),
-                        )
-                    })),
-            )
+            .child(div().flex().flex_wrap().gap(px(4.)).children(
+                choices.into_iter().enumerate().map(|(i, (id, label))| {
+                    let active = id == active_id;
+                    chip_button(("url-resolver-choice", i), label, active, t).on_click(cx.listener(
+                        move |this, _, _, cx| {
+                            this.set_form_value("url-resolver", &id);
+                            cx.notify();
+                        },
+                    ))
+                }),
+            ))
     }
     pub(in crate::ui) fn open_user_url(
         &mut self,

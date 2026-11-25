@@ -275,7 +275,11 @@ impl IrisWindow {
         self.push_toast(msg.into(), false, Duration::from_millis(2000), cx);
     }
 
-    pub(super) fn show_error_toast(&mut self, msg: impl Into<SharedString>, cx: &mut Context<Self>) {
+    pub(super) fn show_error_toast(
+        &mut self,
+        msg: impl Into<SharedString>,
+        cx: &mut Context<Self>,
+    ) {
         self.push_toast(msg.into(), true, Duration::from_millis(3500), cx);
     }
 

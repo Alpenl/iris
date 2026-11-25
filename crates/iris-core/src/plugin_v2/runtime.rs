@@ -7,9 +7,10 @@ mod events;
 mod playback;
 mod window;
 use super::{
-    actor::{Actor, Executor, Spawn, Status, Update},
+    actor::{Actor, Spawn},
     auth::{AuthExecutor, BrowserOpen},
     engine::{CompiledModule, RuntimeEngine},
+    files::{FileExecutor, FileSetup},
     installation::{Installed, Installer},
     instance::next_id,
     ledger::{Ledger, Reservation, Resource},
@@ -17,15 +18,10 @@ use super::{
     pool::IoPool,
     services::{HostServices, WindowServices},
     storage::{Storage, StorageExecutor},
-    tools::{
-        ToolExecutor, ToolSetup,
-        binding::{ToolKind, TrustedModel, TrustedTool},
-    },
 };
 use crate::{vault::CredentialVault, vfs::HttpCancel};
 use iris_api::v2::{
-    ErrorCode, Generation, HostCommand, HostEvent, Id, Manifest, Role,
-    source::{PlaybackSnapshot, SourceDescriptor},
+    ErrorCode, Generation, HostEvent, Id, Manifest, Role, source::SourceDescriptor,
 };
 pub use playback::PlaybackPermit;
 use std::{
@@ -64,9 +60,6 @@ pub struct Setup {
     pub state_directory: PathBuf,
     pub temporary_directory: PathBuf,
     pub vault: CredentialVault,
-    pub tools: BTreeMap<ToolKind, Arc<TrustedTool>>,
-    pub models: BTreeMap<Id, Arc<TrustedModel>>,
-    pub tool_catalog: super::tools::catalog::ToolCatalog,
     pub wake: Arc<dyn Fn() + Send + Sync>,
 }
 struct WindowState {
@@ -74,6 +67,31 @@ struct WindowState {
     services: HostServices,
     media: HttpCancel,
     attachments: Arc<super::enhancement::AttachmentRegistry>,
+}
+struct LogRateLimiter {
+    window_start: std::time::Instant,
+    count: u32,
+}
+impl LogRateLimiter {
+    const MAX_PER_SEC: u32 = 20;
+    fn new() -> Self {
+        Self {
+            window_start: std::time::Instant::now(),
+            count: 0,
+        }
+    }
+    fn allow(&mut self) -> bool {
+        let now = std::time::Instant::now();
+        if now.duration_since(self.window_start) >= std::time::Duration::from_secs(1) {
+            self.window_start = now;
+            self.count = 0;
+        }
+        if self.count >= Self::MAX_PER_SEC {
+            return false;
+        }
+        self.count += 1;
+        true
+    }
 }
 pub struct Control {
     control_id: Id,
@@ -88,6 +106,7 @@ pub struct Control {
     actor: Option<Actor>,
     windows: BTreeMap<Id, WindowState>,
     sources: Vec<SourceDescriptor>,
+    log_limiter: LogRateLimiter,
     stopped: bool,
     quarantined: Option<ErrorCode>,
     _lease: Reservation,
@@ -209,6 +228,7 @@ impl Control {
             actor,
             windows: BTreeMap::new(),
             sources,
+            log_limiter: LogRateLimiter::new(),
             stopped: false,
             quarantined: None,
             _lease: lease,
@@ -229,7 +249,7 @@ impl Control {
                 BTreeSet::new(),
             )?,
             auth: AuthExecutor::new(network.clone(), setup.resources.ledger.clone(), browser),
-            files: ToolExecutor::new(ToolSetup {
+            files: FileExecutor::new(FileSetup {
                 network: network.clone(),
                 ledger: setup.resources.ledger.clone(),
                 capabilities: installed.grants.clone(),
@@ -237,9 +257,6 @@ impl Control {
                     .temporary_directory
                     .join(&installed.installation_id)
                     .join(window.map_or_else(|| "global".into(), |id| id.0.to_string())),
-                tools: setup.tools.clone(),
-                models: setup.models.clone(),
-                catalog: setup.tool_catalog.clone(),
             })?,
             storage: StorageExecutor::new(
                 storage.clone(),
@@ -266,7 +283,7 @@ impl Control {
     pub fn origins(&self) -> &OriginStore {
         &self.origins
     }
-    pub fn window_files(&self, window: Id) -> Result<&ToolExecutor, ErrorCode> {
+    pub fn window_files(&self, window: Id) -> Result<&FileExecutor, ErrorCode> {
         self.live()?;
         self.windows
             .get(&window)

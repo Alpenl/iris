@@ -15,7 +15,6 @@ use crate::settings::Settings;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StreamProfile {
     Hls,
-    Dash,
 }
 
 /// Sealed loopback attachment prepared alongside a [`ScopedPlayback`].
@@ -80,7 +79,6 @@ fn options(profile: Option<StreamProfile>) -> Vec<(&'static str, String)> {
             "hls,mpegts,mov,aac,ac3,eac3,mp3,webvtt",
             true,
         ),
-        Some(StreamProfile::Dash) => ("dash", "http,tcp", "dash,mov,matroska,webvtt", true),
         None => ("", "http,tcp", OPAQUE_FORMATS, false),
     };
     vec![
@@ -144,9 +142,7 @@ impl Session {
         owned.push(("loop-file", self.loop_value(playback.is_live).into()));
         let opts: Vec<_> = owned.iter().map(|(k, v)| (*k, v.as_str())).collect();
         let old_relay = self.event_pump.set_relay(Default::default());
-        let old_scope = self
-            .event_pump
-            .set_scoped(Arc::downgrade(&playback.stream));
+        let old_scope = self.event_pump.set_scoped(Arc::downgrade(&playback.stream));
         let id = match self
             .mpv
             .loadfile_with_options(&playback.url, "replace", &opts)
@@ -166,7 +162,6 @@ impl Session {
         let pending_tracks = playback.attachments.clone();
         let profile_label = match playback.profile {
             Some(StreamProfile::Hls) => "hls",
-            Some(StreamProfile::Dash) => "dash",
             None => "direct",
         };
         let attachment_count = playback.attachments.len();

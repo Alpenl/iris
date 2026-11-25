@@ -326,7 +326,12 @@ impl Store {
     pub fn push_recent_with_title(&mut self, uri: &MediaUri, title: Option<&str>) {
         if uri.may_share_identity() && uri.to_uri_string().len() <= MAX_RECORD_KEY {
             let clean = title.and_then(sanitize_recent_title);
-            promote_recent(&mut self.recent, &mut self.recent_titles, uri, clean.as_deref());
+            promote_recent(
+                &mut self.recent,
+                &mut self.recent_titles,
+                uri,
+                clean.as_deref(),
+            );
             if let Some(pos) = self.recent_pushes.iter().position(|(u, _)| u == uri) {
                 let (_, prev_title) = self.recent_pushes.remove(pos);
                 self.recent_pushes

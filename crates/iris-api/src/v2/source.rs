@@ -41,10 +41,9 @@ impl SourceDescriptor {
                     .icon
                     .as_ref()
                     .is_some_and(|i| !crate::is_valid_id(i) || i.len() > 64)
-                || source
-                    .badge
-                    .as_ref()
-                    .is_some_and(|b| b.trim().is_empty() || b.len() > 24 || b.chars().any(char::is_control))
+                || source.badge.as_ref().is_some_and(|b| {
+                    b.trim().is_empty() || b.len() > 24 || b.chars().any(char::is_control)
+                })
             {
                 return Err("invalid source descriptor");
             }

@@ -116,17 +116,14 @@ pub fn widgets(values: &[Widget]) -> Result<(), ErrorCode> {
                     }
                 }
             }
-            Widget::QrCode {
-                matrix,
-                poll_action_id,
-                ..
-            } => {
-                if let Some(id) = poll_action_id {
-                    identifier(id)?;
+            Widget::PixelGrid { rows, .. } => {
+                if rows.len() > 177 {
+                    return Err(ErrorCode::InvalidArgument);
                 }
-                if matrix.len() > 177
-                    || matrix.iter().any(|row| {
-                        row.len() != matrix.len() || !row.bytes().all(|b| b"01# ".contains(&b))
+                let expected_width = rows.first().map(String::len).unwrap_or(0);
+                if expected_width > 177
+                    || rows.iter().any(|row| {
+                        row.len() != expected_width || !row.bytes().all(|b| b"01# ".contains(&b))
                     })
                 {
                     return Err(ErrorCode::InvalidArgument);

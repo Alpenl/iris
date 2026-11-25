@@ -235,16 +235,29 @@ fn qr_canvas_metrics(dim: usize, max_logical: f32, scale_factor: f32) -> (f32, f
     (mod_dev, total_logical)
 }
 
-fn render_qr_widget(
+fn render_pixel_grid_widget(
     base_id: usize,
     max_logical_side: f32,
     scale_factor: f32,
-    (label, data, matrix, hint): (String, String, Vec<String>, Option<String>),
+    (label, rows, copy_text, caption): (String, Vec<String>, Option<String>, Option<String>),
     t: ThemeTokens,
     cx: &Context<IrisWindow>,
 ) -> AnyElement {
-    let parsed = QrMatrix::from_lines(&matrix);
-    let copy_payload = data.clone();
+    let parsed = QrMatrix::from_lines(&rows);
+    let copy_row = copy_text.filter(|s| !s.trim().is_empty()).map(|data| {
+        let copy_payload = data.clone();
+        let btn = chip_button(("pl-grid-copy", base_id), "复制内容", false, t).on_click(
+            cx.listener(move |this, _, _, cx| {
+                cx.write_to_clipboard(ClipboardItem::new_string(copy_payload.clone()));
+                this.show_toast("内容已复制到剪贴板", cx);
+            }),
+        );
+        let url_txt = trunc_txt(data, t.text_xs, t.text_dim)
+            .flex_1()
+            .min_w(px(0.))
+            .font_family(FONT_MONO);
+        hbetween(8.).child(url_txt).child(btn)
+    });
 
     let grid = parsed.map(|qr| {
         let dim = qr.dim();
@@ -304,19 +317,6 @@ fn render_qr_widget(
             .child(qr_canvas);
         hstack(0.).w_full().justify_center().py(px(4.)).child(sheet)
     });
-    let copy_row = (!data.trim().is_empty()).then(|| {
-        let btn = chip_button(("pl-qr-copy", base_id), "复制内容", false, t).on_click(cx.listener(
-            move |this, _, _, cx| {
-                cx.write_to_clipboard(ClipboardItem::new_string(copy_payload.clone()));
-                this.show_toast("二维码内容已复制到剪贴板", cx);
-            },
-        ));
-        let url_txt = trunc_txt(data, t.text_xs, t.text_dim)
-            .flex_1()
-            .min_w(px(0.))
-            .font_family(FONT_MONO);
-        hbetween(8.).child(url_txt).child(btn)
-    });
 
     surface_card(8., t)
         .when(!label.is_empty(), |d| {
@@ -324,7 +324,7 @@ fn render_qr_widget(
         })
         .children(grid)
         .children(copy_row)
-        .when_some(hint.filter(|h| !h.trim().is_empty()), |d, h| {
+        .when_some(caption.filter(|h| !h.trim().is_empty()), |d, h| {
             d.child(txt(h, t.text_sm, t.text_dim))
         })
         .into_any_element()
@@ -368,7 +368,8 @@ pub(super) fn render_plugin_widget(
         } => hbetween(8.)
             .child(txt(label, t.text_sm, t.text_dim))
             .child(
-                txt(value, t.text_sm, if accent { t.accent } else { t.text }).font_family(FONT_MONO),
+                txt(value, t.text_sm, if accent { t.accent } else { t.text })
+                    .font_family(FONT_MONO),
             )
             .into_any_element(),
 
@@ -461,27 +462,29 @@ pub(super) fn render_plugin_widget(
         }))
         .into_any_element(),
 
-        Widget::ButtonGroup { buttons } => div()
-            .flex()
-            .flex_wrap()
-            .gap(px(4.))
-            .children(buttons.into_iter().enumerate().map(|(bi, btn)| {
-                let (pid_b, act) = (pid_owned.clone(), btn.action_id);
-                let g = btn.icon.as_deref().and_then(Icon::from_name);
-                icon_pill_button(
-                    ("pl-gbtn", bi),
-                    btn.label,
-                    g,
-                    btn.accent,
-                    t.control_h_sm,
-                    rest_bg,
-                    t,
-                )
-                .on_click(cx.listener(move |this, _, w, cx| {
-                    this.invoke_plugin_action(&pid_b, &act, w, cx)
+        Widget::ButtonGroup { buttons } => {
+            div()
+                .flex()
+                .flex_wrap()
+                .gap(px(4.))
+                .children(buttons.into_iter().enumerate().map(|(bi, btn)| {
+                    let (pid_b, act) = (pid_owned.clone(), btn.action_id);
+                    let g = btn.icon.as_deref().and_then(Icon::from_name);
+                    icon_pill_button(
+                        ("pl-gbtn", bi),
+                        btn.label,
+                        g,
+                        btn.accent,
+                        t.control_h_sm,
+                        rest_bg,
+                        t,
+                    )
+                    .on_click(cx.listener(move |this, _, w, cx| {
+                        this.invoke_plugin_action(&pid_b, &act, w, cx)
+                    }))
                 }))
-            }))
-            .into_any_element(),
+                .into_any_element()
+        }
 
         Widget::Input {
             id,
@@ -669,12 +672,11 @@ pub(super) fn render_plugin_widget(
                 .into_any_element()
         }
 
-        Widget::QrCode {
+        Widget::PixelGrid {
             label,
-            data,
-            matrix,
-            hint,
-            ..
+            rows,
+            copy_text,
+            caption,
         } => {
             let window = match &surface {
                 WidgetSurface::Sidebar { window } | WidgetSurface::Modal { window, .. } => *window,
@@ -684,11 +686,11 @@ pub(super) fn render_plugin_widget(
             } else {
                 (win.settings.directory_width - 64.0).clamp(140.0, 256.0)
             };
-            render_qr_widget(
+            render_pixel_grid_widget(
                 base_id,
                 max_logical_side,
                 window.scale_factor(),
-                (label, data, matrix, hint),
+                (label, rows, copy_text, caption),
                 t,
                 cx,
             )
@@ -795,7 +797,10 @@ mod tests {
                     quiet_dev >= mod_dev * QR_QUIET_MODULES as f32 - 0.01,
                     "scale={scale} dim={dim} quiet_dev={quiet_dev} mod_dev={mod_dev}"
                 );
-                assert!(total_logical <= 224.01, "overflowed container: {total_logical}");
+                assert!(
+                    total_logical <= 224.01,
+                    "overflowed container: {total_logical}"
+                );
             }
         }
     }

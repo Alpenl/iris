@@ -283,7 +283,6 @@ impl IrisWindow {
                     ),
             )
             .children(cards)
-            .child(self.settings_tools(t, cx))
     }
 
     fn render_plugin_card(
@@ -375,11 +374,7 @@ impl IrisWindow {
                             .child(
                                 div()
                                     .text_size(t.text_xs)
-                                    .text_color(if status_error {
-                                        t.danger
-                                    } else {
-                                        t.text_faint
-                                    })
+                                    .text_color(if status_error { t.danger } else { t.text_faint })
                                     .child(status_text),
                             ),
                     )
@@ -542,17 +537,19 @@ impl IrisWindow {
                                     ButtonSize::Sm,
                                     t,
                                 )
-                                .on_click(cx.listener(move |this, _, w, cx| {
-                                    if this.confirm_destructive(rm_key.clone(), cx) {
-                                        this.manage_plugin_source(
-                                            &pid_rm,
-                                            &sid_rm,
-                                            SourceManageAction::Remove,
-                                            w,
-                                            cx,
-                                        );
-                                    }
-                                })),
+                                .on_click(cx.listener(
+                                    move |this, _, w, cx| {
+                                        if this.confirm_destructive(rm_key.clone(), cx) {
+                                            this.manage_plugin_source(
+                                                &pid_rm,
+                                                &sid_rm,
+                                                SourceManageAction::Remove,
+                                                w,
+                                                cx,
+                                            );
+                                        }
+                                    },
+                                )),
                             )
                         })
                         .child(

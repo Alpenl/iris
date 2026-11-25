@@ -1,26 +1,39 @@
-//! Guest-created inert data artifacts use the same private, accounted files as
-//! native tools. The API accepts formats and bytes, never filesystem paths.
-use super::*;
-use crate::plugin_v2::files::ArtifactWriter;
-use iris_api::v2::task::ArtifactFormat;
-use std::sync::Weak;
+//! Guest-created inert data artifacts use private, accounted temporary files.
+//! The API accepts formats and bytes, never filesystem paths.
+use super::{FileExecutor, Inner};
+use crate::{
+    plugin_v2::{
+        actor::{IoOutcome, Operation, TaskContext},
+        files::ArtifactWriter,
+        instance::{Blob, next_id},
+    },
+    vfs::HttpCancel,
+};
+use iris_api::v2::{ErrorCode, Generation, Id, task::ArtifactFormat, task_result::ArtifactResult};
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, Weak},
+};
 
 pub(super) struct WriterEntry {
     writer: Option<ArtifactWriter>,
     pub cancel: HttpCancel,
     generation: Generation,
 }
+
 struct Work {
     writer: Option<ArtifactWriter>,
     inner: Weak<Inner>,
     id: Id,
     armed: bool,
 }
+
 impl Work {
     fn disarm(&mut self) {
         self.armed = false;
     }
 }
+
 impl Drop for Work {
     fn drop(&mut self) {
         if self.armed {
@@ -28,6 +41,7 @@ impl Drop for Work {
         }
     }
 }
+
 fn discard(inner: &Weak<Inner>, id: Id) {
     if let Some(inner) = inner.upgrade()
         && let Some(entry) = inner
@@ -40,7 +54,8 @@ fn discard(inner: &Weak<Inner>, id: Id) {
         entry.cancel.cancel();
     }
 }
-impl ToolExecutor {
+
+impl FileExecutor {
     pub(super) fn begin_artifact(
         &self,
         format: ArtifactFormat,
@@ -77,6 +92,7 @@ impl ToolExecutor {
             )
         }))
     }
+
     pub(super) fn write_artifact(
         &self,
         id: Id,
@@ -133,7 +149,11 @@ impl ToolExecutor {
                 }
                 work.disarm();
                 drop(state);
-                let value = super::run::result(&artifact);
+                let value = ArtifactResult {
+                    artifact: artifact.id,
+                    bytes: Id(artifact.size()),
+                    format: artifact.format.clone(),
+                };
                 this.publish(artifact, value, &context)
             } else {
                 let mut state = this.0.state.lock().unwrap_or_else(|e| e.into_inner());

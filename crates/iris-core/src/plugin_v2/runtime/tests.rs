@@ -1,9 +1,10 @@
 use super::*;
 use crate::plugin_v2::{
+    actor::Status,
     installation::Approval,
     package::{Package, Provenance},
 };
-use iris_api::v2::{Capability, NetworkDeclaration};
+use iris_api::v2::{Capability, NetworkDeclaration, source::PlaybackSnapshot};
 use std::{
     io::{Cursor, Write},
     time::{Duration, Instant},
@@ -57,9 +58,6 @@ impl Fixture {
             state_directory: root.join("state"),
             temporary_directory: root.join("temp"),
             vault: CredentialVault::in_memory(),
-            tools: BTreeMap::new(),
-            models: BTreeMap::new(),
-            tool_catalog: Default::default(),
             wake: Arc::new(|| {}),
         };
         let mut installer = Installer::new(root.join("packages"), resources.ledger.clone());
@@ -250,7 +248,7 @@ fn read_state_filter_never_leaks_local_snapshot_through_other_events() {
 fn altered_approval_cannot_be_loaded_against_an_existing_record() {
     let f = Fixture::new(r#"{"ok":[]}"#, vec![Capability::MediaSource]);
     let mut changed = f.installed.clone();
-    changed.grants.insert(Capability::ExternalTool);
+    changed.grants.insert(Capability::Secrets);
     assert!(matches!(
         f.installer.load(&changed),
         Err(ErrorCode::StaleHandle)

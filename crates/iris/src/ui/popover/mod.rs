@@ -30,7 +30,12 @@ pub(super) fn popover_header(
         .justify_between()
         .border_b_1()
         .border_color(t.line)
-        .child(div().text_size(t.text_sm).text_color(t.text_dim).child(title))
+        .child(
+            div()
+                .text_size(t.text_sm)
+                .text_color(t.text_dim)
+                .child(title),
+        )
         .when_some(hint, |d, hint| {
             d.child(
                 div()
@@ -166,11 +171,7 @@ impl IrisWindow {
             .child(panel)
     }
 
-    pub(super) fn handle_popover_key(
-        &mut self,
-        key: &str,
-        cx: &mut Context<Self>,
-    ) -> bool {
+    pub(super) fn handle_popover_key(&mut self, key: &str, cx: &mut Context<Self>) -> bool {
         let Some(kind) = self.overlays.popover else {
             return false;
         };

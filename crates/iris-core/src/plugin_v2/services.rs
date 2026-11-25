@@ -4,10 +4,10 @@ mod windows;
 use super::{
     actor::{Executor, Operation, TaskContext},
     auth::AuthExecutor,
+    files::FileExecutor,
     instance::Blob,
     network::NetworkExecutor,
     storage::StorageExecutor,
-    tools::ToolExecutor,
 };
 use iris_api::v2::{ErrorCode, Generation, task::Task};
 use std::{collections::BTreeMap, sync::Arc};
@@ -16,7 +16,7 @@ pub use windows::WindowServices;
 pub struct HostServices {
     pub network: NetworkExecutor,
     pub auth: AuthExecutor,
-    pub files: ToolExecutor,
+    pub files: FileExecutor,
     pub storage: StorageExecutor,
 }
 impl Executor for HostServices {
@@ -45,11 +45,8 @@ impl Executor for HostServices {
                 self.auth.prepare(task, blobs, context)
             }
             Task::HashCurrentMedia { .. }
-            | Task::QueryTools
-            | Task::InvokeTool { .. }
             | Task::ArtifactBegin { .. }
             | Task::ArtifactWrite { .. }
-            | Task::ExportArtifact { .. }
             | Task::ArtifactRead { .. } => self.files.prepare(task, blobs, context),
         }
     }

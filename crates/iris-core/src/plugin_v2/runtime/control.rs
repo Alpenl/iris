@@ -1,4 +1,17 @@
-use super::*;
+use super::{Control, events};
+use crate::{
+    logging::{self, EventLevel},
+    plugin_v2::{
+        actor::{Actor, Executor, Status, Update},
+        auth::BrowserOpen,
+        enhancement::AttachmentRegistry,
+    },
+    vfs::HttpCancel,
+};
+use iris_api::v2::{
+    ErrorCode, Generation, HostCommand, HostEvent, Id, LogLevel, source::PlaybackSnapshot,
+};
+use std::sync::Arc;
 impl Control {
     /// Directory setup is background-only. The browser hook only queues UI work.
     pub fn open_window(
@@ -34,7 +47,7 @@ impl Control {
         }
         if generation.media != old.media {
             std::mem::take(&mut state.media).cancel();
-            state.attachments = Arc::new(super::super::enhancement::AttachmentRegistry::default());
+            state.attachments = Arc::new(AttachmentRegistry::default());
         }
         state.generation = generation;
         Ok(())
@@ -124,8 +137,31 @@ impl Control {
             return None;
         }
         for command in &update.commands {
-            if let HostCommand::SetSources { sources } = command {
-                self.sources = sources.clone();
+            match command {
+                HostCommand::SetSources { sources } => {
+                    self.sources = sources.clone();
+                }
+                HostCommand::Log { level, message } => {
+                    if self.log_limiter.allow() {
+                        let lvl = match level {
+                            LogLevel::Debug => EventLevel::Debug,
+                            LogLevel::Info => EventLevel::Info,
+                            LogLevel::Warn => EventLevel::Warn,
+                            LogLevel::Error => EventLevel::Error,
+                        };
+                        let redacted = logging::redact_text(message);
+                        logging::event_kv(
+                            lvl,
+                            "plugin",
+                            "log",
+                            &[
+                                ("plugin", self.installed.plugin_id.as_str()),
+                                ("message", redacted.as_str()),
+                            ],
+                        );
+                    }
+                }
+                _ => {}
             }
         }
         Some(update)

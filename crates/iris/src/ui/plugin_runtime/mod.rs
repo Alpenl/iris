@@ -1,10 +1,7 @@
 //! Window-owned presentation of scoped plugin results and host consent.
 mod annotations;
-mod byob;
-mod byob_consent;
 mod consent;
 mod enhance;
-mod export;
 mod notices;
 pub(in crate::ui) use notices::describe_error_code;
 mod overlay;
@@ -109,9 +106,8 @@ pub(super) struct PluginView {
     pub playlist_binding: Option<Arc<Binding>>,
     pub source_filters: Vec<iris_api::v2::source::SourceFilter>,
     pub filter_values: std::collections::BTreeMap<String, String>,
-    pub qr_poll: Option<((String, String), gpui::Task<()>)>,
+    pub view_timer: Option<((String, String, u32), gpui::Task<()>)>,
     thumbnails: thumbnails::Thumbnails,
-    tools: byob::ToolView,
     enhance: enhance::EnhancementView,
 }
 impl PluginView {
@@ -132,9 +128,8 @@ impl PluginView {
             playlist_binding: None,
             source_filters: Vec::new(),
             filter_values: std::collections::BTreeMap::new(),
-            qr_poll: None,
+            view_timer: None,
             thumbnails: thumbnails::Thumbnails::default(),
-            tools: byob::ToolView::default(),
             enhance: enhance::EnhancementView::default(),
         }
     }
@@ -159,9 +154,19 @@ impl IrisWindow {
             .iter()
             .copied()
             .find(|(pid, _, desc)| *pid == plugin_id && desc.id == source_id)
-            .or_else(|| sources.iter().copied().find(|(pid, _, _)| *pid == plugin_id));
+            .or_else(|| {
+                sources
+                    .iter()
+                    .copied()
+                    .find(|(pid, _, _)| *pid == plugin_id)
+            });
         if let Some((_, pname, desc)) = found {
-            if let Some(badge) = desc.badge.as_deref().map(str::trim).filter(|b| !b.is_empty()) {
+            if let Some(badge) = desc
+                .badge
+                .as_deref()
+                .map(str::trim)
+                .filter(|b| !b.is_empty())
+            {
                 return badge.to_owned().into();
             }
             if !pname.trim().is_empty() {
@@ -172,6 +177,22 @@ impl IrisWindow {
     }
     pub(super) fn plugin_media_id(&self) -> Id {
         self.plugins.generation().media
+    }
+    pub(in crate::ui) fn bind_plugin_current_file(&self) {
+        let path = self
+            .active()
+            .session
+            .current()
+            .map(std::path::Path::to_owned);
+        for info in self.plugins.list() {
+            if let Ok(access) = self.plugins.client().access(&info.id) {
+                let _ = access.files.set_current_path(
+                    self.plugin_media_id(),
+                    access.generation,
+                    path.clone(),
+                );
+            }
+        }
     }
     pub(super) fn close_plugin_browse(&mut self) {
         if let Some((plugin, view)) = self.plugin_view.view.take() {
@@ -271,13 +292,6 @@ impl IrisWindow {
     }
     pub(super) fn reconcile_plugin_lifetimes(&mut self, cx: &mut Context<Self>) {
         self.reconcile_enhancements(cx);
-        if self.plugin_view.tools.input.as_ref().is_some_and(|r| {
-            !r.binding.is_live()
-                || r.access.generation != self.plugins.generation()
-                || r.created.elapsed().as_secs() >= 300
-        }) {
-            self.finish_input_consent(false, cx);
-        }
         if self
             .plugin_view
             .playlist_binding
@@ -296,16 +310,6 @@ impl IrisWindow {
             self.close_plugin_browse();
             self.catalog.active_source = super::state::ActiveSource::Local;
             self.rebuild_directory_rows();
-        }
-        if self
-            .plugin_view
-            .tools
-            .review
-            .as_ref()
-            .is_some_and(|(_, created)| created.elapsed().as_secs() >= 300)
-        {
-            self.plugin_view.tools.review = None;
-            cx.notify();
         }
         if let Some(review) = self
             .plugin_view
@@ -382,61 +386,50 @@ impl IrisWindow {
             cx,
         )
     }
-    fn active_qr_poll_target(&self) -> Option<(String, String)> {
+    fn active_view_timer_target(&self) -> Option<(String, String, u32)> {
         if !self.has_host_consent()
             && let Some((pid, modal)) = self.plugins.active_modal()
+            && let Some(timer) = &modal.timer
+            && !timer.action_id.is_empty()
         {
-            for widget in &modal.widgets {
-                if let iris_api::Widget::QrCode {
-                    matrix,
-                    poll_action_id: Some(act),
-                    ..
-                } = widget
-                    && !matrix.is_empty()
-                    && !act.is_empty()
-                {
-                    return Some((pid.to_string(), act.clone()));
-                }
-            }
+            return Some((
+                pid.to_string(),
+                timer.action_id.clone(),
+                timer.interval_ms.clamp(1_000, 300_000),
+            ));
         }
         for (pid, panel) in self.plugins.sidebar_panels() {
-            for section in &panel.sections {
-                for widget in &section.widgets {
-                    if let iris_api::Widget::QrCode {
-                        matrix,
-                        poll_action_id: Some(act),
-                        ..
-                    } = widget
-                        && !matrix.is_empty()
-                        && !act.is_empty()
-                    {
-                        return Some((pid.to_string(), act.clone()));
-                    }
-                }
+            if let Some(timer) = &panel.timer
+                && !timer.action_id.is_empty()
+            {
+                return Some((
+                    pid.to_string(),
+                    timer.action_id.clone(),
+                    timer.interval_ms.clamp(1_000, 300_000),
+                ));
             }
         }
         None
     }
-    pub(super) fn sync_qr_poll_timer(&mut self, cx: &mut Context<Self>) {
-        let next = self.active_qr_poll_target();
-        if self.plugin_view.qr_poll.as_ref().map(|(k, _)| k) == next.as_ref() {
+    pub(super) fn sync_view_timer(&mut self, cx: &mut Context<Self>) {
+        let next = self.active_view_timer_target();
+        if self.plugin_view.view_timer.as_ref().map(|(k, _)| k) == next.as_ref() {
             return;
         }
-        let Some((pid, act)) = next else {
-            self.plugin_view.qr_poll = None;
+        let Some((pid, act, interval_ms)) = next else {
+            self.plugin_view.view_timer = None;
             return;
         };
-        let key = (pid.clone(), act.clone());
+        let key = (pid.clone(), act.clone(), interval_ms);
         let expected = key.clone();
+        let interval = std::time::Duration::from_millis(u64::from(interval_ms));
         let task = cx.spawn(async move |this, cx| {
             for _ in 0..120 {
-                cx.background_executor()
-                    .timer(std::time::Duration::from_secs(2))
-                    .await;
+                cx.background_executor().timer(interval).await;
                 let keep_going = this
                     .update(cx, |this, cx| {
-                        if this.active_qr_poll_target().as_ref() != Some(&expected) {
-                            this.plugin_view.qr_poll = None;
+                        if this.active_view_timer_target().as_ref() != Some(&expected) {
+                            this.plugin_view.view_timer = None;
                             return false;
                         }
                         let snap = this.plugin_snapshot();
@@ -459,6 +452,6 @@ impl IrisWindow {
                 }
             }
         });
-        self.plugin_view.qr_poll = Some((key, task));
+        self.plugin_view.view_timer = Some((key, task));
     }
 }

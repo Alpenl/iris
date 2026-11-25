@@ -46,7 +46,9 @@ pub(in crate::ui) fn select_row(
         .text_size(t.text_md)
         .when(mono, |d| d.font_family(FONT_MONO))
         .when(kb_focused, |d| d.bg(t.hover).text_color(t.text))
-        .when(active && !kb_focused, |d| d.bg(t.selected).text_color(t.text))
+        .when(active && !kb_focused, |d| {
+            d.bg(t.selected).text_color(t.text)
+        })
         .when(!active && !kb_focused, |d| {
             d.text_color(t.text_muted)
                 .hover(|s| s.bg(t.hover).text_color(t.text))

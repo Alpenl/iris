@@ -64,10 +64,7 @@ impl NetworkScope {
         &self.source
     }
 
-    pub(crate) fn authorized(
-        source: Url,
-        policy: Arc<dyn ConnectionPolicy>,
-    ) -> Result<Self> {
+    pub(crate) fn authorized(source: Url, policy: Arc<dyn ConnectionPolicy>) -> Result<Self> {
         policy.check_url(&source)?;
         Ok(Self {
             source,
@@ -360,15 +357,17 @@ pub(super) fn remaining_timeout(
     limit: Duration,
 ) -> Result<Duration> {
     if cancel.is_cancelled() {
-        return Err(anyhow::Error::new(HttpClientError::Cancelled)
-            .context("HTTP request cancelled"));
+        return Err(
+            anyhow::Error::new(HttpClientError::Cancelled).context("HTTP request cancelled")
+        );
     }
     let left = deadline.map_or(limit, |d| {
         d.saturating_duration_since(Instant::now()).min(limit)
     });
     if left.is_zero() {
-        return Err(anyhow::Error::new(HttpClientError::Timeout)
-            .context("HTTP request deadline exceeded"));
+        return Err(
+            anyhow::Error::new(HttpClientError::Timeout).context("HTTP request deadline exceeded")
+        );
     }
     Ok(left)
 }
@@ -492,7 +491,7 @@ pub(crate) fn connect_transport(
 
 // A trusted HTTP proxy CONNECT keeps TLS end-to-end with the native tool. The
 // original https Origin still drives DNS and peer authorization.
-pub(crate) fn connect_authorized(
+fn connect_authorized(
     url: &Url,
     scope: &NetworkScope,
     cancel: &HttpCancel,

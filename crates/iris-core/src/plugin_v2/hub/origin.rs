@@ -1,5 +1,5 @@
-use super::*;
 use super::{
+    Binding, Notice,
     jobs::{Work, guarded},
     worker::Worker,
 };
@@ -11,8 +11,12 @@ use crate::{
     },
     vfs::HttpCancel,
 };
-use iris_api::v2::task_result::OriginResult;
-use std::net::IpAddr;
+use iris_api::v2::{ErrorCode, Generation, HostEvent, Id, task_result::OriginResult};
+use std::{
+    net::IpAddr,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 pub struct OriginSummary {
     pub id: Id,

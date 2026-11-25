@@ -203,6 +203,9 @@ pub fn command(command: &HostCommand) -> Result<(), ErrorCode> {
         SetSidebar { panel } => {
             if let Some(panel) = panel {
                 text(&panel.title, 256)?;
+                if let Some(timer) = &panel.timer {
+                    view_timer(timer)?;
+                }
                 if panel.sections.len() > 32
                     || panel
                         .sections
@@ -272,6 +275,9 @@ pub fn command(command: &HostCommand) -> Result<(), ErrorCode> {
             }
             if let Some(cancel) = &modal.cancel_label {
                 single_line(cancel, 128)?;
+            }
+            if let Some(timer) = &modal.timer {
+                view_timer(timer)?;
             }
             widgets(&modal.widgets)
         }
@@ -418,17 +424,10 @@ pub fn command(command: &HostCommand) -> Result<(), ErrorCode> {
                 Ok(())
             }
         }
-        RequestExport { suggested_name, .. } => {
-            single_line(suggested_name, 240)?;
-            if suggested_name.is_empty() || suggested_name.contains(['/', '\\', ':']) {
-                return Err(ErrorCode::InvalidArgument);
-            }
-            Ok(())
-        }
+        Log { message, .. } => single_line(message, 512),
         // These commands carry opaque capabilities; consuming services check
         // instance/session ownership and current generation before mutation.
         TogglePlayback
-        | RequestMediaInput { .. }
         | ToggleMute
         | OpenNext
         | OpenPrevious
@@ -438,6 +437,13 @@ pub fn command(command: &HostCommand) -> Result<(), ErrorCode> {
         | UpdateManifest { .. }
         | SetMonitorLut { .. } => Ok(()),
     }
+}
+
+fn view_timer(timer: &iris_api::ViewTimer) -> Result<(), ErrorCode> {
+    if !(1_000..=300_000).contains(&timer.interval_ms) {
+        return Err(ErrorCode::InvalidArgument);
+    }
+    identifier(&timer.action_id)
 }
 
 fn timeline_ranges(ranges: impl Iterator<Item = (u64, u64)>) -> Result<(), ErrorCode> {

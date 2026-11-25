@@ -193,8 +193,8 @@ for path in sorted(core_src.rglob("*.rs")):
     )
     prod_code = strip_line_comments(text[: test_mod.start()] if test_mod else text)
     top_domain = parts[0].removesuffix(".rs")
+    assert "use super::*;" not in prod_code, f"{rel} uses forbidden wildcard `use super::*;`"
     if top_domain in isolated_core_domains:
-        assert "use super::*;" not in prod_code, f"{rel} uses forbidden wildcard `use super::*;`"
         for needle in core_forbidden_plugin_refs:
             assert needle not in prod_code, (
                 f"{rel} breaks core->plugin dependency direction via `{needle}`"

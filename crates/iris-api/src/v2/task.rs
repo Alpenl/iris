@@ -86,10 +86,6 @@ pub enum Task {
         media: Id,
         algorithm: FileHash,
     },
-    InvokeTool {
-        task: ToolTask,
-    },
-    QueryTools,
     ArtifactRead {
         handle: Id,
         offset: Id,
@@ -102,10 +98,6 @@ pub enum Task {
         handle: Id,
         blob: Id,
         finish: bool,
-    },
-    ExportArtifact {
-        artifact: Id,
-        export: Id,
     },
 }
 
@@ -126,28 +118,14 @@ impl Task {
             }
             Self::BeginAuth { .. } | Self::OpenAuth { .. } => Capability::UiModal,
             Self::HashCurrentMedia { .. } => Capability::ReadState,
-            Self::ExportArtifact { .. } => Capability::ExportFiles,
-            Self::QueryTools
-            | Self::InvokeTool { .. }
-            | Self::ArtifactRead { .. }
-            | Self::ArtifactBegin { .. }
-            | Self::ArtifactWrite { .. } => Capability::ExternalTool,
+            Self::ArtifactRead { .. } | Self::ArtifactBegin { .. } | Self::ArtifactWrite { .. } => {
+                Capability::MediaEnhance
+            }
         })
     }
     pub fn authorized(&self, grants: &std::collections::BTreeSet<Capability>) -> bool {
         if matches!(self, Self::SecretRead { .. } | Self::SecretWrite { .. }) {
             grants.contains(&Capability::Secrets) || grants.contains(&Capability::MediaSource)
-        } else if matches!(
-            self,
-            Self::ArtifactRead { .. } | Self::ArtifactBegin { .. } | Self::ArtifactWrite { .. }
-        ) {
-            [
-                Capability::MediaEnhance,
-                Capability::ExternalTool,
-                Capability::ExportFiles,
-            ]
-            .iter()
-            .any(|cap| grants.contains(cap))
         } else {
             self.capability().is_none_or(|cap| grants.contains(&cap))
         }
@@ -210,52 +188,4 @@ pub enum FileHash {
     FullMd5,
     FullSha256,
     SparseSha256V1,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum MediaInputAction {
-    Slice,
-    ExtractAudio,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum ToolTask {
-    LosslessSlice {
-        input: Id,
-        export: Id,
-        start_ms: Id,
-        end_ms: Id,
-        container: MediaContainer,
-    },
-    ExtractAudio {
-        input: Id,
-        track: u32,
-        sample_rate: SampleRate,
-    },
-    Transcribe {
-        audio: Id,
-        model: Id,
-        language: Option<String>,
-    },
-    ResolveMetadata {
-        url: String,
-        origin_grant: Option<Id>,
-    },
-}
-
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum MediaContainer {
-    Matroska,
-    Mp4,
-    Webm,
-}
-
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SampleRate {
-    Hz16000,
-    Hz48000,
 }

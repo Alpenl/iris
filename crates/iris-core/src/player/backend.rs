@@ -16,11 +16,11 @@ use crate::library::Kind;
 use crate::logging::{self, EventLevel};
 use crate::settings::{Hwdec, OnEof, Settings, SubLang};
 
-use super::{MediaSourceState, MonitorLutFilter, ScopedStream, Session, next_command_receipt};
 use super::model::{
     AspectMode, Command, MAX_SPEED, MIN_SPEED, PlayerActionError, SessionEvent, SessionUpdate,
 };
 use super::relay::Service;
+use super::{MediaSourceState, MonitorLutFilter, ScopedStream, Session, next_command_receipt};
 mod commands;
 mod references;
 use references::{disable_hls, enable_hls};
@@ -147,10 +147,7 @@ pub(super) struct EventPump {
 }
 
 impl EventPump {
-    pub(super) fn set_scoped(
-        &self,
-        scoped: Weak<dyn ScopedStream>,
-    ) -> Weak<dyn ScopedStream> {
+    pub(super) fn set_scoped(&self, scoped: Weak<dyn ScopedStream>) -> Weak<dyn ScopedStream> {
         std::mem::replace(&mut *self.scoped.lock().unwrap(), scoped)
     }
     pub(super) fn set_relay(&self, relay: Weak<Service>) -> Weak<Service> {
@@ -441,7 +438,8 @@ impl Session {
     pub fn set_sub_lang(&self, sub_lang: SubLang) {
         Self::log_mpv_err(
             "set slang",
-            self.mpv.command_async(&["set", "slang", sub_lang.mpv_slang()]),
+            self.mpv
+                .command_async(&["set", "slang", sub_lang.mpv_slang()]),
         );
     }
 

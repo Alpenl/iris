@@ -293,7 +293,9 @@ impl IrisWindow {
                                         Some(self.plugin_source_badge(plugin_id, source_id)),
                                         true,
                                     ),
-                                    MediaUri::HttpUrl(_) => (Icon::Link, Some("网络流".into()), true),
+                                    MediaUri::HttpUrl(_) => {
+                                        (Icon::Link, Some("网络流".into()), true)
+                                    }
                                 };
                                 div()
                                     .id(("recent-item", i))

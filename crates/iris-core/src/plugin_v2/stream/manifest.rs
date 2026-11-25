@@ -1,8 +1,6 @@
-//! No input XML or HLS line is passed through to a demuxer. Rendering uses an
+//! No input HLS line is passed through to a demuxer. Rendering uses an
 //! explicit format profile and URLs supplied solely by the session registry.
-mod dash;
 mod hls;
-pub(crate) mod restricted;
 use iris_api::v2::{ErrorCode, stream::*};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -13,7 +11,6 @@ pub const ROOT: &str = "__iris_root";
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Profile {
     Hls,
-    Dash,
 }
 pub struct Document {
     pub id: String,
@@ -41,18 +38,6 @@ pub fn compile(
             let input: VirtualHls = crate::plugin_v2::json::decode_exact(bytes, INPUT_LIMIT)?;
             let mut build = Build::new(input.resources.clone(), Profile::Hls, local)?;
             hls::render(input, &mut build)?;
-            build
-        }
-        ManifestFormat::VirtualDash => {
-            let input: VirtualDash = crate::plugin_v2::json::decode_exact(bytes, INPUT_LIMIT)?;
-            let mut build = Build::new(input.resources.clone(), Profile::Dash, local)?;
-            dash::render(input, &mut build)?;
-            build
-        }
-        ManifestFormat::RestrictedHls => {
-            let input: RestrictedHls = crate::plugin_v2::json::decode_exact(bytes, INPUT_LIMIT)?;
-            let mut build = Build::new(input.resources, Profile::Hls, local)?;
-            restricted::render(&input.text, &mut build)?;
             build
         }
     };
@@ -172,7 +157,6 @@ impl<'a> Build<'a> {
             id,
             match self.profile {
                 Profile::Hls => ResourceExtension::M3u8,
-                Profile::Dash => ResourceExtension::Mpd,
             },
         )
     }

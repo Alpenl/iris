@@ -18,9 +18,7 @@ use iris_core::settings::Side;
 
 use super::IrisWindow;
 use super::actions::OpenFile;
-use super::kit::{
-    ButtonSize, ButtonVariant, button, icon_button, tab_strip, tab_strip_item, tip,
-};
+use super::kit::{ButtonSize, ButtonVariant, button, icon_button, tab_strip, tab_strip_item, tip};
 use super::state::{BuiltinDialog, SettingsTab};
 use crate::assets::Icon;
 use crate::theme::ThemeTokens;
@@ -109,14 +107,20 @@ impl IrisWindow {
                 .when(queue_len > 0, |d| {
                     if confirm_clear_queue {
                         d.child(
-                            button("sb-q-clear", "确认清空", ButtonVariant::Danger, ButtonSize::Xs, t)
-                                .tooltip(tip("再次点击确认清空播放队列", None))
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    if this.confirm_destructive("clear-queue", cx) {
-                                        this.queue.clear();
-                                        this.show_toast("已清空播放队列", cx);
-                                    }
-                                })),
+                            button(
+                                "sb-q-clear",
+                                "确认清空",
+                                ButtonVariant::Danger,
+                                ButtonSize::Xs,
+                                t,
+                            )
+                            .tooltip(tip("再次点击确认清空播放队列", None))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if this.confirm_destructive("clear-queue", cx) {
+                                    this.queue.clear();
+                                    this.show_toast("已清空播放队列", cx);
+                                }
+                            })),
                         )
                     } else {
                         d.child(

@@ -1,4 +1,13 @@
-use super::*;
+use super::{Control, Setup, WindowState};
+use crate::{
+    plugin_v2::{
+        actor::Executor, auth::BrowserOpen, installation::Installed, network::NetworkGrant,
+        services::HostServices, storage::Storage,
+    },
+    vfs::HttpCancel,
+};
+use iris_api::v2::{ErrorCode, Generation, HostEvent, Id, source::PlaybackSnapshot};
+use std::sync::Arc;
 
 /// The coordinator moves this plan to its bounded filesystem worker lane.
 pub struct WindowPreparation {

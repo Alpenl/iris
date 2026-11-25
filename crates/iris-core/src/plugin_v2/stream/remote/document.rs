@@ -1,5 +1,13 @@
-use super::*;
-use crate::plugin_v2::network::Origin;
+use super::{RemoteFactory, identity_encoding, unique};
+use crate::{
+    plugin_v2::{
+        ledger::{Reservation, Resource},
+        network::{Origin, TransportKind, normalize_url, raw::RawState},
+    },
+    vfs::HttpCancel,
+};
+use iris_api::v2::{ErrorCode, stream::RemoteResource};
+use std::time::{Duration, Instant};
 use url::Url;
 pub(crate) struct Fetched {
     pub resource: RemoteResource,

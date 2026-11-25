@@ -1,8 +1,15 @@
-use super::*;
+use super::{Approval, ArchivedIdentity, Installed, Installer};
 use crate::plugin_v2::{
-    engine::CompiledModule, instance::next_id, ledger::Reservation, runtime::Resources,
+    engine::CompiledModule,
+    instance::next_id,
+    ledger::{Reservation, Resource},
+    package::{Package, Provenance},
+    runtime::Resources,
 };
+use iris_api::v2::{Capability, ErrorCode, Manifest};
 use std::{
+    collections::BTreeSet,
+    path::Path,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},

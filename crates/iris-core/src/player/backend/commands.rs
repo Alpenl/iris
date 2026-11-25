@@ -142,15 +142,12 @@ impl Session {
             }
             Command::LoadSubtitle(path) => {
                 let raw_in = path.to_string_lossy();
-                if raw_in
-                    .split_once("://")
-                    .is_some_and(|(scheme, _)| {
-                        !scheme.is_empty()
-                            && scheme
-                                .bytes()
-                                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.'))
-                    })
-                {
+                if raw_in.split_once("://").is_some_and(|(scheme, _)| {
+                    !scheme.is_empty()
+                        && scheme
+                            .bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.'))
+                }) {
                     return Err(PlayerActionError::InvalidSubtitlePath.into());
                 }
                 let resolved = crate::library::safe_resolve_path(&path);

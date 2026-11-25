@@ -1,8 +1,6 @@
 use super::{
     Capability, Generation, Id, Role,
-    enhance::{
-        AnnotationEdit, Chapter, EnhancementResource, ExportFormat, OverlayWindow, SubtitleFormat,
-    },
+    enhance::{AnnotationEdit, Chapter, EnhancementResource, OverlayWindow, SubtitleFormat},
     source::{PlaybackSnapshot, ResolvedMedia, SourceDescriptor, SourcePage},
     stream::{ManifestFormat, StreamContext},
 };
@@ -143,15 +141,6 @@ pub enum HostEvent<T> {
         generation: Generation,
         window: OverlayWindow,
     },
-    ExportGranted {
-        request_id: Id,
-        grant: Option<Id>,
-    },
-    MediaInputGranted {
-        request_id: Id,
-        media: Id,
-        grant: Option<Id>,
-    },
     SelectionGranted {
         selection: Id,
         media: Id,
@@ -169,6 +158,15 @@ pub enum HostEvent<T> {
         insecure_auth: bool,
     },
     Shutdown,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LogLevel {
+    Debug,
+    Info,
+    Warn,
+    Error,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -318,19 +316,15 @@ pub enum HostCommand {
         index: u32,
         marker_offset: u32,
     },
-    RequestExport {
-        request_id: Id,
-        format: ExportFormat,
-        suggested_name: String,
-    },
-    RequestMediaInput {
-        request_id: Id,
-        action: super::task::MediaInputAction,
-    },
     /// A separate host-owned confirmation sheet, never a plugin-provided form.
     RequestOrigin {
         request_id: Id,
         origin: String,
+    },
+    /// Structured diagnostic log emitted to host logs (redacted and rate-limited).
+    Log {
+        level: LogLevel,
+        message: String,
     },
 }
 impl HostCommand {
@@ -388,8 +382,7 @@ impl HostCommand {
             | Self::SetMonitorLut { .. }
             | Self::SetTimelineMeta { .. } => Capability::MediaEnhance,
             Self::EditAnnotation { .. } | Self::ReadAnnotation { .. } => Capability::Annotations,
-            Self::RequestExport { .. } => Capability::ExportFiles,
-            Self::RequestMediaInput { .. } => Capability::ExternalTool,
+            Self::Log { .. } => return None,
         })
     }
 

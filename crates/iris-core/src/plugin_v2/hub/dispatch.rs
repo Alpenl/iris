@@ -1,7 +1,15 @@
-use super::jobs::{Work, guarded};
-use super::worker::{Window, Worker};
-use super::*;
-use iris_api::v2::{HostCommand, Role};
+use super::{
+    Binding, Command, Commands, Notice, PluginStatus,
+    jobs::{Work, guarded},
+    worker::{Window, Worker},
+};
+use crate::plugin_v2::{actor::Update, ledger::Resource, requests::RequestTicket};
+use iris_api::v2::{Capability, ErrorCode, Generation, HostCommand, HostEvent, Id, Role};
+use std::{
+    collections::BTreeSet,
+    sync::{Arc, atomic::Ordering},
+    time::Instant,
+};
 
 impl Worker {
     pub fn command(&mut self, command: Command) {
@@ -361,7 +369,7 @@ impl Worker {
             let mut indices = Vec::new();
             for (index, command) in update.commands.iter().enumerate() {
                 let result = match command {
-                    HostCommand::SetSources { .. } => Ok(()), // shared catalog owns this global slot
+                    HostCommand::SetSources { .. } | HostCommand::Log { .. } => Ok(()), // shared catalog / host logging owns these commands
                     HostCommand::RequestOrigin { request_id, origin } => {
                         if !same_media {
                             Err(ErrorCode::StaleHandle)

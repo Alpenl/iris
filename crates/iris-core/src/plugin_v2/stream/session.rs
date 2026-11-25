@@ -325,7 +325,6 @@ impl StreamSession {
         for doc in compiled.documents {
             let (ext, kind) = match doc.profile {
                 Profile::Hls => ("m3u8", ResourceExtension::M3u8),
-                Profile::Dash => ("mpd", ResourceExtension::Mpd),
             };
             local(&doc.id, kind)?;
             let (token, extension) = tokens
@@ -626,6 +625,5 @@ fn extension(ext: ResourceExtension) -> &'static str {
         ResourceExtension::Ass => "ass",
         ResourceExtension::Key => "key",
         ResourceExtension::M3u8 => "m3u8",
-        ResourceExtension::Mpd => "mpd",
     }
 }

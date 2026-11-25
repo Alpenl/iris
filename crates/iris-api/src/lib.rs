@@ -13,7 +13,7 @@ pub use source::{
 };
 pub use workbench::{
     ButtonSpec, ChromeLayoutSpec, Color, PluginModal, SelectOption, SidebarPanel, SidebarSection,
-    StatusBadge, ToolbarButton, UiThemeSpec, Widget, is_valid_hex_color,
+    StatusBadge, ToolbarButton, UiThemeSpec, ViewTimer, Widget, is_valid_hex_color,
 };
 /// Canonical package/control protocol. ABI has its own versioned constant.
 pub const PROTOCOL_VERSION: u32 = 2;

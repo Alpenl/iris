@@ -30,7 +30,6 @@ pub(super) struct EnhancementView {
     pub wake: Option<gpui::Task<()>>,
     pub glyphs: super::overlay::GlyphCache,
     pub ledger: Option<iris_core::plugin_v2::ledger::Ledger>,
-    pub exports: super::export::ExportView,
     pub annotations: super::annotations::AnnotationView,
 }
 pub(super) enum Effect {
@@ -84,19 +83,6 @@ impl IrisWindow {
             .bindings
             .insert(owner.clone(), action.binding.clone());
         match command {
-            HostCommand::RequestMediaInput {
-                request_id,
-                action: input_action,
-            } => {
-                self.request_media_input(action, access, request_id, input_action, cx)?;
-            }
-            HostCommand::RequestExport {
-                request_id,
-                format,
-                suggested_name,
-            } => {
-                self.request_plugin_export(action, access, request_id, format, suggested_name, cx)?;
-            }
             HostCommand::SetTimelineMeta {
                 media,
                 generation,

@@ -35,9 +35,6 @@ fn embedded_distribution_bootstraps_before_window_start_and_respects_disabled_pl
         state_directory: root.join("state"),
         temporary_directory: root.join("temp"),
         vault: vault.clone(),
-        tools: BTreeMap::new(),
-        models: BTreeMap::new(),
-        tool_catalog: Default::default(),
         wake: Arc::new(|| {}),
     };
     let hub = Hub::new(Config {

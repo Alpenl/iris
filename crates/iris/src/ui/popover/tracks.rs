@@ -56,7 +56,11 @@ impl IrisWindow {
             .child(
                 select_row(
                     "sub-toggle-row",
-                    if visible { "隐藏字幕" } else { "字幕已关闭" },
+                    if visible {
+                        "隐藏字幕"
+                    } else {
+                        "字幕已关闭"
+                    },
                     None,
                     !visible,
                     false,

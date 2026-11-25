@@ -265,7 +265,11 @@ impl AnnotationStore {
     pub fn dirty(&self) -> bool {
         !self.edits.is_empty()
     }
-    pub fn edit(&mut self, uris: &[MediaUri], edit: &AnnotationEdit) -> Result<(), AnnotationError> {
+    pub fn edit(
+        &mut self,
+        uris: &[MediaUri],
+        edit: &AnnotationEdit,
+    ) -> Result<(), AnnotationError> {
         if uris.is_empty() || uris.len() > 1000 {
             return Err(AnnotationError::InvalidArgument);
         }
@@ -378,7 +382,9 @@ pub(super) fn validate(records: &Records) -> Result<(), AnnotationError> {
             })?;
         }
     }
-    bounded_json::encode(records, BYTE_LIMIT).map(|_| ()).map_err(Into::into)
+    bounded_json::encode(records, BYTE_LIMIT)
+        .map(|_| ())
+        .map_err(Into::into)
 }
 
 #[cfg(test)]

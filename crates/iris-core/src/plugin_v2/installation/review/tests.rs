@@ -1,5 +1,6 @@
 use super::*;
-use std::io::Cursor;
+use crate::plugin_v2::installation::random_identity;
+use std::io::{Cursor, Write};
 fn package(wasm: &[u8], name: &str) -> Vec<u8> {
     let manifest = serde_json::to_vec(&serde_json::json!({"id":"test.review","name":name,"version":"1","protocol":2,"abi":2,"entry":"plugin.wasm"})).unwrap();
     let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));

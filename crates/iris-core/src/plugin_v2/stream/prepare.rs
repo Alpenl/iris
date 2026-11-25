@@ -94,7 +94,6 @@ impl Playback {
     pub fn into_scoped(self: Arc<Self>) -> Arc<crate::player::ScopedPlayback> {
         let profile = self.profile.map(|p| match p {
             Profile::Hls => crate::player::StreamProfile::Hls,
-            Profile::Dash => crate::player::StreamProfile::Dash,
         });
         let attachments = self
             .attachments

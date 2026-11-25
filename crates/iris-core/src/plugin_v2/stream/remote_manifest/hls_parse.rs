@@ -1,22 +1,19 @@
-//! Restricted media-playlist grammar. Master playlists use VirtualHls instead;
-//! no arbitrary attribute or unknown tag can survive serialization.
-use super::*;
-use iris_api::v2::Id;
+//! Bounded remote HLS media-playlist grammar and attribute-list parser.
+//! Only known tags and explicitly bound local resources survive parsing.
+use crate::plugin_v2::stream::{
+    manifest::{INPUT_LIMIT, RESOURCE_LIMIT, logical},
+    range::decimal,
+};
+use iris_api::v2::{
+    ErrorCode, Id,
+    stream::{
+        ByteRange, HlsKey, HlsSegment, HlsTrack, ResourceBinding, ResourceKind, ResourceSpan,
+        TrackKind,
+    },
+};
+use std::collections::{BTreeMap, BTreeSet};
 
-pub(super) fn render(text: &str, build: &mut Build<'_>) -> Result<(), ErrorCode> {
-    let (track, live) = parse(text, &build.resources)?;
-    hls::render(
-        VirtualHls {
-            resources: Vec::new(),
-            tracks: vec![track],
-            variants: Vec::new(),
-            live,
-        },
-        build,
-    )
-}
-
-pub(crate) fn parse(
+pub(super) fn parse(
     text: &str,
     resources: &BTreeMap<String, ResourceBinding>,
 ) -> Result<(HlsTrack, bool), ErrorCode> {
@@ -134,22 +131,20 @@ pub(crate) fn parse(
                 let value = value.ok_or(ErrorCode::InvalidArgument)?;
                 match tag {
                     "#EXT-X-VERSION" => {
-                        if !(1..=7).contains(&super::super::range::decimal(value)?) {
+                        if !(1..=7).contains(&decimal(value)?) {
                             return Err(ErrorCode::Unsupported);
                         }
                     }
                     "#EXT-X-TARGETDURATION" => {
-                        let n = super::super::range::decimal(value)?;
+                        let n = decimal(value)?;
                         if n == 0 || n > 86400 {
                             return Err(ErrorCode::InvalidArgument);
                         }
                         target = Some(n);
                     }
-                    "#EXT-X-MEDIA-SEQUENCE" => {
-                        track.sequence = Id(super::super::range::decimal(value)?)
-                    }
+                    "#EXT-X-MEDIA-SEQUENCE" => track.sequence = Id(decimal(value)?),
                     "#EXT-X-DISCONTINUITY-SEQUENCE" => {
-                        track.discontinuity_sequence = Id(super::super::range::decimal(value)?)
+                        track.discontinuity_sequence = Id(decimal(value)?)
                     }
                     _ => {
                         if !matches!(value, "VOD" | "EVENT") {
@@ -268,10 +263,19 @@ pub(crate) fn parse(
     Ok((track, !ended))
 }
 
+fn range_end(range: &ByteRange) -> Result<u64, ErrorCode> {
+    if range.len.0 == 0 {
+        return Err(ErrorCode::RangeInvalid);
+    }
+    range
+        .offset
+        .0
+        .checked_add(range.len.0)
+        .ok_or(ErrorCode::RangeInvalid)
+}
+
 fn milliseconds(value: &str) -> Result<u64, ErrorCode> {
     let (whole, fraction) = value.split_once('.').unwrap_or((value, ""));
-    // FFmpeg emits six fractional places even for exact milliseconds. Accept
-    // insignificant zero padding without rounding non-representable durations.
     if !fraction.bytes().all(|b| b.is_ascii_digit()) {
         return Err(ErrorCode::InvalidArgument);
     }
@@ -279,11 +283,11 @@ fn milliseconds(value: &str) -> Result<u64, ErrorCode> {
     if fraction.len() > 3 {
         return Err(ErrorCode::Unsupported);
     }
-    let whole = super::super::range::decimal(whole)?;
+    let whole = decimal(whole)?;
     let fraction = if fraction.is_empty() {
         0
     } else {
-        super::super::range::decimal(fraction)? * 10u64.pow(3 - fraction.len() as u32)
+        decimal(fraction)? * 10u64.pow(3 - fraction.len() as u32)
     };
     let n = whole
         .checked_mul(1000)
@@ -294,16 +298,18 @@ fn milliseconds(value: &str) -> Result<u64, ErrorCode> {
     }
     Ok(n)
 }
+
 fn byte_range(value: &str) -> Result<(u64, Option<u64>), ErrorCode> {
     let (len, offset) = value
         .split_once('@')
         .map_or((value, None), |(len, offset)| (len, Some(offset)));
-    let len = super::super::range::decimal(len)?;
+    let len = decimal(len)?;
     if len == 0 {
         return Err(ErrorCode::RangeInvalid);
     }
-    Ok((len, offset.map(super::super::range::decimal).transpose()?))
+    Ok((len, offset.map(decimal).transpose()?))
 }
+
 fn take(
     attrs: &mut BTreeMap<String, (String, bool)>,
     name: &str,
@@ -315,7 +321,8 @@ fn take(
     }
     Ok(value)
 }
-pub(crate) fn attributes(mut input: &str) -> Result<BTreeMap<String, (String, bool)>, ErrorCode> {
+
+pub(super) fn attributes(mut input: &str) -> Result<BTreeMap<String, (String, bool)>, ErrorCode> {
     let mut out = BTreeMap::new();
     loop {
         let (name, rest) = input.split_once('=').ok_or(ErrorCode::InvalidArgument)?;

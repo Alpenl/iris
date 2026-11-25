@@ -6,7 +6,8 @@ use crate::{
     playback::qn_label,
 };
 use iris_plugin_sdk::api::{
-    ButtonSpec, PluginModal, SelectOption, SidebarPanel, SidebarSection, StatusBadge, Widget,
+    ButtonSpec, PluginModal, SelectOption, SidebarPanel, SidebarSection, StatusBadge, ViewTimer,
+    Widget,
     v2::{HostCommand, source::SourceDescriptor},
 };
 
@@ -90,12 +91,11 @@ pub fn sync_window_ui(
     }
 
     if let Some(qr) = qr {
-        account_widgets.push(Widget::QrCode {
+        account_widgets.push(Widget::PixelGrid {
             label: "哔哩哔哩 App 扫码登录".into(),
-            data: qr.url.clone(),
-            matrix: qr.matrix.clone(),
-            hint: Some(qr.status_hint.clone()),
-            poll_action_id: Some("auto_poll_qr".into()),
+            rows: qr.matrix.clone(),
+            copy_text: Some(qr.url.clone()),
+            caption: Some(qr.status_hint.clone()),
         });
         account_widgets.push(Widget::ButtonGroup {
             buttons: vec![
@@ -182,6 +182,10 @@ pub fn sync_window_ui(
             quick_section,
             playback_section,
         ],
+        timer: qr.map(|_| ViewTimer {
+            interval_ms: 2_000,
+            action_id: "auto_poll_qr".into(),
+        }),
     };
 
     vec![
@@ -197,12 +201,11 @@ pub fn sync_window_ui(
 pub fn build_login_modal(qr: Option<&PendingQr>) -> PluginModal {
     let mut widgets = Vec::new();
     if let Some(qr) = qr {
-        widgets.push(Widget::QrCode {
+        widgets.push(Widget::PixelGrid {
             label: "方式一：使用哔哩哔哩手机 App 扫码登录".into(),
-            data: qr.url.clone(),
-            matrix: qr.matrix.clone(),
-            hint: Some(qr.status_hint.clone()),
-            poll_action_id: Some("auto_modal_poll_qr".into()),
+            rows: qr.matrix.clone(),
+            copy_text: Some(qr.url.clone()),
+            caption: Some(qr.status_hint.clone()),
         });
         widgets.push(Widget::ButtonGroup {
             buttons: vec![
@@ -246,6 +249,10 @@ pub fn build_login_modal(qr: Option<&PendingQr>) -> PluginModal {
         widgets,
         submit_label: Some("保存 Cookie".into()),
         cancel_label: Some("关闭".into()),
+        timer: qr.map(|_| ViewTimer {
+            interval_ms: 2_000,
+            action_id: "auto_modal_poll_qr".into(),
+        }),
     }
 }
 
@@ -266,6 +273,7 @@ pub fn build_target_modal() -> PluginModal {
         }],
         submit_label: Some("解析并播放".into()),
         cancel_label: Some("取消".into()),
+        timer: None,
     }
 }
 

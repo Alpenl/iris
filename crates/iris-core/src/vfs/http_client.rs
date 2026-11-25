@@ -8,12 +8,12 @@ mod connection;
 
 pub use address::{AddressKind, address_kind};
 pub(crate) use connection::doh;
+use connection::remaining_timeout;
 pub(crate) use connection::{
     ConnectRegistration, ConnectionPolicy, HttpClientError, NetworkScope, SocketRegistration,
-    Transport, connect_authorized, connect_transport,
+    Transport, connect_transport,
 };
 pub use connection::{HttpCancel, validate_stream_url};
-use connection::remaining_timeout;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};

@@ -1,5 +1,5 @@
-use super::*;
-use iris_api::v2::Capability;
+use iris_api::v2::{Capability, ErrorCode, HostCommand, HostEvent, source::SourceDescriptor};
+use std::collections::BTreeSet;
 pub(super) fn filter(
     mut event: HostEvent<serde_json::Value>,
     grants: &BTreeSet<Capability>,
@@ -44,8 +44,6 @@ pub(super) fn filter(
         HostEvent::SourceManage { .. } => Some(Capability::MediaSource),
         HostEvent::ResolveUrl { .. } => Some(Capability::UrlResolver),
         HostEvent::OverlayWindowChanged { .. } => Some(Capability::UiOverlay),
-        HostEvent::ExportGranted { .. } => Some(Capability::ExportFiles),
-        HostEvent::MediaInputGranted { .. } => Some(Capability::ExternalTool),
         HostEvent::SelectionGranted { .. } | HostEvent::AnnotationResult { .. } => {
             Some(Capability::Annotations)
         }
@@ -80,5 +78,6 @@ pub(super) fn global_command(command: &HostCommand) -> bool {
             | HostCommand::SetStatus { .. }
             | HostCommand::SetOverlay { .. }
             | HostCommand::SetTheme { .. }
+            | HostCommand::Log { .. }
     )
 }

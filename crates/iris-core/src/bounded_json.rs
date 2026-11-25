@@ -99,10 +99,7 @@ pub fn decode<T: DeserializeOwned>(bytes: &[u8], limit: usize) -> Result<T, Boun
 }
 
 /// Bounds the serialized representation, including escaping, before allocating it.
-pub fn encode<T: serde::Serialize>(
-    value: &T,
-    limit: usize,
-) -> Result<Vec<u8>, BoundedJsonError> {
+pub fn encode<T: serde::Serialize>(value: &T, limit: usize) -> Result<Vec<u8>, BoundedJsonError> {
     struct Writer {
         bytes: Vec<u8>,
         limit: usize,
@@ -178,10 +175,7 @@ mod tests {
             decode::<serde_json::Value>(deep.as_bytes(), 65536),
             Err(BoundedJsonError::Invalid)
         );
-        assert_eq!(
-            encode(&"\0\0", 13),
-            Err(BoundedJsonError::QuotaExceeded)
-        );
+        assert_eq!(encode(&"\0\0", 13), Err(BoundedJsonError::QuotaExceeded));
         assert_eq!(encode(&"\0\0", 14).unwrap(), br#""\u0000\u0000""#);
     }
 }

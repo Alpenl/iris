@@ -471,7 +471,6 @@ fn write_response_headers(
     }
     let mime = match profile {
         Some(super::manifest::Profile::Hls) => "application/vnd.apple.mpegurl",
-        Some(super::manifest::Profile::Dash) => "application/dash+xml",
         None => "application/octet-stream",
     };
     header.push_str(&format!("Content-Type: {mime}\r\n\r\n"));

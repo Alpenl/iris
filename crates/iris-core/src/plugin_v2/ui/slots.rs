@@ -1,4 +1,10 @@
-use super::*;
+use crate::plugin_v2::{actor::Update, hub::Binding};
+use iris_api::{
+    ChromeLayoutSpec, OverlayNode, PluginModal, SidebarPanel, StatusBadge, ToolbarButton,
+    UiThemeSpec,
+    v2::{Capability, HostCommand},
+};
+use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct DirtySlots {

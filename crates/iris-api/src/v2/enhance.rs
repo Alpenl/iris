@@ -116,18 +116,3 @@ pub struct SkipRange {
     pub end_ms: Id,
     pub label: String,
 }
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ExportFormat {
-    Edl,
-    Xmp,
-    Csv,
-    SubRip,
-    WebVtt,
-    Ass,
-    Text,
-    Matroska,
-    Mp4,
-    Webm,
-}

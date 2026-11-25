@@ -1,16 +1,19 @@
-use super::*;
-use crate::plugin_v2::{
-    actor::{Executor, IoOutcome, Operation, TaskContext},
-    instance::Blob,
-    ledger::Activity,
-    network::NetworkGrant,
+use super::{Storage, VALUE_BYTES, check, validate_entry};
+use crate::{
+    plugin_v2::{
+        actor::{Executor, IoOutcome, Operation, TaskContext},
+        instance::Blob,
+        ledger::{Activity, Resource},
+        network::NetworkGrant,
+    },
+    vfs::HttpCancel,
 };
 use iris_api::v2::{
-    Capability, Generation, Role,
+    Capability, ErrorCode, Generation, Id, Role,
     task::{CredentialBucket, Task},
 };
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     sync::{Arc, Mutex},
 };
 

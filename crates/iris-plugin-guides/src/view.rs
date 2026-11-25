@@ -261,6 +261,7 @@ impl GuidesView {
                         },
                     ],
                 }],
+                timer: None,
             })),
         });
         if persist_and_announce {

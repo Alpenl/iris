@@ -121,19 +121,25 @@ impl IrisWindow {
                             MediaUri::HttpUrl(_) => Icon::Link,
                         };
                         let remove_el = if confirming {
-                            button(("bm-del", i), "确认移除", ButtonVariant::Danger, ButtonSize::Xs, t)
-                                .on_click(cx.listener(move |this, _, _, cx| {
+                            button(
+                                ("bm-del", i),
+                                "确认移除",
+                                ButtonVariant::Danger,
+                                ButtonSize::Xs,
+                                t,
+                            )
+                            .on_click(cx.listener(
+                                move |this, _, _, cx| {
                                     if this.confirm_destructive(confirm_key.clone(), cx) {
                                         this.locations.remove_bookmark(&bm_id);
                                         this.show_toast("已移除书签", cx);
                                     }
-                                }))
+                                },
+                            ))
                         } else {
                             icon_button(("bm-del", i), Icon::Close, false, t)
                                 .tooltip(tip("移除书签", None))
-                                .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                                    cx.stop_propagation()
-                                })
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     if this.confirm_destructive(confirm_key.clone(), cx) {
                                         this.locations.remove_bookmark(&bm_id);
@@ -329,10 +335,9 @@ impl IrisWindow {
                                                         t,
                                                     )
                                                     .on_click(cx.listener(move |this, _, w, cx| {
-                                                        if this.confirm_destructive(
-                                                            rm_key.clone(),
-                                                            cx,
-                                                        ) {
+                                                        if this
+                                                            .confirm_destructive(rm_key.clone(), cx)
+                                                        {
                                                             this.manage_plugin_source(
                                                                 &pid_rm,
                                                                 &sid_rm,

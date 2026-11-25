@@ -139,56 +139,55 @@ impl IrisWindow {
                 cx.notify();
             }))
             .into_any_element();
-        let panel_box =
-            div()
-                .id("media-info")
-                .absolute()
-                .top(px(top))
-                .w(px(panel_w))
-                .max_w(px(panel_w))
-                .max_h(px(max_h))
-                .flex()
-                .flex_col()
-                .rounded(t.radius_lg)
-                .overflow_hidden()
-                .bg(t.overlay)
-                .border_1()
-                .border_color(t.line_strong)
-                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
-                .child(panel_header("媒体详情", None, Some(close_btn), t))
-                .child(
-                    div()
-                        .id("media-info-scroll")
-                        .flex_1()
-                        .min_h(px(0.))
-                        .overflow_y_scroll()
-                        .flex()
-                        .flex_col()
-                        .child(div().p(px(10.)).flex().flex_col().gap(px(6.)).children(
-                            rows.into_iter().map(|(k, v)| {
-                                div()
-                                    .flex()
-                                    .items_baseline()
-                                    .justify_between()
-                                    .gap(px(12.))
-                                    .text_size(t.text_sm)
-                                    .child(div().flex_none().text_color(t.text_dim).child(k))
-                                    .child(
-                                        div()
-                                            .min_w(px(0.))
-                                            .truncate()
-                                            .font_family(FONT_MONO)
-                                            .text_color(t.text)
-                                            .child(v),
-                                    )
-                            }),
-                        ))
-                        .when_some(
-                            self.render_personal_annotations(t, cx),
-                            |view, annotations| view.child(annotations),
-                        ),
-                );
+        let panel_box = div()
+            .id("media-info")
+            .absolute()
+            .top(px(top))
+            .w(px(panel_w))
+            .max_w(px(panel_w))
+            .max_h(px(max_h))
+            .flex()
+            .flex_col()
+            .rounded(t.radius_lg)
+            .overflow_hidden()
+            .bg(t.overlay)
+            .border_1()
+            .border_color(t.line_strong)
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+            .child(panel_header("媒体详情", None, Some(close_btn), t))
+            .child(
+                div()
+                    .id("media-info-scroll")
+                    .flex_1()
+                    .min_h(px(0.))
+                    .overflow_y_scroll()
+                    .flex()
+                    .flex_col()
+                    .child(div().p(px(10.)).flex().flex_col().gap(px(6.)).children(
+                        rows.into_iter().map(|(k, v)| {
+                            div()
+                                .flex()
+                                .items_baseline()
+                                .justify_between()
+                                .gap(px(12.))
+                                .text_size(t.text_sm)
+                                .child(div().flex_none().text_color(t.text_dim).child(k))
+                                .child(
+                                    div()
+                                        .min_w(px(0.))
+                                        .truncate()
+                                        .font_family(FONT_MONO)
+                                        .text_color(t.text)
+                                        .child(v),
+                                )
+                        }),
+                    ))
+                    .when_some(
+                        self.render_personal_annotations(t, cx),
+                        |view, annotations| view.child(annotations),
+                    ),
+            );
 
         let place_left = if fullscreen {
             self.settings.directory_side == Side::Right

@@ -7,12 +7,11 @@ mod offline;
 mod origin;
 mod worker;
 use super::{
-    actor::{Status, Update},
-    installation::{ArchivedIdentity, Installed, Installer, Review},
+    actor::Update,
+    installation::{ArchivedIdentity, Installed, Installer},
     ledger::{Reservation, Resource},
-    pool::WorkPool,
     requests::{AcceptedPage, RequestTicket, SourceRequests},
-    runtime::{Control, PreparedWindow, Setup},
+    runtime::{Control, Setup},
     stream::prepare::Playback,
 };
 pub use client::Client;
@@ -29,7 +28,6 @@ use std::{
         Arc, Condvar, Mutex, Weak,
         atomic::{AtomicBool, Ordering},
     },
-    time::{Duration, Instant},
 };
 
 pub struct Config {

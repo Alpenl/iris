@@ -14,10 +14,7 @@ use std::{path::PathBuf, rc::Rc};
 
 impl IrisWindow {
     pub(in crate::ui) fn has_host_consent(&self) -> bool {
-        self.plugin_view.review.is_some()
-            || self.plugin_view.origin.is_some()
-            || self.plugin_view.tools.review.is_some()
-            || self.plugin_view.tools.input.is_some()
+        self.plugin_view.review.is_some() || self.plugin_view.origin.is_some()
     }
     pub(in crate::ui) fn review_plugin_path(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         if path
@@ -63,10 +60,7 @@ impl IrisWindow {
         cx: &mut Context<Self>,
     ) {
         // Only the visible sheet is dismissed. A separate pending sheet stays pending.
-        if self.plugin_view.tools.review.take().is_some() {
-        } else if self.plugin_view.tools.input.is_some() {
-            self.finish_input_consent(false, cx);
-        } else if let Some(origin) = self.plugin_view.origin.take() {
+        if let Some(origin) = self.plugin_view.origin.take() {
             let _ = self
                 .plugins
                 .client()
@@ -129,9 +123,6 @@ impl IrisWindow {
         window: &Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        if let Some(consent) = self.render_tool_consent(window, cx) {
-            return Some(consent);
-        }
         if !self.has_host_consent() {
             return None;
         }

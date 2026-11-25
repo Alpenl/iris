@@ -2839,7 +2839,6 @@ dependencies = [
  "mio",
  "percent-encoding",
  "ring",
- "roxmltree",
  "rustls",
  "rustls-native-certs",
  "rustls-pki-types",

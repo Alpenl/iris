@@ -38,7 +38,12 @@ impl LocalDirectory {
         &self.subfolders
     }
 
-    pub fn set(&mut self, folder: Option<PathBuf>, entries: Vec<Entry>, subfolders: Vec<FolderEntry>) {
+    pub fn set(
+        &mut self,
+        folder: Option<PathBuf>,
+        entries: Vec<Entry>,
+        subfolders: Vec<FolderEntry>,
+    ) {
         self.folder = folder;
         self.entries = entries;
         self.subfolders = subfolders;

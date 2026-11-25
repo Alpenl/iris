@@ -8,10 +8,7 @@ use super::{
 };
 use futures::channel::mpsc::UnboundedReceiver;
 use iris_api::v2::{ErrorCode, Generation};
-use std::{
-    collections::BTreeMap,
-    sync::{Arc, OnceLock},
-};
+use std::sync::{Arc, OnceLock};
 
 impl PluginManager {
     pub fn load_with_wake(disabled: &[String], theme: &str) -> (Self, UnboundedReceiver<()>) {
@@ -42,21 +39,9 @@ fn make_hub(disabled: &[String]) -> Result<Hub, ErrorCode> {
             state_directory: root.join("plugin-v2-state"),
             temporary_directory: root.join("plugin-v2-temp"),
             vault: crate::vault::CredentialVault::system(),
-            tools: BTreeMap::new(),
-            models: BTreeMap::new(),
-            tool_catalog: tool_catalog().clone(),
             wake: Arc::new(|| {}),
         },
         disabled: disabled.iter().cloned().collect(),
-    })
-}
-
-pub fn tool_catalog() -> &'static super::tools::catalog::ToolCatalog {
-    static CATALOG: OnceLock<super::tools::catalog::ToolCatalog> = OnceLock::new();
-    CATALOG.get_or_init(|| {
-        super::tools::catalog::ToolCatalog::new(
-            crate::fs_util::data_dir().map(|p| p.join("plugin-tool-bindings.json")),
-        )
     })
 }
 

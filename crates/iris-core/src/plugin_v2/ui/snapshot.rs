@@ -1,5 +1,5 @@
-use super::*;
 use crate::{library::Kind, player::Session};
+use iris_api::v2::{Id, source::PlaybackSnapshot};
 
 pub fn snapshot_from_session(session: &Session, favorite: bool, media: Id) -> PlaybackSnapshot {
     let state = session.state();

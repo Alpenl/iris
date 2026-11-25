@@ -1,8 +1,7 @@
 //! Convert an already authorized connection into an owned nonblocking transport.
 use super::{RequestGrant, raw};
 use crate::vfs::http_client::{
-    ConnectRegistration, HttpCancel, NetworkScope, SocketRegistration, Transport,
-    connect_authorized, connect_transport,
+    ConnectRegistration, HttpCancel, NetworkScope, SocketRegistration, Transport, connect_transport,
 };
 use iris_api::v2::ErrorCode;
 use mio::{Interest, Registry, Token};
@@ -24,26 +23,6 @@ pub(crate) struct Wire {
     _registration: SocketRegistration,
 }
 impl Wire {
-    pub(crate) fn tunnel(
-        url: &Url,
-        grant: Arc<RequestGrant>,
-        cancel: &HttpCancel,
-    ) -> Result<Self, ErrorCode> {
-        let scope =
-            NetworkScope::authorized(url.clone(), grant.clone()).map_err(|_| ErrorCode::Denied)?;
-        let (transport, registration) = connect_authorized(
-            url,
-            &scope,
-            cancel,
-            Some(Instant::now() + Duration::from_secs(10)),
-            false,
-        )
-        .map_err(|e| raw::transport_error(e, &grant, cancel))?;
-        Ok(Self {
-            state: State::Blocking(transport),
-            _registration: registration,
-        })
-    }
     pub(crate) fn connect(
         url: &Url,
         grant: Arc<RequestGrant>,
@@ -98,13 +77,6 @@ impl Wire {
     }
     pub(crate) fn deregister(&mut self, registry: &Registry) -> io::Result<()> {
         registry.deregister(self.socket()?)
-    }
-    /// Used only for a plain CONNECT tunnel, after its last queued byte flushes.
-    pub(crate) fn shutdown_write(&mut self) -> io::Result<()> {
-        match &mut self.state {
-            State::Plain(socket) => socket.shutdown(std::net::Shutdown::Write),
-            _ => Err(io::ErrorKind::Unsupported.into()),
-        }
     }
     pub(crate) fn reregister(
         &mut self,

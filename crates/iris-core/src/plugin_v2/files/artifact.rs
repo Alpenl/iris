@@ -18,7 +18,6 @@ use std::{
 
 struct Cleanup {
     root: Arc<TempRoot>,
-    directory: Option<Dir>,
     name: String,
     _leases: Vec<Reservation>,
     _activity: ActivityLease,
@@ -45,9 +44,8 @@ fn cleanup_queue() -> Result<&'static mpsc::Sender<Cleanup>, ErrorCode> {
                         // most 1024 jobs including live artifacts; no retry queue grows
                         // independently of the global handle ledger.
                         pending.retain(|job| {
-                            job.directory
-                                .as_ref()
-                                .unwrap_or_else(|| job.root.directory())
+                            job.root
+                                .directory()
                                 .remove_file(&job.name)
                                 .is_err_and(|e| e.kind() != std::io::ErrorKind::NotFound)
                         });
@@ -107,30 +105,6 @@ impl TempRoot {
     pub fn is_quiescent(&self) -> bool {
         self.activity.is_idle()
     }
-    pub(crate) fn scratch_dir(self: &Arc<Self>) -> Result<ScratchDir, ErrorCode> {
-        let lease = self.ledger.reserve(
-            &self.owner,
-            &[(Resource::Handle, 1), (Resource::HostBytes, 4096)],
-        )?;
-        let name = format!(".scratch-{}", super::random_name()?);
-        let mut builder = cap_std::fs::DirBuilder::new();
-        #[cfg(unix)]
-        {
-            use cap_std::fs::DirBuilderExt;
-            builder.mode(0o700);
-        }
-        builder.recursive(false);
-        self.directory()
-            .create_dir_with(&name, &builder)
-            .map_err(|_| ErrorCode::IoError)?;
-        Ok(ScratchDir {
-            path: self.path.join(&name),
-            root: self.clone(),
-            name,
-            _lease: lease,
-            _activity: self.activity.start(),
-        })
-    }
     pub fn writer(self: &Arc<Self>, format: &str) -> Result<ArtifactWriter, ErrorCode> {
         if !matches!(
             format,
@@ -187,18 +161,6 @@ impl Drop for TempRoot {
         let _ = self.parent.remove_dir(&self.name);
     }
 }
-pub(crate) struct ScratchDir {
-    pub(crate) path: PathBuf,
-    root: Arc<TempRoot>,
-    name: String,
-    _lease: Reservation,
-    _activity: ActivityLease,
-}
-impl Drop for ScratchDir {
-    fn drop(&mut self) {
-        let _ = self.root.directory().remove_dir_all(&self.name);
-    }
-}
 pub struct ArtifactWriter {
     file: Option<File>,
     root: Arc<TempRoot>,
@@ -209,28 +171,6 @@ pub struct ArtifactWriter {
     activity: Option<ActivityLease>,
 }
 impl ArtifactWriter {
-    pub fn len(&self) -> u64 {
-        self.bytes
-    }
-    pub fn is_empty(&self) -> bool {
-        self.bytes == 0
-    }
-    pub(crate) fn patch(&mut self, offset: u64, bytes: &[u8]) -> Result<(), ErrorCode> {
-        use std::io::{Seek, SeekFrom};
-        if offset
-            .checked_add(bytes.len() as u64)
-            .is_none_or(|end| end > self.bytes)
-        {
-            return Err(ErrorCode::RangeInvalid);
-        }
-        let file = self.file.as_mut().ok_or(ErrorCode::BadState)?;
-        file.seek(SeekFrom::Start(offset))
-            .map_err(|_| ErrorCode::IoError)?;
-        file.write_all(bytes).map_err(|_| ErrorCode::IoError)?;
-        file.seek(SeekFrom::End(0))
-            .map_err(|_| ErrorCode::IoError)?;
-        Ok(())
-    }
     pub fn write(&mut self, bytes: &[u8], cancel: &HttpCancel) -> Result<(), ErrorCode> {
         if cancel.is_cancelled() {
             return Err(ErrorCode::Cancelled);
@@ -310,15 +250,6 @@ impl Artifact {
             .ok_or(ErrorCode::BadState)?
             .read_at(offset, bytes, cancel)
     }
-    pub(super) fn retire_export(&self, dir: Dir, name: String, leases: Vec<Reservation>) {
-        enqueue(Cleanup {
-            root: self.root.clone(),
-            directory: Some(dir),
-            name,
-            _leases: leases,
-            _activity: self.root.activity.start(),
-        });
-    }
 }
 impl Drop for Artifact {
     fn drop(&mut self) {
@@ -340,7 +271,6 @@ fn queue(
     if let (Some(lease), Some(activity)) = (lease, activity) {
         let job = Cleanup {
             root: root.clone(),
-            directory: None,
             name: name.into(),
             _leases: vec![lease],
             _activity: activity,

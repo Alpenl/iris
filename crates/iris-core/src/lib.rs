@@ -17,7 +17,6 @@ pub mod photo;
 pub mod player;
 pub mod plugin_v2;
 pub mod preset;
-pub(crate) mod process_tree;
 pub mod settings;
 pub mod store;
 pub mod vault;

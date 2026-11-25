@@ -197,17 +197,15 @@ pub enum Widget {
         active: bool,
         action_id: String,
     },
-    /// Scannable 2D QR grid (`matrix` rows of `'1'`/`'0'` or `'#'`/`' '`) for mobile app auth.
-    QrCode {
+    /// Monochrome 2D pixel grid (`rows` of `'1'`/`'0'` or `'#'`/`' '`), e.g. for QR codes or patterns.
+    PixelGrid {
+        #[serde(default)]
         label: String,
+        rows: Vec<String>,
         #[serde(default)]
-        data: String,
+        copy_text: Option<String>,
         #[serde(default)]
-        matrix: Vec<String>,
-        #[serde(default)]
-        hint: Option<String>,
-        #[serde(default)]
-        poll_action_id: Option<String>,
+        caption: Option<String>,
     },
     Link {
         label: String,
@@ -220,6 +218,15 @@ pub enum Widget {
 
 fn default_slider_step() -> f64 {
     1.0
+}
+
+/// Host-managed periodic action dispatch attached to a visible [`SidebarPanel`] or [`PluginModal`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ViewTimer {
+    /// Dispatch interval in milliseconds (host-enforced bounds: `1000..=300_000`).
+    pub interval_ms: u32,
+    pub action_id: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -236,6 +243,8 @@ pub struct SidebarPanel {
     pub title: String,
     #[serde(default)]
     pub sections: Vec<SidebarSection>,
+    #[serde(default)]
+    pub timer: Option<ViewTimer>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -251,6 +260,8 @@ pub struct PluginModal {
     pub submit_label: Option<String>,
     #[serde(default)]
     pub cancel_label: Option<String>,
+    #[serde(default)]
+    pub timer: Option<ViewTimer>,
 }
 
 /// Compact badge rendered inside the control bar status slot (`Permission::UiStatus`).

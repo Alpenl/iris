@@ -1,9 +1,14 @@
-use super::*;
-use crate::plugin_v2::{
-    instance::DetachedBlob,
-    stream::prepare::{GuestFactory, Playback, Preparation},
+use super::Control;
+use crate::{
+    plugin_v2::{
+        actor::Status,
+        instance::DetachedBlob,
+        stream::prepare::{GuestFactory, Playback, Preparation},
+    },
+    vfs::HttpCancel,
 };
-use iris_api::v2::{Capability, stream::StreamSpec};
+use iris_api::v2::{Capability, ErrorCode, Generation, Id, stream::StreamSpec};
+use std::collections::BTreeMap;
 
 pub struct PlaybackPermit {
     preparation: Preparation,

@@ -385,16 +385,14 @@ impl Session {
                 return Err(err.into());
             }
         };
-        if let MediaSourceState::PluginScoped { playback, .. } =
-            std::mem::replace(
-                &mut self.source,
-                MediaSourceState::DirectRemote {
-                    relay,
-                    last_remote: saved_remote,
-                    pending_subs,
-                },
-            )
-        {
+        if let MediaSourceState::PluginScoped { playback, .. } = std::mem::replace(
+            &mut self.source,
+            MediaSourceState::DirectRemote {
+                relay,
+                last_remote: saved_remote,
+                pending_subs,
+            },
+        ) {
             playback.stream.stop();
         }
         self.reset_for_load(

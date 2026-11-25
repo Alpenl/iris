@@ -9,7 +9,7 @@ pub mod stream;
 pub mod task;
 pub mod task_result;
 pub mod wire;
-pub use wire::{HostCommand, HostEvent};
+pub use wire::{HostCommand, HostEvent, LogLevel};
 
 pub use integer::Id;
 pub use manifest::{Capability, HostRule, Manifest, NetworkDeclaration};

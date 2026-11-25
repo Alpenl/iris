@@ -291,17 +291,16 @@ fn qr_login_browse_locate_multi_cdn_and_sibling_subtitles_work_end_to_end() {
     );
     assert_eq!(plugin.windows[&Id(1)].qr.as_ref().unwrap().matrix.len(), 49);
     assert!(qr_cmds.iter().any(|c| match c {
-        HostCommand::SetSidebar { panel: Some(p) } => p.sections.iter().any(|s| {
-            s.widgets.iter().any(|w| {
-                matches!(
-                    w,
-                    Widget::QrCode {
-                        poll_action_id: Some(act),
-                        ..
-                    } if act == "auto_poll_qr"
-                )
-            })
-        }),
+        HostCommand::SetSidebar { panel: Some(p) } => {
+            p.timer
+                .as_ref()
+                .is_some_and(|t| t.action_id == "auto_poll_qr" && t.interval_ms == 2_000)
+                && p.sections.iter().any(|s| {
+                    s.widgets
+                        .iter()
+                        .any(|w| matches!(w, Widget::PixelGrid { .. }))
+                })
+        }
         _ => false,
     }));
 

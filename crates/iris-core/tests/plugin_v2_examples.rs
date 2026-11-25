@@ -12,7 +12,7 @@ use iris_core::{
     vault::CredentialVault,
 };
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeSet,
     io::{Read, Write},
     net::TcpStream,
     path::PathBuf,
@@ -71,9 +71,6 @@ fn user_packages_provide_theme_timer_and_real_random_access_pcm() {
                 state_directory: root.join("state"),
                 temporary_directory: root.join("temp"),
                 vault: CredentialVault::in_memory(),
-                tools: BTreeMap::new(),
-                models: BTreeMap::new(),
-                tool_catalog: Default::default(),
                 wake: Arc::new(|| {}),
             },
         })
