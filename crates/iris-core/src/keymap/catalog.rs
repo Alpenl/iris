@@ -76,15 +76,13 @@ impl ActionEntry {
             "rotate_cw" | "rotate_ccw" | "toggle_hflip" | "toggle_vflip" => {
                 &["Viewport && media == video", "Viewport && media == image"]
             }
-            "quit" | "open_settings" | "open_palette" => {
-                match effective_gpui_context(self.context, keystroke) {
-                    Some("Workspace && !Modal") => &["Workspace"],
-                    Some("Workspace && !TextInput && !Modal") => {
-                        &["Workspace && !TextInput && !Modal"]
-                    }
-                    _ => &[],
+            "quit" | "open_settings" => match effective_gpui_context(self.context, keystroke) {
+                Some("Workspace && !Modal") => &["Workspace"],
+                Some("Workspace && !TextInput && !Modal") => {
+                    &["Workspace && !TextInput && !Modal"]
                 }
-            }
+                _ => &[],
+            },
             _ => match effective_gpui_context(self.context, keystroke) {
                 Some("Viewport && media == video") => &["Viewport && media == video"],
                 Some("Viewport && media == image") => &["Viewport && media == image"],

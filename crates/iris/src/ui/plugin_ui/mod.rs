@@ -280,7 +280,9 @@ impl IrisWindow {
                 body,
                 cancel_cb,
                 submit_cb,
-            ),
+            )
+            .with_error(self.overlays.plugin_modal_error.clone())
+            .with_submit_disabled(is_submitting),
             t,
             cx,
         ))

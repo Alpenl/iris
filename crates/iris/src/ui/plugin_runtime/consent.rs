@@ -78,7 +78,7 @@ impl IrisWindow {
         self.focus.focus(window);
         cx.notify();
     }
-    fn approve_host_consent(&mut self, cx: &mut Context<Self>) {
+    pub(in crate::ui) fn approve_host_consent(&mut self, cx: &mut Context<Self>) {
         let (target_id, result) = if let Some(origin) = &self.plugin_view.origin {
             if self.plugin_view.consent_busy == Some(origin.id) {
                 return;
@@ -254,7 +254,8 @@ impl IrisWindow {
                 body.into_any_element(),
                 cancel,
                 submit,
-            ),
+            )
+            .with_submit_disabled(busy),
             t,
             cx,
         ))

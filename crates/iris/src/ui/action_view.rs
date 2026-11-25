@@ -377,6 +377,11 @@ impl IrisWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.handle_escape(window, cx);
+    }
+
+    /// Single unified `Esc` dismissal pipeline across workspace, modals, menus, and text inputs.
+    pub(in crate::ui) fn handle_escape(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.has_host_consent() {
             self.cancel_host_consent(window, cx);
             return;
@@ -394,18 +399,18 @@ impl IrisWindow {
             EscapeStep::CancelPluginModal => {
                 self.cancel_active_plugin_modal(Some(window), cx);
             }
-            EscapeStep::CloseBuiltinDialog => {
+            EscapeStep::CloseBuiltinDialog
+            | EscapeStep::ClosePalette
+            | EscapeStep::CloseSettings
+            | EscapeStep::ClosePopover
+            | EscapeStep::CloseDirPopup
+            | EscapeStep::BlurSidebarForm => {
                 self.focus.focus(window);
                 self.bump_activity(cx);
                 cx.notify();
             }
-            EscapeStep::ClosePalette => {
-                self.focus.focus(window);
-                self.bump_activity(cx);
-                cx.notify();
-            }
-            EscapeStep::CloseSettings | EscapeStep::ClosePopover | EscapeStep::CloseDirPopup => {
-                self.focus.focus(window);
+            EscapeStep::ClearSearchText => {
+                self.filter_directory_rows();
                 self.bump_activity(cx);
                 cx.notify();
             }

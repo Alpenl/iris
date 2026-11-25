@@ -489,7 +489,7 @@ impl Render for IrisWindow {
             root_ctx.add("TextInput");
         } else {
             root_ctx.add("Workspace");
-            if self.has_active_modal() {
+            if self.has_blocking_overlay() {
                 root_ctx.add("Modal");
             }
             if self.text_inputs.is_any_focused(window) {
@@ -499,12 +499,43 @@ impl Render for IrisWindow {
 
         let show_overlay_tb = !fullscreen
             && hide_tb
+            && !self.has_active_modal()
+            && self.overlays.context_menu.is_none()
             && (self.chrome.titlebar_hover || self.overlays.popover == Some(PopoverKind::Presets));
 
         let root = div()
             .id("root")
             .relative()
             .key_context(root_ctx)
+            .on_key_down(cx.listener(|this, ev: &gpui::KeyDownEvent, window, cx| {
+                let mods = ev.keystroke.modifiers;
+                if mods.alt
+                    || mods.control
+                    || mods.platform
+                    || mods.shift
+                    || this.overlays.recording_shortcut.is_some()
+                    || this.text_inputs.is_any_focused(window)
+                {
+                    return;
+                }
+                let key = ev.keystroke.key.as_str();
+                if this.handle_popover_key(key, cx) {
+                    cx.stop_propagation();
+                    return;
+                }
+                if key == "enter" {
+                    if this.has_host_consent() {
+                        this.approve_host_consent(cx);
+                        cx.stop_propagation();
+                    } else if this.plugins.active_modal().is_some() {
+                        this.submit_active_plugin_modal(window, cx);
+                        cx.stop_propagation();
+                    } else if this.overlays.dialog.is_some() {
+                        this.submit_builtin_dialog(window, cx);
+                        cx.stop_propagation();
+                    }
+                }
+            }))
             .on_any_mouse_down(cx.listener(|this, ev: &gpui::MouseDownEvent, window, _| {
                 if this.overlays.recording_shortcut.is_some()
                     || ev.button != gpui::MouseButton::Left
@@ -555,18 +586,7 @@ impl Render for IrisWindow {
                     row.child(player).children(sidebar)
                 }
             })
-            .when(self.overlays.settings_open, |d| {
-                d.child(self.render_settings_modal(window, cx))
-            })
-            .when(self.overlays.palette_open, |d| {
-                d.child(self.render_command_palette(window, cx))
-            })
-            .children(self.render_builtin_dialog(window, cx))
-            .children(self.render_plugin_modal(window, cx))
-            .children(self.render_host_consent(window, cx))
-            .when_some(self.overlays.context_menu.clone(), |d, menu| {
-                d.child(self.render_context_menu(&menu, window, cx))
-            })
+            // Layer 1.5: frameless overlay titlebar (always below anchored overlays & modals)
             .when(show_overlay_tb, |d| {
                 d.child(
                     div()
@@ -578,6 +598,25 @@ impl Render for IrisWindow {
                         .child(self.render_titlebar(true, cx)),
                 )
             })
+            // Layer 2: anchored overlays (Popover & ContextMenu) on #root
+            .when_some(self.overlays.popover, |d, pop| {
+                d.child(self.render_popover(pop, fullscreen, window, cx))
+            })
+            .when_some(self.overlays.context_menu.clone(), |d, menu| {
+                d.child(self.render_context_menu(&menu, window, cx))
+            })
+            // Layer 3: modal shells
+            .when(self.overlays.settings_open, |d| {
+                d.child(self.render_settings_modal(window, cx))
+            })
+            .when(self.overlays.palette_open, |d| {
+                d.child(self.render_command_palette(window, cx))
+            })
+            .children(self.render_builtin_dialog(window, cx))
+            .children(self.render_plugin_modal(window, cx))
+            .children(self.render_host_consent(window, cx))
+            // Layer 4: feedback (Toast / OSD / loading pill) always on top
+            .children(self.render_top_pill(fullscreen, t, cx))
     }
 }
 

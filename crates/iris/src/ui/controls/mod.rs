@@ -72,8 +72,8 @@ impl IrisWindow {
         let left = self.settings.directory_side == Side::Left;
         let compact = self.effective_compact_controls();
         let avail_w = self.dock_available_width(window);
-        let narrow = avail_w < if compact { 720. } else { 640. };
-        let tiny = avail_w < if compact { 520. } else { 500. };
+        let narrow = avail_w < if compact { 560. } else { 640. };
+        let tiny = avail_w < if compact { 440. } else { 500. };
         let dir_open = self.sidebar_is_visible();
         let mut dir = Some(
             icon_button(

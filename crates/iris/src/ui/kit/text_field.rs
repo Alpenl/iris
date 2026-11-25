@@ -162,6 +162,8 @@ impl IrisWindow {
             }
             ActiveSlot::Form => {
                 self.overlays.submitting_plugin_modal = None;
+                self.overlays.dialog_error = None;
+                self.overlays.plugin_modal_error = None;
             }
         }
         cx.notify();
@@ -440,33 +442,8 @@ impl IrisWindow {
         }
         match ev.keystroke.key.as_str() {
             "escape" => {
-                match kind {
-                    TextFieldKind::Search if !self.text_inputs.search_input.is_empty() => {
-                        self.text_inputs.search_input.clear();
-                        self.filter_directory_rows();
-                    }
-                    TextFieldKind::Search => {
-                        self.text_inputs.search_open = false;
-                        self.focus.focus(w);
-                    }
-                    TextFieldKind::Palette => {
-                        self.overlays.palette_open = false;
-                        self.text_inputs.palette_input.clear();
-                        self.focus.focus(w);
-                    }
-                    TextFieldKind::Form { key, .. } => {
-                        if key.starts_with("modal:") && self.plugins.active_modal().is_some() {
-                            self.cancel_active_plugin_modal(Some(w), cx);
-                            cx.stop_propagation();
-                            return;
-                        }
-                        self.overlays.dialog = None;
-                        self.text_inputs.active_form_key = None;
-                        self.focus.focus(w);
-                    }
-                }
+                self.handle_escape(w, cx);
                 cx.stop_propagation();
-                cx.notify();
             }
             "enter" => {
                 match kind {

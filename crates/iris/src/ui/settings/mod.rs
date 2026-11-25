@@ -145,6 +145,7 @@ impl IrisWindow {
                 id_prefix: "settings-modal",
                 title: "设置".into(),
                 header_hint: self.key_hint("open_settings"),
+                error: None,
                 width: modal_w,
                 fixed_height: Some(modal_h),
                 max_height: modal_h,

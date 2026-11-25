@@ -142,11 +142,15 @@ impl IrisWindow {
         selected: &str,
         cx: &mut Context<Self>,
     ) -> bool {
+        let fail = |this: &mut Self, msg: &str, cx: &mut Context<Self>| {
+            this.overlays.dialog_error = Some(msg.to_owned().into());
+            cx.notify();
+        };
         let matches = self.plugins.url_resolvers(Some(url));
         let plugin = match selected {
             "direct" => None,
             "auto" | "" if matches.len() > 1 => {
-                self.show_toast("多个插件匹配此地址，请选择打开方式", cx);
+                fail(self, "多个插件匹配此地址，请选择打开方式", cx);
                 return false;
             }
             "auto" | "" => matches.first().map(|(id, _)| id.clone()),
@@ -159,17 +163,17 @@ impl IrisWindow {
                 Some(id.into())
             }
             _ => {
-                self.show_toast("所选解析插件已不可用", cx);
+                fail(self, "所选解析插件已不可用", cx);
                 return false;
             }
         };
         if let Some(plugin) = plugin {
             let Ok(parsed) = iris_core::vfs::validate_stream_url(url) else {
-                self.show_toast("请输入合法的 HTTP/HTTPS 地址", cx);
+                fail(self, "请输入合法的 HTTP/HTTPS 地址", cx);
                 return false;
             };
             if !parsed.username().is_empty() || parsed.password().is_some() {
-                self.show_toast("解析地址不能内嵌账号密码，请通过插件登录", cx);
+                fail(self, "解析地址不能内嵌账号密码，请通过插件登录", cx);
                 return false;
             }
             self.cancel_media_loads();
@@ -181,11 +185,18 @@ impl IrisWindow {
                     self.begin_resolve_request(&plugin, "", String::new(), None, request, cx)
                 }
                 Err(error) => {
-                    self.show_toast(format!("解析请求未能提交 · {error:?}"), cx);
+                    log::warn!("resolve_url failed for {plugin}: {error:?}");
+                    let msg = super::notices::describe_error_code(error);
+                    fail(self, &format!("解析请求未能提交 · {msg}"), cx);
                     return false;
                 }
             }
         } else {
+            let trimmed = url.trim();
+            if trimmed.contains("://") && iris_core::vfs::validate_stream_url(trimmed).is_err() {
+                fail(self, "仅支持合法的 http:// 或 https:// 媒体地址", cx);
+                return false;
+            }
             self.open_direct_stream_url(url, None, cx);
         }
         true

@@ -6,8 +6,9 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use gpui::{
-    Bounds, Context, MouseButton, MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollWheelEvent,
-    SharedString, Size, Window, px,
+    Bounds, Context, InteractiveElement, IntoElement, MouseButton, MouseMoveEvent, MouseUpEvent,
+    ParentElement, Pixels, Point, ScrollWheelEvent, SharedString, Size, StatefulInteractiveElement,
+    Styled, Window, div, prelude::FluentBuilder, px,
 };
 use iris_core::player::Command;
 use iris_core::settings::{MAX_DIRECTORY_WIDTH, MIN_DIRECTORY_WIDTH, Side};
@@ -15,7 +16,7 @@ use iris_core::settings::{MAX_DIRECTORY_WIDTH, MIN_DIRECTORY_WIDTH, Side};
 use super::IrisWindow;
 use super::state::{PopoverKind, ScrubState};
 use crate::platform;
-use crate::theme::ThemeTokens;
+use crate::theme::{FLOAT_GAP, FONT_MONO, ThemeTokens};
 
 const SEEK_DRAG_INTERVAL: Duration = Duration::from_millis(40);
 const FULLSCREEN_WAKE_DISTANCE: f32 = 2.0;
@@ -124,6 +125,7 @@ pub(super) struct WindowChromeState {
     pub(super) mouse_pos: Option<Point<Pixels>>,
     pub(super) last_pointer_pos: Option<Point<Pixels>>,
     pub(super) toast: Option<SharedString>,
+    pub(super) toast_is_error: bool,
     pub(super) toast_seq: u64,
     pub(super) osd: Option<SharedString>,
     pub(super) osd_seq: u64,
@@ -153,6 +155,7 @@ impl WindowChromeState {
             mouse_pos: None,
             last_pointer_pos: None,
             toast: None,
+            toast_is_error: false,
             toast_seq: 0,
             osd: None,
             osd_seq: 0,
@@ -245,8 +248,8 @@ impl IrisWindow {
         };
         if self.chrome.fullscreen
             && self.chrome.chrome_visible
-            && !self.overlays.has_blocking()
-            && self.plugins.active_modal().is_none()
+            && !self.has_blocking_overlay()
+            && !self.overlays.dir_popup.is_open()
             && self.chrome.resizing_dir.is_none()
             && !self.chrome.scrub.seeking
             && !self.chrome.scrub.dragging_volume
@@ -269,22 +272,108 @@ impl IrisWindow {
     }
 
     pub(super) fn show_toast(&mut self, msg: impl Into<SharedString>, cx: &mut Context<Self>) {
-        self.chrome.toast = Some(msg.into());
+        self.push_toast(msg.into(), false, Duration::from_millis(2000), cx);
+    }
+
+    pub(super) fn show_error_toast(&mut self, msg: impl Into<SharedString>, cx: &mut Context<Self>) {
+        self.push_toast(msg.into(), true, Duration::from_millis(3500), cx);
+    }
+
+    fn push_toast(
+        &mut self,
+        msg: SharedString,
+        is_error: bool,
+        duration: Duration,
+        cx: &mut Context<Self>,
+    ) {
+        self.chrome.toast = Some(msg);
+        self.chrome.toast_is_error = is_error;
         self.chrome.toast_seq += 1;
         let seq = self.chrome.toast_seq;
         cx.spawn(async move |this, cx| {
-            cx.background_executor()
-                .timer(Duration::from_millis(1800))
-                .await;
+            cx.background_executor().timer(duration).await;
             let _ = this.update(cx, |this, cx| {
                 if this.chrome.toast_seq == seq {
                     this.chrome.toast = None;
+                    this.chrome.toast_is_error = false;
                     cx.notify();
                 }
             });
         })
         .detach();
         cx.notify();
+    }
+
+    pub(super) fn render_top_pill(
+        &self,
+        fullscreen: bool,
+        t: ThemeTokens,
+        cx: &mut Context<Self>,
+    ) -> Option<impl IntoElement> {
+        let vp = self.active();
+        let (msg, is_toast, is_error) = if let Some(msg) = self.chrome.toast.clone() {
+            (msg, true, self.chrome.toast_is_error)
+        } else if let Some(msg) = self.chrome.osd.clone() {
+            (msg, false, false)
+        } else if vp.session.state().buffering {
+            (SharedString::from("缓冲中…"), false, false)
+        } else if vp.loading_visible {
+            (SharedString::from("加载中…"), false, false)
+        } else {
+            return None;
+        };
+        let top = if fullscreen {
+            FLOAT_GAP
+        } else if self.effective_hide_titlebar() {
+            12.
+        } else {
+            f32::from(t.titlebar_h) + 12.
+        };
+        let dot_color = if is_error { t.danger } else { t.accent };
+        let border_color = if is_error { t.danger } else { t.line };
+        let pill = div()
+            .id("top-feedback-pill")
+            .max_w(px(560.))
+            .min_h(px(28.))
+            .px(px(10.))
+            .py(px(4.))
+            .flex()
+            .items_center()
+            .gap(px(8.))
+            .rounded(t.radius_lg)
+            .bg(t.overlay)
+            .border_1()
+            .border_color(border_color)
+            .when(is_toast, |d| {
+                d.cursor_pointer()
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.chrome.toast = None;
+                        this.chrome.toast_is_error = false;
+                        this.chrome.toast_seq += 1;
+                        cx.notify();
+                    }))
+            })
+            .child(div().flex_none().size(px(6.)).bg(dot_color))
+            .child(
+                div()
+                    .min_w(px(0.))
+                    .truncate()
+                    .font_family(FONT_MONO)
+                    .text_size(px(12.))
+                    .text_color(t.text)
+                    .child(msg),
+            );
+        Some(
+            div()
+                .absolute()
+                .top(px(top))
+                .left(px(12.))
+                .right(px(12.))
+                .flex()
+                .justify_center()
+                .child(pill),
+        )
     }
 
     pub(super) fn show_osd(&mut self, msg: impl Into<SharedString>, cx: &mut Context<Self>) {
@@ -424,9 +513,7 @@ impl IrisWindow {
     }
 
     fn directory_hover_allowed(&self, window: &Window) -> bool {
-        !self.overlays.has_menu_or_modal()
-            && self.plugins.active_modal().is_none()
-            && !self.text_inputs.is_any_focused(window)
+        !self.has_blocking_overlay() && !self.text_inputs.is_any_focused(window)
     }
 
     pub(super) fn on_window_pointer_exit(&mut self, window: &Window, cx: &mut Context<Self>) {
@@ -487,6 +574,8 @@ impl IrisWindow {
         }
         let hot_h = f32::from(t.titlebar_h) + 8.;
         let in_hot = !self.chrome.fullscreen
+            && !self.has_active_modal()
+            && self.overlays.context_menu.is_none()
             && ev.position.x >= px(0.)
             && ev.position.x < window.viewport_size().width
             && ev.position.y >= px(0.)

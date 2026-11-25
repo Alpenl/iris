@@ -68,7 +68,7 @@ impl IrisWindow {
         {
             let warn = format!("无法绑定 {disp}：与「{other}」冲突，请选择其他按键");
             self.overlays.shortcut_conflict = Some(warn.clone());
-            self.show_toast(warn, cx);
+            self.show_error_toast(warn, cx);
         } else if let Some((target_id, _)) = self.overlays.recording_shortcut.take() {
             self.keymap.set_binding(&target_id, spec);
             rebind_keys(cx, &self.keymap);
@@ -241,12 +241,12 @@ impl IrisWindow {
                         .rounded(t.radius_md)
                         .bg(t.window_bg)
                         .border_1()
-                        .border_color(t.accent)
+                        .border_color(t.danger)
                         .flex()
                         .items_center()
                         .justify_between()
                         .gap(px(8.))
-                        .child(div().text_size(px(11.)).text_color(t.accent).child(msg))
+                        .child(div().text_size(px(11.)).text_color(t.danger).child(msg))
                         .child(
                             chip_button("dismiss-conflict-banner", "知道了", false, t).on_click(
                                 cx.listener(|this, _, _, cx| {

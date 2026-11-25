@@ -208,6 +208,7 @@ fn platform_primary_workspace_keys_preserve_text_editing() {
         &super::actions::ToggleDirectory as &dyn Action,
         &super::actions::ToggleSearch,
         &super::actions::OpenFile,
+        &super::actions::OpenCommandPalette,
         &TakeScreenshot,
     ] {
         let binding = bindings
@@ -348,6 +349,7 @@ fn overlay_mutual_exclusion_and_escape_priority_never_skip_or_stall() {
         EscapeStep::ClosePopover,
         EscapeStep::CloseInfo,
         EscapeStep::CloseDirPopup,
+        EscapeStep::ClearSearchText,
         EscapeStep::CloseSearch,
         EscapeStep::ExitFullscreen,
     ];

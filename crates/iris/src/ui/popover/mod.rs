@@ -51,7 +51,6 @@ impl IrisWindow {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let t = ThemeTokens::of(cx);
-        let floating_dock = fullscreen || self.effective_floating_dock();
         let is_top_anchored = kind == PopoverKind::Presets;
 
         let base_pop_w: f32 = match kind {
@@ -66,61 +65,39 @@ impl IrisWindow {
             _ => 360.,
         };
 
-        let vp_rect = self.active().rect.get().map(|r| r.0);
         let win_sz = window.viewport_size();
-        let vw_vp = vp_rect
-            .map(|r| r[2] as f32)
-            .filter(|&w| w > 0.)
-            .unwrap_or_else(|| f32::from(win_sz.width));
-        let vh_vp = vp_rect
-            .map(|r| r[3] as f32)
-            .filter(|&h| h > 0.)
-            .unwrap_or_else(|| {
-                let chrome_h = if fullscreen {
-                    0.
-                } else {
-                    let tb = if self.effective_hide_titlebar() {
-                        0.
-                    } else {
-                        f32::from(t.titlebar_h)
-                    };
-                    let dk = if floating_dock {
-                        0.
-                    } else {
-                        f32::from(t.dock_h)
-                    };
-                    tb + dk
-                };
-                (f32::from(win_sz.height) - chrome_h).max(0.)
-            });
-        let pop_w = base_pop_w.min((vw_vp - 16.).max(140.));
-        let margin_v = if is_top_anchored {
-            if fullscreen {
-                FLOAT_GAP
-            } else if self.effective_hide_titlebar() {
-                f32::from(t.titlebar_h) + 6.
-            } else {
-                8.
-            }
-        } else if floating_dock {
-            f32::from(t.dock_h) + 8.
-        } else {
-            8.
-        };
-        let max_h = base_max_h.min((vh_vp - margin_v - 8.).max(96.));
+        let vw = f32::from(win_sz.width);
+        let vh = f32::from(win_sz.height);
+        let pop_w = base_pop_w.min((vw - 16.).max(140.));
 
         let anchor = if is_top_anchored && fullscreen {
             None
         } else {
             self.popover_anchor(kind)
         };
-        let left_px = match (vp_rect, anchor) {
-            (Some([vx, _, vw, _]), Some(ab)) if vw > 0. => {
-                let btn_cx = f32::from(ab.origin.x) + f32::from(ab.size.width) * 0.5 - vx as f32;
-                let max_l = (vw as f32 - pop_w - 8.).max(8.);
-                Some((btn_cx - pop_w * 0.5).clamp(8., max_l))
-            }
-            _ => None,
+        let left_px = anchor.map(|ab| {
+            let btn_cx = f32::from(ab.origin.x) + f32::from(ab.size.width) * 0.5;
+            let max_l = (vw - pop_w - 8.).max(8.);
+            (btn_cx - pop_w * 0.5).clamp(8., max_l)
+        });
+        let (margin_v, max_h) = if is_top_anchored {
+            let top = anchor.map_or_else(
+                || {
+                    if fullscreen {
+                        FLOAT_GAP
+                    } else {
+                        f32::from(t.titlebar_h) + 6.
+                    }
+                },
+                |ab| (f32::from(ab.origin.y) + f32::from(ab.size.height) + 6.).max(8.),
+            );
+            (top, base_max_h.min((vh - top - 8.).max(96.)))
+        } else {
+            let bottom = anchor.map_or_else(
+                || f32::from(t.dock_h) + 8.,
+                |ab| (vh - f32::from(ab.origin.y) + 6.).max(8.),
+            );
+            (bottom, base_max_h.min((vh - bottom - 8.).max(96.)))
         };
 
         let content = match kind {
@@ -145,10 +122,11 @@ impl IrisWindow {
             .border_1()
             .border_color(t.line_strong)
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
             .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
             .child(content);
 
-        if is_top_anchored {
+        let panel = if is_top_anchored {
             base = base.top(px(margin_v));
             if let Some(left) = left_px {
                 base.left(px(left))
@@ -162,13 +140,106 @@ impl IrisWindow {
             } else {
                 base.right(px(12.))
             }
+        };
+
+        div()
+            .id("popover-backdrop")
+            .absolute()
+            .inset_0()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.overlays.popover = None;
+                    cx.stop_propagation();
+                    cx.notify();
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(|this, _, _, cx| {
+                    this.overlays.popover = None;
+                    cx.stop_propagation();
+                    cx.notify();
+                }),
+            )
+            .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+            .child(panel)
+    }
+
+    pub(super) fn handle_popover_key(
+        &mut self,
+        key: &str,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(kind) = self.overlays.popover else {
+            return false;
+        };
+        let len = match kind {
+            PopoverKind::Speed => SPEED_STEPS.len(),
+            PopoverKind::Variants => self
+                .catalog
+                .active_stream_meta
+                .as_ref()
+                .map_or(0, |m| m.variants.len()),
+            _ => return false,
+        };
+        if len == 0 {
+            return false;
+        }
+        match key {
+            "up" | "down" => {
+                let next = match self.overlays.popover_index {
+                    Some(i) => {
+                        let d: isize = if key == "down" { 1 } else { -1 };
+                        (i as isize + d).rem_euclid(len as isize) as usize
+                    }
+                    None if key == "down" => 0,
+                    None => len - 1,
+                };
+                self.overlays.popover_index = Some(next);
+                cx.notify();
+                true
+            }
+            "enter" => {
+                let Some(idx) = self.overlays.popover_index else {
+                    return false;
+                };
+                match kind {
+                    PopoverKind::Speed => {
+                        if let Some(&speed) = SPEED_STEPS.get(idx) {
+                            self.command(Command::SetSpeed(speed), cx);
+                            self.overlays.popover = None;
+                            self.overlays.popover_index = None;
+                            self.show_osd(format!("倍速 · {speed:.2}×"), cx);
+                        }
+                    }
+                    PopoverKind::Variants => {
+                        let chosen = self
+                            .catalog
+                            .active_stream_meta
+                            .as_ref()
+                            .and_then(|m| m.variants.get(idx))
+                            .map(|v| (v.id.clone(), v.label.clone()));
+                        if let Some((vid, vlabel)) = chosen {
+                            self.switch_stream_variant(&vid, cx);
+                            self.overlays.popover_index = None;
+                            self.show_osd(format!("清晰度 · {vlabel}"), cx);
+                        }
+                    }
+                    _ => return false,
+                }
+                true
+            }
+            _ => false,
         }
     }
 
     fn render_speed_popover(&self, t: ThemeTokens, cx: &mut Context<Self>) -> impl IntoElement {
         let current = self.active().session.state().speed;
+        let focused_ix = self.overlays.popover_index;
         let rows = SPEED_STEPS.iter().copied().enumerate().map(|(i, speed)| {
             let active = (current - speed).abs() < 0.02;
+            let kb_focus = focused_ix == Some(i);
             div()
                 .id(("speed-opt", i))
                 .h(px(26.))
@@ -179,8 +250,11 @@ impl IrisWindow {
                 .cursor_pointer()
                 .font_family(FONT_MONO)
                 .text_size(px(12.))
-                .when(active, |d| d.bg(t.selected).text_color(t.text))
-                .when(!active, |d| {
+                .when(active || kb_focus, |d| {
+                    d.bg(if kb_focus { t.hover } else { t.selected })
+                        .text_color(t.text)
+                })
+                .when(!active && !kb_focus, |d| {
                     d.text_color(t.text_muted)
                         .hover(|s| s.bg(t.hover).text_color(t.text))
                 })
@@ -189,6 +263,7 @@ impl IrisWindow {
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.command(Command::SetSpeed(speed), cx);
                     this.overlays.popover = None;
+                    this.overlays.popover_index = None;
                     this.show_osd(format!("倍速 · {speed:.2}×"), cx);
                 }))
         });
@@ -220,11 +295,13 @@ impl IrisWindow {
         };
         let has_variants = !variants.is_empty();
 
+        let focused_ix = self.overlays.popover_index;
         let rows = variants.into_iter().enumerate().map(|(i, v)| {
             let active = match active_var.as_deref() {
                 Some(cur) => cur == v.id,
                 None => i == 0,
             };
+            let kb_focus = focused_ix == Some(i);
             let vid = v.id.clone();
             let vlabel = v.label.clone();
             div()
@@ -238,8 +315,11 @@ impl IrisWindow {
                 .cursor_pointer()
                 .font_family(FONT_MONO)
                 .text_size(px(12.))
-                .when(active, |d| d.bg(t.selected).text_color(t.text))
-                .when(!active, |d| {
+                .when(active || kb_focus, |d| {
+                    d.bg(if kb_focus { t.hover } else { t.selected })
+                        .text_color(t.text)
+                })
+                .when(!active && !kb_focus, |d| {
                     d.text_color(t.text_muted)
                         .hover(|s| s.bg(t.hover).text_color(t.text))
                 })

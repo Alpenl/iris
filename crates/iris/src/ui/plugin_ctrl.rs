@@ -19,6 +19,13 @@ impl IrisWindow {
             || self.plugins.active_modal().is_some()
     }
 
+    /// Single source of truth for any overlay that blocks background playback / workspace shortcuts.
+    pub(super) fn has_blocking_overlay(&self) -> bool {
+        self.has_active_modal()
+            || self.overlays.context_menu.is_some()
+            || self.overlays.popover.is_some()
+    }
+
     pub(super) fn reconcile_active_source(&mut self) {
         let ActiveSource::Plugin(ps) = &self.catalog.active_source else {
             return;
@@ -114,6 +121,7 @@ impl IrisWindow {
         }
         if dirty.modal {
             self.overlays.submitting_plugin_modal = None;
+            self.overlays.plugin_modal_error = None;
             self.overlays.plugin_modal_focus_pending = true;
             if let Some(window) = window {
                 self.sync_plugin_modal_focus(window);
@@ -182,8 +190,14 @@ impl IrisWindow {
                 }
             }
             HostCommand::ShowToast { message } => {
-                self.overlays.clear_submitting_for_plugin(pid);
-                self.show_toast(message, cx);
+                if self.overlays.clear_submitting_for_plugin(pid)
+                    && self.plugins.active_modal().is_some_and(|(p, _)| p == pid)
+                {
+                    self.overlays.plugin_modal_error = Some(message.clone().into());
+                    self.show_error_toast(message, cx);
+                } else {
+                    self.show_toast(message, cx);
+                }
             }
             HostCommand::SetAbLoop { start, end } => {
                 self.command(Command::SetAbLoop { start, end }, cx)
@@ -257,6 +271,7 @@ impl IrisWindow {
             .plugins
             .send_to(&pid, HostEvent::ModalCancel { id: modal_id });
         self.overlays.submitting_plugin_modal = None;
+        self.overlays.plugin_modal_error = None;
         self.overlays.plugin_modal_focus_pending = true;
         // A dismissed front modal can reveal another queued modal without a dirty slot.
         self.apply_poll_report(report, window, cx);

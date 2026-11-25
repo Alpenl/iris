@@ -99,6 +99,50 @@ impl IrisWindow {
         cx.notify();
     }
 
+    pub(super) fn submit_builtin_dialog(&mut self, w: &mut Window, cx: &mut Context<Self>) {
+        let Some(dialog) = self.overlays.dialog.clone() else {
+            return;
+        };
+        match dialog {
+            BuiltinDialog::OpenUrl => {
+                let url = self.form_value("url").trim().to_string();
+                if url.is_empty() {
+                    self.overlays.dialog_error = Some("请输入网络流或媒体地址".into());
+                    cx.notify();
+                    return;
+                }
+                let resolver = self.form_value("url-resolver").to_owned();
+                if !self.open_user_url(&url, &resolver, cx) {
+                    return;
+                }
+                self.overlays.dialog = None;
+                self.overlays.dialog_error = None;
+                self.text_inputs.active_form_key = None;
+                self.focus.focus(w);
+            }
+            BuiltinDialog::SavePreset { scope } => {
+                let name = self.form_value("preset_name").to_string();
+                let desc = self.form_value("preset_desc").to_string();
+                self.overlays.dialog = None;
+                self.overlays.dialog_error = None;
+                self.text_inputs.active_form_key = None;
+                self.focus.focus(w);
+                self.save_current_as_preset(name, desc, scope, w, cx);
+            }
+            BuiltinDialog::ConfirmUninstallPlugin {
+                plugin_id,
+                keep_data,
+                ..
+            } => {
+                self.overlays.dialog = None;
+                self.overlays.dialog_error = None;
+                self.text_inputs.active_form_key = None;
+                self.focus.focus(w);
+                self.uninstall_plugin(&plugin_id, keep_data, cx);
+            }
+        }
+    }
+
     pub(super) fn render_builtin_dialog(
         &self,
         window: &Window,
@@ -112,6 +156,7 @@ impl IrisWindow {
 
         let cancel_cb: ModalCallback = Rc::new(|this, w, cx| {
             this.overlays.dialog = None;
+            this.overlays.dialog_error = None;
             this.text_inputs.active_form_key = None;
             this.focus.focus(w);
             cx.notify();
@@ -122,7 +167,8 @@ impl IrisWindow {
                 let submit: ModalCallback = Rc::new(|this, w, cx| {
                     let url = this.form_value("url").trim().to_string();
                     if url.is_empty() {
-                        this.show_toast("请输入网络流或媒体地址", cx);
+                        this.overlays.dialog_error = Some("请输入网络流或媒体地址".into());
+                        cx.notify();
                         return;
                     }
                     let resolver = this.form_value("url-resolver").to_owned();
@@ -130,6 +176,7 @@ impl IrisWindow {
                         return;
                     }
                     this.overlays.dialog = None;
+                    this.overlays.dialog_error = None;
                     this.text_inputs.active_form_key = None;
                     this.focus.focus(w);
                 });
@@ -362,7 +409,8 @@ impl IrisWindow {
                 body,
                 cancel_cb,
                 on_submit,
-            ),
+            )
+            .with_error(self.overlays.dialog_error.clone()),
             t,
             cx,
         ))

@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
-use gpui::{RenderImage, ScrollHandle, UniformListScrollHandle};
+use gpui::{RenderImage, ScrollHandle, SharedString, UniformListScrollHandle};
 use iris_api::{PluginModal, SourceEntry, StreamVariant};
 use iris_core::catalog::{CatalogItem, MediaFilter};
 use iris_core::preset::{PresetCaptureScope, SidebarMode};
@@ -55,7 +55,7 @@ pub(crate) enum BuiltinDialog {
     },
 }
 
-/// Deterministic single-step outcome of pressing `Esc` in `Workspace && !TextInput`.
+/// Deterministic single-step outcome of pressing `Esc` across the entire window.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum EscapeStep {
     CancelRecording,
@@ -67,6 +67,8 @@ pub(super) enum EscapeStep {
     ClosePopover,
     CloseInfo,
     CloseDirPopup,
+    BlurSidebarForm,
+    ClearSearchText,
     CloseSearch,
     ExitFullscreen,
     Noop,
@@ -333,14 +335,17 @@ pub(super) struct OverlayState {
     pub(super) settings_tab: SettingsTab,
     pub(super) info_open: bool,
     pub(super) popover: Option<PopoverKind>,
+    pub(super) popover_index: Option<usize>,
     pub(super) context_menu: Option<ContextMenu>,
     pub(super) palette_open: bool,
     pub(super) palette_index: usize,
     pub(super) palette_scroll: ScrollHandle,
     pub(super) dialog: Option<BuiltinDialog>,
+    pub(super) dialog_error: Option<SharedString>,
     pub(super) recording_shortcut: Option<(String, String)>,
     pub(super) shortcut_conflict: Option<String>,
     pub(super) submitting_plugin_modal: Option<(String, String)>,
+    pub(super) plugin_modal_error: Option<SharedString>,
     pub(super) plugin_modal_focus_pending: bool,
 }
 
@@ -352,24 +357,23 @@ impl Default for OverlayState {
             settings_tab: SettingsTab::Appearance,
             info_open: false,
             popover: None,
+            popover_index: None,
             context_menu: None,
             palette_open: false,
             palette_index: 0,
             palette_scroll: ScrollHandle::new(),
             dialog: None,
+            dialog_error: None,
             recording_shortcut: None,
             shortcut_conflict: None,
             submitting_plugin_modal: None,
+            plugin_modal_error: None,
             plugin_modal_focus_pending: false,
         }
     }
 }
 
 impl OverlayState {
-    pub(super) fn has_blocking(&self) -> bool {
-        self.dir_popup.is_open() || self.has_menu_or_modal()
-    }
-
     pub(super) fn has_menu_or_modal(&self) -> bool {
         self.popover.is_some()
             || self.settings_open
@@ -384,16 +388,19 @@ impl OverlayState {
 
     pub(super) fn close_menus(&mut self) {
         self.popover = None;
+        self.popover_index = None;
         self.context_menu = None;
     }
 
     pub(super) fn close_all(&mut self) {
         self.dir_popup = DirectoryPopup::Hidden;
         self.popover = None;
+        self.popover_index = None;
         self.settings_open = false;
         self.palette_open = false;
         self.context_menu = None;
         self.dialog = None;
+        self.dialog_error = None;
         self.recording_shortcut = None;
     }
 
@@ -429,6 +436,7 @@ impl OverlayState {
         self.context_menu = None;
         self.palette_open = false;
         self.dialog = None;
+        self.popover_index = None;
         if self.popover == Some(kind) {
             self.popover = None;
         } else {
@@ -446,6 +454,7 @@ impl OverlayState {
 
     pub(super) fn open_dialog(&mut self, dialog: BuiltinDialog) {
         self.close_all();
+        self.dialog_error = None;
         self.dialog = Some(dialog);
     }
 
@@ -464,22 +473,26 @@ impl OverlayState {
         {
             return None;
         }
+        self.plugin_modal_error = None;
         self.submitting_plugin_modal = Some((pid.to_string(), modal.id.clone()));
         Some(buffers.collect_modal_values(pid, modal))
     }
 
-    pub(super) fn clear_submitting_for_plugin(&mut self, pid: &str) {
+    pub(super) fn clear_submitting_for_plugin(&mut self, pid: &str) -> bool {
         if self
             .submitting_plugin_modal
             .as_ref()
             .is_some_and(|(p, _)| p == pid)
         {
             self.submitting_plugin_modal = None;
+            return true;
         }
+        false
     }
 
     pub(super) fn cancel_plugin_modal_state(&mut self, buffers: &mut TextInputBuffers) {
         self.submitting_plugin_modal = None;
+        self.plugin_modal_error = None;
         buffers.clear_modal_fields();
     }
 
@@ -491,11 +504,13 @@ impl OverlayState {
         is_fullscreen: bool,
     ) -> EscapeStep {
         if self.recording_shortcut.take().is_some() {
+            self.shortcut_conflict = None;
             EscapeStep::CancelRecording
         } else if has_plugin_modal {
             self.cancel_plugin_modal_state(buffers);
             EscapeStep::CancelPluginModal
         } else if self.dialog.take().is_some() {
+            self.dialog_error = None;
             buffers.active_form_key = None;
             EscapeStep::CloseBuiltinDialog
         } else if self.context_menu.take().is_some() {
@@ -515,9 +530,18 @@ impl OverlayState {
         } else if self.dir_popup.is_open() {
             self.dir_popup = DirectoryPopup::Hidden;
             EscapeStep::CloseDirPopup
+        } else if buffers
+            .active_form_key
+            .as_deref()
+            .is_some_and(|k| k.starts_with("sb:"))
+        {
+            buffers.active_form_key = None;
+            EscapeStep::BlurSidebarForm
+        } else if buffers.search_open && !buffers.search_input.is_empty() {
+            buffers.search_input.clear();
+            EscapeStep::ClearSearchText
         } else if buffers.search_open {
             buffers.search_open = false;
-            buffers.search_input.clear();
             EscapeStep::CloseSearch
         } else if is_fullscreen {
             EscapeStep::ExitFullscreen

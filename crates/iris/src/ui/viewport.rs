@@ -8,8 +8,7 @@ use std::time::Instant;
 
 use gpui::{
     Context, CursorStyle, InteractiveElement, IntoElement, KeyContext, MouseButton, MouseDownEvent,
-    ParentElement, Pixels, Point, SharedString, Styled, Window, canvas, div,
-    prelude::FluentBuilder, px,
+    ParentElement, Pixels, Point, Styled, Window, canvas, div, prelude::FluentBuilder, px,
 };
 use iris_core::geometry::ImageView;
 use iris_core::input::{self, InputContext, PointerCommand, PointerInput};
@@ -142,7 +141,7 @@ impl IrisWindow {
         InputContext {
             media: self.active().session.kind(),
             zoomed: self.image_can_pan(),
-            overlay: self.overlays.has_blocking() || self.plugins.active_modal().is_some(),
+            overlay: self.has_blocking_overlay() || self.overlays.dir_popup.is_open(),
             video_wheel_volume: self.settings.video_wheel == VideoWheel::Volume,
             single_click_pause: self.settings.single_click_pause,
             photo_double_click_actual: self.settings.photo_double_click_actual,
@@ -248,21 +247,6 @@ impl IrisWindow {
                 .current()
                 .is_some_and(|cur| self.catalog.photo_paths.iter().any(|p| p == cur));
 
-        let top_pill = self
-            .chrome
-            .toast
-            .clone()
-            .or_else(|| self.chrome.osd.clone())
-            .or_else(|| {
-                if session.state().buffering {
-                    Some(SharedString::from("缓冲中…"))
-                } else if vp.loading_visible {
-                    Some(SharedString::from("加载中…"))
-                } else {
-                    None
-                }
-            });
-
         div()
             .id("video")
             .relative()
@@ -280,11 +264,8 @@ impl IrisWindow {
             .child(probe)
             .key_context({
                 let mut kc = KeyContext::default();
-                if self.overlays.settings_open
-                    || self.overlays.context_menu.is_some()
-                    || self.overlays.palette_open
-                    || self.overlays.dialog.is_some()
-                    || self.plugins.active_modal().is_some()
+                if self.has_blocking_overlay()
+                    || self.overlays.dir_popup.is_open()
                     || self.text_inputs.is_any_focused(window)
                 {
                     kc.add("Overlay");
@@ -392,9 +373,15 @@ impl IrisWindow {
                     }
                 }),
             )
+            // Layer 0: media surface fallbacks (audio card / empty state)
             .when(kind == Some(Kind::Audio), |d| {
                 d.child(self.render_audio_card(t))
             })
+            .when(
+                !has_media && vp.pending_path.is_none() && !vp.loading_visible,
+                |d| d.child(self.render_empty_state(t, cx)),
+            )
+            // Layer 1: viewport overlays & floating chrome (media-normalized coords)
             .children(self.render_plugin_overlay(cx))
             .children(self.render_timed_overlay(cx))
             .when(fullscreen && self.chrome.chrome_visible, |d| {
@@ -441,38 +428,9 @@ impl IrisWindow {
                     })
                 })
             })
-            .when_some(top_pill, |d, msg| {
-                d.child(
-                    div()
-                        .absolute()
-                        .top(px(if fullscreen { FLOAT_GAP } else { 12. }))
-                        .left_0()
-                        .right_0()
-                        .flex()
-                        .justify_center()
-                        .child(
-                            div()
-                                .h(px(28.))
-                                .px(px(10.))
-                                .flex()
-                                .items_center()
-                                .gap(px(8.))
-                                .rounded(t.radius_lg)
-                                .bg(t.overlay)
-                                .border_1()
-                                .border_color(t.line)
-                                .child(div().flex_none().size(px(6.)).bg(t.accent))
-                                .child(div().font_family(FONT_MONO).text_size(px(12.)).child(msg)),
-                        ),
-                )
-            })
             .when(self.overlays.info_open && has_media, |d| {
                 d.child(self.render_info_overlay(fullscreen, cx))
             })
-            .when(
-                !has_media && vp.pending_path.is_none() && !vp.loading_visible,
-                |d| d.child(self.render_empty_state(t, cx)),
-            )
             .when(show_filmstrip, |d| {
                 d.children(self.render_photo_filmstrip(fullscreen, t, cx))
             })
@@ -513,9 +471,6 @@ impl IrisWindow {
                         )
                         .child(self.render_dock(true, window, cx)),
                 )
-            })
-            .when_some(self.overlays.popover, |d, pop| {
-                d.child(self.render_popover(pop, fullscreen, window, cx))
             })
     }
 }

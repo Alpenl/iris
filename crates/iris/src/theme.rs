@@ -66,9 +66,12 @@ struct ThemePalette {
     text_dim: u32,
     text_faint: u32,
     accent: u32,
+    danger: u32,
     overlay: u32,
     scrim: u32,
 }
+
+const DANGER_DEFAULT: u32 = 0xF05252FF;
 
 const GRAPHITE_PALETTE: ThemePalette = ThemePalette {
     window_bg: 0x0E0F11FF,
@@ -82,6 +85,7 @@ const GRAPHITE_PALETTE: ThemePalette = ThemePalette {
     text_dim: 0x8D939AFF,
     text_faint: 0x5C6168FF,
     accent: 0xFF5B1FFF,
+    danger: DANGER_DEFAULT,
     overlay: 0x15171AE6,
     scrim: 0x00000099,
 };
@@ -98,6 +102,7 @@ const OLED_PALETTE: ThemePalette = ThemePalette {
     text_dim: 0x7A8088FF,
     text_faint: 0x4E535AFF,
     accent: 0xFF5B1FFF,
+    danger: DANGER_DEFAULT,
     overlay: 0x08090BEB,
     scrim: 0x000000BB,
 };
@@ -114,6 +119,7 @@ const STUDIO_PALETTE: ThemePalette = ThemePalette {
     text_dim: 0x8F8981FF,
     text_faint: 0x635E58FF,
     accent: 0xE59934FF,
+    danger: DANGER_DEFAULT,
     overlay: 0x1C1A18E6,
     scrim: 0x09080799,
 };
@@ -130,6 +136,7 @@ const GLACIER_PALETTE: ThemePalette = ThemePalette {
     text_dim: 0x8695ABFF,
     text_faint: 0x556378FF,
     accent: 0x38BDF8FF,
+    danger: DANGER_DEFAULT,
     overlay: 0x111620E6,
     scrim: 0x04070CA6,
 };
@@ -163,6 +170,7 @@ pub(crate) struct ThemeTokens {
     pub(crate) text_dim: Rgba,
     pub(crate) text_faint: Rgba,
     pub(crate) accent: Rgba,
+    pub(crate) danger: Rgba,
     pub(crate) overlay: Rgba,
     pub(crate) scrim: Rgba,
     pub(crate) radius_lg: Pixels,
@@ -269,6 +277,7 @@ impl ThemeTokens {
                 (&mut p.text_dim, curated.text_dim),
                 (&mut p.text_faint, curated.text_faint),
                 (&mut p.accent, curated.accent),
+                (&mut p.danger, curated.danger),
             ] {
                 *slot = [*slot, fallback, preferred, extreme]
                     .into_iter()
@@ -313,6 +322,7 @@ impl ThemeTokens {
             text_dim: rgba(p.text_dim),
             text_faint: rgba(p.text_faint),
             accent: rgba(p.accent),
+            danger: rgba(p.danger),
             overlay: rgba(p.overlay),
             scrim: rgba(p.scrim),
             radius_lg: px(radius.clamp(0.0, 14.0)),

@@ -20,6 +20,7 @@ pub(in crate::ui) type ModalCallback =
 pub(in crate::ui) struct ModalFooterSpec {
     pub(in crate::ui) cancel_label: SharedString,
     pub(in crate::ui) submit_label: SharedString,
+    pub(in crate::ui) submit_disabled: bool,
     pub(in crate::ui) on_submit: ModalCallback,
 }
 
@@ -27,6 +28,7 @@ pub(in crate::ui) struct ModalShellSpec {
     pub(in crate::ui) id_prefix: &'static str,
     pub(in crate::ui) title: SharedString,
     pub(in crate::ui) header_hint: Option<SharedString>,
+    pub(in crate::ui) error: Option<SharedString>,
     pub(in crate::ui) width: f32,
     pub(in crate::ui) fixed_height: Option<f32>,
     pub(in crate::ui) max_height: f32,
@@ -54,6 +56,7 @@ impl ModalShellSpec {
             id_prefix,
             title: title.into(),
             header_hint: None,
+            error: None,
             width,
             fixed_height: None,
             max_height,
@@ -64,9 +67,22 @@ impl ModalShellSpec {
             footer: Some(ModalFooterSpec {
                 cancel_label: cancel_label.into(),
                 submit_label: submit_label.into(),
+                submit_disabled: false,
                 on_submit,
             }),
         }
+    }
+
+    pub(in crate::ui) fn with_error(mut self, error: Option<SharedString>) -> Self {
+        self.error = error;
+        self
+    }
+
+    pub(in crate::ui) fn with_submit_disabled(mut self, disabled: bool) -> Self {
+        if let Some(footer) = &mut self.footer {
+            footer.submit_disabled = disabled;
+        }
+        self
     }
 }
 
@@ -124,10 +140,41 @@ pub(in crate::ui) fn modal_shell(
                 .on_click(cx.listener(move |this, _, w, cx| cancel_x(this, w, cx))),
         );
 
+    let error_banner = spec.error.filter(|msg| !msg.trim().is_empty()).map(|msg| {
+        div()
+            .flex_none()
+            .px(px(14.))
+            .py(px(8.))
+            .bg(t.window_bg)
+            .border_t_1()
+            .border_color(t.danger)
+            .flex()
+            .items_center()
+            .gap(px(8.))
+            .child(div().flex_none().size(px(6.)).bg(t.danger))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .text_size(px(11.))
+                    .text_color(t.danger)
+                    .child(msg),
+            )
+    });
+
     let footer = spec.footer.map(|f| {
         let submit_btn = f.on_submit;
+        let submit_el = if f.submit_disabled {
+            bordered_button((spec.id_prefix, 5usize), f.submit_label, true, t)
+                .opacity(0.45)
+                .cursor_default()
+        } else {
+            bordered_button((spec.id_prefix, 5usize), f.submit_label, true, t)
+                .on_click(cx.listener(move |this, _, w, cx| submit_btn(this, w, cx)))
+        };
         div()
-            .h(px(44.))
+            .min_h(px(44.))
+            .py(px(8.))
             .flex_none()
             .px(px(14.))
             .flex()
@@ -141,10 +188,7 @@ pub(in crate::ui) fn modal_shell(
                 bordered_button((spec.id_prefix, 4usize), f.cancel_label, false, t)
                     .on_click(cx.listener(move |this, _, w, cx| cancel_btn(this, w, cx))),
             )
-            .child(
-                bordered_button((spec.id_prefix, 5usize), f.submit_label, true, t)
-                    .on_click(cx.listener(move |this, _, w, cx| submit_btn(this, w, cx))),
-            )
+            .child(submit_el)
     });
 
     let body_wrap = if spec.raw_body {
@@ -208,6 +252,7 @@ pub(in crate::ui) fn modal_shell(
                 .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
                 .child(header)
                 .child(body_wrap)
+                .children(error_banner)
                 .children(footer),
         )
         .into_any_element()
