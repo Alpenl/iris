@@ -4,14 +4,14 @@ version = 4
 
 [[package]]
 name = "iris-api"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "iris-plugin-sdk"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "iris-api",
  "serde",
@@ -20,7 +20,7 @@ dependencies = [
 
 [[package]]
 name = "iris-v2-contract-guest"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "iris-plugin-sdk",
 ]

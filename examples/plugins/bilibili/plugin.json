@@ -1,7 +1,7 @@
 {
   "id": "community.bilibili",
   "name": "哔哩哔哩 (BiliSail)",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "author": "Iris Community",
   "description": "参考 BiliSail 接口设计的哔哩哔哩 Wasm 插件：支持扫码与 Cookie 登录、WBI 签名、推荐/热门/动态/收藏/番剧/历史/直播浏览、DASH 分轨选流、CC/AI 字幕转换、章节与实时弹幕。",
   "protocol": 2,

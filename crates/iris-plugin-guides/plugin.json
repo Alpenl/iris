@@ -1,7 +1,7 @@
 {
   "id": "iris.guides",
   "name": "构图辅助线",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "author": "Iris",
   "description": "三分线、黄金分割、中心十字、电影画幅与安全区参考线",
   "protocol": 2,

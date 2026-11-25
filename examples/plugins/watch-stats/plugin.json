@@ -1,7 +1,7 @@
 {
   "id": "example.watch-stats",
   "name": "窗口观影计时",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "protocol": 2,
   "abi": 2,
   "entry": "plugin.wasm",

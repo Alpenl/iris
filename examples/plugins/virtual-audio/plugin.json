@@ -1,7 +1,7 @@
 {
   "id": "example.virtual-audio",
   "name": "虚拟音频数据源",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "protocol": 2,
   "abi": 2,
   "entry": "plugin.wasm",

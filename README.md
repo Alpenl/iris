@@ -2,7 +2,7 @@
 
 Iris 是一个以 [mpv](https://mpv.io) 为播放核心的高性能跨平台照片 / 视频 / 音频播放器，面向 macOS 和 Windows。界面用 Rust 基于 [GPUI](https://www.gpui.rs) 编写；解码与色彩管线由原生视频渲染层独占，本体默认保持硬朗克制的方向 C 模块面板风格，同时通过正交插件系统（`iris-api`）提供**全插件化远程存储（标配免挂载 `iris.webdav`）**、**带个人基线保护的工作区预设**、**多方案可录制快捷键**以及**高自由度界面与视口叠层定制**。
 
-> **当前版本为 0.0.1。** 项目只构建和打包与工作区版本一致的 `0.0.x`。启用 `0.1.x` 需要项目维护者手动授权并修改版本门禁。正式签名与公证需要发行凭据。
+> **当前版本为 0.0.2。** 项目只构建和打包与工作区版本一致的 `0.0.x`。启用 `0.1.x` 需要项目维护者手动授权并修改版本门禁。正式签名与公证需要发行凭据。
 
 文档：[架构](docs/ARCHITECTURE.md) · [插件开发指南](docs/PLUGINS.md) · [Plugin V2 架构](docs/PLUGIN_V2_ARCHITECTURE.md) · [Plugin V2 决议](docs/PLUGIN_V2_DECISIONS.md) · [决策与路线图](docs/DECISIONS.md) · [决议讨论录](docs/DISCUSSIONS.md) · [测试与实测记录](docs/TESTING.md)
 

@@ -5,7 +5,7 @@ on:
       version:
         description: Authorized workspace version (0.0.x)
         required: true
-        default: '0.0.1'
+        default: '0.0.2'
       mode:
         description: Local is unsigned; release requires signing and macOS notarization secrets
         type: choice

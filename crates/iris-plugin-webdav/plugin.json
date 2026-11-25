@@ -1,7 +1,7 @@
 {
   "id": "iris.webdav",
   "name": "WebDAV 远程存储",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "author": "Iris",
   "description": "异步浏览 NAS 与云盘 WebDAV 目录；每个服务器由宿主独立授权",
   "protocol": 2,

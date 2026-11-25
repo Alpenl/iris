@@ -2788,7 +2788,7 @@ checksum = "791930b43c0d5973160d90a8f3894509f2b273430f5c5c73b668636d0287c5c0"
 
 [[package]]
 name = "iris"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "anyhow",
  "cocoa",
@@ -2810,7 +2810,7 @@ dependencies = [
 
 [[package]]
 name = "iris-api"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -2818,7 +2818,7 @@ dependencies = [
 
 [[package]]
 name = "iris-core"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "aes",
  "anyhow",
@@ -2856,7 +2856,7 @@ dependencies = [
 
 [[package]]
 name = "iris-example-baidupan"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "iris-plugin-sdk",
  "miniz_oxide 0.8.9",
@@ -2868,7 +2868,7 @@ dependencies = [
 
 [[package]]
 name = "iris-example-bilibili"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "iris-plugin-sdk",
  "miniz_oxide 0.8.9",
@@ -2881,32 +2881,32 @@ dependencies = [
 
 [[package]]
 name = "iris-example-virtual-audio"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "iris-plugin-sdk",
 ]
 
 [[package]]
 name = "iris-example-watch-stats"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "iris-plugin-sdk",
 ]
 
 [[package]]
 name = "iris-mpv"
-version = "0.0.1"
+version = "0.0.2"
 
 [[package]]
 name = "iris-plugin-guides"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "iris-plugin-sdk",
 ]
 
 [[package]]
 name = "iris-plugin-sdk"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "iris-api",
  "serde",
@@ -2915,7 +2915,7 @@ dependencies = [
 
 [[package]]
 name = "iris-plugin-webdav"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "anyhow",
  "base64",

@@ -1,7 +1,7 @@
 {
   "id": "community.baidupan",
   "name": "百度网盘 (BaiduNetdisk)",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "author": "Iris Community",
   "description": "参考 BaiduPCS-Rust 与 OpenList 接口设计的百度网盘 Wasm 插件：支持百度网盘 App 扫码、Cookie (BDUSS) 与开放平台 OAuth 登录；支持全盘目录浏览与搜索、视频/照片/音频分类视图、PCS Locate v4 / OpenAPI 原画多线路直链、云端转码 HLS（1080P/720P/480P）切换与同目录外挂字幕自动挂载。",
   "protocol": 2,
