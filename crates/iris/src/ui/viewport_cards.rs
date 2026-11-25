@@ -262,22 +262,18 @@ impl IrisWindow {
                                             Some(Kind::Audio) => Icon::Music,
                                             None => Icon::Folder,
                                         };
-                                        (g, None, false)
+                                        (g, None::<SharedString>, false)
                                     }
-                                    MediaUri::Plugin { plugin_id, .. } => (
-                                        if plugin_id == "iris.webdav" {
-                                            Icon::Globe
-                                        } else {
-                                            Icon::Puzzle
-                                        },
-                                        Some(if plugin_id == "iris.webdav" {
-                                            "WebDAV"
-                                        } else {
-                                            "插件源"
-                                        }),
+                                    MediaUri::Plugin {
+                                        plugin_id,
+                                        source_id,
+                                        ..
+                                    } => (
+                                        self.plugin_source_icon(plugin_id, source_id),
+                                        Some(self.plugin_source_badge(plugin_id, source_id)),
                                         true,
                                     ),
-                                    MediaUri::HttpUrl(_) => (Icon::Link, Some("网络流"), true),
+                                    MediaUri::HttpUrl(_) => (Icon::Link, Some("网络流".into()), true),
                                 };
                                 div()
                                     .id(("recent-item", i))

@@ -13,6 +13,9 @@ pub struct SourceDescriptor {
     pub subtitle: Option<String>,
     /// A host icon name, never a URL or filesystem path.
     pub icon: Option<String>,
+    /// Optional short host-rendered badge tag (e.g. `"WebDAV"`, `"云源"`), at most 24 bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub badge: Option<String>,
     #[serde(default)]
     pub supports_search: bool,
     #[serde(default)]
@@ -38,6 +41,10 @@ impl SourceDescriptor {
                     .icon
                     .as_ref()
                     .is_some_and(|i| !crate::is_valid_id(i) || i.len() > 64)
+                || source
+                    .badge
+                    .as_ref()
+                    .is_some_and(|b| b.trim().is_empty() || b.len() > 24 || b.chars().any(char::is_control))
             {
                 return Err("invalid source descriptor");
             }

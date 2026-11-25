@@ -107,7 +107,7 @@ impl IrisWindow {
             self.plugins.dismiss_modal(&plugin);
         }
         self.reconcile_active_source();
-        self.overlays.plugin_modal_focus_pending = true;
+        self.plugin_view.modal.focus_pending = true;
         self.sync_plugin_modal_focus(window);
         self.settings.theme_id = "graphite".into();
         self.settings.floating_dock = false;

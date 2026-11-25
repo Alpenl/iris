@@ -161,9 +161,9 @@ impl IrisWindow {
                 self.overlays.palette_scroll.scroll_to_item(0);
             }
             ActiveSlot::Form => {
-                self.overlays.submitting_plugin_modal = None;
+                self.plugin_view.modal.submitting = None;
                 self.overlays.dialog_error = None;
-                self.overlays.plugin_modal_error = None;
+                self.plugin_view.modal.error = None;
             }
         }
         cx.notify();

@@ -12,13 +12,86 @@ mod sources;
 mod thumbnails;
 mod timeline;
 use super::IrisWindow;
-use gpui::{Context, Window};
+use super::kit::text_buffer::TextInputBuffers;
+use crate::assets::Icon;
+use gpui::{Context, SharedString, Window};
+use iris_api::PluginModal;
 use iris_api::v2::{Generation, Id, source::PlaylistEntry};
 use iris_core::plugin_v2::{
     hub::{Binding, OriginSummary, ReviewSummary},
     requests::AcceptedPage,
 };
+use std::collections::BTreeMap;
 use std::sync::Arc;
+
+/// Maps a plugin-declared `SourceDescriptor::icon` name onto a controlled host [`Icon`].
+pub(in crate::ui) fn source_icon_for_name(name: Option<&str>) -> Icon {
+    match name.map(str::trim) {
+        Some(n) if n.eq_ignore_ascii_case("globe") || n.eq_ignore_ascii_case("server") => {
+            Icon::Globe
+        }
+        Some(n) if n.eq_ignore_ascii_case("folder") || n.eq_ignore_ascii_case("cloud") => {
+            Icon::Folder
+        }
+        Some(n) if n.eq_ignore_ascii_case("link") => Icon::Link,
+        Some(n) => Icon::from_name(n).unwrap_or(Icon::Puzzle),
+        None => Icon::Puzzle,
+    }
+}
+
+/// Consolidated async submission, inline error, and focus state for plugin modals.
+#[derive(Default)]
+pub(in crate::ui) struct PluginModalState {
+    pub(in crate::ui) submitting: Option<(String, String)>,
+    pub(in crate::ui) error: Option<SharedString>,
+    pub(in crate::ui) focus_pending: bool,
+}
+
+impl PluginModalState {
+    pub(in crate::ui) fn begin_submit(
+        &mut self,
+        buffers: &TextInputBuffers,
+        pid: &str,
+        modal: &PluginModal,
+    ) -> Option<BTreeMap<String, String>> {
+        if self
+            .submitting
+            .as_ref()
+            .is_some_and(|(p, m)| p == pid && m == &modal.id)
+        {
+            return None;
+        }
+        self.error = None;
+        self.submitting = Some((pid.to_string(), modal.id.clone()));
+        Some(buffers.collect_modal_values(pid, modal))
+    }
+
+    pub(in crate::ui) fn clear_submitting_for(&mut self, pid: &str) -> bool {
+        if self.submitting.as_ref().is_some_and(|(p, _)| p == pid) {
+            self.submitting = None;
+            return true;
+        }
+        false
+    }
+
+    pub(in crate::ui) fn cancel(&mut self, buffers: &mut TextInputBuffers) {
+        self.submitting = None;
+        self.error = None;
+        buffers.clear_modal_fields();
+    }
+
+    pub(in crate::ui) fn on_dirty(&mut self) {
+        self.submitting = None;
+        self.error = None;
+        self.focus_pending = true;
+    }
+
+    pub(in crate::ui) fn is_submitting(&self, pid: &str, modal_id: &str) -> bool {
+        self.submitting
+            .as_ref()
+            .is_some_and(|(p, m)| p == pid && m == modal_id)
+    }
+}
 
 pub(super) struct PluginView {
     pub deferred: Vec<(String, String)>,
@@ -31,6 +104,7 @@ pub(super) struct PluginView {
     pub insecure_auth: bool,
     pub keep_identity: bool,
     pub consent_busy: Option<Id>,
+    pub modal: PluginModalState,
     pub playlist: Vec<PlaylistEntry>,
     pub playlist_binding: Option<Arc<Binding>>,
     pub source_filters: Vec<iris_api::v2::source::SourceFilter>,
@@ -53,6 +127,7 @@ impl PluginView {
             insecure_auth: false,
             keep_identity: false,
             consent_busy: None,
+            modal: PluginModalState::default(),
             playlist: Vec::new(),
             playlist_binding: None,
             source_filters: Vec::new(),
@@ -65,6 +140,36 @@ impl PluginView {
     }
 }
 impl IrisWindow {
+    pub(in crate::ui) fn plugin_source_icon(&self, plugin_id: &str, source_id: &str) -> Icon {
+        let sources = self.plugins.media_sources();
+        let exact = sources
+            .iter()
+            .find(|(pid, _, desc)| *pid == plugin_id && desc.id == source_id)
+            .or_else(|| sources.iter().find(|(pid, _, _)| *pid == plugin_id));
+        source_icon_for_name(exact.and_then(|(_, _, desc)| desc.icon.as_deref()))
+    }
+
+    pub(in crate::ui) fn plugin_source_badge(
+        &self,
+        plugin_id: &str,
+        source_id: &str,
+    ) -> SharedString {
+        let sources = self.plugins.media_sources();
+        let found = sources
+            .iter()
+            .copied()
+            .find(|(pid, _, desc)| *pid == plugin_id && desc.id == source_id)
+            .or_else(|| sources.iter().copied().find(|(pid, _, _)| *pid == plugin_id));
+        if let Some((_, pname, desc)) = found {
+            if let Some(badge) = desc.badge.as_deref().map(str::trim).filter(|b| !b.is_empty()) {
+                return badge.to_owned().into();
+            }
+            if !pname.trim().is_empty() {
+                return pname.to_owned().into();
+            }
+        }
+        "插件源".into()
+    }
     pub(super) fn plugin_media_id(&self) -> Id {
         self.plugins.generation().media
     }

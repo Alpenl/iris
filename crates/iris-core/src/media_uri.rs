@@ -121,10 +121,8 @@ impl MediaUri {
         }
     }
 
-    /// Parses a URI string or filesystem path into a [`MediaUri`].
-    ///
-    /// Legacy `"webdav://<conn>/<path>"` URIs are losslessly upgraded to
-    /// `MediaUri::Plugin { plugin_id: "iris.webdav", source_id: conn, entry_id: path }`.
+    /// Parses a canonical URI string (`file://`, `plugin://`, `http(s)://`) or local path.
+    /// Legacy persisted schemes (`webdav://`) are handled by [`Self::parse_persisted`].
     pub fn parse(s: &str) -> Self {
         if let Some(rest) =
             strip_prefix_ci(s, "iris-plugin://").or_else(|| strip_prefix_ci(s, "plugin://"))
@@ -144,44 +142,6 @@ impl MediaUri {
                 .unwrap_or_default();
             return MediaUri::Plugin {
                 plugin_id,
-                source_id,
-                entry_id,
-            };
-        }
-
-        if let Some(rest) =
-            strip_prefix_ci(s, "webdav://").or_else(|| strip_prefix_ci(s, "iris-webdav://"))
-        {
-            if let Some((enc_conn, query_rel)) = rest.split_once("?rel=")
-                && !enc_conn.contains('/')
-            {
-                let source_id = percent_decode_str(enc_conn)
-                    .decode_utf8_lossy()
-                    .into_owned();
-                let entry_id = percent_decode_str(query_rel)
-                    .decode_utf8_lossy()
-                    .into_owned();
-                return MediaUri::Plugin {
-                    plugin_id: "iris.webdav".into(),
-                    source_id,
-                    entry_id,
-                };
-            }
-            let (source_id, entry_id) = match rest.split_once('/') {
-                Some((enc_conn, enc_path)) => {
-                    let conn = percent_decode_str(enc_conn)
-                        .decode_utf8_lossy()
-                        .into_owned();
-                    let path = percent_decode_str(enc_path).decode_utf8_lossy();
-                    (conn, format!("/{path}"))
-                }
-                None => (
-                    percent_decode_str(rest).decode_utf8_lossy().into_owned(),
-                    "/".into(),
-                ),
-            };
-            return MediaUri::Plugin {
-                plugin_id: "iris.webdav".into(),
                 source_id,
                 entry_id,
             };
@@ -232,6 +192,51 @@ impl MediaUri {
         }
 
         Self::from(PathBuf::from(s))
+    }
+
+    /// Parses a persisted URI string, upgrading legacy `webdav://` / `iris-webdav://` records
+    /// from earlier Iris versions into canonical `MediaUri::Plugin` form.
+    pub fn parse_persisted(raw: &str) -> Self {
+        Self::upgrade_legacy_webdav(raw).unwrap_or_else(|| Self::parse(raw))
+    }
+
+    fn upgrade_legacy_webdav(raw: &str) -> Option<Self> {
+        let s = raw.trim_start();
+        let rest =
+            strip_prefix_ci(s, "webdav://").or_else(|| strip_prefix_ci(s, "iris-webdav://"))?;
+        if let Some((enc_conn, query_rel)) = rest.split_once("?rel=")
+            && !enc_conn.contains('/')
+        {
+            let source_id = percent_decode_str(enc_conn)
+                .decode_utf8_lossy()
+                .into_owned();
+            let entry_id = percent_decode_str(query_rel)
+                .decode_utf8_lossy()
+                .into_owned();
+            return Some(MediaUri::Plugin {
+                plugin_id: "iris.webdav".into(),
+                source_id,
+                entry_id,
+            });
+        }
+        let (source_id, entry_id) = match rest.split_once('/') {
+            Some((enc_conn, enc_path)) => {
+                let conn = percent_decode_str(enc_conn)
+                    .decode_utf8_lossy()
+                    .into_owned();
+                let path = percent_decode_str(enc_path).decode_utf8_lossy();
+                (conn, format!("/{path}"))
+            }
+            None => (
+                percent_decode_str(rest).decode_utf8_lossy().into_owned(),
+                "/".into(),
+            ),
+        };
+        Some(MediaUri::Plugin {
+            plugin_id: "iris.webdav".into(),
+            source_id,
+            entry_id,
+        })
     }
 
     /// Converts an unambiguous local file URL. Remote authorities, relative
@@ -388,7 +393,7 @@ impl Serialize for MediaUri {
 impl<'de> Deserialize<'de> for MediaUri {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let raw = String::deserialize(deserializer)?;
-        Ok(MediaUri::parse(&raw))
+        Ok(MediaUri::parse_persisted(&raw))
     }
 }
 
@@ -492,8 +497,9 @@ mod tests {
     }
 
     #[test]
-    fn legacy_webdav_uris_upgrade_losslessly_to_iris_webdav_plugin() {
-        let parsed = MediaUri::parse("webdav://home-nas/Movies/Sci%20Fi%20%231/ep%2002.mkv");
+    fn legacy_webdav_uris_upgrade_losslessly_via_parse_persisted() {
+        let parsed =
+            MediaUri::parse_persisted("webdav://home-nas/Movies/Sci%20Fi%20%231/ep%2002.mkv");
         assert_eq!(
             parsed,
             MediaUri::Plugin {
@@ -505,7 +511,7 @@ mod tests {
         assert_eq!(parsed.display_name(), "ep 02.mkv");
         assert_eq!(parsed.as_local_path(), None);
 
-        let root = MediaUri::parse("webdav://home-nas");
+        let root = MediaUri::parse_persisted("webdav://home-nas");
         assert_eq!(
             root,
             MediaUri::Plugin {

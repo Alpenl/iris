@@ -122,10 +122,11 @@ impl IrisWindow {
                         let bm_id = bm.id.clone();
                         let glyph = match &bm.uri {
                             MediaUri::Local(_) => Icon::Folder,
-                            MediaUri::Plugin { plugin_id, .. } if plugin_id == "iris.webdav" => {
-                                Icon::Globe
-                            }
-                            MediaUri::Plugin { .. } => Icon::Puzzle,
+                            MediaUri::Plugin {
+                                plugin_id,
+                                source_id,
+                                ..
+                            } => self.plugin_source_icon(plugin_id, source_id),
                             MediaUri::HttpUrl(_) => Icon::Link,
                         };
                         div()
@@ -215,11 +216,9 @@ impl IrisWindow {
                                 let (pid_rm, sid_rm) = (pid.clone(), desc.id.clone());
                                 let pid_auth = pid.clone();
                                 let auth_cmd = desc.auth_command_id.clone();
-                                let glyph = if pid == "iris.webdav" {
-                                    Icon::Globe
-                                } else {
-                                    Icon::Puzzle
-                                };
+                                let glyph = super::super::plugin_runtime::source_icon_for_name(
+                                    desc.icon.as_deref(),
+                                );
                                 div()
                                     .id(("src-inst", i))
                                     .p(px(9.))

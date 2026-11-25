@@ -1,13 +1,13 @@
 //! Cohesive UI domain state structs: overlays, dialogs, active catalog state,
 //! scrub/pointer tracking, escape-dismissal priority, and bounded LRU thumbnail cache.
 
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
 use gpui::{RenderImage, ScrollHandle, SharedString, UniformListScrollHandle};
-use iris_api::{PluginModal, SourceEntry, StreamVariant};
+use iris_api::{SourceEntry, StreamVariant};
 use iris_core::catalog::{CatalogItem, LocalDirectory, MediaFilter};
 use iris_core::preset::{PresetCaptureScope, SidebarMode};
 
@@ -346,9 +346,6 @@ pub(super) struct OverlayState {
     pub(super) dialog_error: Option<SharedString>,
     pub(super) recording_shortcut: Option<(String, String)>,
     pub(super) shortcut_conflict: Option<String>,
-    pub(super) submitting_plugin_modal: Option<(String, String)>,
-    pub(super) plugin_modal_error: Option<SharedString>,
-    pub(super) plugin_modal_focus_pending: bool,
 }
 
 impl Default for OverlayState {
@@ -368,9 +365,6 @@ impl Default for OverlayState {
             dialog_error: None,
             recording_shortcut: None,
             shortcut_conflict: None,
-            submitting_plugin_modal: None,
-            plugin_modal_error: None,
-            plugin_modal_focus_pending: false,
         }
     }
 }
@@ -460,44 +454,6 @@ impl OverlayState {
         self.dialog = Some(dialog);
     }
 
-    /// Marks `(pid, modal.id)` as awaiting plugin validation without closing the modal
-    /// or erasing `modal:*` fields; returns `None` to debounce duplicate rapid clicks.
-    pub(super) fn begin_plugin_modal_submit(
-        &mut self,
-        buffers: &TextInputBuffers,
-        pid: &str,
-        modal: &PluginModal,
-    ) -> Option<BTreeMap<String, String>> {
-        if self
-            .submitting_plugin_modal
-            .as_ref()
-            .is_some_and(|(p, m)| p == pid && m == &modal.id)
-        {
-            return None;
-        }
-        self.plugin_modal_error = None;
-        self.submitting_plugin_modal = Some((pid.to_string(), modal.id.clone()));
-        Some(buffers.collect_modal_values(pid, modal))
-    }
-
-    pub(super) fn clear_submitting_for_plugin(&mut self, pid: &str) -> bool {
-        if self
-            .submitting_plugin_modal
-            .as_ref()
-            .is_some_and(|(p, _)| p == pid)
-        {
-            self.submitting_plugin_modal = None;
-            return true;
-        }
-        false
-    }
-
-    pub(super) fn cancel_plugin_modal_state(&mut self, buffers: &mut TextInputBuffers) {
-        self.submitting_plugin_modal = None;
-        self.plugin_modal_error = None;
-        buffers.clear_modal_fields();
-    }
-
     /// Peels exactly one top-most UI layer on `Esc` without skipping levels.
     pub(super) fn dismiss_next_escape(
         &mut self,
@@ -509,7 +465,7 @@ impl OverlayState {
             self.shortcut_conflict = None;
             EscapeStep::CancelRecording
         } else if has_plugin_modal {
-            self.cancel_plugin_modal_state(buffers);
+            buffers.clear_modal_fields();
             EscapeStep::CancelPluginModal
         } else if self.dialog.take().is_some() {
             self.dialog_error = None;

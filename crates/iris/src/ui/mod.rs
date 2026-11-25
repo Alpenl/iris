@@ -330,7 +330,7 @@ impl IrisWindow {
             _plugin_events: plugin_events,
         };
 
-        this.overlays.plugin_modal_focus_pending = this.plugins.active_modal().is_some();
+        this.plugin_view.modal.focus_pending = this.plugins.active_modal().is_some();
         this.sync_plugin_modal_focus(window);
         this.sync_theme_tokens(cx);
         this.rebuild_directory_rows();

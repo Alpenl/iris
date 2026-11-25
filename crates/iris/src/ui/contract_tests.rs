@@ -365,7 +365,7 @@ fn overlay_mutual_exclusion_and_escape_priority_never_skip_or_stall() {
 
 #[test]
 fn plugin_modal_async_submit_retains_inputs_until_close_or_cancel() {
-    let mut ov = OverlayState::default();
+    let mut modal_state = super::plugin_runtime::PluginModalState::default();
     let mut buf = TextInputBuffers::default();
     let modal = sample_plugin_modal();
     buf.form_fields
@@ -382,8 +382,8 @@ fn plugin_modal_async_submit_retains_inputs_until_close_or_cancel() {
     );
 
     // 1. Submit marks submitting state, debounces rapid re-click, and preserves inputs.
-    let vals = ov
-        .begin_plugin_modal_submit(&buf, "iris.webdav", &modal)
+    let vals = modal_state
+        .begin_submit(&buf, "iris.webdav", &modal)
         .expect("first submit proceeds");
     assert_eq!(
         vals.get("url").map(String::as_str),
@@ -391,13 +391,10 @@ fn plugin_modal_async_submit_retains_inputs_until_close_or_cancel() {
     );
     assert_eq!(vals.get("pass").map(String::as_str), Some("bad-pass"));
     assert_eq!(vals.get("ro").map(String::as_str), Some("true"));
-    assert!(
-        ov.begin_plugin_modal_submit(&buf, "iris.webdav", &modal)
-            .is_none()
-    );
+    assert!(modal_state.begin_submit(&buf, "iris.webdav", &modal).is_none());
 
     // Validation error (Toast or re-sent same-id OpenModal): user's inputs stay intact!
-    ov.clear_submitting_for_plugin("iris.webdav");
+    modal_state.clear_submitting_for("iris.webdav");
     assert!(!buf.sync_plugin_modal(Some(("iris.webdav", &modal))));
     assert_eq!(
         buf.form_fields["modal:iris.webdav:webdav-auth:url"].text(),
@@ -409,23 +406,17 @@ fn plugin_modal_async_submit_retains_inputs_until_close_or_cancel() {
     );
 
     // 2. Retry succeeds and plugin emits `CloseModal` -> cleans `modal:*`, keeps `sb:*`.
-    assert!(
-        ov.begin_plugin_modal_submit(&buf, "iris.webdav", &modal)
-            .is_some()
-    );
-    ov.cancel_plugin_modal_state(&mut buf);
-    assert!(ov.submitting_plugin_modal.is_none());
+    assert!(modal_state.begin_submit(&buf, "iris.webdav", &modal).is_some());
+    modal_state.cancel(&mut buf);
+    assert!(modal_state.submitting.is_none());
     assert!(!buf.form_fields.keys().any(|k| k.starts_with("modal:")));
     assert_eq!(buf.form_fields["sb:notes:draft"].text(), "keep");
 
     // 3. Re-open, submit (simulating hung plugin), then `ModalCancel` -> cleans `modal:*`.
     assert!(buf.sync_plugin_modal(Some(("iris.webdav", &modal))));
-    assert!(
-        ov.begin_plugin_modal_submit(&buf, "iris.webdav", &modal)
-            .is_some()
-    );
-    ov.cancel_plugin_modal_state(&mut buf);
-    assert!(ov.submitting_plugin_modal.is_none());
+    assert!(modal_state.begin_submit(&buf, "iris.webdav", &modal).is_some());
+    modal_state.cancel(&mut buf);
+    assert!(modal_state.submitting.is_none());
     assert!(buf.active_form_key.is_none());
     assert!(!buf.form_fields.keys().any(|k| k.starts_with("modal:")));
 }

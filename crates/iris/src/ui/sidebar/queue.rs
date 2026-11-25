@@ -111,8 +111,11 @@ impl IrisWindow {
                             let item = this.queue.get(ix)?;
                             let badge: Option<SharedString> = match &item.uri {
                                 MediaUri::Local(_) => None,
-                                MediaUri::Plugin { plugin_id, .. } if plugin_id == "iris.webdav" => Some("DAV".into()),
-                                MediaUri::Plugin { .. } => Some("云源".into()),
+                                MediaUri::Plugin {
+                                    plugin_id,
+                                    source_id,
+                                    ..
+                                } => Some(this.plugin_source_badge(plugin_id, source_id)),
                                 MediaUri::HttpUrl(_) => Some("URL".into()),
                             };
                             let remove = row_action_icon(("q-rm", ix), Icon::Close, false, false, t)

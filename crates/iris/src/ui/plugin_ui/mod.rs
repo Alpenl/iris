@@ -209,11 +209,7 @@ impl IrisWindow {
         let modal_w = (f32::from(vp.width) - 24.).clamp(0., 460.);
         let max_h = (f32::from(vp.height) - 24.).clamp(0., 540.);
 
-        let is_submitting = self
-            .overlays
-            .submitting_plugin_modal
-            .as_ref()
-            .is_some_and(|(p, m)| p == &pid && m == &modal.id);
+        let is_submitting = self.plugin_view.modal.is_submitting(&pid, &modal.id);
 
         let submit_label = if is_submitting {
             "处理中…".into()
@@ -281,7 +277,7 @@ impl IrisWindow {
                 cancel_cb,
                 submit_cb,
             )
-            .with_error(self.overlays.plugin_modal_error.clone())
+            .with_error(self.plugin_view.modal.error.clone())
             .with_submit_disabled(is_submitting),
             t,
             cx,

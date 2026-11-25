@@ -721,7 +721,7 @@ fn decode_any_media_uri(hex_text: &str) -> Option<MediaUri> {
         if let Some(path) = MediaUri::legacy_unc_file_uri_path(s) {
             return Some(MediaUri::from(path));
         }
-        return Some(MediaUri::parse(s));
+        return Some(MediaUri::parse_persisted(s));
     }
     // Legacy Windows paths used UTF-16LE, including in data directories subsequently
     // moved to Unix. Decode textual URIs before treating any bytes as an opaque OS path.
@@ -748,7 +748,7 @@ fn decode_any_media_uri(hex_text: &str) -> Option<MediaUri> {
         if let Some(path) = MediaUri::legacy_unc_file_uri_path(&text) {
             return Some(MediaUri::from(path));
         }
-        return Some(MediaUri::parse(&text));
+        return Some(MediaUri::parse_persisted(&text));
     }
     #[cfg(windows)]
     {

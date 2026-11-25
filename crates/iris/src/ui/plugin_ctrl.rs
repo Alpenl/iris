@@ -120,9 +120,7 @@ impl IrisWindow {
             }
         }
         if dirty.modal {
-            self.overlays.submitting_plugin_modal = None;
-            self.overlays.plugin_modal_error = None;
-            self.overlays.plugin_modal_focus_pending = true;
+            self.plugin_view.modal.on_dirty();
             if let Some(window) = window {
                 self.sync_plugin_modal_focus(window);
             }
@@ -139,7 +137,7 @@ impl IrisWindow {
             }
             return;
         }
-        if !std::mem::take(&mut self.overlays.plugin_modal_focus_pending) {
+        if !std::mem::take(&mut self.plugin_view.modal.focus_pending) {
             return;
         }
         let modal = self.plugins.active_modal();
@@ -190,10 +188,10 @@ impl IrisWindow {
                 }
             }
             HostCommand::ShowToast { message } => {
-                if self.overlays.clear_submitting_for_plugin(pid)
+                if self.plugin_view.modal.clear_submitting_for(pid)
                     && self.plugins.active_modal().is_some_and(|(p, _)| p == pid)
                 {
-                    self.overlays.plugin_modal_error = Some(message.clone().into());
+                    self.plugin_view.modal.error = Some(message.clone().into());
                     self.show_error_toast(message, cx);
                 } else {
                     self.show_toast(message, cx);
@@ -235,9 +233,10 @@ impl IrisWindow {
         else {
             return;
         };
-        let Some(values) = self
-            .overlays
-            .begin_plugin_modal_submit(&self.text_inputs, &pid, &modal)
+        let Some(values) =
+            self.plugin_view
+                .modal
+                .begin_submit(&self.text_inputs, &pid, &modal)
         else {
             return;
         };
@@ -270,9 +269,7 @@ impl IrisWindow {
         let report = self
             .plugins
             .send_to(&pid, HostEvent::ModalCancel { id: modal_id });
-        self.overlays.submitting_plugin_modal = None;
-        self.overlays.plugin_modal_error = None;
-        self.overlays.plugin_modal_focus_pending = true;
+        self.plugin_view.modal.on_dirty();
         // A dismissed front modal can reveal another queued modal without a dirty slot.
         self.apply_poll_report(report, window, cx);
         self.bump_activity(cx);
