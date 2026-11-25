@@ -396,7 +396,7 @@ impl IrisWindow {
                         .absolute()
                         .top(px(FLOAT_GAP))
                         .max_w(px(520.))
-                        .h(px(28.))
+                        .h(t.control_h_md)
                         .px(px(10.))
                         .flex()
                         .items_center()
@@ -409,7 +409,7 @@ impl IrisWindow {
                             div()
                                 .min_w(px(0.))
                                 .truncate()
-                                .text_size(px(12.))
+                                .text_size(t.text_md)
                                 .child(name),
                         )
                         .when_some(self.media_info(), |d, info| {
@@ -417,7 +417,7 @@ impl IrisWindow {
                                 div()
                                     .flex_none()
                                     .font_family(FONT_MONO)
-                                    .text_size(px(11.))
+                                    .text_size(t.text_sm)
                                     .text_color(t.text_dim)
                                     .child(info),
                             )
@@ -430,7 +430,7 @@ impl IrisWindow {
                 })
             })
             .when(self.overlays.info_open && has_media, |d| {
-                d.child(self.render_info_overlay(fullscreen, cx))
+                d.child(self.render_info_overlay(fullscreen, window, cx))
             })
             .when(show_filmstrip, |d| {
                 d.children(self.render_photo_filmstrip(fullscreen, t, cx))

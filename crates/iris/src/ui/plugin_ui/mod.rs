@@ -16,7 +16,7 @@ use iris_api::{SidebarPanel, StatusBadge};
 
 use super::IrisWindow;
 use super::kit::modal::{ModalCallback, ModalShellSpec, modal_shell};
-use super::kit::tip;
+use super::kit::{panel_header, surface_card, tip};
 use crate::theme::{FONT_MONO, ThemeTokens};
 use widgets::{WidgetSurface, render_plugin_widget};
 
@@ -45,7 +45,7 @@ impl IrisWindow {
                     .unwrap_or_else(|| format!("插件状态 · {pid}"));
                 div()
                     .id(("plugin-status", i))
-                    .h(px(22.))
+                    .h(px((f32::from(t.control_h_sm) - 2.).max(20.)))
                     .px(px(7.))
                     .flex()
                     .items_center()
@@ -59,7 +59,7 @@ impl IrisWindow {
                         t.line_strong
                     })
                     .font_family(FONT_MONO)
-                    .text_size(px(10.))
+                    .text_size(t.text_xs)
                     .text_color(if badge.accent { t.text } else { t.text_muted })
                     .when(action.is_some(), |d| {
                         d.cursor_pointer().hover(|s| s.bg(t.hover))
@@ -116,7 +116,7 @@ impl IrisWindow {
                         .when(!section.heading.is_empty(), |d| {
                             d.child(
                                 div()
-                                    .text_size(px(10.))
+                                    .text_size(t.text_xs)
                                     .text_color(t.text_faint)
                                     .child(section.heading),
                             )
@@ -126,33 +126,20 @@ impl IrisWindow {
                 );
             }
             panel_els.push(
-                div()
+                surface_card(0., t)
                     .id(SharedString::from(format!("plugin-panel:{pid}")))
-                    .flex()
-                    .flex_col()
-                    .gap(px(8.))
-                    .p(px(10.))
+                    .p(px(0.))
                     .rounded(t.radius_lg)
-                    .bg(t.window_bg)
-                    .border_1()
-                    .border_color(t.line)
+                    .overflow_hidden()
+                    .child(panel_header(panel_data.title, None, None, t))
                     .child(
                         div()
+                            .p(px(10.))
                             .flex()
-                            .items_center()
-                            .gap(px(6.))
-                            .pb(px(6.))
-                            .border_b_1()
-                            .border_color(t.line)
-                            .child(div().size(px(6.)).bg(t.accent))
-                            .child(
-                                div()
-                                    .text_size(px(12.))
-                                    .text_color(t.text)
-                                    .child(panel_data.title),
-                            ),
+                            .flex_col()
+                            .gap(px(8.))
+                            .children(section_els),
                     )
-                    .children(section_els)
                     .into_any_element(),
             );
         }
@@ -176,13 +163,13 @@ impl IrisWindow {
                         .gap(px(4.))
                         .child(
                             div()
-                                .text_size(px(12.))
+                                .text_size(t.text_md)
                                 .text_color(t.text_dim)
                                 .child("没有提供侧栏面板的启用插件"),
                         )
                         .child(
                             div()
-                                .text_size(px(11.))
+                                .text_size(t.text_sm)
                                 .text_color(t.text_faint)
                                 .child("在 设置 → 插件 中启用或添加外部插件"),
                         ),
@@ -260,7 +247,7 @@ impl IrisWindow {
             .flex_col()
             .gap(px(12.))
             .when_some(modal.subtitle.filter(|s| !s.trim().is_empty()), |d, sub| {
-                d.child(div().text_size(px(11.)).text_color(t.text_dim).child(sub))
+                d.child(div().text_size(t.text_sm).text_color(t.text_dim).child(sub))
             })
             .children(widget_nodes)
             .into_any_element();

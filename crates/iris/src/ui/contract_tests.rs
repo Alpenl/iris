@@ -420,3 +420,35 @@ fn plugin_modal_async_submit_retains_inputs_until_close_or_cancel() {
     assert!(buf.active_form_key.is_none());
     assert!(!buf.form_fields.keys().any(|k| k.starts_with("modal:")));
 }
+
+#[test]
+fn inline_destructive_confirmation_arms_confirms_and_expires() {
+    use std::time::{Duration, Instant};
+
+    let mut ov = OverlayState::default();
+    let t0 = Instant::now();
+    let ttl = Duration::from_secs(3);
+
+    // First click arms confirmation instead of executing immediately.
+    assert!(!ov.is_confirming("clear-queue", t0));
+    assert!(!ov.confirm_or_arm("clear-queue", t0, ttl));
+    assert!(ov.is_confirming("clear-queue", t0 + Duration::from_secs(1)));
+
+    // Different key replaces pending confirmation safely.
+    assert!(!ov.confirm_or_arm("clear-recent", t0 + Duration::from_secs(1), ttl));
+    assert!(!ov.is_confirming("clear-queue", t0 + Duration::from_secs(1)));
+    assert!(ov.is_confirming("clear-recent", t0 + Duration::from_secs(2)));
+
+    // Second click within TTL confirms and clears pending state.
+    assert!(ov.confirm_or_arm("clear-recent", t0 + Duration::from_secs(2), ttl));
+    assert!(!ov.is_confirming("clear-recent", t0 + Duration::from_secs(2)));
+
+    // Expired confirmation requires arming again.
+    assert!(!ov.confirm_or_arm("clear-progress", t0, ttl));
+    assert!(!ov.is_confirming("clear-progress", t0 + ttl));
+    assert!(!ov.confirm_or_arm("clear-progress", t0 + ttl, ttl));
+
+    // close_all clears any armed confirmation.
+    ov.close_all();
+    assert!(!ov.is_confirming("clear-progress", t0 + ttl + Duration::from_secs(1)));
+}

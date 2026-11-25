@@ -96,7 +96,7 @@ impl IrisWindow {
             .child(if item_count == 0 {
                 div()
                     .p(px(14.))
-                    .text_size(px(12.))
+                    .text_size(t.text_md)
                     .text_color(t.text_faint)
                     .child("播放队列为空。在任意本地或远程条目上右键选择「加入播放队列」即可跨目录混合排队。")
                     .into_any_element()

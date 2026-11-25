@@ -20,7 +20,7 @@ use super::super::kit::list_row::{
     MediaRowSpec, folder_row, media_row, row_action_icon, thin_scrollbar,
 };
 use super::super::kit::text_field::{TextFieldKind, TextFieldSpec};
-use super::super::kit::{bordered_button, icon};
+use super::super::kit::{bordered_button, icon, tab_strip, tab_strip_item};
 use super::super::state::ActiveSource;
 use crate::assets::Icon;
 use crate::theme::ThemeTokens;
@@ -99,7 +99,7 @@ impl IrisWindow {
                                         .child(
                                             div()
                                                 .truncate()
-                                                .text_size(px(11.))
+                                                .text_size(t.text_sm)
                                                 .text_color(t.text)
                                                 .child(badge),
                                         ),
@@ -111,7 +111,7 @@ impl IrisWindow {
                                         .py(px(2.))
                                         .rounded(t.radius_sm)
                                         .cursor_pointer()
-                                        .text_size(px(10.))
+                                        .text_size(t.text_xs)
                                         .text_color(t.text_dim)
                                         .hover(|s| s.bg(t.hover).text_color(t.text))
                                         .child("返回本地")
@@ -124,13 +124,13 @@ impl IrisWindow {
                         .when(loading, |d| {
                             d.child(
                                 div()
-                                    .text_size(px(11.))
+                                    .text_size(t.text_sm)
                                     .text_color(t.text_dim)
                                     .child("正在加载远程目录…"),
                             )
                         })
                         .when_some(error, |d, err| {
-                            d.child(div().text_size(px(11.)).text_color(t.accent).child(err))
+                            d.child(div().text_size(t.text_sm).text_color(t.danger).child(err))
                         })
                         .when(!authenticated, |d| {
                             d.child(
@@ -142,7 +142,7 @@ impl IrisWindow {
                                     .child(
                                         div()
                                             .flex_1()
-                                            .text_size(px(11.))
+                                            .text_size(t.text_sm)
                                             .text_color(t.text_dim)
                                             .child(
                                                 auth_hint.unwrap_or_else(|| "需要登录授权".into()),
@@ -346,39 +346,15 @@ impl IrisWindow {
             .children(source_banner)
             .children(search_bar)
             .child(
-                div()
-                    .h(px(28.))
-                    .flex_none()
-                    .px(px(6.))
-                    .flex()
-                    .items_center()
-                    .gap(px(2.))
-                    .border_b_1()
-                    .border_color(t.line)
-                    .children(tabs.into_iter().enumerate().map(|(i, (lbl, cnt, f))| {
-                        let active = f == filter;
-                        div()
-                            .id(("dir-ftab", i))
-                            .h(px(22.))
-                            .px(px(7.))
-                            .flex()
-                            .items_center()
-                            .gap(px(4.))
-                            .rounded(t.radius_sm)
-                            .cursor_pointer()
-                            .text_size(px(11.))
-                            .when(active, |d| d.bg(t.selected).text_color(t.text))
-                            .when(!active, |d| {
-                                d.text_color(t.text_dim)
-                                    .hover(|s| s.bg(t.hover).text_color(t.text))
-                            })
-                            .child(format!("{lbl} {cnt}"))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.catalog.filter = f;
-                                this.filter_directory_rows();
-                                cx.notify();
-                            }))
-                    })),
+                tab_strip(t).children(tabs.into_iter().enumerate().map(|(i, (lbl, cnt, f))| {
+                    let active = f == filter;
+                    tab_strip_item(("dir-ftab", i), format!("{lbl} {cnt}"), None, active, t)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.catalog.filter = f;
+                            this.filter_directory_rows();
+                            cx.notify();
+                        }))
+                })),
             )
             .child(
                 div()
@@ -392,7 +368,7 @@ impl IrisWindow {
                                 .flex()
                                 .items_center()
                                 .justify_center()
-                                .text_size(px(12.))
+                                .text_size(t.text_md)
                                 .text_color(t.text_faint)
                                 .child(
                                     if filter == MediaFilter::FavoritesOnly

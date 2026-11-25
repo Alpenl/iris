@@ -405,12 +405,12 @@ impl IrisWindow {
                 .border_color(t.line)
                 .child(
                     div()
-                        .text_size(px(11.))
+                        .text_size(t.text_sm)
                         .text_color(t.text_dim)
                         .child(format!("个人标记 · {} 个时间标记", value.markers.len())),
                 )
-                .child(hstack(3.).children(ratings))
-                .child(hstack(3.).children(colors))
+                .child(div().flex().flex_wrap().gap(px(3.)).children(ratings))
+                .child(div().flex().flex_wrap().gap(px(3.)).children(colors))
                 .child(
                     chip_button("add-time-marker", "标记当前时间", false, t).on_click(cx.listener(
                         |this, _, _, cx| {
@@ -446,7 +446,7 @@ impl IrisWindow {
                         )
                         .child(
                             div()
-                                .text_size(px(11.))
+                                .text_size(t.text_sm)
                                 .child(format!("{} / {pages}", page + 1)),
                         )
                         .child(

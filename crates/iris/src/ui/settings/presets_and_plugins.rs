@@ -16,7 +16,10 @@ use iris_core::preset::{PresetCaptureScope, WorkspacePreset};
 
 use super::super::IrisWindow;
 use super::super::kit::form::{chip_button, toggle};
-use super::super::kit::{badge_pill, bordered_button, hbetween, hstack, vstack};
+use super::super::kit::{
+    ButtonSize, ButtonVariant, badge_pill, bordered_button, button, hbetween, hstack, surface_card,
+    vstack,
+};
 use super::super::state::BuiltinDialog;
 use crate::theme::{FONT_MONO, ThemeTokens};
 
@@ -24,12 +27,14 @@ fn render_preset_card(
     ix: usize,
     preset: WorkspacePreset,
     is_active: bool,
+    confirm_delete: bool,
     key_badge: Option<SharedString>,
     t: ThemeTokens,
     cx: &Context<IrisWindow>,
 ) -> AnyElement {
     let is_builtin = preset.builtin;
     let (pid_apply, pid_update, pid_delete) = (preset.id.clone(), preset.id.clone(), preset.id);
+    let del_key = format!("del-preset:{pid_delete}");
     let (has_layout, has_playback, has_plugins) = (
         preset.layout.is_some(),
         preset.playback.is_some(),
@@ -62,27 +67,38 @@ fn render_preset_card(
                 )),
             )
             .child(
-                chip_button(("preset-del", ix), "删除", false, t).on_click(cx.listener(
-                    move |this, _, w, cx| {
-                        if this.presets.delete_custom(&pid_delete) {
-                            this.keymap.reset_binding(&format!("preset:{pid_delete}"));
-                            crate::ui::rebind_keys(cx, &this.keymap);
-                            if this.settings.active_preset == pid_delete {
-                                this.activate_preset("default", w, cx);
-                            }
-                            this.show_toast("已删除自定义工作区预设", cx);
-                            cx.notify();
-                        }
+                button(
+                    ("preset-del", ix),
+                    if confirm_delete {
+                        "再次点击确认"
+                    } else {
+                        "删除"
                     },
-                )),
+                    if confirm_delete {
+                        ButtonVariant::Danger
+                    } else {
+                        ButtonVariant::Secondary
+                    },
+                    ButtonSize::Sm,
+                    t,
+                )
+                .on_click(cx.listener(move |this, _, w, cx| {
+                    if this.confirm_destructive(del_key.clone(), cx)
+                        && this.presets.delete_custom(&pid_delete)
+                    {
+                        this.keymap.reset_binding(&format!("preset:{pid_delete}"));
+                        crate::ui::rebind_keys(cx, &this.keymap);
+                        if this.settings.active_preset == pid_delete {
+                            this.activate_preset("default", w, cx);
+                        }
+                        this.show_toast("已删除自定义工作区预设", cx);
+                        cx.notify();
+                    }
+                })),
             )
         });
 
-    vstack(6.)
-        .p(px(10.))
-        .rounded(t.radius_md)
-        .bg(t.window_bg)
-        .border_1()
+    surface_card(6., t)
         .border_color(if is_active { t.accent } else { t.line })
         .child(
             hbetween(8.)
@@ -92,7 +108,7 @@ fn render_preset_card(
                         .min_w(px(0.))
                         .child(
                             div()
-                                .text_size(px(12.))
+                                .text_size(t.text_md)
                                 .font_weight(FontWeight::MEDIUM)
                                 .text_color(t.text)
                                 .truncate()
@@ -111,7 +127,7 @@ fn render_preset_card(
         .when(!preset.description.is_empty(), |d| {
             d.child(
                 div()
-                    .text_size(px(11.))
+                    .text_size(t.text_sm)
                     .text_color(t.text_dim)
                     .child(preset.description),
             )
@@ -141,8 +157,9 @@ impl IrisWindow {
             .enumerate()
             .map(|(i, p)| {
                 let is_active = p.id == active_id;
+                let confirm_del = self.is_confirming(&format!("del-preset:{}", p.id));
                 let kb = self.key_hint(&format!("preset:{}", p.id));
-                render_preset_card(i, p, is_active, kb, t, cx)
+                render_preset_card(i, p, is_active, confirm_del, kb, t, cx)
             })
             .collect();
 
@@ -158,12 +175,12 @@ impl IrisWindow {
                             .min_w(px(0.))
                             .child(
                                 div()
-                                    .text_size(px(12.))
+                                    .text_size(t.text_md)
                                     .text_color(t.text)
                                     .child("工作区与场景预设"),
                             )
                             .child(
-                                div().text_size(px(11.)).text_color(t.text_faint).child(
+                                div().text_size(t.text_sm).text_color(t.text_faint).child(
                                     "稀疏补丁仅修改预设声明字段，切回默认时自动还原个人基线",
                                 ),
                             ),
@@ -211,30 +228,31 @@ impl IrisWindow {
                     .filter(|(p, _)| p == &info.id)
                     .map(|(_, d)| d.clone())
                     .collect();
-                Self::render_plugin_card(i, info.clone(), plugin_sources, t, cx)
+                self.render_plugin_card(i, info.clone(), plugin_sources, t, cx)
             })
             .collect();
 
         vstack(12.)
             .child(
                 hbetween(8.)
+                    .flex_wrap()
                     .pb(px(10.))
                     .border_b_1()
                     .border_color(t.line)
                     .child(
                         vstack(2.)
                             .flex_1()
-                            .min_w(px(0.))
+                            .min_w(px(160.))
                             .child(
                                 div()
-                                    .text_size(px(12.))
+                                    .text_size(t.text_md)
                                     .text_color(t.text)
                                     .child("控制面、虚拟数据源与界面主题插件"),
                             )
                             .child(
                                 div()
                                     .font_family(FONT_MONO)
-                                    .text_size(px(10.))
+                                    .text_size(t.text_xs)
                                     .text_color(t.text_faint)
                                     .truncate()
                                     .child(dir_text),
@@ -269,6 +287,7 @@ impl IrisWindow {
     }
 
     fn render_plugin_card(
+        &self,
         i: usize,
         info: PluginInfo,
         plugin_sources: Vec<SourceDescriptor>,
@@ -310,7 +329,10 @@ impl IrisWindow {
         let source_rows: Vec<AnyElement> = plugin_sources
             .into_iter()
             .enumerate()
-            .map(|(si, src)| Self::render_plugin_source_row(pid.clone(), si, enabled, src, t, cx))
+            .map(|(si, src)| {
+                let confirm_rm = self.is_confirming(&format!("rm-src:{pid}:{}", src.id));
+                Self::render_plugin_source_row(pid.clone(), si, enabled, confirm_rm, src, t, cx)
+            })
             .collect();
         let perm_pills = info
             .binding
@@ -324,13 +346,8 @@ impl IrisWindow {
                 badge_pill(perm.label(), hi, t)
             });
 
-        vstack(6.)
+        surface_card(6., t)
             .id(("plugin-card", i))
-            .p(px(10.))
-            .rounded(t.radius_md)
-            .bg(t.window_bg)
-            .border_1()
-            .border_color(t.line)
             .child(
                 hbetween(10.)
                     .child(
@@ -341,7 +358,7 @@ impl IrisWindow {
                             .gap(px(6.))
                             .child(
                                 div()
-                                    .text_size(px(12.))
+                                    .text_size(t.text_md)
                                     .font_weight(FontWeight::MEDIUM)
                                     .text_color(t.text)
                                     .child(name),
@@ -349,7 +366,7 @@ impl IrisWindow {
                             .child(
                                 div()
                                     .font_family(FONT_MONO)
-                                    .text_size(px(10.))
+                                    .text_size(t.text_xs)
                                     .text_color(t.text_faint)
                                     .child(format!("v{}", version)),
                             )
@@ -357,7 +374,7 @@ impl IrisWindow {
                             .when(has_theme_spec, |d| d.child(badge_pill("主题皮肤", true, t)))
                             .child(
                                 div()
-                                    .text_size(px(10.))
+                                    .text_size(t.text_xs)
                                     .text_color(if status_error {
                                         t.danger
                                     } else {
@@ -430,7 +447,7 @@ impl IrisWindow {
             .when(!description.is_empty(), |d| {
                 d.child(
                     div()
-                        .text_size(px(11.))
+                        .text_size(t.text_sm)
                         .text_color(t.text_dim)
                         .child(description),
                 )
@@ -446,13 +463,15 @@ impl IrisWindow {
         pid: String,
         row_ix: usize,
         enabled: bool,
+        confirm_rm: bool,
         src: SourceDescriptor,
         t: ThemeTokens,
         cx: &Context<Self>,
     ) -> AnyElement {
         let (pid_s, sid_s) = (pid.clone(), src.id.clone());
         let (pid_cfg, sid_cfg) = (pid.clone(), src.id.clone());
-        let (pid_rm, sid_rm) = (pid, src.id);
+        let (pid_rm, sid_rm) = (pid.clone(), src.id.clone());
+        let rm_key = format!("rm-src:{pid}:{}", src.id);
         let auth_cmd = src.auth_command_id;
 
         hbetween(8.)
@@ -468,7 +487,7 @@ impl IrisWindow {
                     .child(badge_pill("数据源", true, t))
                     .child(
                         div()
-                            .text_size(px(11.))
+                            .text_size(t.text_sm)
                             .text_color(t.text)
                             .truncate()
                             .child(src.name),
@@ -508,8 +527,23 @@ impl IrisWindow {
                         })
                         .when(src.removable, |row| {
                             row.child(
-                                chip_button(("pl-src-rm", row_ix), "移除", false, t).on_click(
-                                    cx.listener(move |this, _, w, cx| {
+                                button(
+                                    ("pl-src-rm", row_ix),
+                                    if confirm_rm {
+                                        "再次点击确认"
+                                    } else {
+                                        "移除"
+                                    },
+                                    if confirm_rm {
+                                        ButtonVariant::Danger
+                                    } else {
+                                        ButtonVariant::Secondary
+                                    },
+                                    ButtonSize::Sm,
+                                    t,
+                                )
+                                .on_click(cx.listener(move |this, _, w, cx| {
+                                    if this.confirm_destructive(rm_key.clone(), cx) {
                                         this.manage_plugin_source(
                                             &pid_rm,
                                             &sid_rm,
@@ -517,8 +551,8 @@ impl IrisWindow {
                                             w,
                                             cx,
                                         );
-                                    }),
-                                ),
+                                    }
+                                })),
                             )
                         })
                         .child(

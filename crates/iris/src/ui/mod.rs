@@ -363,6 +363,38 @@ impl IrisWindow {
         &mut self.viewports[0]
     }
 
+    pub(super) fn is_confirming(&self, key: &str) -> bool {
+        self.overlays.is_confirming(key, Instant::now())
+    }
+
+    /// Two-click inline confirmation guard for destructive actions (3s auto-reset).
+    pub(super) fn confirm_destructive(&mut self, key: impl Into<String>, cx: &mut Context<Self>) -> bool {
+        let key = key.into();
+        let now = Instant::now();
+        let ttl = Duration::from_secs(3);
+        if self.overlays.confirm_or_arm(key.clone(), now, ttl) {
+            cx.notify();
+            return true;
+        }
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(ttl).await;
+            let _ = this.update(cx, |this, cx| {
+                if this
+                    .overlays
+                    .pending_confirm
+                    .as_ref()
+                    .is_some_and(|(k, until)| k == &key && Instant::now() >= *until)
+                {
+                    this.overlays.pending_confirm = None;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+        cx.notify();
+        false
+    }
+
     pub(super) fn command(&mut self, command: Command, cx: &mut Context<Self>) {
         if let Err(e) = self.active_mut().session.execute(command) {
             log::warn!("player command failed: {e:#}");

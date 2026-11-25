@@ -156,7 +156,8 @@ impl IrisWindow {
                 let x = f32::from(p.x - b.origin.x).clamp(0., width);
                 let hover_t = x as f64 / width as f64 * duration;
                 let chapter_title = session.chapter_at(hover_t).map(|c| c.title.clone());
-                let box_w: f32 = if chapter_title.is_some() { 180. } else { 76. };
+                let max_box: f32 = if chapter_title.is_some() { 220. } else { 84. };
+                let box_w = max_box.min((width - 8.).max(64.));
                 let left = (x - box_w / 2.).clamp(0., (width - box_w).max(0.));
                 Some(
                     div()
@@ -168,7 +169,7 @@ impl IrisWindow {
                         .justify_center()
                         .child(
                             div()
-                                .h(px(22.))
+                                .min_h(t.control_h_sm)
                                 .max_w(px(box_w))
                                 .px(px(6.))
                                 .flex()
@@ -179,14 +180,15 @@ impl IrisWindow {
                                 .border_1()
                                 .border_color(t.line_strong)
                                 .font_family(FONT_MONO)
-                                .text_size(px(11.))
+                                .text_size(t.text_sm)
                                 .text_color(t.text)
-                                .child(format_time(hover_t))
+                                .child(div().flex_none().child(format_time(hover_t)))
                                 .when_some(chapter_title, |d, ch| {
                                     d.child(
                                         div()
+                                            .min_w(px(0.))
                                             .font_family(FONT_UI)
-                                            .text_size(px(10.))
+                                            .text_size(t.text_xs)
                                             .text_color(t.text_dim)
                                             .truncate()
                                             .child(ch),

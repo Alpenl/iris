@@ -136,8 +136,8 @@ impl IrisWindow {
             return None;
         }
         // Authorization uses native colors, unaffected by a plugin's selected theme.
-        let t = ThemeTokens::resolve("graphite", None);
-        let line = |text: String| div().text_size(px(12.)).text_color(t.text).child(text);
+        let t = ThemeTokens::resolve_scaled("graphite", None, self.settings.ui_font_scale);
+        let line = |text: String| div().text_size(t.text_md).text_color(t.text).child(text);
         let mut body = div().flex().flex_col().gap(px(10.));
         let title;
         if let Some(origin) = &self.plugin_view.origin {

@@ -12,12 +12,15 @@ use gpui::{
     Context, CursorStyle, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
     ParentElement, StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder, px,
 };
+use iris_core::library::{SortBy, SortOrder};
 use iris_core::preset::SidebarMode;
 use iris_core::settings::Side;
 
 use super::IrisWindow;
 use super::actions::OpenFile;
-use super::kit::{badge_pill, icon_button, tip};
+use super::kit::{
+    ButtonSize, ButtonVariant, button, icon_button, tab_strip, tab_strip_item, tip,
+};
 use super::state::{BuiltinDialog, SettingsTab};
 use crate::assets::Icon;
 use crate::theme::ThemeTokens;
@@ -41,6 +44,18 @@ impl IrisWindow {
         let side = self.settings.directory_side;
         let queue_len = self.queue.len();
 
+        let sort_by_label = match self.settings.sort_by {
+            SortBy::Name => "名称",
+            SortBy::Modified => "修改时间",
+            SortBy::Size => "文件大小",
+        };
+        let sort_order_label = match self.settings.sort_order {
+            SortOrder::Asc => "升序",
+            SortOrder::Desc => "降序",
+        };
+        let sort_tip = format!("排序：按{sort_by_label} · {sort_order_label}（点击切换）");
+        let confirm_clear_queue = self.is_confirming("clear-queue");
+
         let header_actions = match mode {
             SidebarMode::Files => div()
                 .flex()
@@ -55,7 +70,7 @@ impl IrisWindow {
                 )
                 .child(
                     icon_button("sb-sort", Icon::Sort, false, t)
-                        .tooltip(tip("切换排序方式", None))
+                        .tooltip(tip(sort_tip, None))
                         .on_click(cx.listener(|this, _, _, cx| this.cycle_sort(cx))),
                 )
                 .child(
@@ -92,14 +107,29 @@ impl IrisWindow {
                         .on_click(cx.listener(|this, _, w, cx| this.prompt_append_queue(w, cx))),
                 )
                 .when(queue_len > 0, |d| {
-                    d.child(
-                        icon_button("sb-q-clear", Icon::Close, false, t)
-                            .tooltip(tip("清空播放队列", None))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.queue.clear();
-                                cx.notify();
-                            })),
-                    )
+                    if confirm_clear_queue {
+                        d.child(
+                            button("sb-q-clear", "确认清空", ButtonVariant::Danger, ButtonSize::Xs, t)
+                                .tooltip(tip("再次点击确认清空播放队列", None))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    if this.confirm_destructive("clear-queue", cx) {
+                                        this.queue.clear();
+                                        this.show_toast("已清空播放队列", cx);
+                                    }
+                                })),
+                        )
+                    } else {
+                        d.child(
+                            icon_button("sb-q-clear", Icon::Close, false, t)
+                                .tooltip(tip("清空播放队列", None))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    if this.confirm_destructive("clear-queue", cx) {
+                                        this.queue.clear();
+                                        this.show_toast("已清空播放队列", cx);
+                                    }
+                                })),
+                        )
+                    }
                 }),
             SidebarMode::Plugins => div()
                 .flex()
@@ -162,49 +192,24 @@ impl IrisWindow {
                         div()
                             .min_w(px(0.))
                             .truncate()
-                            .text_size(px(12.))
+                            .text_size(t.text_md)
                             .text_color(t.text)
                             .child(self.sidebar_header_title()),
                     )
                     .child(header_actions),
             )
             .child(
-                div()
-                    .h(px(30.))
-                    .flex_none()
-                    .px(px(6.))
-                    .flex()
-                    .items_center()
-                    .gap(px(2.))
-                    .border_b_1()
-                    .border_color(t.line)
-                    .children(modes.into_iter().enumerate().map(|(i, (m, label))| {
-                        let active = m == mode;
-                        div()
-                            .id(("sb-mode", i))
-                            .flex_1()
-                            .h(px(22.))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .gap(px(4.))
-                            .rounded(t.radius_sm)
-                            .cursor_pointer()
-                            .text_size(px(11.))
-                            .when(active, |d| d.bg(t.selected).text_color(t.text))
-                            .when(!active, |d| {
-                                d.text_color(t.text_dim)
-                                    .hover(|s| s.bg(t.hover).text_color(t.text))
-                            })
-                            .child(label)
-                            .when(m == SidebarMode::Queue && queue_len > 0, |d| {
-                                d.child(badge_pill(queue_len.to_string(), active, t))
-                            })
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.catalog.sidebar_mode = m;
-                                cx.notify();
-                            }))
-                    })),
+                tab_strip(t).children(modes.into_iter().enumerate().map(|(i, (m, label))| {
+                    let active = m == mode;
+                    let badge = (m == SidebarMode::Queue && queue_len > 0)
+                        .then(|| queue_len.to_string().into());
+                    tab_strip_item(("sb-mode", i), label, badge, active, t).on_click(cx.listener(
+                        move |this, _, _, cx| {
+                            this.catalog.sidebar_mode = m;
+                            cx.notify();
+                        },
+                    ))
+                })),
             )
             .child(body)
             .when(!floating, |d| {

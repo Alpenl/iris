@@ -14,6 +14,7 @@ use gpui::{
 };
 
 use super::IrisWindow;
+use super::kit::list_row::select_row;
 use super::kit::modal::{ModalCallback, ModalShellSpec, modal_shell};
 use super::state::SettingsTab;
 use crate::theme::ThemeTokens;
@@ -53,7 +54,8 @@ impl IrisWindow {
         let nav_rail = div()
             .id("settings-nav-rail")
             .w(px(144.))
-            .max_w(gpui::relative(0.35))
+            .min_w(px(96.))
+            .max_w(gpui::relative(0.32))
             .flex_none()
             .h_full()
             .overflow_y_scroll()
@@ -66,41 +68,35 @@ impl IrisWindow {
             .gap(px(2.))
             .children(NAV_TABS.iter().map(|&(tab, label)| {
                 let active = self.overlays.settings_tab == tab;
-                div()
-                    .id(("settings-tab", tab as usize))
-                    .relative()
-                    .h(px(30.))
-                    .px(px(14.))
-                    .flex_none()
-                    .flex()
-                    .items_center()
-                    .cursor_pointer()
-                    .text_size(px(12.))
-                    .when(active, |d| d.bg(t.selected).text_color(t.text))
-                    .when(!active, |d| {
-                        d.text_color(t.text_dim)
-                            .hover(|s| s.bg(t.hover).text_color(t.text))
-                    })
-                    .when(active, |d| {
-                        d.child(
-                            div()
-                                .absolute()
-                                .left_0()
-                                .top(px(5.))
-                                .bottom(px(5.))
-                                .w(px(2.))
-                                .bg(t.accent),
-                        )
-                    })
-                    .child(label)
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .on_click(cx.listener(move |this, _, w, cx| {
-                        if this.overlays.recording_shortcut.take().is_some() {
-                            this.focus.focus(w);
-                        }
-                        this.overlays.settings_tab = tab;
-                        cx.notify();
-                    }))
+                select_row(
+                    ("settings-tab", tab as usize),
+                    label,
+                    None,
+                    active,
+                    false,
+                    false,
+                    t,
+                )
+                .px(px(12.))
+                .when(active, |d| {
+                    d.child(
+                        div()
+                            .absolute()
+                            .left_0()
+                            .top(px(5.))
+                            .bottom(px(5.))
+                            .w(px(2.))
+                            .bg(t.accent),
+                    )
+                })
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_click(cx.listener(move |this, _, w, cx| {
+                    if this.overlays.recording_shortcut.take().is_some() {
+                        this.focus.focus(w);
+                    }
+                    this.overlays.settings_tab = tab;
+                    cx.notify();
+                }))
             }));
 
         let mut content = div()

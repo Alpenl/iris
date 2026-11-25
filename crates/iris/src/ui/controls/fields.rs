@@ -13,12 +13,13 @@ use super::super::actions::{
     ToggleLoop, TogglePause, ZoomIn, ZoomOut,
 };
 use super::super::kit::{
-    badge_pill, ghost, hstack, icon, icon_button, icon_on_ghost, text_button, tip,
+    badge_pill, ghost, hstack, icon, icon_button, icon_button_disabled, icon_on_ghost,
+    text_button, tip,
 };
 use super::super::state::PopoverKind;
 use super::{anchor_wrap, dock_sep};
 use crate::assets::Icon;
-use crate::theme::{BUTTON, FONT_MONO, ThemeTokens};
+use crate::theme::{FONT_MONO, ThemeTokens};
 
 impl IrisWindow {
     pub(super) fn render_plugin_toolbar_slot(
@@ -72,7 +73,7 @@ impl IrisWindow {
             let lbl = div()
                 .max_w(px(88.))
                 .truncate()
-                .text_size(px(11.))
+                .text_size(t.text_sm)
                 .text_color(col)
                 .child(btn.label);
             base.px(px(if compact { 5. } else { 7. }))
@@ -115,6 +116,13 @@ impl IrisWindow {
         Some(anchor_wrap(self.chrome.probes.anchor_variants.clone(), btn))
     }
 
+    fn can_step_media(&self) -> bool {
+        if !self.queue.is_empty() {
+            return self.queue.len() > 1;
+        }
+        self.catalog.playable_count > 1 || self.plugin_view.playlist.len() > 1
+    }
+
     fn step_button(
         &self,
         id: &'static str,
@@ -127,6 +135,10 @@ impl IrisWindow {
         } else {
             (Icon::Next, "下一个", "open_next")
         };
+        if !self.can_step_media() {
+            return icon_button_disabled(id, glyph, false, t)
+                .tooltip(tip("当前列表仅有一项", None));
+        }
         icon_button(id, glyph, false, t)
             .tooltip(self.act_tip(lbl, act))
             .on_click(cx.listener(move |this, _, _, cx| this.step(delta, true, cx)))
@@ -228,14 +240,14 @@ impl IrisWindow {
             };
             hstack(if compact { 4. } else { 5. })
                 .id(("time-readout", usize::from(rem)))
-                .h(px(BUTTON))
+                .h(t.control_h_md)
                 .ml(px(if compact { 2. } else { 4. }))
                 .px(px(if compact { 4. } else { 6. }))
                 .rounded(t.radius_sm)
                 .cursor_pointer()
                 .hover(|s| s.bg(t.hover))
                 .font_family(FONT_MONO)
-                .text_size(px(12.))
+                .text_size(t.text_md)
                 .tooltip(tip(tip_lbl, None))
                 .on_click(cx.listener(|this, _, _, cx| {
                     this.chrome.show_remaining = !this.chrome.show_remaining;
@@ -319,7 +331,7 @@ impl IrisWindow {
             .gap(px(5.))
             .child(icon_on_ghost(Icon::Audio, audio_col, t))
             .when(!narrow && !compact, |d| {
-                d.child(div().font_family(FONT_MONO).text_size(px(11.)).child(audio))
+                d.child(div().font_family(FONT_MONO).text_size(t.text_sm).child(audio))
             })
             .tooltip(self.act_tip("音轨与输出设备 · 点击选择", "cycle_audio"))
             .on_click(cx.listener(|this, _, _, cx| this.toggle_popover(PopoverKind::Audio, cx)));
@@ -429,7 +441,7 @@ impl IrisWindow {
         let counter = hstack(if compact { 4. } else { 6. })
             .pl(px(if compact { 6. } else { 10. }))
             .font_family(FONT_MONO)
-            .text_size(px(12.))
+            .text_size(t.text_md)
             .child(div().text_color(t.text).child(pos_str))
             .child(div().text_color(t.text_faint).child("/"))
             .child(div().text_color(t.text_dim).child(total_str));
@@ -472,16 +484,42 @@ impl IrisWindow {
             .tooltip(self.act_tip("水平镜像翻转", "toggle_hflip"))
             .on_click(cx.listener(|this, _, w, cx| this.toggle_hflip(&ToggleHFlip, w, cx)));
         let zoom_readout = div()
-            .w(px(46.))
+            .w(px(48.))
             .flex()
             .justify_center()
             .font_family(FONT_MONO)
-            .text_size(px(12.))
+            .text_size(t.text_md)
             .text_color(t.text_dim)
             .child(pct_str);
 
         let fit_on = !view.zoomed();
+        let at_min_zoom = view.zoom <= -3.99;
+        let at_max_zoom = view.zoom >= 5.99;
         let more_slot = self.chrome.probes.anchor_more.clone();
+        let zoom_out_btn = if at_min_zoom {
+            icon_button_disabled("zoom-out", Icon::Minus, false, t)
+                .tooltip(tip("已达最小缩放比例", None))
+        } else {
+            icon_button("zoom-out", Icon::Minus, false, t)
+                .tooltip(self.act_tip("缩小", "zoom_out"))
+                .on_click(cx.listener(|this, _, w, cx| this.zoom_out(&ZoomOut, w, cx)))
+        };
+        let zoom_in_btn = if at_max_zoom {
+            icon_button_disabled("zoom-in", Icon::Plus, false, t)
+                .tooltip(tip("已达最大缩放比例", None))
+        } else {
+            icon_button("zoom-in", Icon::Plus, false, t)
+                .tooltip(self.act_tip("放大", "zoom_in"))
+                .on_click(cx.listener(|this, _, w, cx| this.zoom_in(&ZoomIn, w, cx)))
+        };
+        let fit_btn = if fit_on {
+            icon_button_disabled(("fit", 1usize), Icon::Fit, true, t)
+                .tooltip(tip("当前已适应窗口", None))
+        } else {
+            icon_button(("fit", 0usize), Icon::Fit, false, t)
+                .tooltip(self.act_tip("适应窗口", "fit_image"))
+                .on_click(cx.listener(|this, _, w, cx| this.fit_image(&FitImage, w, cx)))
+        };
         hstack(if compact { 1. } else { 2. })
             .when(!narrow, |d| d.child(strip_btn).child(flip_btn))
             .child(
@@ -491,22 +529,10 @@ impl IrisWindow {
             )
             .child(anchor_wrap(more_slot, more_btn))
             .child(dock_sep(compact, t))
-            .child(
-                icon_button("zoom-out", Icon::Minus, false, t)
-                    .tooltip(self.act_tip("缩小", "zoom_out"))
-                    .on_click(cx.listener(|this, _, w, cx| this.zoom_out(&ZoomOut, w, cx))),
-            )
+            .child(zoom_out_btn)
             .when(!compact, |d| d.child(zoom_readout))
-            .child(
-                icon_button("zoom-in", Icon::Plus, false, t)
-                    .tooltip(self.act_tip("放大", "zoom_in"))
-                    .on_click(cx.listener(|this, _, w, cx| this.zoom_in(&ZoomIn, w, cx))),
-            )
-            .child(
-                icon_button(("fit", usize::from(fit_on)), Icon::Fit, fit_on, t)
-                    .tooltip(self.act_tip("适应窗口", "fit_image"))
-                    .on_click(cx.listener(|this, _, w, cx| this.fit_image(&FitImage, w, cx))),
-            )
+            .child(zoom_in_btn)
+            .child(fit_btn)
             .when(!narrow && !compact, |d| {
                 d.child(
                     text_button("actual", "1:1", t)

@@ -66,7 +66,7 @@ impl IrisWindow {
         };
         let preset_slot = self.chrome.probes.anchor_presets.clone();
 
-        let win_btn = |id: &'static str, glyph: Icon, label: &'static str, accent_hover: bool| {
+        let win_btn = |id: &'static str, glyph: Icon, label: &'static str, danger_hover: bool| {
             div()
                 .id(id)
                 .group(id)
@@ -80,10 +80,10 @@ impl IrisWindow {
                 .border_color(t.line)
                 .cursor_pointer()
                 .tooltip(tip(label, None))
-                .when(accent_hover, |d| {
-                    d.hover(|s| s.bg(t.accent).border_color(t.accent))
+                .when(danger_hover, |d| {
+                    d.hover(|s| s.bg(t.danger).border_color(t.danger))
                 })
-                .when(!accent_hover, |d| {
+                .when(!danger_hover, |d| {
                     d.hover(|s| s.bg(t.hover).border_color(t.line_strong))
                 })
                 .child(icon(glyph, 11., t.text_dim).group_hover(id, move |s| s.text_color(t.text)))
@@ -91,7 +91,9 @@ impl IrisWindow {
 
         let preset_pill = div()
             .relative()
-            .flex_none()
+            .flex_shrink()
+            .min_w(px(0.))
+            .max_w(px(164.))
             .child(
                 div()
                     .id((
@@ -99,9 +101,9 @@ impl IrisWindow {
                         usize::from(preset_open) * 2 + usize::from(non_default),
                     ))
                     .group("win-preset")
-                    .h(px(22.))
+                    .h(px((f32::from(t.control_h_sm) - 2.).max(22.)))
                     .px(px(7.))
-                    .flex_none()
+                    .min_w(px(0.))
                     .flex()
                     .items_center()
                     .gap(px(5.))
@@ -142,9 +144,9 @@ impl IrisWindow {
                     )
                     .child(
                         div()
-                            .max_w(px(148.))
+                            .min_w(px(0.))
                             .truncate()
-                            .text_size(px(11.))
+                            .text_size(t.text_sm)
                             .text_color(if preset_hi { t.text } else { t.text_muted })
                             .group_hover("win-preset", move |s| s.text_color(t.text))
                             .child(preset_label),
@@ -264,7 +266,7 @@ impl IrisWindow {
                 div()
                     .flex_none()
                     .font_weight(FontWeight::BOLD)
-                    .text_size(px(13.))
+                    .text_size(t.text_lg)
                     .child("IRIS"),
             )
             .child(div().flex_none().w(px(1.)).h(px(14.)).bg(t.line))
@@ -276,10 +278,13 @@ impl IrisWindow {
                     .items_center()
                     .gap(px(6.))
                     .font_family(FONT_MONO)
-                    .text_size(px(11.))
+                    .text_size(t.text_sm)
                     .child(
                         div()
-                            .flex_none()
+                            .flex_shrink()
+                            .min_w(px(0.))
+                            .max_w(px(140.))
+                            .truncate()
                             .text_color(if remote_badge { t.accent } else { t.text_dim })
                             .child(folder),
                     )
@@ -297,9 +302,12 @@ impl IrisWindow {
             .when_some(meta_info, |d, info| {
                 d.child(
                     div()
-                        .flex_none()
+                        .flex_shrink()
+                        .min_w(px(0.))
+                        .max_w(px(180.))
+                        .truncate()
                         .font_family(FONT_MONO)
-                        .text_size(px(11.))
+                        .text_size(t.text_sm)
                         .text_color(t.text_dim)
                         .child(info),
                 )

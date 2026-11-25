@@ -10,13 +10,17 @@ use iris_api::UiThemeSpec;
 pub(crate) const FONT_UI: &str = "Space Grotesk";
 pub(crate) const FONT_MONO: &str = "IBM Plex Mono";
 
+pub(crate) const SPACE_XS: f32 = 4.;
+pub(crate) const SPACE_SM: f32 = 8.;
+pub(crate) const SPACE_MD: f32 = 12.;
+pub(crate) const SPACE_LG: f32 = 16.;
+
 const TITLEBAR_H: f32 = 36.;
 /// The control bar under the picture; floating in fullscreen.
 const DOCK_H: f32 = 44.;
 /// Padding for fullscreen overlays such as the media title and info panel.
-pub(crate) const FLOAT_GAP: f32 = 16.;
+pub(crate) const FLOAT_GAP: f32 = SPACE_LG;
 const ROW_H: f32 = 28.;
-pub(crate) const BUTTON: f32 = 28.;
 
 const DEFAULT_CORNER_RADIUS: f32 = 0.0;
 const MIN_TEXT_CONTRAST: f32 = 4.5;
@@ -156,6 +160,12 @@ impl ThemePalette {
     }
 }
 
+/// Returns `(window_bg_rgb, accent_rgb)` for theme card swatches from the single palette table.
+pub(crate) fn theme_preview_colors(id: &str) -> (u32, u32) {
+    let p = ThemePalette::for_id(id);
+    (p.window_bg >> 8, p.accent >> 8)
+}
+
 /// Precomputed GPUI `Global` visual palette and clamped layout metrics.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct ThemeTokens {
@@ -179,6 +189,13 @@ pub(crate) struct ThemeTokens {
     pub(crate) titlebar_h: Pixels,
     pub(crate) dock_h: Pixels,
     pub(crate) row_h: Pixels,
+    pub(crate) text_xs: Pixels,
+    pub(crate) text_sm: Pixels,
+    pub(crate) text_md: Pixels,
+    pub(crate) text_lg: Pixels,
+    pub(crate) control_h_sm: Pixels,
+    pub(crate) control_h_md: Pixels,
+    pub(crate) ui_scale: f32,
 }
 
 impl Global for ThemeTokens {}
@@ -196,9 +213,27 @@ impl ThemeTokens {
         cx.try_global::<Self>().copied().unwrap_or_default()
     }
 
-    /// Resolves `base_id` merged with optional plugin [`UiThemeSpec`] overrides,
-    /// clamping all metrics and enforcing a minimum luminance safety floor on `text`.
+    /// Resolves `base_id` merged with optional plugin [`UiThemeSpec`] overrides at `1.0` scale.
     pub(crate) fn resolve(base_id: &str, plugin_override: Option<&UiThemeSpec>) -> Self {
+        Self::resolve_scaled(base_id, plugin_override, 1.0)
+    }
+
+    /// Resolves `base_id` merged with optional plugin [`UiThemeSpec`] overrides and
+    /// user `ui_font_scale` (`0.85`..=`1.35`), enforcing contrast floors and anti-clipping
+    /// container heights across all scale factors.
+    pub(crate) fn resolve_scaled(
+        base_id: &str,
+        plugin_override: Option<&UiThemeSpec>,
+        ui_font_scale: f32,
+    ) -> Self {
+        let s = if ui_font_scale.is_finite() {
+            ui_font_scale.clamp(
+                iris_core::settings::MIN_UI_FONT_SCALE,
+                iris_core::settings::MAX_UI_FONT_SCALE,
+            )
+        } else {
+            iris_core::settings::DEFAULT_UI_FONT_SCALE
+        };
         let mut p = ThemePalette::for_id(base_id);
         let mut tb_h = TITLEBAR_H;
         let mut dk_h = DOCK_H;
@@ -310,6 +345,26 @@ impl ThemeTokens {
             }
         }
 
+        let text_xs = px((10. * s).round());
+        let text_sm = px((11. * s).round());
+        let text_md = px((12. * s).round());
+        let text_lg = px((13. * s).round());
+        let control_h_sm = px((24. * s).round());
+        let control_h_md = px((28. * s).round());
+        let min_line_h = (f32::from(text_md) * 1.8).ceil();
+        let tb_h = (tb_h * s)
+            .round()
+            .max(min_line_h + 6.)
+            .clamp(28., (52. * s).ceil());
+        let dk_h = (dk_h * s)
+            .round()
+            .max(min_line_h + 12.)
+            .clamp(34., (64. * s).ceil());
+        let rw_h = (rw_h * s)
+            .round()
+            .max(min_line_h)
+            .clamp(22., (40. * s).ceil());
+
         Self {
             window_bg: rgba(p.window_bg),
             panel: rgba(p.panel),
@@ -331,6 +386,13 @@ impl ThemeTokens {
             titlebar_h: px(tb_h),
             dock_h: px(dk_h),
             row_h: px(rw_h),
+            text_xs,
+            text_sm,
+            text_md,
+            text_lg,
+            control_h_sm,
+            control_h_md,
+            ui_scale: s,
         }
     }
 }
@@ -543,5 +605,28 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn ui_font_scaling_prevents_container_clipping_across_full_range() {
+        for scale in [0.5, 0.85, 1.0, 1.2, 1.35, 2.0, f32::NAN] {
+            let t = ThemeTokens::resolve_scaled("graphite", None, scale);
+            assert!(
+                (0.85..=1.35).contains(&t.ui_scale),
+                "clamped ui_scale={}",
+                t.ui_scale
+            );
+            assert!(t.text_xs <= t.text_sm && t.text_sm <= t.text_md && t.text_md <= t.text_lg);
+            assert!(f32::from(t.row_h) >= f32::from(t.text_md) * 1.8);
+            assert!(f32::from(t.titlebar_h) >= f32::from(t.text_md) * 1.8 + 6.);
+            assert!(f32::from(t.dock_h) >= f32::from(t.text_md) * 1.8 + 12.);
+            assert!(f32::from(t.control_h_sm) >= f32::from(t.text_sm) * 1.8);
+            assert!(f32::from(t.control_h_md) >= f32::from(t.text_md) * 1.8);
+        }
+        let max_t = ThemeTokens::resolve_scaled("graphite", None, 1.35);
+        assert_eq!(max_t.text_md, px(16.0));
+        assert!(f32::from(max_t.row_h) >= 29.0);
+        assert_eq!(super::theme_preview_colors("oled"), (0x000000, 0xFF5B1F));
+        assert_eq!(super::theme_preview_colors("glacier"), (0x0B0E14, 0x38BDF8));
     }
 }

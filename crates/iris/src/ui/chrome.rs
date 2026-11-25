@@ -334,7 +334,7 @@ impl IrisWindow {
         let pill = div()
             .id("top-feedback-pill")
             .max_w(px(560.))
-            .min_h(px(28.))
+            .min_h(t.control_h_md)
             .px(px(10.))
             .py(px(4.))
             .flex()
@@ -360,7 +360,7 @@ impl IrisWindow {
                     .min_w(px(0.))
                     .truncate()
                     .font_family(FONT_MONO)
-                    .text_size(px(12.))
+                    .text_size(t.text_md)
                     .text_color(t.text)
                     .child(msg),
             );

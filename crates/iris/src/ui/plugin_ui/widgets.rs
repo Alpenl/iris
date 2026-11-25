@@ -5,8 +5,8 @@ use std::rc::Rc;
 
 use gpui::{
     AnyElement, Bounds, ClipboardItem, Context, Div, ElementId, InteractiveElement, IntoElement,
-    MouseButton, ParentElement, Rgba, SharedString, Stateful, StatefulInteractiveElement, Styled,
-    Window, canvas, div, fill, point, prelude::FluentBuilder, px, relative, rgb, size,
+    MouseButton, ParentElement, Pixels, Rgba, SharedString, Stateful, StatefulInteractiveElement,
+    Styled, Window, canvas, div, fill, point, prelude::FluentBuilder, px, relative, rgb, size,
 };
 use iris_api::Widget;
 
@@ -14,7 +14,7 @@ use super::super::IrisWindow;
 use super::super::kit::form::{check_indicator, chip_button, stepper_box};
 use super::super::kit::text_buffer::format_slider_value;
 use super::super::kit::text_field::{FormEnterCallback, TextFieldSpec};
-use super::super::kit::{badge_pill, hbetween, hstack, icon, vstack};
+use super::super::kit::{badge_pill, hbetween, hstack, icon, surface_card, vstack};
 use crate::assets::Icon;
 use crate::theme::{FONT_MONO, FONT_UI, ThemeTokens};
 
@@ -72,21 +72,12 @@ fn finite_value(value: f64, lo: f64, hi: f64, fallback: f64) -> f64 {
     }
 }
 
-fn txt(s: impl Into<SharedString>, size: f32, col: Rgba) -> Div {
-    div().text_size(px(size)).text_color(col).child(s.into())
+fn txt(s: impl Into<SharedString>, size: Pixels, col: Rgba) -> Div {
+    div().text_size(size).text_color(col).child(s.into())
 }
 
-fn trunc_txt(s: impl Into<SharedString>, size: f32, col: Rgba) -> Div {
+fn trunc_txt(s: impl Into<SharedString>, size: Pixels, col: Rgba) -> Div {
     txt(s, size, col).truncate()
-}
-
-fn card_box(gap: f32, t: ThemeTokens) -> Div {
-    vstack(gap)
-        .p(px(10.))
-        .rounded(t.radius_md)
-        .bg(t.window_bg)
-        .border_1()
-        .border_color(t.line)
 }
 
 fn row_box(id: impl Into<ElementId>, bg: Rgba, border: Rgba, t: ThemeTokens) -> Stateful<Div> {
@@ -136,20 +127,20 @@ fn icon_pill_button(
     label: impl Into<SharedString>,
     glyph: Option<Icon>,
     hi: bool,
-    height: f32,
+    height: Pixels,
     rest_bg: Rgba,
     t: ThemeTokens,
 ) -> Stateful<Div> {
     hstack(6.)
         .id(id)
-        .h(px(height))
+        .h(height)
         .px(px(9.))
         .rounded(t.radius_md)
         .cursor_pointer()
         .border_1()
         .border_color(if hi { t.accent } else { t.line_strong })
         .bg(if hi { t.selected } else { rest_bg })
-        .text_size(px(11.))
+        .text_size(t.text_sm)
         .text_color(if hi { t.text } else { t.text_muted })
         .hover(|s| s.bg(t.hover).text_color(t.text))
         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
@@ -320,21 +311,21 @@ fn render_qr_widget(
                 this.show_toast("二维码内容已复制到剪贴板", cx);
             },
         ));
-        let url_txt = trunc_txt(data, 10., t.text_dim)
+        let url_txt = trunc_txt(data, t.text_xs, t.text_dim)
             .flex_1()
             .min_w(px(0.))
             .font_family(FONT_MONO);
         hbetween(8.).child(url_txt).child(btn)
     });
 
-    card_box(8., t)
+    surface_card(8., t)
         .when(!label.is_empty(), |d| {
-            d.child(txt(label, 11., t.text_muted))
+            d.child(txt(label, t.text_sm, t.text_muted))
         })
         .children(grid)
         .children(copy_row)
         .when_some(hint.filter(|h| !h.trim().is_empty()), |d, h| {
-            d.child(txt(h, 11., t.text_dim))
+            d.child(txt(h, t.text_sm, t.text_dim))
         })
         .into_any_element()
 }
@@ -358,7 +349,7 @@ pub(super) fn render_plugin_widget(
 
     let content = match widget {
         Widget::Label { text, muted, mono } => {
-            txt(text, 11., if muted { t.text_dim } else { t.text })
+            txt(text, t.text_sm, if muted { t.text_dim } else { t.text })
                 .font_family(if mono { FONT_MONO } else { FONT_UI })
                 .when(is_modal, |d| {
                     d.p(px(8.))
@@ -375,8 +366,10 @@ pub(super) fn render_plugin_widget(
             value,
             accent,
         } => hbetween(8.)
-            .child(txt(label, 11., t.text_dim))
-            .child(txt(value, 11., if accent { t.accent } else { t.text }).font_family(FONT_MONO))
+            .child(txt(label, t.text_sm, t.text_dim))
+            .child(
+                txt(value, t.text_sm, if accent { t.accent } else { t.text }).font_family(FONT_MONO),
+            )
             .into_any_element(),
 
         Widget::Progress { label, ratio } => {
@@ -386,7 +379,9 @@ pub(super) fn render_plugin_widget(
                 0.
             };
             vstack(4.)
-                .when(!label.is_empty(), |d| d.child(txt(label, 10., t.text_dim)))
+                .when(!label.is_empty(), |d| {
+                    d.child(txt(label, t.text_xs, t.text_dim))
+                })
                 .child(progress_bar(pct, t))
                 .into_any_element()
         }
@@ -434,9 +429,13 @@ pub(super) fn render_plugin_widget(
                 cx.listener(move |this, _, w, cx| dec_cb(this, -st, w, cx)),
                 cx.listener(move |this, _, w, cx| step_cb(this, st, w, cx)),
             );
-            let lbl = trunc_txt(label, 11., if is_modal { t.text_muted } else { t.text_dim })
-                .flex_1()
-                .min_w(px(0.));
+            let lbl = trunc_txt(
+                label,
+                t.text_sm,
+                if is_modal { t.text_muted } else { t.text_dim },
+            )
+            .flex_1()
+            .min_w(px(0.));
             vstack(5.)
                 .child(hbetween(8.).child(lbl).child(controls))
                 .child(progress_bar(ratio, t))
@@ -453,7 +452,7 @@ pub(super) fn render_plugin_widget(
             label,
             icon_name.as_deref().and_then(Icon::from_name),
             accent,
-            26.,
+            t.control_h_md,
             rest_bg,
             t,
         )
@@ -469,10 +468,18 @@ pub(super) fn render_plugin_widget(
             .children(buttons.into_iter().enumerate().map(|(bi, btn)| {
                 let (pid_b, act) = (pid_owned.clone(), btn.action_id);
                 let g = btn.icon.as_deref().and_then(Icon::from_name);
-                icon_pill_button(("pl-gbtn", bi), btn.label, g, btn.accent, 24., rest_bg, t)
-                    .on_click(cx.listener(move |this, _, w, cx| {
-                        this.invoke_plugin_action(&pid_b, &act, w, cx)
-                    }))
+                icon_pill_button(
+                    ("pl-gbtn", bi),
+                    btn.label,
+                    g,
+                    btn.accent,
+                    t.control_h_sm,
+                    rest_bg,
+                    t,
+                )
+                .on_click(cx.listener(move |this, _, w, cx| {
+                    this.invoke_plugin_action(&pid_b, &act, w, cx)
+                }))
             }))
             .into_any_element(),
 
@@ -495,7 +502,7 @@ pub(super) fn render_plugin_widget(
                     let spec =
                         TextFieldSpec::form(key, Some(value), placeholder, secret, Some(on_submit));
                     vstack(5.)
-                        .when_some(lbl, |d, l| d.child(txt(l, 11., t.text_muted)))
+                        .when_some(lbl, |d, l| d.child(txt(l, t.text_sm, t.text_muted)))
                         .child(win.render_text_field(spec, Some(window), cx))
                         .into_any_element()
                 }
@@ -527,7 +534,7 @@ pub(super) fn render_plugin_widget(
                         Some(submit_cb),
                     );
                     let btn = chip_button(("pl-inp-sub", base_id), "提交", false, t)
-                        .h(px(30.))
+                        .h(px(f32::from(t.control_h_md).max(30.)))
                         .on_click(cx.listener(move |this, _, w, cx| btn_cb(this, w, cx)));
                     let field = div().flex_1().min_w(px(0.)).child(win.render_text_field(
                         spec,
@@ -535,7 +542,7 @@ pub(super) fn render_plugin_widget(
                         cx,
                     ));
                     vstack(4.)
-                        .when_some(lbl, |d, l| d.child(txt(l, 10., t.text_dim)))
+                        .when_some(lbl, |d, l| d.child(txt(l, t.text_xs, t.text_dim)))
                         .child(hstack(4.).child(field).child(btn))
                         .into_any_element()
                 }
@@ -563,7 +570,7 @@ pub(super) fn render_plugin_widget(
             } else {
                 t.text_muted
             };
-            let lbl = trunc_txt(label, if is_modal { 12. } else { 11. }, lbl_col)
+            let lbl = trunc_txt(label, if is_modal { t.text_md } else { t.text_sm }, lbl_col)
                 .flex_1()
                 .min_w(px(0.));
             row_box(
@@ -572,7 +579,11 @@ pub(super) fn render_plugin_widget(
                 border,
                 t,
             )
-            .h(px(if is_modal { 30. } else { 26. }))
+            .h(if is_modal {
+                t.control_h_md
+            } else {
+                t.control_h_sm
+            })
             .px(px(if is_modal { 10. } else { 8. }))
             .on_click(cx.listener(move |this, _, w, cx| {
                 let next_s = if !cur { "true" } else { "false" };
@@ -603,13 +614,21 @@ pub(super) fn render_plugin_widget(
             let chips = options.into_iter().enumerate().map(|(oi, opt)| {
                 let (cb, val) = (on_sel.clone(), opt.value);
                 chip_button(("pl-sel", oi), opt.label, val == cur_sel, t)
-                    .h(px(if is_modal { 26. } else { 24. }))
+                    .h(if is_modal {
+                        t.control_h_md
+                    } else {
+                        t.control_h_sm
+                    })
                     .on_click(cx.listener(move |this, _, w, cx| cb(this, val.clone(), w, cx)))
             });
             let lbl_col = if is_modal { t.text_muted } else { t.text_dim };
             vstack(4.)
                 .when_some(label.filter(|l| !l.is_empty()), |d, l| {
-                    d.child(txt(l, if is_modal { 11. } else { 10. }, lbl_col))
+                    d.child(txt(
+                        l,
+                        if is_modal { t.text_sm } else { t.text_xs },
+                        lbl_col,
+                    ))
                 })
                 .child(div().flex().flex_wrap().gap(px(4.)).children(chips))
                 .into_any_element()
@@ -627,9 +646,9 @@ pub(super) fn render_plugin_widget(
             let text_col = vstack(1.)
                 .flex_1()
                 .min_w(px(0.))
-                .child(trunc_txt(title, 11., t_col))
+                .child(trunc_txt(title, t.text_sm, t_col))
                 .when_some(subtitle.filter(|s| !s.is_empty()), |d, sub| {
-                    d.child(trunc_txt(sub, 10., t.text_faint))
+                    d.child(trunc_txt(sub, t.text_xs, t.text_faint))
                 });
             let (bg, border) = if active {
                 (t.selected, t.accent)
@@ -688,17 +707,24 @@ pub(super) fn render_plugin_widget(
                 .unwrap_or("复制链接")
                 .to_string();
             let btn_id = ("pl-lnk-copy", base_id);
-            let copy_btn =
-                icon_pill_button(btn_id, btn_lbl, Some(Icon::Link), true, 26., t.panel, t)
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        cx.write_to_clipboard(ClipboardItem::new_string(copy_url.clone()));
-                        this.show_toast("已复制链接到剪贴板", cx);
-                    }));
-            card_box(6., t)
+            let copy_btn = icon_pill_button(
+                btn_id,
+                btn_lbl,
+                Some(Icon::Link),
+                true,
+                t.control_h_md,
+                t.panel,
+                t,
+            )
+            .on_click(cx.listener(move |this, _, _, cx| {
+                cx.write_to_clipboard(ClipboardItem::new_string(copy_url.clone()));
+                this.show_toast("已复制链接到剪贴板", cx);
+            }));
+            surface_card(6., t)
                 .when(!label.is_empty(), |d| {
-                    d.child(txt(label, 11., t.text_muted))
+                    d.child(txt(label, t.text_sm, t.text_muted))
                 })
-                .child(trunc_txt(url, 10., t.text_dim).font_family(FONT_MONO))
+                .child(trunc_txt(url, t.text_xs, t.text_dim).font_family(FONT_MONO))
                 .child(hstack(0.).child(copy_btn))
                 .into_any_element()
         }

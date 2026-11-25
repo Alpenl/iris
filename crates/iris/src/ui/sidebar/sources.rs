@@ -13,7 +13,10 @@ use iris_core::vfs::PinnedBookmark;
 
 use super::super::IrisWindow;
 use super::super::actions::OpenFile;
-use super::super::kit::{badge_pill, bordered_button, icon, icon_button, tip};
+use super::super::kit::{
+    ButtonSize, ButtonVariant, badge_pill, bordered_button, button, icon, icon_button,
+    section_label, surface_card, tip,
+};
 use super::super::state::BuiltinDialog;
 use crate::assets::Icon;
 use crate::theme::{FONT_MONO, ThemeTokens};
@@ -45,12 +48,7 @@ impl IrisWindow {
                     .flex()
                     .flex_col()
                     .gap(px(6.))
-                    .child(
-                        div()
-                            .text_size(px(11.))
-                            .text_color(t.text_dim)
-                            .child("快速打开与连接创建"),
-                    )
+                    .child(section_label("快速打开与连接创建", t))
                     .child(
                         div()
                             .flex()
@@ -96,23 +94,14 @@ impl IrisWindow {
                             .flex()
                             .items_center()
                             .justify_between()
-                            .child(
-                                div()
-                                    .text_size(px(11.))
-                                    .text_color(t.text_dim)
-                                    .child("常驻书签"),
-                            )
+                            .child(section_label("常驻书签", t))
                             .child(badge_pill(bookmarks.len().to_string(), false, t)),
                     )
                     .when(bookmarks.is_empty(), |d| {
                         d.child(
-                            div()
+                            surface_card(0., t)
                                 .p(px(8.))
-                                .rounded(t.radius_md)
-                                .bg(t.window_bg)
-                                .border_1()
-                                .border_color(t.line)
-                                .text_size(px(11.))
+                                .text_size(t.text_sm)
                                 .text_color(t.text_faint)
                                 .child("在目录顶栏点击大头针可将常用文件夹固定在此处"),
                         )
@@ -120,6 +109,8 @@ impl IrisWindow {
                     .children(bookmarks.into_iter().enumerate().map(|(i, bm)| {
                         let bm_open = bm.clone();
                         let bm_id = bm.id.clone();
+                        let confirm_key = format!("rm-bm:{bm_id}");
+                        let confirming = self.is_confirming(&confirm_key);
                         let glyph = match &bm.uri {
                             MediaUri::Local(_) => Icon::Folder,
                             MediaUri::Plugin {
@@ -129,10 +120,32 @@ impl IrisWindow {
                             } => self.plugin_source_icon(plugin_id, source_id),
                             MediaUri::HttpUrl(_) => Icon::Link,
                         };
+                        let remove_el = if confirming {
+                            button(("bm-del", i), "确认移除", ButtonVariant::Danger, ButtonSize::Xs, t)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    if this.confirm_destructive(confirm_key.clone(), cx) {
+                                        this.locations.remove_bookmark(&bm_id);
+                                        this.show_toast("已移除书签", cx);
+                                    }
+                                }))
+                        } else {
+                            icon_button(("bm-del", i), Icon::Close, false, t)
+                                .tooltip(tip("移除书签", None))
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                    cx.stop_propagation()
+                                })
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    if this.confirm_destructive(confirm_key.clone(), cx) {
+                                        this.locations.remove_bookmark(&bm_id);
+                                        this.show_toast("已移除书签", cx);
+                                    }
+                                }))
+                        };
                         div()
                             .id(("bm-card", i))
-                            .h(px(30.))
+                            .min_h(t.row_h)
                             .px(px(8.))
+                            .py(px(2.))
                             .flex()
                             .items_center()
                             .justify_between()
@@ -153,22 +166,12 @@ impl IrisWindow {
                                     .child(
                                         div()
                                             .truncate()
-                                            .text_size(px(12.))
+                                            .text_size(t.text_md)
                                             .text_color(t.text)
                                             .child(bm.name),
                                     ),
                             )
-                            .child(
-                                icon_button(("bm-del", i), Icon::Close, false, t)
-                                    .tooltip(tip("移除书签", None))
-                                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                                        cx.stop_propagation()
-                                    })
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.locations.remove_bookmark(&bm_id);
-                                        cx.notify();
-                                    })),
-                            )
+                            .child(remove_el)
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.open_bookmark(&bm_open, cx);
                             }))
@@ -185,23 +188,14 @@ impl IrisWindow {
                             .flex()
                             .items_center()
                             .justify_between()
-                            .child(
-                                div()
-                                    .text_size(px(11.))
-                                    .text_color(t.text_dim)
-                                    .child("已连接数据源"),
-                            )
+                            .child(section_label("已连接数据源", t))
                             .child(badge_pill(sources.len().to_string(), false, t)),
                     )
                     .when(sources.is_empty(), |d| {
                         d.child(
-                            div()
+                            surface_card(0., t)
                                 .p(px(8.))
-                                .rounded(t.radius_md)
-                                .bg(t.window_bg)
-                                .border_1()
-                                .border_color(t.line)
-                                .text_size(px(11.))
+                                .text_size(t.text_sm)
                                 .text_color(t.text_faint)
                                 .child("尚未添加远程存储或云盘连接"),
                         )
@@ -214,21 +208,16 @@ impl IrisWindow {
                                 let (pid_browse, sid_browse) = (pid.clone(), desc.id.clone());
                                 let (pid_cfg, sid_cfg) = (pid.clone(), desc.id.clone());
                                 let (pid_rm, sid_rm) = (pid.clone(), desc.id.clone());
+                                let rm_key = format!("rm-src:{pid}:{}", desc.id);
+                                let rm_confirming = self.is_confirming(&rm_key);
                                 let pid_auth = pid.clone();
                                 let auth_cmd = desc.auth_command_id.clone();
                                 let glyph = super::super::plugin_runtime::source_icon_for_name(
                                     desc.icon.as_deref(),
                                 );
-                                div()
+                                surface_card(6., t)
                                     .id(("src-inst", i))
                                     .p(px(9.))
-                                    .rounded(t.radius_md)
-                                    .bg(t.window_bg)
-                                    .border_1()
-                                    .border_color(t.line)
-                                    .flex()
-                                    .flex_col()
-                                    .gap(px(6.))
                                     .child(
                                         div()
                                             .flex()
@@ -245,7 +234,7 @@ impl IrisWindow {
                                                     .child(
                                                         div()
                                                             .truncate()
-                                                            .text_size(px(12.))
+                                                            .text_size(t.text_md)
                                                             .text_color(t.text)
                                                             .child(desc.name),
                                                     ),
@@ -256,7 +245,7 @@ impl IrisWindow {
                                         d.child(
                                             div()
                                                 .font_family(FONT_MONO)
-                                                .text_size(px(10.))
+                                                .text_size(t.text_xs)
                                                 .text_color(t.text_faint)
                                                 .truncate()
                                                 .child(sub),
@@ -265,6 +254,7 @@ impl IrisWindow {
                                     .child(
                                         div()
                                             .flex()
+                                            .flex_wrap()
                                             .items_center()
                                             .gap(px(6.))
                                             .child(
@@ -323,20 +313,34 @@ impl IrisWindow {
                                             })
                                             .when(desc.removable, |r| {
                                                 r.child(
-                                                    bordered_button(
+                                                    button(
                                                         ("src-rm", i),
-                                                        "移除",
-                                                        false,
+                                                        if rm_confirming {
+                                                            "再次点击确认"
+                                                        } else {
+                                                            "移除"
+                                                        },
+                                                        if rm_confirming {
+                                                            ButtonVariant::Danger
+                                                        } else {
+                                                            ButtonVariant::Secondary
+                                                        },
+                                                        ButtonSize::Md,
                                                         t,
                                                     )
                                                     .on_click(cx.listener(move |this, _, w, cx| {
-                                                        this.manage_plugin_source(
-                                                            &pid_rm,
-                                                            &sid_rm,
-                                                            SourceManageAction::Remove,
-                                                            w,
+                                                        if this.confirm_destructive(
+                                                            rm_key.clone(),
                                                             cx,
-                                                        );
+                                                        ) {
+                                                            this.manage_plugin_source(
+                                                                &pid_rm,
+                                                                &sid_rm,
+                                                                SourceManageAction::Remove,
+                                                                w,
+                                                                cx,
+                                                            );
+                                                        }
                                                     })),
                                                 )
                                             }),

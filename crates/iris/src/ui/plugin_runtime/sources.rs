@@ -1,9 +1,9 @@
 use super::super::{IrisWindow, state::ActiveSource};
 use crate::theme::ThemeTokens;
-use crate::ui::kit::bordered_button;
+use crate::ui::kit::form::chip_button;
 use gpui::{
-    Context, InteractiveElement, IntoElement, ParentElement, StatefulInteractiveElement, Styled,
-    div, px,
+    Context, InteractiveElement, IntoElement, ParentElement, SharedString,
+    StatefulInteractiveElement, Styled, div, px,
 };
 use iris_core::media_uri::MediaUri;
 
@@ -66,47 +66,66 @@ impl IrisWindow {
             .overflow_y_scroll()
             .flex()
             .flex_col()
-            .gap(px(4.))
+            .gap(px(6.))
             .children(self.plugin_view.source_filters.iter().map(|filter| {
                 let id = filter.id.clone();
-                let label = filter
-                    .selected
-                    .as_ref()
-                    .and_then(|value| filter.options.iter().find(|o| o.value == *value))
-                    .map_or("不限", |o| o.label.as_str());
-                let title = format!("{}：{}", filter.label, label);
-                let next = filter
-                    .selected
-                    .as_ref()
-                    .and_then(|v| filter.options.iter().position(|o| &o.value == v))
-                    .map_or(0, |i| i + 1);
-                let value = filter.options.get(next).map(|o| o.value.clone());
-                bordered_button(
-                    gpui::SharedString::from(format!("source-filter-{id}")),
-                    title,
-                    false,
-                    t,
-                )
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    let ActiveSource::Plugin(view) = &this.catalog.active_source else {
-                        return;
-                    };
-                    let (pid, sid, folder) = (
-                        view.plugin_id.clone(),
-                        view.source_id.clone(),
-                        view.folder_id.clone(),
-                    );
-                    if let Some(value) = &value {
-                        this.plugin_view
-                            .filter_values
-                            .insert(id.clone(), value.clone());
-                    } else {
-                        this.plugin_view.filter_values.remove(&id);
-                    }
-                    let query = (!this.text_inputs.search_input.is_empty())
-                        .then(|| this.text_inputs.search_input.text().trim().to_owned());
-                    this.browse_plugin_source(&pid, &sid, folder, None, query, cx);
-                }))
+                let selected = filter.selected.clone();
+                let mut options: Vec<(Option<String>, String)> = vec![(None, "不限".into())];
+                options.extend(
+                    filter
+                        .options
+                        .iter()
+                        .map(|o| (Some(o.value.clone()), o.label.clone())),
+                );
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.))
+                    .child(
+                        div()
+                            .text_size(t.text_xs)
+                            .text_color(t.text_dim)
+                            .child(filter.label.clone()),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_wrap()
+                            .gap(px(4.))
+                            .children(options.into_iter().enumerate().map(|(oi, (val, label))| {
+                                let active = selected == val;
+                                let filter_id = id.clone();
+                                chip_button(
+                                    SharedString::from(format!("source-filter-{filter_id}-{oi}")),
+                                    label,
+                                    active,
+                                    t,
+                                )
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    let ActiveSource::Plugin(view) = &this.catalog.active_source
+                                    else {
+                                        return;
+                                    };
+                                    let (pid, sid, folder) = (
+                                        view.plugin_id.clone(),
+                                        view.source_id.clone(),
+                                        view.folder_id.clone(),
+                                    );
+                                    if let Some(value) = &val {
+                                        this.plugin_view
+                                            .filter_values
+                                            .insert(filter_id.clone(), value.clone());
+                                    } else {
+                                        this.plugin_view.filter_values.remove(&filter_id);
+                                    }
+                                    let query = (!this.text_inputs.search_input.is_empty())
+                                        .then(|| {
+                                            this.text_inputs.search_input.text().trim().to_owned()
+                                        });
+                                    this.browse_plugin_source(&pid, &sid, folder, None, query, cx);
+                                }))
+                            })),
+                    )
             }))
     }
     pub(in crate::ui) fn render_url_resolver_choice(
@@ -120,21 +139,37 @@ impl IrisWindow {
         ];
         choices.extend(self.plugins.url_resolvers(None));
         let selected = self.form_value("url-resolver");
-        let index = choices
+        let active_id = choices
             .iter()
-            .position(|(id, _)| id == selected)
-            .unwrap_or(0);
-        let next = choices[(index + 1) % choices.len()].0.clone();
-        bordered_button(
-            "url-resolver-choice",
-            format!("打开方式：{}", choices[index].1),
-            false,
-            t,
-        )
-        .on_click(cx.listener(move |this, _, _, cx| {
-            this.set_form_value("url-resolver", &next);
-            cx.notify();
-        }))
+            .find(|(id, _)| id == selected)
+            .map(|(id, _)| id.as_str())
+            .unwrap_or("auto")
+            .to_owned();
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(4.))
+            .child(
+                div()
+                    .text_size(t.text_sm)
+                    .text_color(t.text_muted)
+                    .child("打开方式"),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .gap(px(4.))
+                    .children(choices.into_iter().enumerate().map(|(i, (id, label))| {
+                        let active = id == active_id;
+                        chip_button(("url-resolver-choice", i), label, active, t).on_click(
+                            cx.listener(move |this, _, _, cx| {
+                                this.set_form_value("url-resolver", &id);
+                                cx.notify();
+                            }),
+                        )
+                    })),
+            )
     }
     pub(in crate::ui) fn open_user_url(
         &mut self,

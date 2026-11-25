@@ -346,6 +346,7 @@ pub(super) struct OverlayState {
     pub(super) dialog_error: Option<SharedString>,
     pub(super) recording_shortcut: Option<(String, String)>,
     pub(super) shortcut_conflict: Option<String>,
+    pub(super) pending_confirm: Option<(String, Instant)>,
 }
 
 impl Default for OverlayState {
@@ -365,6 +366,7 @@ impl Default for OverlayState {
             dialog_error: None,
             recording_shortcut: None,
             shortcut_conflict: None,
+            pending_confirm: None,
         }
     }
 }
@@ -388,6 +390,28 @@ impl OverlayState {
         self.context_menu = None;
     }
 
+    pub(super) fn is_confirming(&self, key: &str, now: Instant) -> bool {
+        self.pending_confirm
+            .as_ref()
+            .is_some_and(|(k, until)| k == key && now < *until)
+    }
+
+    pub(super) fn confirm_or_arm(
+        &mut self,
+        key: impl Into<String>,
+        now: Instant,
+        ttl: std::time::Duration,
+    ) -> bool {
+        let key = key.into();
+        if self.is_confirming(&key, now) {
+            self.pending_confirm = None;
+            true
+        } else {
+            self.pending_confirm = Some((key, now + ttl));
+            false
+        }
+    }
+
     pub(super) fn close_all(&mut self) {
         self.dir_popup = DirectoryPopup::Hidden;
         self.popover = None;
@@ -398,6 +422,7 @@ impl OverlayState {
         self.dialog = None;
         self.dialog_error = None;
         self.recording_shortcut = None;
+        self.pending_confirm = None;
     }
 
     pub(super) fn open_settings(&mut self, tab: Option<SettingsTab>) {

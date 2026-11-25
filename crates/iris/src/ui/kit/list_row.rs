@@ -21,6 +21,56 @@ pub(in crate::ui) fn kind_glyph(kind: Kind) -> Icon {
     }
 }
 
+/// Single-line selectable list row with unified right-side `t.accent` checkmark.
+pub(in crate::ui) fn select_row(
+    id: impl Into<ElementId>,
+    label: impl Into<SharedString>,
+    trailing_meta: Option<SharedString>,
+    active: bool,
+    kb_focused: bool,
+    mono: bool,
+    t: ThemeTokens,
+) -> Stateful<Div> {
+    div()
+        .id(id)
+        .relative()
+        .h(t.row_h)
+        .w_full()
+        .flex_none()
+        .px(px(10.))
+        .flex()
+        .items_center()
+        .justify_between()
+        .gap(px(8.))
+        .cursor_pointer()
+        .text_size(t.text_md)
+        .when(mono, |d| d.font_family(FONT_MONO))
+        .when(kb_focused, |d| d.bg(t.hover).text_color(t.text))
+        .when(active && !kb_focused, |d| d.bg(t.selected).text_color(t.text))
+        .when(!active && !kb_focused, |d| {
+            d.text_color(t.text_muted)
+                .hover(|s| s.bg(t.hover).text_color(t.text))
+        })
+        .child(div().flex_1().min_w(px(0.)).truncate().child(label.into()))
+        .child(
+            div()
+                .flex_none()
+                .flex()
+                .items_center()
+                .gap(px(6.))
+                .when_some(trailing_meta.filter(|s| !s.is_empty()), |d, meta| {
+                    d.child(
+                        div()
+                            .font_family(FONT_MONO)
+                            .text_size(t.text_xs)
+                            .text_color(t.text_faint)
+                            .child(meta),
+                    )
+                })
+                .when(active, |d| d.child(icon(Icon::Check, 12., t.accent))),
+        )
+}
+
 /// Renders a parent (`..`) or child folder row at `t.row_h`.
 pub(in crate::ui) fn folder_row(
     id: impl Into<ElementId>,
@@ -49,7 +99,7 @@ pub(in crate::ui) fn folder_row(
                 .flex_1()
                 .min_w(px(0.))
                 .truncate()
-                .text_size(px(12.))
+                .text_size(t.text_md)
                 .child(title.into()),
         )
         .when_some(subtitle.filter(|s| !s.is_empty()), |d, sub| {
@@ -57,7 +107,7 @@ pub(in crate::ui) fn folder_row(
                 div()
                     .flex_none()
                     .font_family(FONT_MONO)
-                    .text_size(px(10.))
+                    .text_size(t.text_xs)
                     .text_color(t.text_faint)
                     .child(sub),
             )
@@ -138,7 +188,7 @@ pub(in crate::ui) fn media_row(
                 .flex_1()
                 .min_w(px(0.))
                 .truncate()
-                .text_size(px(12.))
+                .text_size(t.text_md)
                 .child(spec.title),
         )
         .when(spec.is_live, |d| d.child(badge_pill("LIVE", true, t)))
@@ -149,7 +199,7 @@ pub(in crate::ui) fn media_row(
                     div()
                         .flex_none()
                         .font_family(FONT_MONO)
-                        .text_size(px(10.))
+                        .text_size(t.text_xs)
                         .text_color(t.text_faint)
                         .child(meta),
                 )

@@ -11,9 +11,8 @@ use gpui::{
 use iris_core::player::{Command, SPEED_STEPS};
 
 use super::IrisWindow;
-use super::kit::icon;
+use super::kit::list_row::select_row;
 use super::state::PopoverKind;
-use crate::assets::Icon;
 use crate::theme::{FLOAT_GAP, FONT_MONO, ThemeTokens};
 
 pub(super) fn popover_header(
@@ -22,20 +21,21 @@ pub(super) fn popover_header(
     t: ThemeTokens,
 ) -> impl IntoElement {
     div()
-        .h(px(30.))
+        .min_h(px((f32::from(t.control_h_sm) + 6.).max(28.)))
         .flex_none()
         .px(px(10.))
+        .py(px(3.))
         .flex()
         .items_center()
         .justify_between()
         .border_b_1()
         .border_color(t.line)
-        .child(div().text_size(px(11.)).text_color(t.text_dim).child(title))
+        .child(div().text_size(t.text_sm).text_color(t.text_dim).child(title))
         .when_some(hint, |d, hint| {
             d.child(
                 div()
                     .font_family(FONT_MONO)
-                    .text_size(px(10.))
+                    .text_size(t.text_xs)
                     .text_color(t.text_faint)
                     .child(hint),
             )
@@ -240,32 +240,21 @@ impl IrisWindow {
         let rows = SPEED_STEPS.iter().copied().enumerate().map(|(i, speed)| {
             let active = (current - speed).abs() < 0.02;
             let kb_focus = focused_ix == Some(i);
-            div()
-                .id(("speed-opt", i))
-                .h(px(26.))
-                .px(px(10.))
-                .flex()
-                .items_center()
-                .justify_between()
-                .cursor_pointer()
-                .font_family(FONT_MONO)
-                .text_size(px(12.))
-                .when(active || kb_focus, |d| {
-                    d.bg(if kb_focus { t.hover } else { t.selected })
-                        .text_color(t.text)
-                })
-                .when(!active && !kb_focus, |d| {
-                    d.text_color(t.text_muted)
-                        .hover(|s| s.bg(t.hover).text_color(t.text))
-                })
-                .child(format!("{speed:.2}×"))
-                .when(active, |d| d.child(icon(Icon::Check, 12., t.accent)))
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.command(Command::SetSpeed(speed), cx);
-                    this.overlays.popover = None;
-                    this.overlays.popover_index = None;
-                    this.show_osd(format!("倍速 · {speed:.2}×"), cx);
-                }))
+            select_row(
+                ("speed-opt", i),
+                format!("{speed:.2}×"),
+                None,
+                active,
+                kb_focus,
+                true,
+                t,
+            )
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.command(Command::SetSpeed(speed), cx);
+                this.overlays.popover = None;
+                this.overlays.popover_index = None;
+                this.show_osd(format!("倍速 · {speed:.2}×"), cx);
+            }))
         });
 
         div()
@@ -304,37 +293,19 @@ impl IrisWindow {
             let kb_focus = focused_ix == Some(i);
             let vid = v.id.clone();
             let vlabel = v.label.clone();
-            div()
-                .id(("variant-opt", i))
-                .h(t.row_h)
-                .px(px(10.))
-                .flex()
-                .items_center()
-                .justify_between()
-                .gap(px(8.))
-                .cursor_pointer()
-                .font_family(FONT_MONO)
-                .text_size(px(12.))
-                .when(active || kb_focus, |d| {
-                    d.bg(if kb_focus { t.hover } else { t.selected })
-                        .text_color(t.text)
-                })
-                .when(!active && !kb_focus, |d| {
-                    d.text_color(t.text_muted)
-                        .hover(|s| s.bg(t.hover).text_color(t.text))
-                })
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w(px(0.))
-                        .truncate()
-                        .child(vlabel.clone()),
-                )
-                .when(active, |d| d.child(icon(Icon::Check, 12., t.accent)))
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.switch_stream_variant(&vid, cx);
-                    this.show_osd(format!("清晰度 · {vlabel}"), cx);
-                }))
+            select_row(
+                ("variant-opt", i),
+                vlabel.clone(),
+                None,
+                active,
+                kb_focus,
+                true,
+                t,
+            )
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.switch_stream_variant(&vid, cx);
+                this.show_osd(format!("清晰度 · {vlabel}"), cx);
+            }))
         });
 
         div()
@@ -360,7 +331,7 @@ impl IrisWindow {
                             div()
                                 .px(px(10.))
                                 .py(px(8.))
-                                .text_size(px(11.))
+                                .text_size(t.text_sm)
                                 .text_color(t.text_faint)
                                 .child("当前流没有可切换的清晰度档位"),
                         )

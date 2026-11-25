@@ -473,8 +473,9 @@ impl IrisWindow {
                     .child(
                         div()
                             .flex_none()
-                            .h(px(40.))
+                            .min_h(px((f32::from(t.control_h_md) + 12.).max(40.)))
                             .px(px(6.))
+                            .py(px(3.))
                             .flex()
                             .items_center()
                             .bg(t.window_bg)
@@ -485,7 +486,7 @@ impl IrisWindow {
                                     id: "palette-search".into(),
                                     kind: TextFieldKind::Palette,
                                     placeholder: "输入命令、工作区预设、数据源或插件动作…".into(),
-                                    height: px(34.),
+                                    height: px((f32::from(t.control_h_md) + 6.).max(34.)),
                                     leading_icon: Some(Icon::Command),
                                     borderless: true,
                                 },
@@ -507,7 +508,7 @@ impl IrisWindow {
                                 d.child(
                                     div()
                                         .p(px(14.))
-                                        .text_size(px(12.))
+                                        .text_size(t.text_md)
                                         .text_color(t.text_faint)
                                         .child("没有匹配的命令"),
                                 )
@@ -540,7 +541,7 @@ impl IrisWindow {
                                             .child(
                                                 div()
                                                     .truncate()
-                                                    .text_size(px(12.))
+                                                    .text_size(t.text_md)
                                                     .text_color(t.text)
                                                     .child(entry.title),
                                             )
@@ -548,7 +549,7 @@ impl IrisWindow {
                                                 d.child(
                                                     div()
                                                         .truncate()
-                                                        .text_size(px(10.))
+                                                        .text_size(t.text_xs)
                                                         .text_color(t.text_dim)
                                                         .child(sub),
                                                 )
@@ -565,7 +566,7 @@ impl IrisWindow {
                                                 d.child(
                                                     div()
                                                         .font_family(FONT_MONO)
-                                                        .text_size(px(10.))
+                                                        .text_size(t.text_xs)
                                                         .text_color(t.text_dim)
                                                         .child(key),
                                                 )

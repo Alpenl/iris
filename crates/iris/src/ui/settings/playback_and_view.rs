@@ -258,13 +258,13 @@ impl IrisWindow {
                             .gap(px(2.))
                             .child(
                                 div()
-                                    .text_size(px(12.))
+                                    .text_size(t.text_md)
                                     .text_color(t.text)
                                     .child("默认音频输出设备"),
                             )
                             .child(
                                 div()
-                                    .text_size(px(11.))
+                                    .text_size(t.text_sm)
                                     .text_color(t.text_faint)
                                     .child("选择音频输出通道，切换立即生效并持久化"),
                             ),
@@ -315,7 +315,7 @@ impl IrisWindow {
                                         .gap(px(1.))
                                         .child(
                                             div()
-                                                .text_size(px(12.))
+                                                .text_size(t.text_md)
                                                 .text_color(if active {
                                                     t.text
                                                 } else {
@@ -328,7 +328,7 @@ impl IrisWindow {
                                             d.child(
                                                 div()
                                                     .font_family(FONT_MONO)
-                                                    .text_size(px(10.))
+                                                    .text_size(t.text_xs)
                                                     .text_color(t.text_faint)
                                                     .truncate()
                                                     .child(dev.name),

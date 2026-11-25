@@ -15,7 +15,7 @@ use super::actions::OpenFile;
 use super::kit::{badge_pill, icon};
 use super::state::BuiltinDialog;
 use crate::assets::Icon;
-use crate::theme::{BUTTON, FONT_MONO, ThemeTokens};
+use crate::theme::{FONT_MONO, ThemeTokens};
 
 impl IrisWindow {
     pub(super) fn render_audio_card(&self, t: ThemeTokens) -> impl IntoElement {
@@ -77,14 +77,14 @@ impl IrisWindow {
                         div()
                             .max_w(px(320.))
                             .truncate()
-                            .text_size(px(14.))
+                            .text_size(t.text_lg)
                             .text_color(t.text)
                             .child(name),
                     )
                     .child(
                         div()
                             .font_family(FONT_MONO)
-                            .text_size(px(12.))
+                            .text_size(t.text_md)
                             .text_color(if st.is_live { t.accent } else { t.text_dim })
                             .child(status),
                     ),
@@ -109,6 +109,7 @@ impl IrisWindow {
             .collect();
         let open_local_key = self.key_hint("open_file");
         let open_url_key = self.key_hint("open_stream_url");
+        let confirm_recent = self.is_confirming("clear-recent");
 
         let cta_btn = |id: &'static str,
                        glyph: Icon,
@@ -117,7 +118,7 @@ impl IrisWindow {
                        key: Option<SharedString>| {
             div()
                 .id(id)
-                .h(px(BUTTON))
+                .h(t.control_h_md)
                 .px(px(12.))
                 .flex()
                 .items_center()
@@ -126,7 +127,7 @@ impl IrisWindow {
                 .bg(t.panel)
                 .border_1()
                 .border_color(t.line_strong)
-                .text_size(px(12.))
+                .text_size(t.text_md)
                 .cursor_pointer()
                 .hover(|s| s.bg(t.hover).border_color(t.accent))
                 .active(|s| s.bg(t.selected))
@@ -141,7 +142,7 @@ impl IrisWindow {
                     d.child(
                         div()
                             .font_family(FONT_MONO)
-                            .text_size(px(11.))
+                            .text_size(t.text_sm)
                             .text_color(t.text_dim)
                             .child(k),
                     )
@@ -159,13 +160,15 @@ impl IrisWindow {
             .gap(px(14.))
             .child(
                 div()
-                    .text_size(px(13.))
+                    .text_size(t.text_lg)
                     .text_color(t.text_dim)
                     .child("拖入本地媒体 / 文件夹，或连接网络流与远程数据源"),
             )
             .child(
                 div()
                     .flex()
+                    .flex_wrap()
+                    .justify_center()
                     .items_center()
                     .gap(px(8.))
                     .child(
@@ -200,7 +203,7 @@ impl IrisWindow {
                     .items_center()
                     .gap(px(5.))
                     .cursor_pointer()
-                    .text_size(px(11.))
+                    .text_size(t.text_sm)
                     .text_color(t.text_faint)
                     .hover(|s| s.text_color(t.text))
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
@@ -215,6 +218,7 @@ impl IrisWindow {
                     div()
                         .mt(px(4.))
                         .w(px(380.))
+                        .max_w(gpui::relative(0.92))
                         .rounded(t.radius_lg)
                         .overflow_hidden()
                         .bg(t.panel)
@@ -225,7 +229,7 @@ impl IrisWindow {
                         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                         .child(
                             div()
-                                .h(px(28.))
+                                .min_h(t.row_h)
                                 .px(px(10.))
                                 .flex()
                                 .items_center()
@@ -234,21 +238,37 @@ impl IrisWindow {
                                 .border_color(t.line)
                                 .child(
                                     div()
-                                        .text_size(px(11.))
+                                        .text_size(t.text_sm)
                                         .text_color(t.text_dim)
                                         .child("最近打开"),
                                 )
                                 .child(
                                     div()
                                         .id("clear-recent")
-                                        .text_size(px(10.))
-                                        .text_color(t.text_faint)
+                                        .text_size(t.text_xs)
+                                        .text_color(if confirm_recent {
+                                            t.danger
+                                        } else {
+                                            t.text_faint
+                                        })
                                         .cursor_pointer()
-                                        .hover(|s| s.text_color(t.text))
-                                        .child("清空")
+                                        .hover(|s| {
+                                            s.text_color(if confirm_recent {
+                                                t.danger
+                                            } else {
+                                                t.text
+                                            })
+                                        })
+                                        .child(if confirm_recent {
+                                            "再次点击确认清空"
+                                        } else {
+                                            "清空"
+                                        })
                                         .on_click(cx.listener(|this, _, _, cx| {
-                                            this.store.clear_recent();
-                                            cx.notify();
+                                            if this.confirm_destructive("clear-recent", cx) {
+                                                this.store.clear_recent();
+                                                this.show_toast("已清除最近打开记录", cx);
+                                            }
                                         })),
                                 ),
                         )
@@ -277,13 +297,13 @@ impl IrisWindow {
                                 };
                                 div()
                                     .id(("recent-item", i))
-                                    .h(px(26.))
+                                    .h(t.row_h)
                                     .px(px(10.))
                                     .flex()
                                     .items_center()
                                     .gap(px(8.))
                                     .cursor_pointer()
-                                    .text_size(px(12.))
+                                    .text_size(t.text_md)
                                     .text_color(t.text_muted)
                                     .hover(|s| s.bg(t.hover).text_color(t.text))
                                     .child(icon(

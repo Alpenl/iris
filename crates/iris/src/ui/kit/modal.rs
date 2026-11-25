@@ -4,13 +4,13 @@
 use std::rc::Rc;
 
 use gpui::{
-    AnyElement, Context, Div, ElementId, FontWeight, InteractiveElement, IntoElement, MouseButton,
+    AnyElement, Context, Div, ElementId, InteractiveElement, IntoElement, MouseButton,
     ParentElement, SharedString, Stateful, StatefulInteractiveElement, Styled, Window, div,
     prelude::FluentBuilder, px,
 };
 
 use super::super::IrisWindow;
-use super::{bordered_button, icon, icon_button, tip};
+use super::{bordered_button, icon, icon_button, panel_header, tip};
 use crate::assets::Icon;
 use crate::theme::{FONT_MONO, ThemeTokens};
 
@@ -98,47 +98,11 @@ pub(in crate::ui) fn modal_shell(
         spec.on_cancel,
     );
 
-    let header = div()
-        .h(px(38.))
-        .flex_none()
-        .px(px(14.))
-        .flex()
-        .items_center()
-        .justify_between()
-        .bg(t.window_bg)
-        .border_b_1()
-        .border_color(t.line)
-        .child(
-            div()
-                .flex()
-                .items_center()
-                .gap(px(8.))
-                .min_w(px(0.))
-                .child(div().size(px(6.)).flex_none().bg(t.accent))
-                .child(
-                    div()
-                        .font_weight(FontWeight::MEDIUM)
-                        .text_size(px(13.))
-                        .text_color(t.text)
-                        .truncate()
-                        .child(spec.title),
-                )
-                .when_some(spec.header_hint.filter(|h| !h.is_empty()), |d, hint| {
-                    d.child(
-                        div()
-                            .flex_none()
-                            .font_family(FONT_MONO)
-                            .text_size(px(11.))
-                            .text_color(t.text_faint)
-                            .child(hint),
-                    )
-                }),
-        )
-        .child(
-            icon_button((spec.id_prefix, 2usize), Icon::Close, false, t)
-                .tooltip(tip("关闭", Some("Esc".into())))
-                .on_click(cx.listener(move |this, _, w, cx| cancel_x(this, w, cx))),
-        );
+    let close_btn = icon_button((spec.id_prefix, 2usize), Icon::Close, false, t)
+        .tooltip(tip("关闭", Some("Esc".into())))
+        .on_click(cx.listener(move |this, _, w, cx| cancel_x(this, w, cx)))
+        .into_any_element();
+    let header = panel_header(spec.title, spec.header_hint, Some(close_btn), t);
 
     let error_banner = spec.error.filter(|msg| !msg.trim().is_empty()).map(|msg| {
         div()
@@ -156,7 +120,7 @@ pub(in crate::ui) fn modal_shell(
                 div()
                     .flex_1()
                     .min_w(px(0.))
-                    .text_size(px(11.))
+                    .text_size(t.text_sm)
                     .text_color(t.danger)
                     .child(msg),
             )
@@ -277,7 +241,7 @@ pub(in crate::ui) fn menu_row(
         .gap(px(12.))
         .rounded(t.radius_sm)
         .cursor_pointer()
-        .text_size(px(12.))
+        .text_size(t.text_md)
         .text_color(if active_accent { t.accent } else { t.text })
         .hover(|s| s.bg(t.hover))
         .active(|s| s.bg(t.selected))
@@ -302,7 +266,7 @@ pub(in crate::ui) fn menu_row(
                 div()
                     .flex_none()
                     .font_family(FONT_MONO)
-                    .text_size(px(10.))
+                    .text_size(t.text_xs)
                     .text_color(t.text_dim)
                     .child(key),
             )

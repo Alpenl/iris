@@ -14,6 +14,10 @@ pub const DEFAULT_DIRECTORY_WIDTH: f32 = 288.;
 pub const MIN_DIRECTORY_WIDTH: f32 = 220.;
 pub const MAX_DIRECTORY_WIDTH: f32 = 520.;
 
+pub const DEFAULT_UI_FONT_SCALE: f32 = 1.0;
+pub const MIN_UI_FONT_SCALE: f32 = 0.85;
+pub const MAX_UI_FONT_SCALE: f32 = 1.35;
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Side {
@@ -149,6 +153,8 @@ pub struct Settings {
     pub hidden_dock_buttons: Vec<String>,
     /// Preferred audio output device name (`"auto"` by default).
     pub audio_device: String,
+    /// Global UI typography & control height scale multiplier (`0.85`..=`1.35`).
+    pub ui_font_scale: f32,
 }
 
 impl Default for Settings {
@@ -187,6 +193,7 @@ impl Default for Settings {
             compact_controls: false,
             hidden_dock_buttons: Vec::new(),
             audio_device: "auto".into(),
+            ui_font_scale: DEFAULT_UI_FONT_SCALE,
         }
     }
 }
@@ -378,6 +385,13 @@ impl Settings {
                         s.audio_device = clean;
                     }
                 }
+                ("ui_font_scale", v) => {
+                    if let Ok(scale) = v.parse::<f32>()
+                        && scale.is_finite()
+                    {
+                        s.ui_font_scale = scale.clamp(MIN_UI_FONT_SCALE, MAX_UI_FONT_SCALE);
+                    }
+                }
                 _ => {}
             }
         }
@@ -527,6 +541,13 @@ impl Settings {
                 &audio_device
             }
         ));
+        let ui_font_scale = if self.ui_font_scale.is_finite() {
+            self.ui_font_scale
+                .clamp(MIN_UI_FONT_SCALE, MAX_UI_FONT_SCALE)
+        } else {
+            DEFAULT_UI_FONT_SCALE
+        };
+        text.push_str(&format!("ui_font_scale = {ui_font_scale:.2}\n"));
 
         fs_util::atomic_write(path, &text)
     }
@@ -613,6 +634,7 @@ mod tests {
             compact_controls: true,
             hidden_dock_buttons: vec!["screenshot".into(), "loop".into()],
             audio_device: "coreaudio/BuiltInSpeakerDevice".into(),
+            ui_font_scale: 1.15,
         };
         custom.save_to(&file).unwrap();
         let loaded = Settings::load_from(&file);
@@ -620,7 +642,7 @@ mod tests {
 
         std::fs::write(
             &file,
-            "directory_width = 9999\nfullscreen_hide_ms = 50\nsub_scale = NaN\nvolume = 180\ntheme_id =   \naudio_device = \n",
+            "directory_width = 9999\nfullscreen_hide_ms = 50\nsub_scale = NaN\nvolume = 180\ntheme_id =   \naudio_device = \nui_font_scale = 9.5\n",
         )
         .unwrap();
         let clamped = Settings::load_from(&file);
@@ -635,6 +657,10 @@ mod tests {
         assert!(!clamped.compact_controls);
         assert!(clamped.hidden_dock_buttons.is_empty());
         assert_eq!(clamped.audio_device, "auto");
+        assert_eq!(clamped.ui_font_scale, MAX_UI_FONT_SCALE);
+
+        std::fs::write(&file, "ui_font_scale = NaN\n").unwrap();
+        assert_eq!(Settings::load_from(&file).ui_font_scale, DEFAULT_UI_FONT_SCALE);
 
         // Verify serde snake_case serialization for preset-shared enums.
         let json = serde_json::to_string(&(

@@ -240,6 +240,8 @@ impl IrisWindow {
         let text_el = if focused && !is_empty {
             let caret = state_ref.display_caret_index();
             let shown = SharedString::from(shown);
+            let font_size = t.text_md;
+            let line_height = px((f32::from(font_size) * 1.45).ceil());
             canvas(
                 move |_, w, _| {
                     let run = TextRun {
@@ -250,13 +252,12 @@ impl IrisWindow {
                         underline: None,
                         strikethrough: None,
                     };
-                    w.text_system().shape_line(shown, px(12.), &[run], None)
+                    w.text_system().shape_line(shown, font_size, &[run], None)
                 },
                 move |bounds, line, w, cx| {
                     let right = line.x_for_index(caret + '▏'.len_utf8());
                     let mut origin = bounds.origin;
                     origin.x -= (right - bounds.size.width).max(px(0.));
-                    let line_height = px(16.);
                     origin.y += (bounds.size.height - line_height) * 0.5;
                     w.with_content_mask(Some(ContentMask { bounds }), |w| {
                         let _ = line.paint(origin, line_height, w, cx);
@@ -272,7 +273,7 @@ impl IrisWindow {
                 .flex_1()
                 .min_w(px(0.))
                 .truncate()
-                .text_size(px(12.))
+                .text_size(t.text_md)
                 .text_color(t.text)
                 .child(shown)
                 .into_any_element()
@@ -283,7 +284,7 @@ impl IrisWindow {
                 .flex()
                 .items_center()
                 .truncate()
-                .text_size(px(12.))
+                .text_size(t.text_md)
                 .child(div().text_color(t.accent).child("▏"))
                 .when(!placeholder.is_empty(), |d| {
                     d.child(div().truncate().text_color(t.text_faint).child(placeholder))
@@ -294,16 +295,17 @@ impl IrisWindow {
                 .flex_1()
                 .min_w(px(0.))
                 .truncate()
-                .text_size(px(12.))
+                .text_size(t.text_md)
                 .text_color(t.text_faint)
                 .child(placeholder)
                 .into_any_element()
         };
 
+        let field_h = px(f32::from(spec.height).max(f32::from(t.control_h_md)));
         let mut el = div()
             .id(spec.id)
             .relative()
-            .h(spec.height)
+            .h(field_h)
             .w_full()
             .px(px(9.))
             .flex()

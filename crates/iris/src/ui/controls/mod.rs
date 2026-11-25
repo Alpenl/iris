@@ -22,7 +22,7 @@ use super::actions::{
 };
 use super::kit::{ghost, icon, icon_button, icon_on_ghost, separator, tip};
 use crate::assets::Icon;
-use crate::theme::{BUTTON, FONT_MONO, ThemeTokens};
+use crate::theme::{FONT_MONO, ThemeTokens};
 
 fn anchor_wrap(
     slot: Rc<Cell<Option<Bounds<Pixels>>>>,
@@ -201,7 +201,7 @@ impl IrisWindow {
         div()
             .id("volume")
             .group("volume")
-            .h(px(BUTTON))
+            .h(t.control_h_md)
             .flex()
             .items_center()
             .gap(px(if compact { 2. } else { 4. }))
@@ -236,7 +236,7 @@ impl IrisWindow {
                         .relative()
                         .flex()
                         .items_center()
-                        .h(px(BUTTON))
+                        .h(t.control_h_md)
                         .cursor_pointer()
                         .tooltip(tip("音量 · 点击或按住拖动调节", self.key_hint("volume_up")))
                         .on_mouse_down(
@@ -256,7 +256,7 @@ impl IrisWindow {
                             let on = i < filled;
                             div()
                                 .w(px(if compact { 5. } else { 6. }))
-                                .h(px(BUTTON))
+                                .h(t.control_h_md)
                                 .flex()
                                 .items_center()
                                 .child(
@@ -274,10 +274,10 @@ impl IrisWindow {
                 .when(!compact, |d| {
                     d.child(
                         div()
-                            .w(px(24.))
+                            .w(px(26.))
                             .pl(px(2.))
                             .font_family(FONT_MONO)
-                            .text_size(px(11.))
+                            .text_size(t.text_sm)
                             .text_color(if muted { t.text_faint } else { t.text_dim })
                             .child(if muted {
                                 "0".to_string()

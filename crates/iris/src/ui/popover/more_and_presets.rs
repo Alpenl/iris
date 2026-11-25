@@ -13,12 +13,15 @@ use iris_core::preset::PresetCaptureScope;
 use super::super::IrisWindow;
 use super::super::actions::{RotateCw, TakeScreenshot, ToggleHFlip, ToggleInfo, ToggleVFlip};
 use super::super::kit::form::{segmented, stepper};
+use super::super::kit::list_row::select_row;
 use super::super::kit::modal::menu_row;
-use super::super::kit::{badge_pill, hbetween, hstack, icon, vstack};
+use super::super::kit::{
+    ButtonSize, ButtonVariant, badge_pill, button, hbetween, hstack, icon, vstack,
+};
 use super::super::state::{BuiltinDialog, SettingsTab};
 use super::popover_header;
 use crate::assets::Icon;
-use crate::theme::{FONT_MONO, ThemeTokens};
+use crate::theme::ThemeTokens;
 
 #[derive(Clone, Copy)]
 enum EqChannel {
@@ -92,7 +95,7 @@ impl IrisWindow {
         let header = hbetween(6.)
             .child(
                 hstack(6.)
-                    .text_size(px(10.))
+                    .text_size(t.text_xs)
                     .text_color(t.text_dim)
                     .child(icon(Icon::Sliders, 12., t.text_faint))
                     .child("画面均衡器"),
@@ -100,7 +103,7 @@ impl IrisWindow {
             .child(
                 div()
                     .id("eq-reset-all")
-                    .text_size(px(10.))
+                    .text_size(t.text_xs)
                     .text_color(if eq_dirty { t.accent } else { t.text_faint })
                     .cursor_pointer()
                     .hover(|s| s.text_color(t.text))
@@ -121,10 +124,10 @@ impl IrisWindow {
                     format!("{val:+}")
                 };
                 hbetween(8.)
-                    .min_h(px(26.))
+                    .min_h(t.control_h_sm)
                     .child(
                         div()
-                            .text_size(px(11.))
+                            .text_size(t.text_sm)
                             .text_color(if val != 0 { t.text } else { t.text_muted })
                             .child(ch.label()),
                     )
@@ -162,32 +165,22 @@ impl IrisWindow {
             .enumerate()
             .map(|(i, ch)| {
                 let active = current_ch == i as i64;
-                hbetween(8.)
-                    .id(("ch-row", i))
-                    .h(px(24.))
-                    .px(px(10.))
-                    .cursor_pointer()
-                    .text_size(px(11.))
-                    .when(active, |d| d.bg(t.selected).text_color(t.text))
-                    .when(!active, |d| {
-                        d.text_color(t.text_muted)
-                            .hover(|s| s.bg(t.hover).text_color(t.text))
-                    })
-                    .child(div().flex_1().min_w(px(0.)).truncate().child(ch.title))
-                    .child(
-                        div()
-                            .flex_none()
-                            .font_family(FONT_MONO)
-                            .text_size(px(10.))
-                            .text_color(t.text_faint)
-                            .child(format_time(ch.time)),
-                    )
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.command(Command::SelectChapter(i), cx);
-                        this.overlays.popover = None;
-                        cx.notify();
-                    }))
-                    .into_any_element()
+                select_row(
+                    ("ch-row", i),
+                    ch.title,
+                    Some(format_time(ch.time).into()),
+                    active,
+                    false,
+                    false,
+                    t,
+                )
+                .text_size(t.text_sm)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.command(Command::SelectChapter(i), cx);
+                    this.overlays.popover = None;
+                    cx.notify();
+                }))
+                .into_any_element()
             })
             .collect();
 
@@ -199,7 +192,7 @@ impl IrisWindow {
                     .px(px(10.))
                     .pt(px(6.))
                     .pb(px(4.))
-                    .text_size(px(10.))
+                    .text_size(t.text_xs)
                     .text_color(t.text_dim)
                     .child("章节"),
             )
@@ -288,7 +281,7 @@ impl IrisWindow {
                 .border_color(t.line)
                 .child(
                     hstack(6.)
-                        .text_size(px(10.))
+                        .text_size(t.text_xs)
                         .text_color(t.text_dim)
                         .child(icon(Icon::Aspect, 12., t.text_faint))
                         .child("画面比例"),
@@ -347,42 +340,30 @@ impl IrisWindow {
             .map(|(i, p)| {
                 let active = p.id == active_id;
                 let (pid, builtin) = (p.id, p.builtin);
-                let glyph = if active {
-                    icon(Icon::Check, 12., t.accent)
-                } else {
-                    icon(Icon::Layers, 11., t.text_faint)
-                };
                 let title_col = if active { t.text } else { t.text_muted };
                 div()
                     .id(("preset-row", i))
                     .px(px(10.))
                     .py(px(6.))
                     .flex()
-                    .items_start()
+                    .items_center()
+                    .justify_between()
                     .gap(px(8.))
                     .cursor_pointer()
                     .when(active, |d| d.bg(t.selected))
                     .when(!active, |d| d.hover(|s| s.bg(t.hover)))
                     .child(
-                        div()
-                            .w(px(14.))
-                            .pt(px(2.))
-                            .flex_none()
-                            .flex()
-                            .justify_center()
-                            .child(glyph),
-                    )
-                    .child(
                         vstack(2.)
                             .flex_1()
                             .min_w(px(0.))
                             .child(
-                                hbetween(6.)
+                                hstack(6.)
+                                    .min_w(px(0.))
                                     .child(
                                         div()
                                             .min_w(px(0.))
                                             .truncate()
-                                            .text_size(px(12.))
+                                            .text_size(t.text_md)
                                             .text_color(title_col)
                                             .child(p.name),
                                     )
@@ -396,12 +377,13 @@ impl IrisWindow {
                                 d.child(
                                     div()
                                         .truncate()
-                                        .text_size(px(10.))
+                                        .text_size(t.text_xs)
                                         .text_color(t.text_dim)
                                         .child(p.description),
                                 )
                             }),
                     )
+                    .when(active, |d| d.child(icon(Icon::Check, 12., t.accent)))
                     .on_click(cx.listener(move |this, _, w, cx| this.activate_preset(&pid, w, cx)))
                     .into_any_element()
             })
@@ -409,15 +391,13 @@ impl IrisWindow {
 
         let fbtn = |id: &'static str, label: &'static str, accent: bool| {
             let hover_text = if accent { t.accent } else { t.text };
-            hstack(0.)
-                .id(id)
-                .h(px(26.))
+            button(id, label, ButtonVariant::Ghost, ButtonSize::Sm, t)
+                .w_full()
+                .justify_start()
                 .px(px(10.))
-                .cursor_pointer()
-                .text_size(px(11.))
+                .rounded(px(0.))
                 .text_color(if accent { t.accent } else { t.text_muted })
                 .hover(move |s| s.bg(t.hover).text_color(hover_text))
-                .child(label)
         };
 
         vstack(0.)

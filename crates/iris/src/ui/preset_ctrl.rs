@@ -21,7 +21,11 @@ impl IrisWindow {
             .map(str::to_owned);
         let _ = self.plugins.select_theme(desired);
         let (plugin_theme, _) = self.plugins.active_ui_overrides();
-        let tokens = ThemeTokens::resolve(&self.settings.theme_id, plugin_theme.as_ref());
+        let tokens = ThemeTokens::resolve_scaled(
+            &self.settings.theme_id,
+            plugin_theme.as_ref(),
+            self.settings.ui_font_scale,
+        );
         cx.set_global(tokens);
     }
 

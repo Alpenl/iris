@@ -9,16 +9,22 @@ use gpui::{
 };
 use iris_core::logging;
 use iris_core::settings::{
-    DEFAULT_DIRECTORY_WIDTH, MAX_DIRECTORY_WIDTH, MIN_DIRECTORY_WIDTH, Side, path as settings_path,
+    DEFAULT_DIRECTORY_WIDTH, DEFAULT_UI_FONT_SCALE, MAX_DIRECTORY_WIDTH, MAX_UI_FONT_SCALE,
+    MIN_DIRECTORY_WIDTH, MIN_UI_FONT_SCALE, Side, path as settings_path,
 };
 
 use super::super::IrisWindow;
 use super::super::actions::ToggleAlwaysOnTop;
 use super::super::kit::form::{checkbox, chip_button, segmented, setting_row, stepper, toggle};
-use super::super::kit::{badge_pill, bordered_button, hbetween, hstack, icon, vstack};
+use super::super::kit::{
+    ButtonSize, ButtonVariant, badge_pill, bordered_button, button, hbetween, hstack, icon,
+    section_label, vstack,
+};
 use crate::assets::Icon;
 use crate::platform::REVEAL_IN_FILE_MANAGER_LABEL;
-use crate::theme::{BUILTIN_THEMES, BuiltinThemeInfo, FONT_MONO, ThemeTokens};
+use crate::theme::{
+    BUILTIN_THEMES, BuiltinThemeInfo, FONT_MONO, ThemeTokens, theme_preview_colors,
+};
 
 const DOCK_BUTTON_TOGGLES: &[(&str, &str)] = &[
     ("screenshot", "截图"),
@@ -31,15 +37,6 @@ const DOCK_BUTTON_TOGGLES: &[(&str, &str)] = &[
     ("favorite", "收藏"),
 ];
 
-fn theme_swatch_colors(id: &str) -> (u32, u32) {
-    match id {
-        "oled" => (0x000000, 0xFF5B1F),
-        "studio" => (0x141312, 0xE59934),
-        "glacier" => (0x0B0E14, 0x38BDF8),
-        _ => (0x0E0F11, 0xFF5B1F),
-    }
-}
-
 fn render_theme_card(
     card_ix: usize,
     th: &BuiltinThemeInfo,
@@ -47,7 +44,7 @@ fn render_theme_card(
     t: ThemeTokens,
     cx: &Context<IrisWindow>,
 ) -> AnyElement {
-    let (bg_hex, acc_hex) = theme_swatch_colors(th.id);
+    let (bg_hex, acc_hex) = theme_preview_colors(th.id);
     let (tid, tname) = (th.id, th.name);
     let swatch = div()
         .w(px(18.))
@@ -87,13 +84,13 @@ fn render_theme_card(
                 .child(
                     hstack(6.)
                         .child(swatch)
-                        .child(div().text_size(px(12.)).text_color(t.text).child(th.name)),
+                        .child(div().text_size(t.text_md).text_color(t.text).child(th.name)),
                 )
                 .when(active, |d| d.child(icon(Icon::Check, 12., t.accent))),
         )
         .child(
             div()
-                .text_size(px(10.))
+                .text_size(t.text_xs)
                 .text_color(t.text_faint)
                 .truncate()
                 .child(th.description),
@@ -114,11 +111,11 @@ fn reveal_path_row(
             vstack(2.)
                 .flex_1()
                 .min_w(px(0.))
-                .child(div().text_size(px(12.)).child(title))
+                .child(div().text_size(t.text_md).child(title))
                 .child(
                     div()
                         .font_family(FONT_MONO)
-                        .text_size(px(10.))
+                        .text_size(t.text_xs)
                         .text_color(t.text_faint)
                         .truncate()
                         .child(display_path),
@@ -219,13 +216,12 @@ impl IrisWindow {
             s.always_on_top,
         );
 
+        let ui_scale = s.ui_font_scale;
+        let confirm_recent = self.is_confirming("clear-recent");
+        let confirm_progress = self.is_confirming("clear-progress");
+
         let data_sec = vstack(10.)
-            .child(
-                div()
-                    .text_size(px(11.))
-                    .text_color(t.text_dim)
-                    .child("应用数据与历史清理"),
-            )
+            .child(section_label("应用数据与历史清理", t))
             .child(reveal_path_row(
                 "reveal-cfg",
                 "配置与数据目录",
@@ -259,19 +255,49 @@ impl IrisWindow {
             .child(setting_row(
                 "最近打开记录",
                 "清除空窗口显示的最近打开文件与远程地址列表",
-                bordered_button("clear-recent-btn", "清除最近", false, t).on_click(cx.listener(
-                    |this, _, _, cx| {
+                button(
+                    "clear-recent-btn",
+                    if confirm_recent {
+                        "再次点击确认"
+                    } else {
+                        "清除最近"
+                    },
+                    if confirm_recent {
+                        ButtonVariant::Danger
+                    } else {
+                        ButtonVariant::Secondary
+                    },
+                    ButtonSize::Md,
+                    t,
+                )
+                .on_click(cx.listener(|this, _, _, cx| {
+                    if this.confirm_destructive("clear-recent", cx) {
                         this.store.clear_recent();
                         this.show_toast("已清除最近打开记录", cx);
-                    },
-                )),
+                    }
+                })),
                 t,
             ))
             .child(setting_row(
                 "播放进度历史",
                 "清除所有本地与远程媒体的续播时间点，收藏列表不受影响",
-                bordered_button("clear-progress", "清除进度", false, t).on_click(cx.listener(
-                    |this, _, _, cx| {
+                button(
+                    "clear-progress",
+                    if confirm_progress {
+                        "再次点击确认"
+                    } else {
+                        "清除进度"
+                    },
+                    if confirm_progress {
+                        ButtonVariant::Danger
+                    } else {
+                        ButtonVariant::Secondary
+                    },
+                    ButtonSize::Md,
+                    t,
+                )
+                .on_click(cx.listener(|this, _, _, cx| {
+                    if this.confirm_destructive("clear-progress", cx) {
                         let n = this.store.clear_progress();
                         let msg = if n > 0 {
                             format!("已清除 {n} 条播放进度")
@@ -279,8 +305,8 @@ impl IrisWindow {
                             "没有可清除的播放进度".into()
                         };
                         this.show_toast(msg, cx);
-                    },
-                )),
+                    }
+                })),
                 t,
             ));
 
@@ -296,13 +322,13 @@ impl IrisWindow {
                                 vstack(2.)
                                     .child(
                                         div()
-                                            .text_size(px(12.))
+                                            .text_size(t.text_md)
                                             .text_color(t.text)
                                             .child("色彩与面板主题"),
                                     )
                                     .child(
                                         div()
-                                            .text_size(px(11.))
+                                            .text_size(t.text_sm)
                                             .text_color(t.text_faint)
                                             .child("内置 4 套工作台色彩方案，实时无重启切换"),
                                     ),
@@ -329,6 +355,39 @@ impl IrisWindow {
                     )
                     .child(vstack(6.).children(theme_rows)),
             )
+            .child(setting_row(
+                "界面字体缩放",
+                "全局缩放界面字号与控件行高（85%–135%），实时生效且不随预设覆盖",
+                stepper(
+                    "set-ui-font-scale",
+                    format!("{:.0}%", ui_scale * 100.),
+                    (ui_scale - DEFAULT_UI_FONT_SCALE).abs() > 0.01,
+                    t,
+                    cx.listener(|this, _, _, cx| {
+                        this.settings.ui_font_scale =
+                            (((this.settings.ui_font_scale - 0.05) * 100.).round() / 100.)
+                                .clamp(MIN_UI_FONT_SCALE, MAX_UI_FONT_SCALE);
+                        this.preset_rt.record_user_edit(&this.settings);
+                        this.sync_theme_tokens(cx);
+                        cx.notify();
+                    }),
+                    cx.listener(|this, _, _, cx| {
+                        this.settings.ui_font_scale =
+                            (((this.settings.ui_font_scale + 0.05) * 100.).round() / 100.)
+                                .clamp(MIN_UI_FONT_SCALE, MAX_UI_FONT_SCALE);
+                        this.preset_rt.record_user_edit(&this.settings);
+                        this.sync_theme_tokens(cx);
+                        cx.notify();
+                    }),
+                    cx.listener(|this, _, _, cx| {
+                        this.settings.ui_font_scale = DEFAULT_UI_FONT_SCALE;
+                        this.preset_rt.record_user_edit(&this.settings);
+                        this.sync_theme_tokens(cx);
+                        cx.notify();
+                    }),
+                ),
+                t,
+            ))
             .child(setting_row(
                 "侧栏停靠位置",
                 "全屏时将鼠标移到这一侧的屏幕边缘可展开侧栏，移回画面可收起",
@@ -470,13 +529,13 @@ impl IrisWindow {
                         vstack(2.)
                             .child(
                                 div()
-                                    .text_size(px(12.))
+                                    .text_size(t.text_md)
                                     .text_color(t.text)
                                     .child("底栏常驻按钮显隐"),
                             )
                             .child(
                                 div()
-                                    .text_size(px(11.))
+                                    .text_size(t.text_sm)
                                     .text_color(t.text_faint)
                                     .child("勾选要在底部控制栏常驻显示的功能按钮"),
                             ),

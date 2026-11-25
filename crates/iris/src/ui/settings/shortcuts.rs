@@ -9,8 +9,8 @@ use iris_core::keymap::{self, KeymapScheme};
 
 use super::super::IrisWindow;
 use super::super::actions::rebind_keys;
-use super::super::kit::badge_pill;
 use super::super::kit::form::{chip_button, segmented};
+use super::super::kit::{badge_pill, section_label};
 use crate::platform::IS_MACOS;
 use crate::theme::{FONT_MONO, FONT_UI, ThemeTokens};
 
@@ -152,13 +152,13 @@ impl IrisWindow {
                                     .gap(px(2.))
                                     .child(
                                         div()
-                                            .text_size(px(12.))
+                                            .text_size(t.text_md)
                                             .text_color(t.text)
                                             .child("快捷键方案与自定义录制"),
                                     )
                                     .child(
                                         div()
-                                            .text_size(px(11.))
+                                            .text_size(t.text_sm)
                                             .text_color(t.text_faint)
                                             .child(cur_scheme.description()),
                                     ),
@@ -221,7 +221,7 @@ impl IrisWindow {
                         .items_center()
                         .justify_between()
                         .gap(px(8.))
-                        .child(div().text_size(px(11.)).text_color(t.text).child(format!(
+                        .child(div().text_size(t.text_sm).text_color(t.text).child(format!(
                             "正在录制「{rec}」：请直接按下目标按键或组合键，按 Esc 取消"
                         )))
                         .child(chip_button("cancel-rec-banner", "取消", false, t).on_click(
@@ -246,7 +246,7 @@ impl IrisWindow {
                         .items_center()
                         .justify_between()
                         .gap(px(8.))
-                        .child(div().text_size(px(11.)).text_color(t.danger).child(msg))
+                        .child(div().text_size(t.text_sm).text_color(t.danger).child(msg))
                         .child(
                             chip_button("dismiss-conflict-banner", "知道了", false, t).on_click(
                                 cx.listener(|this, _, _, cx| {
@@ -266,13 +266,10 @@ impl IrisWindow {
                         .flex_col()
                         .gap(px(4.))
                         .child(
-                            div()
-                                .text_size(px(11.))
-                                .text_color(t.text_dim)
+                            section_label(cat_title, t)
                                 .pb(px(4.))
                                 .border_b_1()
-                                .border_color(t.line)
-                                .child(cat_title),
+                                .border_color(t.line),
                         )
                         .children(entries.into_iter().map(move |entry| {
                             self.render_shortcut_recorder_row(
@@ -294,13 +291,10 @@ impl IrisWindow {
                     .gap(px(4.))
                     .pt(px(4.))
                     .child(
-                        div()
-                            .text_size(px(11.))
-                            .text_color(t.text_dim)
+                        section_label("工作区预设快捷键", t)
                             .pb(px(4.))
                             .border_b_1()
-                            .border_color(t.line)
-                            .child("工作区预设快捷键"),
+                            .border_color(t.line),
                     )
                     .children(preset_rows.into_iter().map(|(target_id, title)| {
                         self.render_shortcut_recorder_row(
@@ -322,13 +316,10 @@ impl IrisWindow {
                         .gap(px(4.))
                         .pt(px(4.))
                         .child(
-                            div()
-                                .text_size(px(11.))
-                                .text_color(t.text_dim)
+                            section_label("启用插件命令快捷键", t)
                                 .pb(px(4.))
                                 .border_b_1()
-                                .border_color(t.line)
-                                .child("启用插件命令快捷键"),
+                                .border_color(t.line),
                         )
                         .children(plugin_rows.into_iter().map(|(target_id, title)| {
                             self.render_shortcut_recorder_row(
@@ -378,7 +369,7 @@ impl IrisWindow {
         let reset_btn_id = SharedString::from(format!("sc-rst:{target_id}"));
 
         div()
-            .min_h(px(28.))
+            .min_h(t.row_h)
             .py(px(2.))
             .flex()
             .items_center()
@@ -393,7 +384,7 @@ impl IrisWindow {
                     .gap(px(6.))
                     .child(
                         div()
-                            .text_size(px(12.))
+                            .text_size(t.text_md)
                             .text_color(if is_recording { t.text } else { t.text_muted })
                             .truncate()
                             .child(title),
@@ -427,7 +418,7 @@ impl IrisWindow {
                     .child(
                         div()
                             .id(row_btn_id)
-                            .h(px(24.))
+                            .h(t.control_h_sm)
                             .min_w(px(68.))
                             .px(px(8.))
                             .flex()
@@ -440,7 +431,7 @@ impl IrisWindow {
                             } else {
                                 FONT_MONO
                             })
-                            .text_size(px(11.))
+                            .text_size(t.text_sm)
                             .bg(if is_recording {
                                 t.selected
                             } else {

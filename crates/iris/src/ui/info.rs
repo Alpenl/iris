@@ -3,13 +3,13 @@
 use gpui::prelude::FluentBuilder;
 use gpui::{
     Context, InteractiveElement, IntoElement, MouseButton, ParentElement,
-    StatefulInteractiveElement, Styled, div, px,
+    StatefulInteractiveElement, Styled, Window, div, px,
 };
 use iris_core::library::{Kind, format_size};
 use iris_core::settings::Side;
 
 use super::IrisWindow;
-use super::kit::{icon_button, tip};
+use super::kit::{icon_button, panel_header, tip};
 use crate::assets::Icon;
 use crate::theme::{FLOAT_GAP, FONT_MONO, ThemeTokens};
 
@@ -17,6 +17,7 @@ impl IrisWindow {
     pub(super) fn render_info_overlay(
         &self,
         fullscreen: bool,
+        window: &Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let t = ThemeTokens::of(cx);
@@ -127,14 +128,25 @@ impl IrisWindow {
             None => {}
         }
 
+        let vp = window.viewport_size();
         let top = if fullscreen { FLOAT_GAP + 36. } else { 12. };
+        let panel_w = (f32::from(vp.width) - 24.).clamp(200., 330.);
+        let max_h = (f32::from(vp.height) - top - 16.).max(160.);
+        let close_btn = icon_button("info-close", Icon::Close, false, t)
+            .tooltip(tip("关闭详情", self.key_hint("toggle_info")))
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.overlays.info_open = false;
+                cx.notify();
+            }))
+            .into_any_element();
         let panel_box =
             div()
                 .id("media-info")
                 .absolute()
                 .top(px(top))
-                .w(px(330.))
-                .max_w(px(330.))
+                .w(px(panel_w))
+                .max_w(px(panel_w))
+                .max_h(px(max_h))
                 .flex()
                 .flex_col()
                 .rounded(t.radius_lg)
@@ -144,59 +156,38 @@ impl IrisWindow {
                 .border_color(t.line_strong)
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+                .child(panel_header("媒体详情", None, Some(close_btn), t))
                 .child(
                     div()
-                        .h(px(32.))
-                        .px(px(10.))
+                        .id("media-info-scroll")
+                        .flex_1()
+                        .min_h(px(0.))
+                        .overflow_y_scroll()
                         .flex()
-                        .items_center()
-                        .justify_between()
-                        .border_b_1()
-                        .border_color(t.line)
-                        .child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap(px(8.))
-                                .child(div().size(px(6.)).bg(t.accent))
-                                .child(
-                                    div()
-                                        .text_size(px(12.))
-                                        .text_color(t.text)
-                                        .child("媒体详情"),
-                                ),
-                        )
-                        .child(
-                            icon_button("info-close", Icon::Close, false, t)
-                                .tooltip(tip("关闭详情", self.key_hint("toggle_info")))
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.overlays.info_open = false;
-                                    cx.notify();
-                                })),
-                        ),
-                )
-                .child(div().p(px(10.)).flex().flex_col().gap(px(6.)).children(
-                    rows.into_iter().map(|(k, v)| {
-                        div()
-                            .flex()
-                            .items_baseline()
-                            .justify_between()
-                            .gap(px(12.))
-                            .text_size(px(11.))
-                            .child(div().flex_none().text_color(t.text_dim).child(k))
-                            .child(
+                        .flex_col()
+                        .child(div().p(px(10.)).flex().flex_col().gap(px(6.)).children(
+                            rows.into_iter().map(|(k, v)| {
                                 div()
-                                    .min_w(px(0.))
-                                    .truncate()
-                                    .font_family(FONT_MONO)
-                                    .text_color(t.text)
-                                    .child(v),
-                            )
-                    }),
-                ))
-                .when_some(
-                    self.render_personal_annotations(t, cx),
-                    |view, annotations| view.child(annotations),
+                                    .flex()
+                                    .items_baseline()
+                                    .justify_between()
+                                    .gap(px(12.))
+                                    .text_size(t.text_sm)
+                                    .child(div().flex_none().text_color(t.text_dim).child(k))
+                                    .child(
+                                        div()
+                                            .min_w(px(0.))
+                                            .truncate()
+                                            .font_family(FONT_MONO)
+                                            .text_color(t.text)
+                                            .child(v),
+                                    )
+                            }),
+                        ))
+                        .when_some(
+                            self.render_personal_annotations(t, cx),
+                            |view, annotations| view.child(annotations),
+                        ),
                 );
 
         let place_left = if fullscreen {

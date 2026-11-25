@@ -21,38 +21,40 @@ pub(in crate::ui) fn setting_row(
     let desc = desc.into();
     div()
         .flex()
+        .flex_wrap()
         .items_center()
         .justify_between()
-        .gap(px(16.))
+        .gap_x(px(16.))
+        .gap_y(px(8.))
         .pb(px(12.))
         .border_b_1()
         .border_color(t.line)
         .child(
             div()
                 .flex_1()
-                .min_w(px(0.))
+                .min_w(px(160.))
                 .flex()
                 .flex_col()
                 .gap(px(2.))
                 .child(
                     div()
-                        .text_size(px(12.))
+                        .text_size(t.text_md)
                         .text_color(t.text)
                         .child(title.into()),
                 )
                 .when(!desc.is_empty(), |d| {
                     d.child(
                         div()
-                            .text_size(px(11.))
+                            .text_size(t.text_sm)
                             .text_color(t.text_faint)
                             .child(desc),
                     )
                 }),
         )
-        .child(div().flex_none().child(control))
+        .child(div().flex_shrink_0().max_w_full().child(control))
 }
 
-/// Compact 24px framed action/chip button (`active = true` highlights `t.accent` border).
+/// Compact framed action/chip button (`active = true` highlights `t.accent` border).
 pub(in crate::ui) fn chip_button(
     id: impl Into<ElementId>,
     label: impl Into<SharedString>,
@@ -61,7 +63,7 @@ pub(in crate::ui) fn chip_button(
 ) -> Stateful<Div> {
     div()
         .id(id)
-        .h(px(24.))
+        .h(t.control_h_sm)
         .px(px(8.))
         .flex_none()
         .flex()
@@ -73,7 +75,7 @@ pub(in crate::ui) fn chip_button(
         .bg(if active { t.selected } else { t.panel })
         .border_1()
         .border_color(if active { t.accent } else { t.line_strong })
-        .text_size(px(11.))
+        .text_size(t.text_sm)
         .text_color(if active { t.text } else { t.text_muted })
         .hover(|s| s.bg(t.hover).text_color(t.text))
         .active(|s| s.bg(t.selected))
@@ -145,7 +147,7 @@ pub(in crate::ui) fn checkbox(
         .child(check_indicator(checked, 15., t))
         .child(
             div()
-                .text_size(px(12.))
+                .text_size(t.text_md)
                 .text_color(if checked { t.text } else { t.text_muted })
                 .child(label.into()),
         )
@@ -161,6 +163,7 @@ pub(in crate::ui) fn segmented<T: Copy + PartialEq + 'static>(
 ) -> Div {
     div()
         .flex()
+        .flex_wrap()
         .items_center()
         .rounded(t.radius_md)
         .overflow_hidden()
@@ -171,12 +174,12 @@ pub(in crate::ui) fn segmented<T: Copy + PartialEq + 'static>(
             let active = value == current;
             div()
                 .id((id, i))
-                .h(px(24.))
+                .h(t.control_h_sm)
                 .px(px(10.))
                 .flex()
                 .items_center()
                 .cursor_pointer()
-                .text_size(px(11.))
+                .text_size(t.text_sm)
                 .when(i > 0, |d| d.border_l_1().border_color(t.line))
                 .when(active, |d| d.bg(t.selected).text_color(t.text))
                 .when(!active, |d| {
@@ -205,7 +208,7 @@ pub(in crate::ui) fn stepper_box(
     let step_btn = |btn_id: ElementId, glyph: Icon, right_border: bool| {
         div()
             .id(btn_id)
-            .size(px(24.))
+            .size(t.control_h_sm)
             .flex()
             .items_center()
             .justify_center()
@@ -233,7 +236,7 @@ pub(in crate::ui) fn stepper_box(
                 .flex()
                 .justify_center()
                 .font_family(FONT_MONO)
-                .text_size(px(11.))
+                .text_size(t.text_sm)
                 .text_color(t.text)
                 .child(display.into()),
         )
@@ -257,13 +260,13 @@ pub(in crate::ui) fn stepper(
             d.child(
                 div()
                     .id((id, 99usize))
-                    .h(px(24.))
+                    .h(t.control_h_sm)
                     .px(px(8.))
                     .flex()
                     .items_center()
                     .rounded(t.radius_sm)
                     .cursor_pointer()
-                    .text_size(px(11.))
+                    .text_size(t.text_sm)
                     .text_color(t.text_dim)
                     .hover(|s| s.bg(t.hover).text_color(t.text))
                     .child("重置")

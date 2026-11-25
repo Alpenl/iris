@@ -204,7 +204,7 @@ impl IrisWindow {
                     .gap(px(8.))
                     .child(
                         div()
-                            .text_size(px(11.))
+                            .text_size(t.text_sm)
                             .text_color(t.text_dim)
                             .child("支持 HTTP / HTTPS 视频、HLS (.m3u8)、音频与远程图片直链"),
                     )
@@ -268,7 +268,7 @@ impl IrisWindow {
                             .gap(px(4.))
                             .child(
                                 div()
-                                    .text_size(px(11.))
+                                    .text_size(t.text_sm)
                                     .text_color(t.text_muted)
                                     .child("预设名称"),
                             )
@@ -281,7 +281,7 @@ impl IrisWindow {
                             .gap(px(4.))
                             .child(
                                 div()
-                                    .text_size(px(11.))
+                                    .text_size(t.text_sm)
                                     .text_color(t.text_muted)
                                     .child("备注说明"),
                             )
@@ -295,7 +295,7 @@ impl IrisWindow {
                             .pt(px(4.))
                             .child(
                                 div()
-                                    .text_size(px(11.))
+                                    .text_size(t.text_sm)
                                     .text_color(t.text_dim)
                                     .child("包含配置范围"),
                             )
@@ -367,14 +367,14 @@ impl IrisWindow {
                     .gap(px(8.))
                     .child(
                         div()
-                            .text_size(px(12.))
+                            .text_size(t.text_md)
                             .text_color(t.text)
                             .child(format!("确定要删除插件「{plugin_name}」吗？")),
                     )
                     .child(
                         div()
                             .font_family(crate::theme::FONT_MONO)
-                            .text_size(px(11.))
+                            .text_size(t.text_sm)
                             .text_color(t.text_muted)
                             .child(plugin_id),
                     )
@@ -392,7 +392,7 @@ impl IrisWindow {
                             cx.notify();
                         }),
                     ))
-                    .child(div().text_size(px(11.)).text_color(t.text_dim).child(desc))
+                    .child(div().text_size(t.text_sm).text_color(t.text_dim).child(desc))
                     .into_any_element();
                 ("删除插件", "确认删除", content, submit)
             }
