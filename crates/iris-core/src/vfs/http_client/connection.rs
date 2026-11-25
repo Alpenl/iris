@@ -1,4 +1,6 @@
 //! Resolution, connection setup and cancellation shared by VFS and authenticated playback.
+pub(crate) mod doh;
+pub(crate) mod duplex;
 
 use std::collections::BTreeMap;
 use std::io::{self, Read, Write};
@@ -12,68 +14,14 @@ use rustls_pki_types::ServerName;
 use url::{Host, Url};
 
 use super::{CONNECT_TIMEOUT, IO_TIMEOUT};
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum AddressKind {
-    Public,
-    Private,
-    Loopback,
-    Forbidden,
-}
-
-fn address_kind(ip: IpAddr) -> AddressKind {
-    match ip.to_canonical() {
-        IpAddr::V4(v4) => {
-            let [a, b, ..] = v4.octets();
-            if a == 0
-                || v4.is_link_local()
-                || v4.is_multicast()
-                || a >= 240
-                || (a == 192 && b == 0 && v4.octets()[2] == 0)
-                || (a == 198 && (18..=19).contains(&b))
-            {
-                AddressKind::Forbidden
-            } else if v4.is_loopback() {
-                AddressKind::Loopback
-            } else if v4.is_private() || (a == 100 && (64..128).contains(&b)) {
-                AddressKind::Private
-            } else {
-                AddressKind::Public
-            }
-        }
-        IpAddr::V6(v6) => {
-            let parts = v6.segments();
-            if v6.is_unspecified()
-                || v6.is_unicast_link_local()
-                || v6.is_multicast()
-                || parts[0] & 0xffc0 == 0xfec0
-                || v6 == std::net::Ipv6Addr::new(0xfd00, 0xec2, 0, 0, 0, 0, 0, 0x254)
-            {
-                AddressKind::Forbidden
-            } else if v6.is_loopback() {
-                AddressKind::Loopback
-            } else if parts[..6] == [0; 6]
-                || parts[..6] == [0x64, 0xff9b, 0, 0, 0, 0]
-                || parts[..3] == [0x64, 0xff9b, 1]
-                || parts[0] == 0x2002
-                || parts[..2] == [0x2001, 0]
-            {
-                // Embedded destinations depend on tunnel configuration. Only
-                // canonical IPv4-mapped addresses have native IPv4 semantics.
-                AddressKind::Forbidden
-            } else if v6.is_unique_local() {
-                AddressKind::Private
-            } else {
-                AddressKind::Public
-            }
-        }
-    }
-}
+use crate::plugin_v2::network::{AddressKind, address_kind};
 
 /// Private destinations are limited to the selected host's original addresses.
 /// Public origins never acquire permission for a private destination via redirect or DNS.
 pub(crate) struct NetworkScope {
     pub(super) source: Url,
     private_peers: OnceLock<Vec<IpAddr>>,
+    policy: Option<Arc<crate::plugin_v2::network::RequestGrant>>,
 }
 
 impl NetworkScope {
@@ -81,6 +29,7 @@ impl NetworkScope {
         Self {
             source,
             private_peers: OnceLock::new(),
+            policy: None,
         }
     }
 
@@ -88,7 +37,22 @@ impl NetworkScope {
         &self.source
     }
 
+    pub(crate) fn authorized(
+        source: Url,
+        policy: Arc<crate::plugin_v2::network::RequestGrant>,
+    ) -> Result<Self> {
+        policy.check_url(&source)?;
+        Ok(Self {
+            source,
+            private_peers: OnceLock::new(),
+            policy: Some(policy),
+        })
+    }
+
     fn permits(&self, url: &Url, addr: SocketAddr) -> bool {
+        if let Some(policy) = &self.policy {
+            return policy.check_address(url, addr).is_ok();
+        }
         let ip = addr.ip().to_canonical();
         match address_kind(ip) {
             AddressKind::Forbidden => false,
@@ -114,19 +78,61 @@ struct CancelState {
     cancelled: bool,
     next_id: u64,
     sockets: BTreeMap<u64, TcpStream>,
-    connects: BTreeMap<u64, Waker>,
+    connects: BTreeMap<u64, Arc<Waker>>,
+    children: Vec<std::sync::Weak<Mutex<CancelState>>>,
 }
 
 impl HttpCancel {
-    pub fn cancel(&self) {
+    /// Link an operation to a second cancellation authority without transferring
+    /// ownership. Used for instance lifetime AND network-grant revocation.
+    pub(crate) fn link(&self, child: &HttpCancel) -> Result<()> {
+        if Arc::ptr_eq(&self.0, &child.0) {
+            return Ok(());
+        }
         let mut state = self.0.lock().unwrap();
-        state.cancelled = true;
-        for socket in state.sockets.values() {
-            let _ = socket.shutdown(Shutdown::Both);
+        if state.cancelled {
+            drop(state);
+            child.cancel();
+            bail!("operation cancelled");
         }
-        for wake in state.connects.values() {
-            let _ = wake.wake();
+        state.children.retain(|w| w.strong_count() > 0);
+        if !state
+            .children
+            .iter()
+            .any(|w| w.ptr_eq(&Arc::downgrade(&child.0)))
+        {
+            state.children.push(Arc::downgrade(&child.0));
         }
+        Ok(())
+    }
+    pub fn cancel(&self) {
+        let children = {
+            let mut state = self.0.lock().unwrap();
+            state.cancelled = true;
+            for socket in state.sockets.values() {
+                let _ = socket.shutdown(Shutdown::Both);
+            }
+            for wake in state.connects.values() {
+                let _ = wake.wake();
+            }
+            std::mem::take(&mut state.children)
+        };
+        for child in children {
+            if let Some(arc) = child.upgrade() {
+                Self(arc).cancel();
+            }
+        }
+    }
+
+    pub(crate) fn child(&self) -> Result<Self> {
+        let mut state = self.0.lock().unwrap();
+        if state.cancelled {
+            bail!("HTTP request cancelled");
+        }
+        state.children.retain(|w| w.strong_count() > 0);
+        let child = Self::default();
+        state.children.push(Arc::downgrade(&child.0));
+        Ok(child)
     }
 
     pub fn is_cancelled(&self) -> bool {
@@ -144,6 +150,9 @@ impl HttpCancel {
         Ok(SocketRegistration(self.clone(), id))
     }
     fn register_connect(&self, wake: Waker) -> Result<ConnectRegistration> {
+        self.register_shared_wake(Arc::new(wake))
+    }
+    pub(crate) fn register_shared_wake(&self, wake: Arc<Waker>) -> Result<ConnectRegistration> {
         let mut state = self.0.lock().unwrap();
         if state.cancelled {
             bail!("HTTP request cancelled");
@@ -163,7 +172,7 @@ impl Drop for SocketRegistration {
     }
 }
 
-struct ConnectRegistration(HttpCancel, u64);
+pub(crate) struct ConnectRegistration(HttpCancel, u64);
 
 impl Drop for ConnectRegistration {
     fn drop(&mut self) {
@@ -234,6 +243,7 @@ fn tls_config() -> Result<Arc<rustls::ClientConfig>> {
 pub(super) struct TimedSocket {
     tcp: TcpStream,
     deadline: Option<Instant>,
+    idle_timeout: Duration,
 }
 
 impl TimedSocket {
@@ -242,7 +252,7 @@ impl TimedSocket {
             .map(|d| {
                 d.checked_duration_since(Instant::now())
                     .filter(|d| !d.is_zero())
-                    .map(|d| d.min(IO_TIMEOUT))
+                    .map(|d| d.min(self.idle_timeout))
                     .ok_or_else(|| {
                         io::Error::new(io::ErrorKind::TimedOut, "HTTP request deadline exceeded")
                     })
@@ -285,7 +295,7 @@ impl Transport {
             Self::Tls(s) => &mut s.sock,
         };
         socket.deadline = deadline;
-        socket.tcp.set_read_timeout(Some(IO_TIMEOUT))
+        socket.tcp.set_read_timeout(Some(socket.idle_timeout))
     }
 }
 
@@ -319,13 +329,15 @@ pub(super) fn remaining_timeout(
     limit: Duration,
 ) -> Result<Duration> {
     if cancel.is_cancelled() {
-        bail!("HTTP request cancelled");
+        return Err(anyhow::Error::new(iris_api::v2::ErrorCode::Cancelled)
+            .context("HTTP request cancelled"));
     }
     let left = deadline.map_or(limit, |d| {
         d.saturating_duration_since(Instant::now()).min(limit)
     });
     if left.is_zero() {
-        bail!("HTTP request deadline exceeded");
+        return Err(anyhow::Error::new(iris_api::v2::ErrorCode::Timeout)
+            .context("HTTP request deadline exceeded"));
     }
     Ok(left)
 }
@@ -337,6 +349,7 @@ fn resolve_system(
     host: &str,
     cancel: &HttpCancel,
     deadline: Option<Instant>,
+    scope: &NetworkScope,
 ) -> Result<Vec<IpAddr>> {
     // The platform resolver preserves the hosts file, split DNS, and Bonjour.
     // Share one outstanding lookup per host and isolate its bounded workers
@@ -347,19 +360,34 @@ fn resolve_system(
     let lookup = if let Some(lookup) = pending.get(host) {
         lookup.clone()
     } else {
-        if pending.len() >= 8 {
+        let limit = 16;
+        if pending.len() >= limit {
             bail!("system DNS lookup limit reached");
         }
+        let dns_reservation = scope.policy.as_ref().map(|p| p.reserve_dns()).transpose()?;
         let lookup = Arc::new((Mutex::new(None), std::sync::Condvar::new()));
         let worker = lookup.clone();
         let hostname = host.to_owned();
         std::thread::Builder::new()
             .name("iris-http-dns".into())
             .spawn(move || {
+                let _dns_reservation = dns_reservation;
+                let worker_deadline = Instant::now() + CONNECT_TIMEOUT;
+                let worker_cancel = HttpCancel::default();
                 let result = (hostname.as_str(), 0)
                     .to_socket_addrs()
-                    .map(|addrs| addrs.map(|addr| addr.ip()).collect())
-                    .map_err(|err| err.to_string());
+                    .map_err(|err| err.to_string())
+                    .and_then(|addrs| {
+                        let ips: Vec<_> = addrs.take(65).map(|addr| addr.ip()).collect();
+                        if ips.len() > 64 {
+                            Err("system DNS result exceeds address limit".into())
+                        } else if doh::should_bypass_fake_ip(&hostname, &ips) {
+                            doh::resolve_a_records(&hostname, &worker_cancel, worker_deadline)
+                                .map_err(|err| format!("DoH fallback failed: {err}"))
+                        } else {
+                            Ok(ips)
+                        }
+                    });
                 *worker.0.lock().unwrap() = Some(result);
                 worker.1.notify_all();
                 LOOKUPS.lock().unwrap().remove(&hostname);
@@ -416,12 +444,39 @@ fn connect_tcp(
     }
 }
 
+fn filter_resolved_ips(ips: impl IntoIterator<Item = IpAddr>) -> Vec<IpAddr> {
+    ips.into_iter()
+        .filter(|ip| !matches!(ip, IpAddr::V6(v6) if v6.is_unicast_link_local()))
+        .collect()
+}
+
 pub(super) fn connect_transport(
     url: &Url,
     scope: &NetworkScope,
     cancel: &HttpCancel,
     deadline: Option<Instant>,
 ) -> Result<(Transport, SocketRegistration)> {
+    connect_authorized(url, scope, cancel, deadline, true)
+}
+
+// A trusted HTTP proxy CONNECT keeps TLS end-to-end with the native tool. The
+// original https Origin still drives DNS and peer authorization.
+fn connect_authorized(
+    url: &Url,
+    scope: &NetworkScope,
+    cancel: &HttpCancel,
+    deadline: Option<Instant>,
+    negotiate_tls: bool,
+) -> Result<(Transport, SocketRegistration)> {
+    if let Some(policy) = &scope.policy {
+        policy.check_url(url)?;
+        policy.cancel().link(cancel)?;
+    }
+    let connect_deadline = if scope.policy.is_some() {
+        Some(Instant::now() + remaining_timeout(cancel, deadline, CONNECT_TIMEOUT)?)
+    } else {
+        deadline
+    };
     let raw_host = url.host_str().ok_or_else(|| anyhow!("missing URL host"))?;
     let host = raw_host
         .strip_prefix('[')
@@ -431,17 +486,19 @@ pub(super) fn connect_transport(
     let addrs = if let Ok(ip) = host.parse::<IpAddr>() {
         vec![SocketAddr::new(ip, port)]
     } else {
-        resolve_system(host, cancel, deadline)?
-            .into_iter()
+        let ips = resolve_system(host, cancel, connect_deadline, scope)?;
+        let ips = filter_resolved_ips(ips);
+        ips.into_iter()
             .map(|ip| SocketAddr::new(ip, port))
             .collect()
     };
-    if addrs.is_empty() || addrs.iter().any(|&addr| !scope.permits(url, addr)) {
-        bail!("blocked disallowed or empty HTTP destination");
+    if addrs.is_empty() || !addrs.iter().all(|&addr| scope.permits(url, addr)) {
+        return Err(anyhow::Error::new(iris_api::v2::ErrorCode::Denied)
+            .context("blocked disallowed or empty HTTP destination"));
     }
     let mut connected = None;
     for &addr in &addrs {
-        if let Ok(tcp) = connect_tcp(addr, cancel, deadline) {
+        if let Ok(tcp) = connect_tcp(addr, cancel, connect_deadline) {
             if scope.source.origin() == url.origin() {
                 scope.private_peers.get_or_init(|| {
                     let kind = address_kind(addr.ip());
@@ -455,7 +512,7 @@ pub(super) fn connect_transport(
                         .collect()
                 });
             }
-            if !scope.permits(url, addr) {
+            if !scope.permits(url, tcp.peer_addr()?) {
                 bail!("HTTP peer outside authorized destination");
             }
             connected = Some(tcp);
@@ -464,14 +521,31 @@ pub(super) fn connect_transport(
     }
     let tcp = connected.ok_or_else(|| anyhow!("HTTP connection failed"))?;
     let registration = cancel.register(&tcp)?;
-    let timeout = remaining_timeout(cancel, deadline, IO_TIMEOUT)?;
+    let idle_timeout = if scope.policy.is_some() {
+        Duration::from_secs(30)
+    } else {
+        IO_TIMEOUT
+    };
+    let timeout = remaining_timeout(cancel, deadline, idle_timeout)?;
     tcp.set_nodelay(true)?;
     tcp.set_read_timeout(Some(timeout))?;
     tcp.set_write_timeout(Some(timeout))?;
-    let tcp = TimedSocket { tcp, deadline };
-    if url.scheme() == "https" {
+    let mut tcp = TimedSocket {
+        tcp,
+        deadline,
+        idle_timeout,
+    };
+    if negotiate_tls && matches!(url.scheme(), "https" | "wss") {
         let sni = ServerName::try_from(host.to_string()).map_err(|_| anyhow!("bad SNI: {host}"))?;
-        let conn = rustls::ClientConnection::new(tls_config()?, sni)?;
+        let mut conn = rustls::ClientConnection::new(tls_config()?, sni)?;
+        let handshake_end =
+            Instant::now() + remaining_timeout(cancel, connect_deadline, CONNECT_TIMEOUT)?;
+        tcp.deadline = Some(handshake_end);
+        while conn.is_handshaking() {
+            remaining_timeout(cancel, Some(handshake_end), CONNECT_TIMEOUT)?;
+            conn.complete_io(&mut tcp)?;
+        }
+        tcp.deadline = deadline;
         Ok((
             Transport::Tls(Box::new(rustls::StreamOwned::new(conn, tcp))),
             registration,
@@ -533,25 +607,51 @@ mod tests {
             assert!(!public.permits(&selected, addr));
         }
         assert!(!public.permits(&selected, "10.0.0.1:9010".parse().unwrap()));
-        assert!(public.permits(&other, "203.0.113.1:9010".parse().unwrap()));
+        assert!(public.permits(&other, "93.184.216.34:9010".parse().unwrap()));
     }
-}
 
-#[cfg(test)]
-#[test]
-fn cancelling_registered_socket_wakes_the_reader() {
-    let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
-    let mut reader = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-    let (_sender, _) = listener.accept().unwrap();
-    let cancel = HttpCancel::default();
-    let registration = cancel.register(&reader).unwrap();
-    let (done, result) = std::sync::mpsc::channel();
-    let worker = std::thread::spawn(move || {
-        let _registration = registration;
-        let value = reader.read(&mut [0]);
-        done.send(value).unwrap();
-    });
-    cancel.cancel();
-    assert!(!matches!(result.recv_timeout(Duration::from_secs(2)).unwrap(), Ok(n) if n > 0));
-    worker.join().unwrap();
+    #[test]
+    fn cancelling_registered_socket_wakes_the_reader() {
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let mut reader = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (_sender, _) = listener.accept().unwrap();
+        let cancel = HttpCancel::default();
+        let registration = cancel.register(&reader).unwrap();
+        let (done, result) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let _registration = registration;
+            let value = reader.read(&mut [0]);
+            done.send(value).unwrap();
+        });
+        cancel.cancel();
+        assert!(!matches!(result.recv_timeout(Duration::from_secs(2)).unwrap(), Ok(n) if n > 0));
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn dual_stack_dns_filters_ipv6_link_local_while_blocking_pure_link_local_and_literals() {
+        let bonjour = Url::parse("http://nas.local:5005/dav").unwrap();
+        let scope = NetworkScope::new(bonjour.clone());
+        let filtered = filter_resolved_ips([
+            "192.168.1.42".parse().unwrap(),
+            "fe80::1234:abcd".parse().unwrap(),
+        ]);
+        assert_eq!(filtered, vec!["192.168.1.42".parse::<IpAddr>().unwrap()]);
+        assert!(
+            filtered
+                .iter()
+                .all(|&ip| scope.permits(&bonjour, SocketAddr::new(ip, 5005)))
+        );
+
+        let only_link_local = filter_resolved_ips(["fe80::1".parse().unwrap()]);
+        assert!(only_link_local.is_empty());
+        assert!(validate_stream_url("http://[fe80::1]:5005/dav").is_err());
+
+        let parent = HttpCancel::default();
+        let child = parent.child().unwrap();
+        assert!(!child.is_cancelled());
+        parent.cancel();
+        assert!(child.is_cancelled());
+        assert!(parent.child().is_err());
+    }
 }

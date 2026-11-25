@@ -10,6 +10,7 @@ use iris_core::library::Kind;
 use iris_core::media_uri::MediaUri;
 
 use super::IrisWindow;
+use super::actions::{ClearAbLoop, CycleAbLoop};
 use super::actions::{
     CycleAspect, OpenFile, OpenSettings, RotateCw, TakeScreenshot, ToggleAlwaysOnTop, ToggleInfo,
     ToggleLoop, TogglePause,
@@ -48,7 +49,7 @@ impl IrisWindow {
         const MENU_W: f32 = 236.;
         let vp = window.viewport_size();
         let (vw, vh) = (f32::from(vp.width), f32::from(vp.height));
-        let items = match &menu.target {
+        let mut items = match &menu.target {
             ContextTarget::Viewport => self.viewport_context_items(t, cx),
             ContextTarget::Media {
                 uri,
@@ -64,8 +65,43 @@ impl IrisWindow {
                 cx,
             ),
         };
-        let est_h = (items.len() as f32 * f32::from(t.row_h)).clamp(120., 420.);
-        let x = f32::from(menu.pos.x).clamp(8., (vw - MENU_W - 8.).max(8.));
+        // Only the current viewport is a supported plugin context. Browsed
+        // files are never passed to a command as an implicit selection grant.
+        if matches!(menu.target, ContextTarget::Viewport) {
+            let commands = self.plugins.commands();
+            let mut contributions = commands
+                .into_iter()
+                .filter(|(_, _, c)| c.context_menu)
+                .take(32)
+                .peekable();
+            if contributions.peek().is_some() {
+                items.push(menu_divider(t).into_any_element());
+            }
+            for (plugin, name, command) in contributions {
+                let pid = plugin.to_owned();
+                let cid = command.id.clone();
+                let label = format!("{name} · {}", command.title);
+                items.push(
+                    menu_row(
+                        gpui::SharedString::from(format!("cm-plugin-{pid}-{cid}")),
+                        None,
+                        label,
+                        None,
+                        false,
+                        t,
+                    )
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.overlays.context_menu = None;
+                        this.invoke_plugin_command(&pid, &cid, window, cx);
+                    }))
+                    .into_any_element(),
+                );
+            }
+        }
+        let menu_w = MENU_W.min((vw - 16.).max(140.));
+        let max_h = (vh - 16.).clamp(96., 420.);
+        let est_h = (items.len() as f32 * f32::from(t.row_h) + 8.).clamp(96., max_h);
+        let x = f32::from(menu.pos.x).clamp(8., (vw - menu_w - 8.).max(8.));
         let y = f32::from(menu.pos.y).clamp(8., (vh - est_h - 8.).max(8.));
 
         div()
@@ -95,7 +131,9 @@ impl IrisWindow {
                     .absolute()
                     .left(px(x))
                     .top(px(y))
-                    .w(px(MENU_W))
+                    .w(px(menu_w))
+                    .max_h(px(max_h))
+                    .overflow_y_scroll()
                     .p(px(4.))
                     .flex()
                     .flex_col()
@@ -153,6 +191,40 @@ impl IrisWindow {
                 }))
                 .into_any_element(),
             );
+            if !st.is_live {
+                out.push(
+                    menu_row(
+                        "cm-vp-ab",
+                        Some(Icon::Repeat),
+                        "设置 A / B 点或清除区间",
+                        self.key_hint("cycle_ab_loop"),
+                        st.ab_start.is_some(),
+                        t,
+                    )
+                    .on_click(cx.listener(|this, _, w, cx| {
+                        this.overlays.context_menu = None;
+                        this.cycle_ab_loop(&CycleAbLoop, w, cx);
+                    }))
+                    .into_any_element(),
+                );
+                if st.ab_start.is_some() || st.ab_end.is_some() {
+                    out.push(
+                        menu_row(
+                            "cm-vp-ab-clear",
+                            None,
+                            "清除 A-B 循环",
+                            self.key_hint("clear_ab_loop"),
+                            false,
+                            t,
+                        )
+                        .on_click(cx.listener(|this, _, w, cx| {
+                            this.overlays.context_menu = None;
+                            this.clear_ab_loop(&ClearAbLoop, w, cx);
+                        }))
+                        .into_any_element(),
+                    );
+                }
+            }
             out.push(menu_divider(t).into_any_element());
         }
 
@@ -447,6 +519,7 @@ impl IrisWindow {
                     this.overlays.context_menu = None;
                     this.store.toggle_favorite(&u_fav);
                     this.rebuild_directory_rows();
+                    this.scan_visible_favorites(cx);
                     cx.notify();
                 }))
                 .into_any_element(),

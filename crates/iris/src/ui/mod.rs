@@ -6,8 +6,6 @@ mod action_view;
 mod actions;
 mod chrome;
 mod context_menu;
-#[cfg(test)]
-mod contract_tests;
 mod controls;
 #[cfg(any(debug_assertions, feature = "devtools"))]
 mod debug_cmd;
@@ -17,6 +15,7 @@ mod info;
 mod kit;
 mod palette;
 mod plugin_ctrl;
+mod plugin_runtime;
 mod plugin_ui;
 mod popover;
 mod preset_ctrl;
@@ -42,7 +41,7 @@ use iris_core::input::{self, PointerCommand, PointerInput};
 use iris_core::keymap::Keymap;
 use iris_core::library::Kind;
 use iris_core::player::{Command, MAX_SPEED, MIN_SPEED, Session};
-use iris_core::plugin::PluginManager;
+use iris_core::plugin_v2::ui::PluginManager;
 use iris_core::preset::{PresetManager, PresetRuntime, SidebarMode};
 use iris_core::settings::{Settings, Side};
 use iris_core::store::Store;
@@ -77,8 +76,10 @@ pub(crate) struct IrisWindow {
     preset_rt: PresetRuntime,
     keymap: Keymap,
     plugins: PluginManager,
+    plugin_view: plugin_runtime::PluginView,
     locations: LocationStore,
     store: Store,
+    store_flush: Option<Task<()>>,
     last_plugin_tick: Instant,
     last_save: Instant,
     last_now_playing: Instant,
@@ -173,7 +174,7 @@ impl IrisWindow {
         });
 
         let (plugins, mut plugin_wake_rx) =
-            PluginManager::load_with_wake(&settings.disabled_plugins);
+            PluginManager::load_with_wake(&settings.disabled_plugins, &settings.theme_id);
         let plugin_events = cx.spawn_in(window, async move |this, cx| {
             while plugin_wake_rx.next().await.is_some() {
                 if this
@@ -218,11 +219,9 @@ impl IrisWindow {
                             MediaKey::Pause if !state.paused && !state.ended => {
                                 this.command(Command::TogglePlayback, cx);
                             }
-                            #[cfg(target_os = "macos")]
                             MediaKey::Toggle => this.command(Command::TogglePlayback, cx),
                             MediaKey::Next => this.step(1, true, cx),
                             MediaKey::Prev => this.step(-1, true, cx),
-                            #[cfg(target_os = "windows")]
                             MediaKey::Seek(seconds) => {
                                 this.command(Command::SeekAbsolute(seconds), cx)
                             }
@@ -302,8 +301,10 @@ impl IrisWindow {
             preset_rt,
             keymap,
             plugins,
+            plugin_view: plugin_runtime::PluginView::new(init_plugin_cmds),
             locations: LocationStore::load(),
             store: Store::load(),
+            store_flush: None,
             last_plugin_tick: now,
             last_save: now,
             last_now_playing: now - Duration::from_secs(10),
@@ -316,9 +317,6 @@ impl IrisWindow {
             _plugin_events: plugin_events,
         };
 
-        for (pid, cmd_id) in init_plugin_cmds {
-            this.invoke_plugin_command(&pid, &cmd_id, window, cx);
-        }
         this.overlays.plugin_modal_focus_pending = this.plugins.active_modal().is_some();
         this.sync_plugin_modal_focus(window);
         this.sync_theme_tokens(cx);
@@ -366,6 +364,7 @@ impl IrisWindow {
         self.sleep_preventer.set_active(false);
         self.media_keys.take();
         self.plugins.shutdown();
+        self.store_flush.take();
         self.save_progress_sync();
         let (vol, spd) = {
             let st = self.active().session.state();
@@ -400,10 +399,14 @@ impl Drop for IrisWindow {
 impl Render for IrisWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.chrome.render_count += 1;
+        self.prepare_timed_overlay_frame(window, cx);
         self.sync_fullscreen(window, cx);
         self.sync_plugin_modal_focus(window);
+        if !self.text_inputs.form_focus.is_focused(window) {
+            self.text_inputs.active_form_key = None;
+        }
         self.scan_visible_favorites(cx);
-        let modal_visible = self.plugins.active_modal().is_some();
+        let modal_visible = self.has_host_consent() || self.plugins.active_modal().is_some();
         let files_visible = self.sidebar_is_visible()
             && self.catalog.sidebar_mode == SidebarMode::Files
             && !modal_visible
@@ -486,6 +489,9 @@ impl Render for IrisWindow {
             root_ctx.add("TextInput");
         } else {
             root_ctx.add("Workspace");
+            if self.has_active_modal() {
+                root_ctx.add("Modal");
+            }
             if self.text_inputs.is_any_focused(window) {
                 root_ctx.add("TextInput");
             }
@@ -499,8 +505,11 @@ impl Render for IrisWindow {
             .id("root")
             .relative()
             .key_context(root_ctx)
-            .on_any_mouse_down(cx.listener(|this, _, window, _| {
-                if this.overlays.recording_shortcut.is_some() {
+            .on_any_mouse_down(cx.listener(|this, ev: &gpui::MouseDownEvent, window, _| {
+                if this.overlays.recording_shortcut.is_some()
+                    || ev.button != gpui::MouseButton::Left
+                    || this.has_active_modal()
+                {
                     return;
                 }
                 this.text_inputs.active_form_key = None;
@@ -519,7 +528,9 @@ impl Render for IrisWindow {
             .when(self.chrome.resizing_dir.is_some(), |d| {
                 d.cursor(CursorStyle::ResizeLeftRight)
             })
-            .when(!self.chrome_shown(), |d| d.cursor(CursorStyle::None))
+            .when(!self.chrome_shown() && !self.has_host_consent(), |d| {
+                d.cursor(CursorStyle::None)
+            })
             .when(!fullscreen && !hide_tb, |d| {
                 d.child(self.render_titlebar(false, cx))
             })
@@ -552,6 +563,7 @@ impl Render for IrisWindow {
             })
             .children(self.render_builtin_dialog(window, cx))
             .children(self.render_plugin_modal(window, cx))
+            .children(self.render_host_consent(window, cx))
             .when_some(self.overlays.context_menu.clone(), |d, menu| {
                 d.child(self.render_context_menu(&menu, window, cx))
             })
@@ -568,3 +580,6 @@ impl Render for IrisWindow {
             })
     }
 }
+
+#[cfg(test)]
+mod contract_tests;

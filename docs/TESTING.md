@@ -100,7 +100,7 @@ python3 scripts/icc-report.py out/
 - **修复前**：视频层没有标注色彩空间，系统把 mpv 的输出当成屏幕原始值。不管图片带什么配置文件，像素值都一样；sRGB 纯红显示为 (252,0,0)，应为 (234,51,35)。所有 BT.709 视频在 P3 屏上都偏艳。同一窗口里 GPUI 界面的颜色是对的。
 - **修复后**（视频层标 Display P3，mpv 输出 `target-prim=display-p3`、`target-trc=srgb`）：sRGB 和无标签内容与预期值相差不超过 3 个色阶，例如红色测得 (231,50,35)，预期 (234,51,35)。1080p 测试画面改动前后并排比较，色条不再过饱和。
 - **视频层修复后的遗留**：带 P3 / Adobe RGB 配置文件的照片被当成 sRGB，显示偏淡（P3 红测得 (231,50,35)，应为 (255,0,0)）。修复前这类照片在 P3 屏上碰巧是对的，因为两个错误互相抵消。
-- **逐张覆盖原色后**（`crates/iris/src/photo.rs` + `icc.rs`）：21 个色块（PNG / JPEG 测试素材，另加 sips 生成的 P3 / Adobe RGB HEIC、P3 TIFF 和带 nclx 的 HEIC）与 ColorSync 预期值相差都不超过 3 个色阶，例如 P3 红 (252,0,0) 对 (255,0,0)。Adobe RGB 纯绿超出 P3：mpv 默认映射测得 (0,241,105)，改为 `gamut-mapping-mode=clip` 后 (0,249,45)，预期 (0,250,45)。EXIF 方向和翻页延迟（JPEG 中位数 89 ms、HEIC 296 ms）不变；照片之后打开视频，`vf` 已清空。
+- **逐张覆盖原色后**（`crates/iris-core/src/photo/`）：21 个色块（PNG / JPEG 测试素材，另加 sips 生成的 P3 / Adobe RGB HEIC、P3 TIFF 和带 nclx 的 HEIC）与 ColorSync 预期值相差都不超过 3 个色阶，例如 P3 红 (252,0,0) 对 (255,0,0)。Adobe RGB 纯绿超出 P3：mpv 默认映射测得 (0,241,105)，改为 `gamut-mapping-mode=clip` 后 (0,249,45)，预期 (0,250,45)。EXIF 方向和翻页延迟（JPEG 中位数 89 ms、HEIC 296 ms）不变；照片之后打开视频，`vf` 已清空。
 - WebP：`make-webp-test-media.py` 生成的色块已进单元测试（`photo::tests::reads_colour_from_test_media`，sRGB / P3 / Adobe RGB 都识别正确）。
 - **未实测**：放在网络盘上的照片。文件头读取已移到后台线程（`player::prepare`），不再卡界面，但慢盘上的打开延迟没有测过。
 
@@ -111,7 +111,7 @@ python3 scripts/icc-report.py out/
 | 1080p60 H.264 | 30.7% | 31.6% | 0 |
 | 4K HEVC 10bit | 22.3% | 22.3% | 0 |
 
-两边都是 videotoolbox 硬解，差别在噪声范围内。README 里的 24% / 17% 是 2026-11-20 用另一种测法得出的，不能和这张表直接比较。
+两边都是 videotoolbox 硬解，差别在噪声范围内（早期 2026-11-20 不同采样口径下的历史数字不再直接与该表横向比较）。
 
 ### 未验证 / 未复现
 

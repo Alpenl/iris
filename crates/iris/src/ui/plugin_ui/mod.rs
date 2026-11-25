@@ -3,7 +3,7 @@
 //! - Control bar status badge slot (`render_plugin_status_slot`)
 //! - Declarative `PluginModal` built on `kit::modal::modal_shell` with async validation
 
-mod overlay;
+pub(super) mod overlay;
 mod widgets;
 
 use std::rc::Rc;
@@ -77,7 +77,11 @@ impl IrisWindow {
         ))
     }
 
-    pub(super) fn render_plugin_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(super) fn render_plugin_sidebar(
+        &self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let panels: Vec<(String, SidebarPanel)> = self
             .plugins
             .sidebar_panels()
@@ -98,7 +102,7 @@ impl IrisWindow {
                         &pid,
                         wi,
                         widget,
-                        WidgetSurface::Sidebar,
+                        WidgetSurface::Sidebar { window },
                         t,
                         cx,
                     ));
@@ -192,6 +196,9 @@ impl IrisWindow {
         window: &Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
+        if self.has_host_consent() {
+            return None;
+        }
         let (pid, modal) = self
             .plugins
             .active_modal()

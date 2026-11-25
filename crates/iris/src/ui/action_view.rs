@@ -56,12 +56,13 @@ impl IrisWindow {
         let Some(uri) = self.active().session.current_media_uri() else {
             return;
         };
-        if !uri.may_share_identity() {
+        if !self.active().session.may_share_current_identity() {
             self.show_toast("此链接仅用于本次播放，无法收藏", cx);
             return;
         }
         let added = self.store.toggle_favorite(&uri);
         self.rebuild_directory_rows();
+        self.scan_visible_favorites(cx);
         self.show_toast(
             if added {
                 "已收藏"
@@ -78,6 +79,9 @@ impl IrisWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.has_active_modal() {
+            return;
+        }
         self.open_builtin_dialog(BuiltinDialog::OpenUrl, window, cx);
     }
 
@@ -87,6 +91,9 @@ impl IrisWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.has_active_modal() {
+            return;
+        }
         let next = self
             .presets
             .next_id(&self.settings.active_preset)
@@ -100,6 +107,9 @@ impl IrisWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.has_active_modal() {
+            return;
+        }
         self.activate_preset(&act.id, window, cx);
     }
 
@@ -109,6 +119,9 @@ impl IrisWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.has_active_modal() {
+            return;
+        }
         self.invoke_plugin_command(&act.plugin_id, &act.command_id, window, cx);
     }
 
@@ -135,6 +148,7 @@ impl IrisWindow {
         self.overlays.info_open = !self.overlays.info_open;
         if self.overlays.info_open {
             self.active_mut().refresh_cached_stats(true);
+            self.refresh_annotations(cx);
         }
         cx.notify();
     }
@@ -200,6 +214,9 @@ impl IrisWindow {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.has_active_modal() {
+            return;
+        }
         self.overlays.close_menus();
         if self.chrome.fullscreen {
             self.overlays.dir_popup = if self.overlays.dir_popup.is_open() {
@@ -227,6 +244,9 @@ impl IrisWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.has_active_modal() {
+            return;
+        }
         if self.chrome.fullscreen {
             self.overlays.dir_popup = DirectoryPopup::Manual;
             self.bump_activity(cx);
@@ -252,6 +272,9 @@ impl IrisWindow {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.has_active_modal() {
+            return;
+        }
         if let ActiveSource::Plugin(ps) = &self.catalog.active_source {
             let (pid, sid, fid) = (
                 ps.plugin_id.clone(),
@@ -264,7 +287,7 @@ impl IrisWindow {
             self.browse_plugin_source(&pid, &sid, fid, None, q, cx);
             return;
         }
-        if self.media_load_pending() {
+        if self.active().pending_path.is_some() {
             return;
         }
         let Some(folder) = self.active().session.folder().map(Path::to_path_buf) else {
@@ -279,6 +302,7 @@ impl IrisWindow {
             let scan = task.await;
             let _ = this.update(cx, |this, cx| {
                 if this.active().load_generation != generation
+                    || this.active().pending_path.is_some()
                     || !this.catalog.active_source.is_local()
                     || this.active().session.folder() != Some(folder.as_path())
                 {
@@ -303,7 +327,10 @@ impl IrisWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.plugins.active_modal().is_some() {
+        if self.has_host_consent()
+            || self.plugins.active_modal().is_some()
+            || self.overlays.dialog.is_some()
+        {
             return;
         }
         self.overlays.toggle_settings();
@@ -318,7 +345,10 @@ impl IrisWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.plugins.active_modal().is_some() {
+        if self.has_host_consent()
+            || self.plugins.active_modal().is_some()
+            || self.overlays.dialog.is_some()
+        {
             return;
         }
         if self.overlays.toggle_palette() {
@@ -347,6 +377,10 @@ impl IrisWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.has_host_consent() {
+            self.cancel_host_consent(window, cx);
+            return;
+        }
         let has_plugin_modal = self.plugins.active_modal().is_some();
         match self.overlays.dismiss_next_escape(
             &mut self.text_inputs,
@@ -354,6 +388,7 @@ impl IrisWindow {
             window.is_fullscreen(),
         ) {
             EscapeStep::CancelRecording | EscapeStep::CloseContextMenu | EscapeStep::CloseInfo => {
+                self.bump_activity(cx);
                 cx.notify();
             }
             EscapeStep::CancelPluginModal => {
@@ -361,6 +396,7 @@ impl IrisWindow {
             }
             EscapeStep::CloseBuiltinDialog => {
                 self.focus.focus(window);
+                self.bump_activity(cx);
                 cx.notify();
             }
             EscapeStep::ClosePalette => {
@@ -376,6 +412,7 @@ impl IrisWindow {
             EscapeStep::CloseSearch => {
                 self.filter_directory_rows();
                 self.focus.focus(window);
+                self.bump_activity(cx);
                 cx.notify();
             }
             EscapeStep::ExitFullscreen => window.toggle_fullscreen(),
@@ -500,6 +537,9 @@ impl IrisWindow {
     }
 
     pub(super) fn open_file(&mut self, _: &OpenFile, _: &mut Window, cx: &mut Context<Self>) {
+        if self.has_active_modal() {
+            return;
+        }
         let rx = cx.prompt_for_paths(PathPromptOptions {
             files: true,
             directories: true,

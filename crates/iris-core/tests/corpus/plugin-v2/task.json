@@ -1,0 +1,1 @@
+{"operation":"http_start","url":"http://127.0.0.1:80/","method":"GET","headers":[["X-Test","x\r\nHost: attacker"]]}

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/iris-mpv", "crates/iris-api", "crates/iris-core", "crates/iris"]
+members = ["crates/iris-mpv", "crates/iris-api", "crates/iris-plugin-sdk", "crates/iris-plugin-guides", "crates/iris-plugin-webdav", "crates/iris-core", "crates/iris", "examples/plugins/watch-stats", "examples/plugins/virtual-audio", "examples/plugins/bilibili", "examples/plugins/baidupan"]
 default-members = ["crates/iris"]
 
 [workspace.package]

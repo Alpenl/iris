@@ -1,0 +1,89 @@
+//! Installation-wide submission order across windows. Waiting happens only in
+//! the bounded control I/O lane, never in a Store callback or the UI thread.
+use crate::{plugin_v2::instance::next_id, vfs::HttpCancel};
+use iris_api::v2::{ErrorCode, Id};
+use std::{
+    collections::VecDeque,
+    sync::{Arc, Condvar, Mutex},
+    time::{Duration, Instant},
+};
+
+#[derive(Default)]
+pub(super) struct Serial {
+    queue: Mutex<VecDeque<Id>>,
+    changed: Condvar,
+}
+pub(super) struct Ticket {
+    serial: Arc<Serial>,
+    id: Id,
+}
+impl Serial {
+    pub fn enter(self: &Arc<Self>) -> Result<Ticket, ErrorCode> {
+        let mut queue = self.queue.lock().unwrap_or_else(|e| e.into_inner());
+        if queue.len() >= 8 {
+            return Err(ErrorCode::Backpressure);
+        }
+        let id = Id(next_id()?);
+        queue.push_back(id);
+        Ok(Ticket {
+            serial: self.clone(),
+            id,
+        })
+    }
+}
+impl Ticket {
+    pub fn wait(&self, cancel: &HttpCancel) -> Result<(), ErrorCode> {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut queue = self.serial.queue.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            if cancel.is_cancelled() {
+                return Err(ErrorCode::Cancelled);
+            }
+            if queue.front() == Some(&self.id) {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(ErrorCode::Timeout);
+            }
+            queue = self
+                .serial
+                .changed
+                .wait_timeout(queue, Duration::from_millis(20))
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+        }
+    }
+}
+impl Drop for Ticket {
+    fn drop(&mut self) {
+        let mut queue = self.serial.queue.lock().unwrap_or_else(|e| e.into_inner());
+        queue.retain(|id| *id != self.id);
+        self.serial.changed.notify_all();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn dropped_head_and_cancelled_waiter_preserve_order_and_capacity() {
+        let serial = Arc::new(Serial::default());
+        let head = serial.enter().unwrap();
+        let second = serial.enter().unwrap();
+        let cancel = HttpCancel::default();
+        cancel.cancel();
+        assert_eq!(second.wait(&cancel), Err(ErrorCode::Cancelled));
+        drop(second);
+        let third = serial.enter().unwrap();
+        let (sent, received) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            third.wait(&HttpCancel::default()).unwrap();
+            sent.send(()).unwrap();
+        });
+        assert!(received.recv_timeout(Duration::from_millis(30)).is_err());
+        drop(head);
+        received.recv_timeout(Duration::from_secs(2)).unwrap();
+        worker.join().unwrap();
+        assert!(serial.queue.lock().unwrap().is_empty());
+    }
+}

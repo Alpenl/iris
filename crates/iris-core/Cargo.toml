@@ -16,6 +16,15 @@ devtools = []
 anyhow.workspace = true
 iris-mpv = { path = "../iris-mpv" }
 iris-api = { path = "../iris-api" }
+iris-plugin-sdk = { path = "../iris-plugin-sdk" }
+wasmtime = { version = "=51.0.0", default-features = false, features = ["runtime", "cranelift", "std"] }
+zip = { version = "=9.8.2", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+cap-std = "4.0.3"
+aes = "0.8"
+cbc = { version = "0.1", features = ["alloc"] }
+md-5 = "0.10"
+sha1 = "0.10"
+blake3 = "1"
 futures = "0.3"
 miniz_oxide = "0.8"
 log = "0.4"
@@ -27,6 +36,8 @@ percent-encoding = "2.3"
 base64 = "0.22"
 roxmltree = "0.20"
 httparse = "1.10"
+httpdate = "1"
+tungstenite = { version = "=0.30.0", default-features = false, features = ["handshake"] }
 mio = { version = "1", features = ["net", "os-poll"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-native-certs = "0.8"
@@ -44,3 +55,6 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Globali
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+wat = "1"

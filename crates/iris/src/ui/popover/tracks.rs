@@ -267,49 +267,58 @@ impl IrisWindow {
             .child(popover_header("音轨", self.key_hint("cycle_audio"), t))
             .child(
                 div()
-                    .id("audio-list")
-                    .max_h(px(160.))
+                    .id("audio-popover-scroll")
+                    .flex_1()
+                    .min_h(px(0.))
                     .overflow_y_scroll()
-                    .py(px(4.))
-                    .flex()
-                    .flex_col()
-                    .children(track_rows)
-                    .when(!has_tracks, |d| {
-                        d.child(
-                            div()
-                                .px(px(10.))
-                                .py(px(8.))
-                                .text_size(px(11.))
-                                .text_color(t.text_faint)
-                                .child("当前媒体没有音轨"),
-                        )
-                    }),
-            )
-            .child(
-                div()
-                    .border_t_1()
-                    .border_color(t.line)
                     .flex()
                     .flex_col()
                     .child(
                         div()
-                            .h(px(26.))
-                            .px(px(10.))
+                            .id("audio-list")
+                            .max_h(px(160.))
+                            .overflow_y_scroll()
+                            .py(px(4.))
                             .flex()
-                            .items_center()
-                            .text_size(px(10.))
-                            .text_color(t.text_dim)
-                            .child("音频输出设备"),
+                            .flex_col()
+                            .children(track_rows)
+                            .when(!has_tracks, |d| {
+                                d.child(
+                                    div()
+                                        .px(px(10.))
+                                        .py(px(8.))
+                                        .text_size(px(11.))
+                                        .text_color(t.text_faint)
+                                        .child("当前媒体没有音轨"),
+                                )
+                            }),
                     )
                     .child(
                         div()
-                            .id("audio-dev-list")
-                            .max_h(px(196.))
-                            .overflow_y_scroll()
-                            .pb(px(4.))
+                            .border_t_1()
+                            .border_color(t.line)
                             .flex()
                             .flex_col()
-                            .children(device_rows),
+                            .child(
+                                div()
+                                    .h(px(26.))
+                                    .px(px(10.))
+                                    .flex()
+                                    .items_center()
+                                    .text_size(px(10.))
+                                    .text_color(t.text_dim)
+                                    .child("音频输出设备"),
+                            )
+                            .child(
+                                div()
+                                    .id("audio-dev-list")
+                                    .max_h(px(196.))
+                                    .overflow_y_scroll()
+                                    .pb(px(4.))
+                                    .flex()
+                                    .flex_col()
+                                    .children(device_rows),
+                            ),
                     ),
             )
     }

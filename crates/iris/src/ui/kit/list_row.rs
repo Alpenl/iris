@@ -1,9 +1,9 @@
 //! Unified virtual-list media/folder rows (`t.row_h`) and 3px slim scrollbar.
 
 use gpui::{
-    AnyElement, Div, ElementId, InteractiveElement, MouseButton, ParentElement, SharedString,
-    Stateful, StatefulInteractiveElement, Styled, UniformListScrollHandle, div,
-    prelude::FluentBuilder, px, relative,
+    AnyElement, Div, ElementId, InteractiveElement, IntoElement, MouseButton, ParentElement,
+    SharedString, Stateful, StatefulInteractiveElement, Styled, StyledImage,
+    UniformListScrollHandle, div, prelude::FluentBuilder, px, relative,
 };
 use iris_core::library::Kind;
 
@@ -72,6 +72,7 @@ pub(in crate::ui) struct MediaRowSpec {
     pub(in crate::ui) is_live: bool,
     pub(in crate::ui) progress: Option<f32>,
     pub(in crate::ui) trailing: Option<AnyElement>,
+    pub(in crate::ui) thumbnail: Option<std::sync::Arc<gpui::RenderImage>>,
 }
 
 /// Renders a unified catalog or play-queue media row with optional 2px resume bar.
@@ -124,7 +125,14 @@ pub(in crate::ui) fn media_row(
                     .bg(t.accent),
             )
         })
-        .child(icon(glyph, 14., glyph_color))
+        .child(match spec.thumbnail {
+            Some(image) => gpui::img(image)
+                .w(px(24.))
+                .h(px(24.))
+                .object_fit(gpui::ObjectFit::Contain)
+                .into_any_element(),
+            None => icon(glyph, 14., glyph_color).into_any_element(),
+        })
         .child(
             div()
                 .flex_1()

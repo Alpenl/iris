@@ -188,28 +188,46 @@ pub(super) fn jpeg<R: Read + Seek>(
     Some(())
 }
 
-pub(super) fn png<R: Read + Seek>(r: &mut R, h: &mut Header) -> Option<()> {
+pub(super) fn png<R: Read + Seek>(r: &mut R, h: &mut Header, orientation_only: bool) -> Option<()> {
     if read_n(r, 8)? != b"\x89PNG\r\n\x1a\n" {
         return None;
     }
+    let mut saw_exif = false;
     for _ in 0..MAX_CHUNKS {
         let head = read_n(r, 8)?;
         let len_u32 = be32(&head);
         let len = len_u32 as usize;
         match &head[4..8] {
-            b"IHDR" if (8..=64).contains(&len) => {
+            b"IHDR" if !orientation_only && (8..=64).contains(&len) => {
                 let d = read_n(r, len)?;
                 h.size = Some((be32(&d), be32(&d[4..])));
                 r.seek(SeekFrom::Current(4)).ok()?;
             }
-            b"iCCP" if len <= MAX_ICC => {
+            b"iCCP" if !orientation_only && len <= MAX_ICC && h.colour.is_none() => {
                 let data = read_n(r, len)?;
-                let name_end = data.iter().position(|&b| b == 0)?;
-                let z = data.get(name_end + 2..)?;
-                let icc =
-                    miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(z, MAX_ICC).ok()?;
-                h.colour = Some(ColourTag::Icc(icc));
-                return Some(());
+                r.seek(SeekFrom::Current(4)).ok()?;
+                if let Some(name_end) = data.iter().position(|&b| b == 0)
+                    && let Some(z) = data.get(name_end + 2..)
+                    && let Ok(icc) =
+                        miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(z, MAX_ICC)
+                {
+                    h.colour = Some(ColourTag::Icc(icc));
+                }
+            }
+            b"eXIf" if (8..=MAX_EXIF).contains(&len) && !saw_exif => {
+                saw_exif = true;
+                let data = read_n(r, len)?;
+                r.seek(SeekFrom::Current(4)).ok()?;
+                let tiff = data.strip_prefix(b"Exif\0\0").unwrap_or(&data);
+                let mode = if orientation_only {
+                    exif::Mode::Orientation
+                } else {
+                    exif::Mode::Summary
+                };
+                exif::tiff(&mut std::io::Cursor::new(tiff), h, mode);
+                if orientation_only {
+                    return Some(());
+                }
             }
             b"IDAT" | b"IEND" => return Some(()),
             _ => {
@@ -220,7 +238,11 @@ pub(super) fn png<R: Read + Seek>(r: &mut R, h: &mut Header) -> Option<()> {
     Some(())
 }
 
-pub(super) fn webp<R: Read + Seek>(r: &mut R, h: &mut Header) -> Option<()> {
+pub(super) fn webp<R: Read + Seek>(
+    r: &mut R,
+    h: &mut Header,
+    orientation_only: bool,
+) -> Option<()> {
     let head = read_n(r, 12)?;
     if &head[..4] != b"RIFF" || &head[8..12] != b"WEBP" {
         return None;
@@ -239,31 +261,43 @@ pub(super) fn webp<R: Read + Seek>(r: &mut R, h: &mut Header) -> Option<()> {
         left = left.checked_sub(8 + padded)?;
         let start = r.stream_position().ok()?;
         match &c[..4] {
-            b"VP8X" if len >= 10 => {
+            b"VP8X" if !orientation_only && len >= 10 => {
                 let mut d = [0; 10];
                 r.read_exact(&mut d).ok()?;
                 h.size = Some((le24(&d[4..]) + 1, le24(&d[7..]) + 1));
             }
-            b"ICCP" if len <= MAX_ICC && h.colour.is_none() => {
+            b"ICCP" if !orientation_only && len <= MAX_ICC && h.colour.is_none() => {
                 h.colour = Some(ColourTag::Icc(read_n(r, len)?))
             }
             b"EXIF" if len <= MAX_EXIF && !saw_exif => {
                 saw_exif = true;
                 let data = read_n(r, len)?;
                 let tiff = data.strip_prefix(b"Exif\0\0").unwrap_or(&data);
-                exif::tiff(&mut std::io::Cursor::new(tiff), h, exif::Mode::Summary);
+                let mode = if orientation_only {
+                    exif::Mode::Orientation
+                } else {
+                    exif::Mode::Summary
+                };
+                exif::tiff(&mut std::io::Cursor::new(tiff), h, mode);
+                if orientation_only {
+                    return Some(());
+                }
             }
-            b"VP8L" if h.size.is_none() && len >= 5 => {
+            b"VP8L" if !orientation_only && h.size.is_none() && len >= 5 => {
                 let mut d = [0; 5];
                 r.read_exact(&mut d).ok()?;
-                let bits = u32::from_le_bytes(d[1..].try_into().ok()?);
-                h.size = Some(((bits & 0x3FFF) + 1, ((bits >> 14) & 0x3FFF) + 1));
+                if d[0] == 0x2F {
+                    let bits = u32::from_le_bytes(d[1..].try_into().ok()?);
+                    h.size = Some(((bits & 0x3FFF) + 1, ((bits >> 14) & 0x3FFF) + 1));
+                }
             }
-            b"VP8 " if h.size.is_none() && len >= 10 => {
+            b"VP8 " if !orientation_only && h.size.is_none() && len >= 10 => {
                 let mut d = [0; 10];
                 r.read_exact(&mut d).ok()?;
-                let le14 = |b: &[u8]| u16::from_le_bytes([b[0], b[1]]) as u32 & 0x3FFF;
-                h.size = Some((le14(&d[6..]), le14(&d[8..])));
+                if d[0] & 1 == 0 && d[3..6] == [0x9D, 0x01, 0x2A] {
+                    let le14 = |b: &[u8]| u16::from_le_bytes([b[0], b[1]]) as u32 & 0x3FFF;
+                    h.size = Some((le14(&d[6..]), le14(&d[8..])));
+                }
             }
             _ => {}
         }

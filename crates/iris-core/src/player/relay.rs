@@ -2,6 +2,11 @@
 //! for redirects and inherited by HLS child contexts. Keep credentials in Iris and
 //! give libmpv encrypted, playback-scoped resource URLs instead.
 
+mod playlist;
+mod transfer;
+
+use transfer::{copy_stream, ensure_identity, read_request, valid_range};
+
 use std::collections::BTreeMap;
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -13,6 +18,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use mio::{Events, Interest, Poll, Token, Waker};
+use playlist::{is_hls, rewrite_playlist};
 use ring::aead::{Aad, CHACHA20_POLY1305, LessSafeKey, Nonce, UnboundKey};
 use ring::rand::{SecureRandom, SystemRandom};
 use url::Url;
@@ -27,7 +33,6 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_URL: usize = 2800;
 const MAX_REQUEST: usize = 24 * 1024;
 const MAX_PLAYLIST: usize = 4 * 1024 * 1024;
-const MAX_REWRITTEN_PLAYLIST: usize = 16 * 1024 * 1024;
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(10);
 const RELAY_WORKERS: usize = 8;
 const GLOBAL_WORKERS: usize = 32;
@@ -85,10 +90,9 @@ impl Routes {
                 .and_then(|name| name.rsplit_once('.'))
                 .and_then(|(_, suffix)| {
                     [
-                        "m3u8", "m3u", "mp4", "m4v", "m4a", "m4s", "cmfv", "cmfa", "ts", "m2ts",
-                        "aac", "ac3", "ec3", "mp3", "vtt", "webvtt", "srt", "ass", "ssa", "webm",
-                        "mkv", "mov", "ogg", "flac", "wav", "jpg", "jpeg", "png", "heic", "avif",
-                        "webp", "key",
+                        "mp4", "m4v", "m4a", "m4s", "cmfv", "cmfa", "ts", "m2ts", "aac", "ac3",
+                        "ec3", "mp3", "vtt", "webvtt", "srt", "ass", "ssa", "webm", "mkv", "mov",
+                        "ogg", "flac", "wav", "jpg", "jpeg", "png", "heic", "avif", "webp", "key",
                     ]
                     .into_iter()
                     .find(|ext| ext.eq_ignore_ascii_case(suffix))
@@ -145,28 +149,106 @@ impl Routes {
     }
 }
 
+struct ClientState {
+    cancel: HttpCancel,
+    writable: Arc<(Mutex<u64>, Condvar)>,
+}
+
 pub(super) struct Service {
     routes: Routes,
     scope: NetworkScope,
     headers: BTreeMap<String, String>,
     cancel: HttpCancel,
     workers: AtomicUsize,
+    registry: mio::Registry,
+    wake: Waker,
+    next_token: AtomicUsize,
+    clients: Mutex<BTreeMap<usize, ClientState>>,
+}
+
+struct ClientWatch<'a> {
+    service: &'a Service,
+    token: usize,
+    stream: mio::net::TcpStream,
+    writable: Arc<(Mutex<u64>, Condvar)>,
+    armed_writable: bool,
+}
+
+impl ClientWatch<'_> {
+    fn writable_gen(&self) -> u64 {
+        *self.writable.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn wait_writable(&mut self, seen_gen: u64, cancel: &HttpCancel) -> io::Result<()> {
+        if cancel.is_cancelled() {
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "relay cancelled",
+            ));
+        }
+        if let Err(err) = self.service.registry.reregister(
+            &mut self.stream,
+            Token(self.token),
+            Interest::READABLE | Interest::WRITABLE,
+        ) {
+            if cancel.is_cancelled() {
+                return Err(io::Error::new(
+                    io::ErrorKind::ConnectionAborted,
+                    "relay cancelled",
+                ));
+            }
+            return Err(err);
+        }
+        self.armed_writable = true;
+        let guard = self.writable.0.lock().unwrap_or_else(|e| e.into_inner());
+        if *guard == seen_gen {
+            let _ = self
+                .writable
+                .1
+                .wait_timeout(guard, Duration::from_millis(100));
+        }
+        if cancel.is_cancelled() {
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "relay cancelled",
+            ));
+        }
+        Ok(())
+    }
+
+    fn disarm_writable(&mut self) {
+        if self.armed_writable {
+            self.armed_writable = false;
+            let _ = self.service.registry.reregister(
+                &mut self.stream,
+                Token(self.token),
+                Interest::READABLE,
+            );
+        }
+    }
+}
+
+impl Drop for ClientWatch<'_> {
+    fn drop(&mut self) {
+        self.service.clients.lock().unwrap().remove(&self.token);
+        let _ = self.service.registry.deregister(&mut self.stream);
+    }
 }
 
 pub(super) struct PlaybackRelay {
     service: Arc<Service>,
     listener: Option<thread::JoinHandle<()>>,
-    wake: Waker,
 }
 
 impl PlaybackRelay {
     pub(super) fn start(url: Url, headers: BTreeMap<String, String>) -> Result<Self> {
         const LISTENER: Token = Token(0);
-        const CANCEL: Token = Token(1);
+        const WAKE: Token = Token(1);
         let mut listener =
             mio::net::TcpListener::bind(SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 0)))?;
         let mut poll = Poll::new()?;
-        let wake = Waker::new(poll.registry(), CANCEL)?;
+        let registry = poll.registry().try_clone()?;
+        let wake = Waker::new(poll.registry(), WAKE)?;
         poll.registry()
             .register(&mut listener, LISTENER, Interest::READABLE)?;
         let service = Arc::new(Service {
@@ -175,35 +257,124 @@ impl PlaybackRelay {
             headers,
             cancel: HttpCancel::default(),
             workers: AtomicUsize::new(0),
+            registry,
+            wake,
+            next_token: AtomicUsize::new(2),
+            clients: Mutex::new(BTreeMap::new()),
         });
         let server = Arc::clone(&service);
         let listener = thread::Builder::new()
             .name("iris-media-relay".into())
             .spawn(move || {
-                let mut events = Events::with_capacity(2);
+                let mut events = Events::with_capacity(16);
                 let mut workers: Vec<thread::JoinHandle<()>> = Vec::new();
+                let mut waiting: Option<(TcpStream, Instant)> = None;
+                let mut accept_ready = false;
                 while !server.cancel.is_cancelled() {
-                    match poll.poll(&mut events, None) {
+                    if let Some((socket, deadline)) = waiting.take() {
+                        if let Some(worker) = server.try_reserve_worker() {
+                            workers.retain(|w| !w.is_finished());
+                            if let Some(handle) = server.spawn_worker(worker, socket) {
+                                workers.push(handle);
+                            }
+                        } else if Instant::now() >= deadline {
+                            reject_busy(socket);
+                        } else {
+                            waiting = Some((socket, deadline));
+                        }
+                    }
+                    if waiting.is_none() && accept_ready {
+                        while !server.cancel.is_cancelled() {
+                            match listener.accept() {
+                                Ok((socket, _)) => {
+                                    let socket = TcpStream::from(socket);
+                                    workers.retain(|w| !w.is_finished());
+                                    if let Some(worker) = server.try_reserve_worker() {
+                                        if let Some(handle) = server.spawn_worker(worker, socket) {
+                                            workers.push(handle);
+                                        }
+                                    } else {
+                                        waiting = Some((socket, Instant::now() + SLOT_WAIT));
+                                        break;
+                                    }
+                                }
+                                Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                                    accept_ready = false;
+                                    break;
+                                }
+                                Err(err)
+                                    if matches!(
+                                        err.kind(),
+                                        io::ErrorKind::Interrupted
+                                            | io::ErrorKind::ConnectionReset
+                                            | io::ErrorKind::ConnectionAborted
+                                    ) =>
+                                {
+                                    continue;
+                                }
+                                Err(err) => {
+                                    log::warn!("relay accept failed: {err}");
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    let timeout = if let Some((_, deadline)) = waiting {
+                        Some(
+                            deadline
+                                .saturating_duration_since(Instant::now())
+                                .min(Duration::from_millis(10)),
+                        )
+                    } else if accept_ready {
+                        Some(Duration::from_millis(20))
+                    } else {
+                        None
+                    };
+                    match poll.poll(&mut events, timeout) {
                         Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
                         Err(_) => break,
                         Ok(()) => (),
                     }
-                    if !events.iter().any(|event| event.token() == LISTENER) {
-                        continue;
-                    }
-                    while !server.cancel.is_cancelled() {
-                        let socket = match listener.accept() {
-                            Ok((socket, _)) => TcpStream::from(socket),
-                            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
-                            Err(_) => break,
-                        };
-                        workers.retain(|worker| !worker.is_finished());
-                        if let Some(worker) = server.dispatch(socket) {
-                            workers.push(worker);
+                    for event in &events {
+                        match event.token() {
+                            LISTENER => accept_ready = true,
+                            WAKE => (),
+                            Token(id)
+                                if event.is_readable()
+                                    || event.is_read_closed()
+                                    || event.is_write_closed()
+                                    || event.is_error() =>
+                            {
+                                if let Some(client) = server.clients.lock().unwrap().remove(&id) {
+                                    client.cancel.cancel();
+                                    let mut epoch =
+                                        client.writable.0.lock().unwrap_or_else(|e| e.into_inner());
+                                    *epoch = epoch.wrapping_add(1);
+                                    client.writable.1.notify_all();
+                                }
+                            }
+                            Token(id) if event.is_writable() => {
+                                let writable = server
+                                    .clients
+                                    .lock()
+                                    .unwrap()
+                                    .get(&id)
+                                    .map(|c| c.writable.clone());
+                                if let Some(writable) = writable {
+                                    let mut epoch =
+                                        writable.0.lock().unwrap_or_else(|e| e.into_inner());
+                                    *epoch = epoch.wrapping_add(1);
+                                    writable.1.notify_all();
+                                }
+                            }
+                            _ => (),
                         }
                     }
                 }
                 server.cancel.cancel();
+                if let Some((socket, _)) = waiting {
+                    drop(socket);
+                }
                 for worker in workers {
                     let _ = worker.join();
                 }
@@ -211,7 +382,6 @@ impl PlaybackRelay {
         Ok(Self {
             service,
             listener: Some(listener),
-            wake,
         })
     }
 
@@ -232,7 +402,7 @@ impl PlaybackRelay {
         // Synchronize with the admission check before waking the listener.
         let _workers = ACTIVE_WORKERS.lock().unwrap();
         WORKER_AVAILABLE.notify_all();
-        let _ = self.wake.wake();
+        let _ = self.service.wake.wake();
     }
 }
 
@@ -240,7 +410,24 @@ impl Drop for PlaybackRelay {
     fn drop(&mut self) {
         self.cancel();
         if let Some(listener) = self.listener.take() {
-            let _ = listener.join();
+            if listener.is_finished() {
+                let _ = listener.join();
+            } else {
+                let handle = Arc::new(Mutex::new(Some(listener)));
+                let bg = Arc::clone(&handle);
+                if thread::Builder::new()
+                    .name("iris-relay-reap".into())
+                    .spawn(move || {
+                        if let Some(h) = bg.lock().unwrap().take() {
+                            let _ = h.join();
+                        }
+                    })
+                    .is_err()
+                    && let Some(h) = handle.lock().unwrap().take()
+                {
+                    let _ = h.join();
+                }
+            }
         }
     }
 }
@@ -253,20 +440,23 @@ impl Drop for Worker {
         self.0.workers.fetch_sub(1, Ordering::Relaxed);
         *active -= 1;
         WORKER_AVAILABLE.notify_all();
+        let _ = self.0.wake.wake();
     }
 }
 
+fn reject_busy(mut socket: TcpStream) {
+    // Drain the ordinary small request before replying so closing the
+    // socket does not discard the response as an unread-data reset.
+    let _ = read_request(&mut socket, Duration::from_millis(100));
+    let _ = socket.set_write_timeout(Some(Duration::from_millis(100)));
+    let _ = socket.write_all(
+        b"HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+    );
+}
+
 impl Service {
-    fn reserve_worker(self: &Arc<Self>) -> Option<Worker> {
-        // The listener holds at most one accepted socket while waiting. A
-        // superseded range can release its slot without a new request or polling.
-        let (mut active, _) = WORKER_AVAILABLE
-            .wait_timeout_while(ACTIVE_WORKERS.lock().unwrap(), SLOT_WAIT, |active| {
-                !self.cancel.is_cancelled()
-                    && (*active >= GLOBAL_WORKERS
-                        || self.workers.load(Ordering::Relaxed) >= RELAY_WORKERS)
-            })
-            .unwrap();
+    fn try_reserve_worker(self: &Arc<Self>) -> Option<Worker> {
+        let mut active = ACTIVE_WORKERS.lock().unwrap();
         if self.cancel.is_cancelled()
             || *active >= GLOBAL_WORKERS
             || self.workers.load(Ordering::Relaxed) >= RELAY_WORKERS
@@ -278,18 +468,11 @@ impl Service {
         Some(Worker(Arc::clone(self)))
     }
 
-    fn dispatch(self: &Arc<Self>, mut socket: TcpStream) -> Option<thread::JoinHandle<()>> {
-        let Some(worker) = self.reserve_worker() else {
-            if self.cancel.is_cancelled() {
-                return None;
-            }
-            // Drain the ordinary small request before replying so closing the
-            // socket does not discard the response as an unread-data reset.
-            let _ = read_request(&mut socket, Duration::from_millis(100));
-            let _ = socket.set_write_timeout(Some(Duration::from_millis(100)));
-            let _ = socket.write_all(b"HTTP/1.1 503 Service Unavailable\r\nRetry-After: 1\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
-            return None;
-        };
+    fn spawn_worker(
+        self: &Arc<Self>,
+        worker: Worker,
+        mut socket: TcpStream,
+    ) -> Option<thread::JoinHandle<()>> {
         thread::Builder::new().name("iris-media-request".into()).spawn(move || {
             let service = &worker.0;
             let Ok(_registration) = service.cancel.register(&socket) else { return };
@@ -298,6 +481,34 @@ impl Service {
                 let _ = socket.write_all(b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
             }
         }).ok()
+    }
+
+    fn watch_client(&self, socket: &TcpStream, req_cancel: HttpCancel) -> Result<ClientWatch<'_>> {
+        let cloned = socket.try_clone()?;
+        let mut stream = mio::net::TcpStream::from_std(cloned);
+        let token = self.next_token.fetch_add(1, Ordering::Relaxed);
+        let writable = Arc::new((Mutex::new(0u64), Condvar::new()));
+        self.clients.lock().unwrap().insert(
+            token,
+            ClientState {
+                cancel: req_cancel,
+                writable: writable.clone(),
+            },
+        );
+        if let Err(err) = self
+            .registry
+            .register(&mut stream, Token(token), Interest::READABLE)
+        {
+            self.clients.lock().unwrap().remove(&token);
+            return Err(err.into());
+        }
+        Ok(ClientWatch {
+            service: self,
+            token,
+            stream,
+            writable,
+            armed_writable: false,
+        })
     }
 
     fn serve(&self, socket: &mut TcpStream, committed: &mut bool) -> Result<()> {
@@ -335,17 +546,27 @@ impl Service {
         let (url, kind) = self
             .routes
             .open(request.path.context("missing playback route")?)?;
+        let req_cancel = self.cancel.child()?;
+        let mut client_watch = self.watch_client(socket, req_cancel.clone())?;
         if kind == RouteKind::Subtitle {
             // Remote attachments share the media's address policy even when
             // their origin has no access to the media request headers.
             let empty = BTreeMap::new();
             let source = self.scope.source();
-            let (headers, credentials) = if source.origin() == url.origin() {
-                (&self.headers, source)
+            let headers = if source.origin() == url.origin() {
+                &self.headers
             } else {
-                (&empty, &url)
+                &empty
             };
-            let text = fetch_subtitle(&url, headers, credentials, &self.scope, &self.cancel)?;
+            let credentials = if source.origin() == url.origin()
+                && url.username().is_empty()
+                && url.password().is_none()
+            {
+                source
+            } else {
+                &url
+            };
+            let text = fetch_subtitle(&url, headers, credentials, &self.scope, &req_cancel)?;
             *committed = true;
             write!(
                 socket,
@@ -359,7 +580,13 @@ impl Service {
         }
         let playlist = kind == RouteKind::Playlist;
         let deadline = playlist.then(|| Instant::now() + REQUEST_TIMEOUT);
-        let mut response = self.open(url, method, if playlist { None } else { range }, deadline)?;
+        let mut response = self.open(
+            url,
+            method,
+            if playlist { None } else { range },
+            deadline,
+            &req_cancel,
+        )?;
         if !matches!(response.status, 200 | 206) {
             *committed = true;
             write!(
@@ -393,20 +620,40 @@ impl Service {
             return Ok(());
         }
 
+        let mut sniffed = Vec::new();
+        let mut deferred_err = None;
+        if !playlist && method == "GET" && range.is_none_or(|r| r.starts_with("bytes=0-")) {
+            let mut buf = [0u8; 64];
+            let mut used = 0;
+            while used < buf.len()
+                && crate::plugin_v2::stream::prepare::adaptive_prefix_undecided(&buf[..used])
+            {
+                match response.body().read(&mut buf[used..]) {
+                    Ok(0) => break,
+                    Ok(n) => used += n,
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(e) if used == 0 => return Err(e.into()),
+                    Err(e) => {
+                        deferred_err = Some(e);
+                        break;
+                    }
+                }
+            }
+            ensure!(
+                !crate::plugin_v2::stream::prepare::adaptive(&buf[..used]),
+                "unexpected adaptive manifest on media route"
+            );
+            sniffed.extend_from_slice(&buf[..used]);
+        }
         let chunked = method == "GET" && !response.headers.contains_key("content-length");
         *committed = true;
         write!(
             socket,
-            "HTTP/1.1 {} OK\r\nConnection: close\r\nCache-Control: no-store\r\n",
+            "HTTP/1.1 {} OK\r\nConnection: close\r\nCache-Control: no-store\r\nContent-Type: application/octet-stream\r\n",
             response.status
         )?;
-        for name in [
-            "content-type",
-            "content-length",
-            "content-range",
-            "accept-ranges",
-        ] {
-            if name != "content-type" && playlist {
+        for name in ["content-length", "content-range", "accept-ranges"] {
+            if playlist {
                 continue;
             }
             if let Some(value) = response.headers.get(name) {
@@ -417,12 +664,32 @@ impl Service {
             socket.write_all(b"Transfer-Encoding: chunked\r\n")?;
         }
         socket.write_all(b"\r\n")?;
-        if method == "GET" {
-            if chunked {
-                copy_chunked(response.body(), socket)?;
-            } else {
-                io::copy(response.body(), socket)?;
+        if let Some(err) = deferred_err {
+            if !sniffed.is_empty() {
+                if chunked {
+                    write!(socket, "{:x}\r\n", sniffed.len())?;
+                    socket.write_all(&sniffed)?;
+                    socket.write_all(b"\r\n")?;
+                } else {
+                    socket.write_all(&sniffed)?;
+                }
             }
+            return Err(err.into());
+        }
+        if method == "GET" {
+            // Switch to nonblocking writes with NO SO_SNDTIMEO before streaming
+            // body bytes so long pauses or full demuxer caches never time out or
+            // trigger Winsock SO_SNDTIMEO partial-write hazards.
+            socket.set_write_timeout(None)?;
+            socket.set_nonblocking(true)?;
+            let mut combined = io::Cursor::new(sniffed).chain(response.body());
+            copy_stream(
+                &mut combined,
+                socket,
+                chunked,
+                &mut client_watch,
+                &req_cancel,
+            )?;
         }
         Ok(())
     }
@@ -433,6 +700,7 @@ impl Service {
         method: &str,
         range: Option<&str>,
         deadline: Option<Instant>,
+        cancel: &HttpCancel,
     ) -> Result<crate::vfs::http_client::HttpStream> {
         open_stream(
             Request {
@@ -443,7 +711,7 @@ impl Service {
                 range,
             },
             &self.scope,
-            &self.cancel,
+            cancel,
             deadline,
         )
     }
@@ -460,7 +728,16 @@ impl Service {
             return Ok(None);
         }
         let deadline = Instant::now() + REQUEST_TIMEOUT;
-        let mut response = self.open(source.clone(), "GET", Some("bytes=0-9"), Some(deadline))?;
+        let mut response = self.open(
+            source.clone(),
+            "GET",
+            Some("bytes=0-9"),
+            Some(deadline),
+            &self.cancel,
+        )?;
+        if !matches!(response.status, 200 | 206) {
+            response = self.open(source.clone(), "GET", None, Some(deadline), &self.cancel)?;
+        }
         ensure!(
             matches!(response.status, 200 | 206),
             "media probe failed with HTTP {}",
@@ -486,275 +763,6 @@ impl Service {
             Ok(None)
         }
     }
-}
-
-fn read_request(socket: &mut TcpStream, timeout: Duration) -> Result<Vec<u8>> {
-    socket.set_nonblocking(false)?;
-    let deadline = Instant::now() + timeout;
-    let mut raw = Vec::with_capacity(2048);
-    let mut buf = [0; 2048];
-    loop {
-        let left = deadline
-            .checked_duration_since(Instant::now())
-            .context("relay request timeout")?;
-        socket.set_read_timeout(Some(left))?;
-        let n = socket.read(&mut buf)?;
-        ensure!(
-            n != 0 && raw.len() + n <= MAX_REQUEST,
-            "invalid relay request size"
-        );
-        let scan = raw.len().saturating_sub(3);
-        raw.extend_from_slice(&buf[..n]);
-        if raw[scan..].windows(4).any(|w| w == b"\r\n\r\n") {
-            return Ok(raw);
-        }
-    }
-}
-
-fn ensure_identity(response: &crate::vfs::http_client::HttpStream) -> Result<()> {
-    ensure!(
-        response
-            .headers
-            .get("content-encoding")
-            .is_none_or(|v| v.eq_ignore_ascii_case("identity")),
-        "unsupported media content encoding"
-    );
-    Ok(())
-}
-
-fn is_hls(prefix: &[u8]) -> bool {
-    prefix
-        .strip_prefix(b"\xef\xbb\xbf")
-        .unwrap_or(prefix)
-        .starts_with(b"#EXTM3U")
-}
-
-fn copy_chunked(mut body: impl Read, socket: &mut TcpStream) -> io::Result<()> {
-    let mut buffer = [0; 16 * 1024];
-    loop {
-        let n = match body.read(&mut buffer) {
-            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
-            result => result?,
-        };
-        if n == 0 {
-            return socket.write_all(b"0\r\n\r\n");
-        }
-        write!(socket, "{n:x}\r\n")?;
-        socket.write_all(&buffer[..n])?;
-        socket.write_all(b"\r\n")?;
-    }
-}
-
-fn valid_range(value: &str) -> bool {
-    let Some((start, end)) = value.strip_prefix("bytes=").and_then(|s| s.split_once('-')) else {
-        return false;
-    };
-    let integer = |s: &str| s.bytes().all(|b| b.is_ascii_digit()) && s.parse::<u64>().is_ok();
-    (!start.is_empty() || !end.is_empty())
-        && (start.is_empty() || integer(start))
-        && (end.is_empty() || integer(end))
-}
-
-fn rewrite_playlist(input: &str, base: &Url, routes: &Routes) -> Result<String> {
-    let mut out = String::with_capacity(input.len());
-    let lines = input.trim_start_matches('\u{feff}');
-    ensure!(
-        !lines.contains('\0') && !lines.contains("{$"),
-        "unsupported HLS playlist syntax"
-    );
-    ensure!(
-        lines.lines().next() == Some("#EXTM3U"),
-        "invalid HLS playlist"
-    );
-    let mut variant = false;
-    let mut rewritten = BTreeMap::new();
-    for line in lines.lines() {
-        // Match the demuxer's treatment of surrounding whitespace and reject
-        // control characters that could create a second logical line.
-        ensure!(
-            line.bytes().all(|b| b >= 0x20 || b == b'\t'),
-            "invalid HLS line"
-        );
-        let line = line.trim_ascii();
-        let before = out.len();
-        if line.starts_with('#') {
-            ensure!(
-                !line.starts_with("#EXT-X-DEFINE:")
-                    && !line.starts_with("#EXT-X-CONTENT-STEERING:"),
-                "unsupported HLS playlist indirection"
-            );
-            if line.starts_with("#EXT-X-STREAM-INF:") {
-                variant = true;
-            }
-            if let Some((tag, attrs)) = line.split_once(':')
-                && tag.starts_with("#EXT-X-")
-            {
-                match tag {
-                    // Scalar tags never consult the attribute parser.
-                    "#EXT-X-VERSION"
-                    | "#EXT-X-TARGETDURATION"
-                    | "#EXT-X-MEDIA-SEQUENCE"
-                    | "#EXT-X-DISCONTINUITY-SEQUENCE"
-                    | "#EXT-X-PLAYLIST-TYPE"
-                    | "#EXT-X-BYTERANGE"
-                    | "#EXT-X-PROGRAM-DATE-TIME"
-                    | "#EXT-X-BITRATE" => out.push_str(line),
-                    "#EXT-X-STREAM-INF"
-                    | "#EXT-X-KEY"
-                    | "#EXT-X-MEDIA"
-                    | "#EXT-X-MAP"
-                    | "#EXT-X-START"
-                    | "#EXT-X-DATERANGE"
-                    | "#EXT-X-I-FRAME-STREAM-INF"
-                    | "#EXT-X-IMAGE-STREAM-INF"
-                    | "#EXT-X-SESSION-DATA"
-                    | "#EXT-X-SESSION-KEY"
-                    | "#EXT-X-PART"
-                    | "#EXT-X-PART-INF"
-                    | "#EXT-X-SERVER-CONTROL"
-                    | "#EXT-X-SKIP"
-                    | "#EXT-X-PRELOAD-HINT"
-                    | "#EXT-X-RENDITION-REPORT" => {
-                        out.push_str(tag);
-                        out.push(':');
-                        rewrite_attributes(tag, attrs, base, routes, &mut rewritten, &mut out)?;
-                    }
-                    // Preserve compatibility with private scalar extensions by
-                    // skipping unrecognized tags before they reach the demuxer.
-                    _ => continue,
-                }
-            } else {
-                out.push_str(line);
-            }
-        } else if !line.is_empty() {
-            let url = validate_stream_url(base.join(line)?.as_str())?;
-            let (kind, ext) = if variant {
-                (RouteKind::Playlist, "m3u8")
-            } else {
-                (RouteKind::Media, "ts")
-            };
-            rewrite_uri(url, kind, ext, routes, &mut rewritten, &mut out)?;
-            variant = false;
-        }
-        ensure!(
-            out.len() - before < 4096,
-            "HLS line exceeds the demuxer limit"
-        );
-        out.push('\n');
-        ensure!(
-            out.len() <= MAX_REWRITTEN_PLAYLIST,
-            "rewritten playlist exceeds limit"
-        );
-    }
-    Ok(out)
-}
-
-type RewrittenUris = BTreeMap<(Url, &'static str, &'static str), String>;
-
-fn rewrite_uri(
-    url: Url,
-    kind: RouteKind,
-    extension: &'static str,
-    routes: &Routes,
-    rewritten: &mut RewrittenUris,
-    out: &mut String,
-) -> Result<()> {
-    // Byte ranges and keys can reference the same representation more than once.
-    use std::collections::btree_map::Entry;
-    let local = match rewritten.entry((url, kind.tag(), extension)) {
-        Entry::Occupied(entry) => entry.into_mut(),
-        Entry::Vacant(entry) => {
-            let local = routes.seal(&entry.key().0, kind, extension)?;
-            entry.insert(local)
-        }
-    };
-    out.push_str(local);
-    Ok(())
-}
-
-/// Rewrite complete URI attributes, respecting commas inside quoted values (RFC 8216 §4.2).
-fn rewrite_attributes(
-    tag: &str,
-    mut attrs: &str,
-    base: &Url,
-    routes: &Routes,
-    rewritten: &mut RewrittenUris,
-    out: &mut String,
-) -> Result<()> {
-    // Accept an unambiguous subset of RFC 8216 §4.2. In particular, do not
-    // pass whitespace-delimited attributes or quotes interpreted by libavformat.
-    loop {
-        let (key, rest) = attrs
-            .split_once('=')
-            .context("missing HLS attribute value")?;
-        ensure!(
-            !key.is_empty()
-                && key
-                    .bytes()
-                    .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'-'),
-            "invalid HLS attribute name"
-        );
-        let (raw, tail, quoted) = if let Some(rest) = rest.strip_prefix('"') {
-            let (value, tail) = rest.split_once('"').context("unterminated HLS attribute")?;
-            ensure!(
-                !value.contains(['\\', '\t']),
-                "invalid quoted HLS attribute"
-            );
-            (value, tail, true)
-        } else {
-            let end = rest.find(',').unwrap_or(rest.len());
-            let value = &rest[..end];
-            ensure!(
-                !value.is_empty()
-                    && value
-                        .bytes()
-                        .all(|b| !b.is_ascii_whitespace() && !matches!(b, b'=' | b'"' | b'\\')),
-                "invalid unquoted HLS attribute"
-            );
-            (value, &rest[end..], false)
-        };
-        let next = if tail.is_empty() {
-            None
-        } else {
-            Some(
-                tail.strip_prefix(',')
-                    .filter(|s| !s.is_empty())
-                    .context("invalid HLS attribute separator")?,
-            )
-        };
-        out.push_str(key);
-        out.push('=');
-        if quoted {
-            out.push('"');
-        }
-        if key == "URI" || key.ends_with("-URI") {
-            ensure!(quoted && !raw.is_empty(), "invalid HLS URI attribute");
-            let url = validate_stream_url(base.join(raw)?.as_str())?;
-            let (kind, fallback) = match tag {
-                "#EXT-X-MEDIA"
-                | "#EXT-X-I-FRAME-STREAM-INF"
-                | "#EXT-X-IMAGE-STREAM-INF"
-                | "#EXT-X-RENDITION-REPORT" => (RouteKind::Playlist, "m3u8"),
-                "#EXT-X-KEY" | "#EXT-X-SESSION-KEY" => (RouteKind::Media, "key"),
-                "#EXT-X-MAP" => (RouteKind::Media, "mp4"),
-                _ => (RouteKind::Media, "ts"),
-            };
-            rewrite_uri(url, kind, fallback, routes, rewritten, out)?;
-        } else {
-            out.push_str(raw);
-        }
-        if quoted {
-            out.push('"');
-        }
-        ensure!(
-            out.len() <= MAX_REWRITTEN_PLAYLIST,
-            "rewritten playlist exceeds limit"
-        );
-        let Some(rest) = next else { break };
-        out.push(',');
-        attrs = rest;
-    }
-    Ok(())
 }
 
 #[cfg(test)]

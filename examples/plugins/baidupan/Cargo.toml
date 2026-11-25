@@ -1,0 +1,21 @@
+[package]
+name = "iris-example-baidupan"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+iris-plugin-sdk = { path = "../../../crates/iris-plugin-sdk" }
+miniz_oxide = "0.8"
+percent-encoding = "2.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+url = "2"
+
+[lints]
+workspace = true

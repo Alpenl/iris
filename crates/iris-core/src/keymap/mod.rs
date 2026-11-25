@@ -93,12 +93,14 @@ pub fn effective_gpui_context(declared_ctx: &str, keystroke: &str) -> Option<&'s
     match declared_ctx.trim() {
         "Workspace" => {
             if safe_while_typing(&chord, is_macos) {
-                Some("Workspace")
+                Some("Workspace && !Modal")
             } else {
-                Some("Workspace && !TextInput")
+                Some("Workspace && !TextInput && !Modal")
             }
         }
-        "Workspace && !TextInput" => Some("Workspace && !TextInput"),
+        "Workspace && !TextInput" | "Workspace && !TextInput && !Modal" => {
+            Some("Workspace && !TextInput && !Modal")
+        }
         "Viewport" => Some("Viewport"),
         "Viewport && media == video" => Some("Viewport && media == video"),
         "Viewport && media == image" => Some("Viewport && media == image"),
@@ -567,7 +569,7 @@ mod tests {
 
     #[test]
     fn builtin_schemes_have_zero_conflicts_and_lock_text_input_firewall() {
-        assert_eq!(ACTIONS.len(), 52);
+        assert_eq!(ACTIONS.len(), 54);
         for &scheme in KeymapScheme::ALL {
             let km = Keymap {
                 scheme,
@@ -613,7 +615,7 @@ mod tests {
         ] {
             assert_eq!(
                 effective_gpui_context("Workspace", single),
-                Some("Workspace && !TextInput")
+                Some("Workspace && !TextInput && !Modal")
             );
         }
         for chord in [
@@ -627,7 +629,7 @@ mod tests {
         ] {
             assert_eq!(
                 effective_gpui_context("Workspace", chord),
-                Some("Workspace")
+                Some("Workspace && !Modal")
             );
         }
     }

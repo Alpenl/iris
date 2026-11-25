@@ -4,9 +4,9 @@
 use std::rc::Rc;
 
 use gpui::{
-    AnyElement, ClipboardItem, Context, Div, ElementId, InteractiveElement, IntoElement,
+    AnyElement, Bounds, ClipboardItem, Context, Div, ElementId, InteractiveElement, IntoElement,
     MouseButton, ParentElement, Rgba, SharedString, Stateful, StatefulInteractiveElement, Styled,
-    Window, div, prelude::FluentBuilder, px, relative, rgb,
+    Window, canvas, div, fill, point, prelude::FluentBuilder, px, relative, rgb, size,
 };
 use iris_api::Widget;
 
@@ -22,7 +22,9 @@ type ValCallback<T> = Rc<dyn Fn(&mut IrisWindow, T, &mut Window, &mut Context<Ir
 
 #[derive(Clone)]
 pub(super) enum WidgetSurface<'a> {
-    Sidebar,
+    Sidebar {
+        window: &'a Window,
+    },
     Modal {
         modal_id: &'a str,
         on_submit: FormEnterCallback,
@@ -157,40 +159,158 @@ fn icon_pill_button(
         .child(label.into())
 }
 
+/// ISO/IEC 18004 requires at least 4 modules of pure-white quiet zone on every side.
+const QR_QUIET_MODULES: usize = 4;
+
+struct QrMatrix {
+    width: usize,
+    height: usize,
+    /// Per-row coalesced `[start_col, end_col)` dark runs so adjacent modules share exact
+    /// edges and paint without horizontal seams or thousands of layout nodes.
+    dark_runs: Vec<Vec<(usize, usize)>>,
+}
+
+impl QrMatrix {
+    fn from_lines(matrix: &[String]) -> Option<Self> {
+        let grid: Vec<Vec<bool>> = matrix
+            .iter()
+            .filter(|r| !r.is_empty())
+            .take(96)
+            .map(|row| row.chars().take(96).map(is_qr_dark_module).collect())
+            .collect();
+        let (mut min_r, mut max_r) = (usize::MAX, 0usize);
+        let (mut min_c, mut max_c) = (usize::MAX, 0usize);
+        for (ry, row) in grid.iter().enumerate() {
+            for (cx, &dark) in row.iter().enumerate() {
+                if dark {
+                    min_r = min_r.min(ry);
+                    max_r = max_r.max(ry);
+                    min_c = min_c.min(cx);
+                    max_c = max_c.max(cx);
+                }
+            }
+        }
+        if min_r > max_r || min_c > max_c {
+            return None;
+        }
+        let width = max_c - min_c + 1;
+        let height = max_r - min_r + 1;
+        let mut dark_runs = Vec::with_capacity(height);
+        for row in &grid[min_r..=max_r] {
+            let mut runs = Vec::new();
+            let mut run_start = None;
+            for col in 0..width {
+                let dark = row.get(min_c + col).copied().unwrap_or(false);
+                match (run_start, dark) {
+                    (None, true) => run_start = Some(col),
+                    (Some(s), false) => {
+                        runs.push((s, col));
+                        run_start = None;
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(s) = run_start {
+                runs.push((s, width));
+            }
+            dark_runs.push(runs);
+        }
+        Some(Self {
+            width,
+            height,
+            dark_runs,
+        })
+    }
+
+    fn dim(&self) -> usize {
+        self.width.max(self.height).max(1)
+    }
+}
+
+/// Computes `(module_dev_px, total_logical_side)` snapped to an exact integer number of
+/// device pixels per module so fractional DPI scaling (125%/150%/175%) never produces
+/// subpixel white seams between rows or columns.
+fn qr_canvas_metrics(dim: usize, max_logical: f32, scale_factor: f32) -> (f32, f32) {
+    let scale = if scale_factor.is_finite() && scale_factor >= 1.0 {
+        scale_factor
+    } else {
+        1.0
+    };
+    let total_modules = (dim.max(1) + QR_QUIET_MODULES * 2) as f32;
+    let max_dev = (max_logical.max(64.0) * scale).floor();
+    let cap_dev = (8.0 * scale).ceil();
+    let mod_dev = (max_dev / total_modules).floor().clamp(1.0, cap_dev);
+    let total_logical = (mod_dev * total_modules) / scale;
+    (mod_dev, total_logical)
+}
+
 fn render_qr_widget(
     base_id: usize,
-    is_modal: bool,
+    max_logical_side: f32,
+    scale_factor: f32,
     (label, data, matrix, hint): (String, String, Vec<String>, Option<String>),
     t: ThemeTokens,
     cx: &Context<IrisWindow>,
 ) -> AnyElement {
-    let parsed_rows: Vec<Vec<bool>> = matrix
-        .iter()
-        .filter(|r| !r.is_empty())
-        .take(96)
-        .map(|row| row.chars().take(96).map(is_qr_dark_module).collect())
-        .collect();
-    let max_cols = parsed_rows.iter().map(Vec::len).max().unwrap_or(0);
-    let dim = parsed_rows.len().max(max_cols).max(1);
-    let cell = ((if is_modal { 168.0 } else { 148.0 }) / dim as f32)
-        .floor()
-        .clamp(2.0, 8.0);
+    let parsed = QrMatrix::from_lines(&matrix);
     let copy_payload = data.clone();
 
-    let grid = (!parsed_rows.is_empty() && max_cols > 0).then(|| {
-        let rows = parsed_rows.into_iter().map(|row| {
-            let cells = (0..max_cols).map(|ci| {
-                let dark = row.get(ci).copied().unwrap_or(false);
-                div().size(px(cell)).when(dark, |m| m.bg(rgb(0x000000)))
-            });
-            div().flex().h(px(cell)).children(cells)
-        });
-        let sheet = vstack(0.)
-            .p(px(10.))
+    let grid = parsed.map(|qr| {
+        let dim = qr.dim();
+        let (_, total_logical) = qr_canvas_metrics(dim, max_logical_side, scale_factor);
+        let qr = std::rc::Rc::new(qr);
+        let qr_paint = qr.clone();
+        let qr_canvas = canvas(
+            |_, _, _| {},
+            move |bounds, _, window, _| {
+                window.paint_quad(fill(bounds, rgb(0xFFFFFF)));
+                let scale = window.scale_factor();
+                let scale = if scale.is_finite() && scale >= 1.0 {
+                    scale
+                } else {
+                    1.0
+                };
+                let avail_w = f32::from(bounds.size.width) * scale;
+                let avail_h = f32::from(bounds.size.height) * scale;
+                let total_modules = (qr_paint.dim() + QR_QUIET_MODULES * 2) as f32;
+                let mod_dev = ((avail_w.min(avail_h) + 0.05) / total_modules)
+                    .floor()
+                    .max(1.0);
+                let qr_dev_w = mod_dev * qr_paint.width as f32;
+                let qr_dev_h = mod_dev * qr_paint.height as f32;
+                let origin_dev_x =
+                    (f32::from(bounds.origin.x) * scale + (avail_w - qr_dev_w) * 0.5).round();
+                let origin_dev_y =
+                    (f32::from(bounds.origin.y) * scale + (avail_h - qr_dev_h) * 0.5).round();
+
+                for (ry, runs) in qr_paint.dark_runs.iter().enumerate() {
+                    if runs.is_empty() {
+                        continue;
+                    }
+                    let y0 = px((origin_dev_y + ry as f32 * mod_dev) / scale);
+                    let y1 = px((origin_dev_y + (ry + 1) as f32 * mod_dev) / scale);
+                    let h = y1 - y0;
+                    for &(rx0, rx1) in runs {
+                        let x0 = px((origin_dev_x + rx0 as f32 * mod_dev) / scale);
+                        let x1 = px((origin_dev_x + rx1 as f32 * mod_dev) / scale);
+                        window.paint_quad(fill(
+                            Bounds::new(point(x0, y0), size(x1 - x0, h)),
+                            rgb(0x000000),
+                        ));
+                    }
+                }
+            },
+        )
+        .w(px(total_logical))
+        .h(px(total_logical))
+        .flex_none();
+
+        let sheet = div()
+            .flex_none()
             .bg(rgb(0xFFFFFF))
             .border_1()
             .border_color(t.line_strong)
-            .children(rows);
+            .child(qr_canvas);
         hstack(0.).w_full().justify_center().py(px(4.)).child(sheet)
     });
     let copy_row = (!data.trim().is_empty()).then(|| {
@@ -233,7 +353,7 @@ pub(super) fn render_plugin_widget(
     let pid_owned = pid.to_string();
     let modal_key = |id: &str| match &surface {
         WidgetSurface::Modal { modal_id, .. } => Some(format!("modal:{pid}:{modal_id}:{id}")),
-        WidgetSurface::Sidebar => None,
+        WidgetSurface::Sidebar { .. } => None,
     };
 
     let content = match widget {
@@ -379,7 +499,7 @@ pub(super) fn render_plugin_widget(
                         .child(win.render_text_field(spec, Some(window), cx))
                         .into_any_element()
                 }
-                WidgetSurface::Sidebar => {
+                WidgetSurface::Sidebar { window } => {
                     let field_key = format!("sb:{pid_owned}:{id}");
                     let seed_sub = value.clone();
                     let target_act = action_id.filter(|a| !a.is_empty()).unwrap_or(id);
@@ -409,10 +529,11 @@ pub(super) fn render_plugin_widget(
                     let btn = chip_button(("pl-inp-sub", base_id), "提交", false, t)
                         .h(px(30.))
                         .on_click(cx.listener(move |this, _, w, cx| btn_cb(this, w, cx)));
-                    let field = div()
-                        .flex_1()
-                        .min_w(px(0.))
-                        .child(win.render_text_field(spec, None, cx));
+                    let field = div().flex_1().min_w(px(0.)).child(win.render_text_field(
+                        spec,
+                        Some(window),
+                        cx,
+                    ));
                     vstack(4.)
                         .when_some(lbl, |d, l| d.child(txt(l, 10., t.text_dim)))
                         .child(hstack(4.).child(field).child(btn))
@@ -534,7 +655,25 @@ pub(super) fn render_plugin_widget(
             data,
             matrix,
             hint,
-        } => render_qr_widget(base_id, is_modal, (label, data, matrix, hint), t, cx),
+            ..
+        } => {
+            let window = match &surface {
+                WidgetSurface::Sidebar { window } | WidgetSurface::Modal { window, .. } => *window,
+            };
+            let max_logical_side = if is_modal {
+                (f32::from(window.viewport_size().width) - 108.0).clamp(160.0, 260.0)
+            } else {
+                (win.settings.directory_width - 64.0).clamp(140.0, 256.0)
+            };
+            render_qr_widget(
+                base_id,
+                max_logical_side,
+                window.scale_factor(),
+                (label, data, matrix, hint),
+                t,
+                cx,
+            )
+        }
 
         Widget::Link {
             label,
@@ -579,7 +718,9 @@ pub(super) fn render_plugin_widget(
 
 #[cfg(test)]
 mod tests {
-    use super::{finite_value, sanitize_range, step_clamped};
+    use super::{
+        QR_QUIET_MODULES, QrMatrix, finite_value, qr_canvas_metrics, sanitize_range, step_clamped,
+    };
 
     #[test]
     fn slider_extreme_ranges_and_invalid_drafts_stay_finite() {
@@ -594,6 +735,42 @@ mod tests {
             assert!((0. ..=1.).contains(&((value - lo) / (hi - lo))));
             assert_eq!(finite_value(f64::NAN, lo, hi, value), value);
             assert!((lo..=hi).contains(&step_clamped(value, step, lo, hi)));
+        }
+    }
+
+    #[test]
+    fn qr_matrix_trims_outer_margins_and_coalesces_dark_runs() {
+        let raw = vec![
+            "0000000".into(),
+            "0110110".into(),
+            "0100010".into(),
+            "0111110".into(),
+            "0000000".into(),
+        ];
+        let parsed = QrMatrix::from_lines(&raw).expect("non-empty qr");
+        assert_eq!(parsed.width, 5);
+        assert_eq!(parsed.height, 3);
+        assert_eq!(parsed.dark_runs[0], vec![(0, 2), (3, 5)]);
+        assert_eq!(parsed.dark_runs[1], vec![(0, 1), (4, 5)]);
+        assert_eq!(parsed.dark_runs[2], vec![(0, 5)]);
+        assert!(QrMatrix::from_lines(&["000".into(), "000".into()]).is_none());
+    }
+
+    #[test]
+    fn qr_canvas_metrics_snaps_to_integer_device_pixels_across_dpi_scales() {
+        for scale in [1.0f32, 1.25, 1.5, 1.75, 2.0] {
+            for dim in [29usize, 37, 49] {
+                let (mod_dev, total_logical) = qr_canvas_metrics(dim, 224.0, scale);
+                assert_eq!(mod_dev.fract(), 0.0, "scale={scale} dim={dim}");
+                assert!(mod_dev >= 3.0, "scale={scale} dim={dim} mod_dev={mod_dev}");
+                let total_dev = (total_logical * scale).round();
+                let quiet_dev = (total_dev - mod_dev * dim as f32) * 0.5;
+                assert!(
+                    quiet_dev >= mod_dev * QR_QUIET_MODULES as f32 - 0.01,
+                    "scale={scale} dim={dim} quiet_dev={quiet_dev} mod_dev={mod_dev}"
+                );
+                assert!(total_logical <= 224.01, "overflowed container: {total_logical}");
+            }
         }
     }
 }

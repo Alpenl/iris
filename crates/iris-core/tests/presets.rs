@@ -6,6 +6,45 @@ use iris_core::preset::{
 use iris_core::settings::{Settings, Side};
 
 #[test]
+fn another_windows_layout_save_preserves_explicit_plugin_toggles() {
+    let dir = std::env::temp_dir().join(format!("iris-preset-multi-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("settings.conf");
+    Settings::default().save_to(&file).unwrap();
+    let manager = PresetManager::load_from(&dir.join("presets.json"));
+    let (mut a, mut first, _) = PresetRuntime::restore_on_startup_with_path(
+        &manager,
+        Settings::load_from(&file),
+        Some(file.clone()),
+    );
+    let (mut b, mut second, _) = PresetRuntime::restore_on_startup_with_path(
+        &manager,
+        Settings::load_from(&file),
+        Some(file.clone()),
+    );
+    first.set_plugin_enabled(&mut a, "test.tool", false);
+    b.directory_width = 333.;
+    second.record_user_edit(&b);
+    assert!(
+        Settings::load_from(&file)
+            .disabled_plugins
+            .contains(&"test.tool".into())
+    );
+    // The second window's settings still say enabled. An explicit enable click
+    // must nevertheless win, while a later unrelated first-window edit cannot undo it.
+    second.set_plugin_enabled(&mut b, "test.tool", true);
+    a.directory_width = 444.;
+    first.record_user_edit(&a);
+    assert!(
+        !Settings::load_from(&file)
+            .disabled_plugins
+            .contains(&"test.tool".into())
+    );
+    std::fs::remove_file(file).unwrap();
+    std::fs::remove_dir(dir).unwrap();
+}
+
+#[test]
 fn sparse_revert_user_edit_promotion_crash_restart_and_custom_crud() {
     let dir = std::env::temp_dir().join(format!("iris-preset-1b-test-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -214,4 +253,119 @@ fn startup_pip_restores_default_window_without_a_saved_size() {
     let transition = runtime.switch_preset(&mgr, "default", &mut active, PresetLayout::default());
     assert_eq!(transition.window_size, Some(DEFAULT_WINDOW_SIZE));
     assert_eq!((active.window_width, active.window_height), (None, None));
+}
+
+#[test]
+fn updating_active_or_inactive_preset_keeps_revert_and_plugin_scopes_isolated() {
+    let dir = std::env::temp_dir().join(format!("iris-preset-update-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let settings_file = dir.join("settings.conf");
+    let presets_file = dir.join("presets.json");
+
+    let mut mgr = PresetManager::load_from(&presets_file);
+    let initial = Settings {
+        seek_step: 10.0,
+        disabled_plugins: vec!["ext.alpha".into()],
+        ..Default::default()
+    };
+    initial.save_to(&settings_file).unwrap();
+    let (mut active, mut rt, _) = PresetRuntime::restore_on_startup_with_path(
+        &mgr,
+        Settings::load_from(&settings_file),
+        Some(settings_file.clone()),
+    );
+    let layout = PresetLayout {
+        sidebar_mode: SidebarMode::Files,
+        window_size: Some((1280., 720.)),
+    };
+
+    // Save two custom presets: `p1` (forces `ext.alpha` disabled) and `p2` (clean plugin patch).
+    let p1 = PresetManager::capture_from_current(
+        "p1",
+        "预设一",
+        "",
+        PresetCaptureScope::default(),
+        &active,
+        &rt,
+        SidebarMode::Files,
+        layout.window_size,
+        1.0,
+        AspectMode::Original,
+    );
+    let mut p1 = p1;
+    p1.plugins.as_mut().unwrap().disable_plugins = vec!["ext.alpha".into()];
+    mgr.save_custom(p1);
+    mgr.save_custom(PresetManager::capture_from_current(
+        "p2",
+        "预设二",
+        "",
+        PresetCaptureScope::default(),
+        &active,
+        &rt,
+        SidebarMode::Files,
+        layout.window_size,
+        1.0,
+        AspectMode::Original,
+    ));
+
+    // Activate `p1`: `initial_plugins` holds `ext.alpha = true`, matching baseline.
+    rt.switch_preset(&mgr, "p1", &mut active, layout);
+    assert!(!rt.is_modified(&active));
+
+    // Updating INACTIVE `p2` while `p1` is active must NOT copy `p1`'s `initial_plugins` into `p2`.
+    assert!(mgr.update_from_current(
+        "p2",
+        PresetCaptureScope::default(),
+        &active,
+        &rt,
+        SidebarMode::Files,
+        layout.window_size,
+        1.0,
+        AspectMode::Original,
+    ));
+    assert!(
+        mgr.get("p2")
+            .unwrap()
+            .plugins
+            .as_ref()
+            .unwrap()
+            .disable_plugins
+            .is_empty()
+    );
+
+    // Tweak `seek_step` and disable `ext.chat` while inside `p1` -> `is_modified` turns true.
+    active.seek_step = 4.0;
+    rt.record_user_edit(&active);
+    rt.set_plugin_enabled(&mut active, "ext.chat", false);
+    assert!(rt.is_modified(&active));
+
+    // Merge live tweaks into active `p1` and sync runtime -> `is_modified` clears AND
+    // switching back to `default` reverts `seek_step` (10.0) and `ext.chat` (enabled)!
+    assert!(mgr.update_from_current(
+        "p1",
+        PresetCaptureScope::default(),
+        &active,
+        &rt,
+        SidebarMode::Files,
+        layout.window_size,
+        1.0,
+        AspectMode::Original,
+    ));
+    let updated_p1 = mgr.get("p1").unwrap().clone();
+    rt.sync_updated_active_preset(&updated_p1, &active);
+    assert!(!rt.is_modified(&active));
+    assert_eq!(rt.baseline().seek_step, 10.0);
+    assert!(
+        !rt.baseline()
+            .disabled_plugins
+            .iter()
+            .any(|x| x == "ext.chat")
+    );
+
+    rt.switch_preset(&mgr, "default", &mut active, layout);
+    assert_eq!(active.seek_step, 10.0);
+    assert_eq!(active.disabled_plugins, vec!["ext.alpha"]);
+
+    let _ = std::fs::remove_dir_all(&dir);
 }

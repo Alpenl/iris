@@ -140,7 +140,7 @@
 - **macOS 新功能实机走查**：Windows 11 双屏实体机已于 2026-11-23 完成全量 72 项测试、三套 Clippy、原生 D3D11（含连续 3 次设备丢失重置自愈并恢复 `d3d11va` 硬解与看图状态）/跨屏 ICC/WIC 缩略图/窗口控制与 `WM_CLOSE` 落盘/单实例转发、`1B+` 稀疏预设、`iris.webdav`（Windows 凭据管理器）及外部插件/无边框护栏实测核销（见 `TESTING.md`）；macOS 侧的触控板双指捏合、系统媒体键以及中期重构后的 GUI 仍待在实体 Mac 上人工点验。
 - **最低系统版本**：打包脚本当前以 macOS 11 为构建目标；实际支持下限仍需对应系统验证。
 - **商业模式**：是否走 Open-Core，仍未决定。
-- **正式分发签名**：当前仅支持未签名本地包与 CI 构建；正式分发需要 Developer ID / 公证与 Windows Authenticode 凭据。
+- **正式分发签名**：`scripts/release/package.py` 与发行工作流已实现未签名本地包（`--mode local`）及正式签名发布模式（`--mode release`：macOS Developer ID 逐项签名与 `notarytool` 公证装订、Windows Authenticode 签名）；实际产出已签名发行包需提供对应发行证书凭据。
 - **跨显示器**：窗口移到另一块屏幕时刷新率和任意多屏 ICC 组合尚未完整验证。
 - **控制协议边界**：仅 debug 或显式 `devtools` 构建启用，限定同用户；普通 release 不监听。
 - **未复现的问题**：早期一次全新启动后先开图片黑屏的历史记录，此后未能复现。

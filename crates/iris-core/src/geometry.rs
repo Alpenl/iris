@@ -12,23 +12,60 @@ impl ImageView {
         *self = Self::default();
     }
     pub fn zoomed(&self) -> bool {
-        self.zoom.abs() > 0.0001 || self.pan != [0., 0.]
+        (self.zoom.is_finite() && self.zoom.abs() > 0.0001)
+            || (self.pan[0].is_finite() && self.pan[1].is_finite() && self.pan != [0., 0.])
     }
 
     pub fn displayed(&self, viewport: [f64; 2], media: [f64; 2]) -> [f64; 2] {
-        let scale = fit(viewport, media) * self.zoom.exp2();
-        [media[0] * scale, media[1] * scale]
+        if !viewport[0].is_finite()
+            || !viewport[1].is_finite()
+            || !media[0].is_finite()
+            || !media[1].is_finite()
+            || viewport[0] <= 0.
+            || viewport[1] <= 0.
+        {
+            return [0., 0.];
+        }
+        let zoom = if self.zoom.is_finite() {
+            self.zoom.clamp(-4., 6.)
+        } else {
+            0.
+        };
+        let scale = fit(viewport, media) * zoom.exp2();
+        [media[0].max(1.) * scale, media[1].max(1.) * scale]
     }
 
     /// Physical screen pixels per image pixel; 1.0 is actual size.
     pub fn pixel_scale(&self, viewport: [f64; 2], media: [f64; 2], backing_scale: f64) -> f64 {
-        fit(viewport, media) * self.zoom.exp2() * backing_scale
+        let bs = if backing_scale.is_finite() && backing_scale > 0. {
+            backing_scale
+        } else {
+            1.
+        };
+        let zoom = if self.zoom.is_finite() {
+            self.zoom.clamp(-4., 6.)
+        } else {
+            0.
+        };
+        fit(viewport, media) * zoom.exp2() * bs
     }
 
     /// Keeps the media point beneath the pointer fixed while changing scale.
     pub fn zoom_at(&mut self, delta: f64, pointer: [f64; 2], viewport: [f64; 2], media: [f64; 2]) {
-        if viewport[0] <= 0. || viewport[1] <= 0. {
+        if !delta.is_finite()
+            || !pointer[0].is_finite()
+            || !pointer[1].is_finite()
+            || !viewport[0].is_finite()
+            || !viewport[1].is_finite()
+            || !media[0].is_finite()
+            || !media[1].is_finite()
+            || viewport[0] <= 0.
+            || viewport[1] <= 0.
+        {
             return;
+        }
+        if !self.zoom.is_finite() || !self.pan[0].is_finite() || !self.pan[1].is_finite() {
+            self.reset();
         }
         let old = self.displayed(viewport, media);
         let zoom = (self.zoom + delta).clamp(-4., 6.);
@@ -44,6 +81,20 @@ impl ImageView {
     }
 
     pub fn pan_by(&mut self, delta: [f64; 2], viewport: [f64; 2], media: [f64; 2]) {
+        if !delta[0].is_finite()
+            || !delta[1].is_finite()
+            || !viewport[0].is_finite()
+            || !viewport[1].is_finite()
+            || !media[0].is_finite()
+            || !media[1].is_finite()
+            || viewport[0] <= 0.
+            || viewport[1] <= 0.
+        {
+            return;
+        }
+        if !self.zoom.is_finite() || !self.pan[0].is_finite() || !self.pan[1].is_finite() {
+            self.reset();
+        }
         let displayed = self.displayed(viewport, media);
         for axis in 0..2 {
             self.pan[axis] += delta[axis] / displayed[axis].max(1.);
@@ -54,6 +105,17 @@ impl ImageView {
     pub fn toggle_actual_size(&mut self, viewport: [f64; 2], media: [f64; 2], backing_scale: f64) {
         if self.zoomed() {
             self.reset();
+            return;
+        }
+        if !viewport[0].is_finite()
+            || !viewport[1].is_finite()
+            || !media[0].is_finite()
+            || !media[1].is_finite()
+            || !backing_scale.is_finite()
+            || viewport[0] <= 0.
+            || viewport[1] <= 0.
+            || backing_scale <= 0.
+        {
             return;
         }
         let fit = fit(viewport, media);
@@ -75,6 +137,15 @@ impl ImageView {
 
 /// The scale at which mpv shows the whole image in the viewport.
 fn fit(viewport: [f64; 2], media: [f64; 2]) -> f64 {
+    if !viewport[0].is_finite()
+        || !viewport[1].is_finite()
+        || !media[0].is_finite()
+        || !media[1].is_finite()
+        || viewport[0] <= 0.
+        || viewport[1] <= 0.
+    {
+        return 0.;
+    }
     (viewport[0] / media[0].max(1.)).min(viewport[1] / media[1].max(1.))
 }
 

@@ -12,7 +12,7 @@ use super::super::kit::icon;
 use crate::assets::Icon;
 use crate::theme::{FONT_MONO, FONT_UI, ThemeTokens, parse_hex_rgba};
 
-fn resolve_overlay_color(color: &Color, opacity: f32, t: ThemeTokens) -> Rgba {
+pub(in crate::ui) fn resolve_overlay_color(color: &Color, opacity: f32, t: ThemeTokens) -> Rgba {
     let mut c = match color {
         Color::White => t.text,
         Color::Muted => t.text_muted,
@@ -43,7 +43,14 @@ impl IrisWindow {
         &self,
         cx: &mut Context<Self>,
     ) -> Option<impl IntoElement> {
-        let mut tagged_nodes = self.plugins.overlay_nodes().peekable();
+        self.render_overlay_nodes(self.plugins.overlay_nodes(), cx)
+    }
+    pub(in crate::ui) fn render_overlay_nodes<'a>(
+        &self,
+        tagged: impl Iterator<Item = (&'a str, &'a OverlayNode)>,
+        cx: &mut Context<Self>,
+    ) -> Option<impl IntoElement> {
+        let mut tagged_nodes = tagged.peekable();
         tagged_nodes.peek()?;
 
         let t = ThemeTokens::of(cx);

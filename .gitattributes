@@ -22,3 +22,5 @@
 *.mp4 binary
 *.mkv binary
 *.mov binary
+*.wasm binary
+*.irisplugin binary

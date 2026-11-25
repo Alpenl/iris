@@ -6,15 +6,20 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow};
 
 use crate::fs_util;
 
 /// Maximum secret payload size in bytes (strictly below Windows `CRED_MAX_CREDENTIAL_BLOB_SIZE = 2560`).
 pub const MAX_SECRET_BYTES: usize = 2048;
+/// Maximum stored credential keys per plugin/source scope.
+pub const MAX_SECRETS_PER_SCOPE: usize = 64;
 
 const MAX_KEY_BYTES: usize = 256;
+const VAULT_WRITE_LOCK_TIMEOUT: Duration = Duration::from_millis(1200);
+const VAULT_READ_LOCK_TIMEOUT: Duration = Duration::from_millis(250);
 
 type ScopedSecrets = BTreeMap<String, BTreeMap<String, String>>;
 type CredentialIndex = BTreeMap<String, BTreeSet<String>>;
@@ -33,13 +38,67 @@ pub struct CredentialVault {
     backend: VaultBackend,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VaultErrorKind {
+    QuotaExceeded,
+    Busy,
+    InvalidArgument,
+    Backend,
+}
+
+#[derive(Debug)]
+pub struct VaultError {
+    pub kind: VaultErrorKind,
+    pub message: String,
+}
+
+impl std::fmt::Display for VaultError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for VaultError {}
+
+fn vault_err(kind: VaultErrorKind, message: impl Into<String>) -> anyhow::Error {
+    anyhow::Error::new(VaultError {
+        kind,
+        message: message.into(),
+    })
+}
+
+pub fn vault_error_code(error: &anyhow::Error) -> iris_api::v2::ErrorCode {
+    if let Some(typed) = error.downcast_ref::<VaultError>() {
+        return match typed.kind {
+            VaultErrorKind::QuotaExceeded => iris_api::v2::ErrorCode::QuotaExceeded,
+            VaultErrorKind::Busy => iris_api::v2::ErrorCode::Backpressure,
+            VaultErrorKind::InvalidArgument => iris_api::v2::ErrorCode::InvalidArgument,
+            VaultErrorKind::Backend => iris_api::v2::ErrorCode::IoError,
+        };
+    }
+    if error
+        .chain()
+        .filter_map(|cause| cause.downcast_ref::<io::Error>())
+        .any(|io_err| io_err.kind() == io::ErrorKind::WouldBlock)
+    {
+        return iris_api::v2::ErrorCode::Backpressure;
+    }
+    iris_api::v2::ErrorCode::IoError
+}
+
 fn validate_id_part<'a>(label: &str, val: &'a str) -> Result<&'a str> {
     let trimmed = val.trim();
     if trimmed.is_empty() || trimmed.len() > MAX_KEY_BYTES {
-        bail!("invalid credential {label}");
+        return Err(vault_err(
+            VaultErrorKind::InvalidArgument,
+            format!("invalid credential {label}"),
+        ));
     }
     if trimmed.bytes().any(|b| matches!(b, b'\0' | b'\r' | b'\n')) {
-        bail!("credential {label} contains control characters");
+        return Err(vault_err(
+            VaultErrorKind::InvalidArgument,
+            format!("credential {label} contains control characters"),
+        ));
     }
     Ok(trimmed)
 }
@@ -54,14 +113,28 @@ fn read_json_map<T: serde::de::DeserializeOwned + Default>(path: &Path) -> Resul
 }
 
 fn vault_lock(path: &Path) -> Result<std::fs::File> {
-    fs_util::lock_file(path).context("could not lock credential vault")
+    fs_util::lock_file_with_timeout(path, VAULT_WRITE_LOCK_TIMEOUT)
+        .context("could not lock credential vault")
+}
+
+fn try_vault_read_lock(path: &Path) -> Result<Option<std::fs::File>> {
+    match fs_util::lock_file_with_timeout(path, VAULT_READ_LOCK_TIMEOUT) {
+        Ok(file) => Ok(Some(file)),
+        Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(None),
+        Err(e) => Err(e).context("could not lock credential vault"),
+    }
+}
+
+#[cfg(any(debug_assertions, feature = "devtools"))]
+fn test_file_lock_path(path: &Path) -> PathBuf {
+    let mut lock = path.as_os_str().to_os_string();
+    lock.push(".lock");
+    PathBuf::from(lock)
 }
 
 #[cfg(any(debug_assertions, feature = "devtools"))]
 fn test_file_lock(path: &Path) -> Result<std::fs::File> {
-    let mut lock = path.as_os_str().to_os_string();
-    lock.push(".lock");
-    vault_lock(Path::new(&lock))
+    vault_lock(&test_file_lock_path(path))
 }
 
 fn log_read_error(error: anyhow::Error) {
@@ -353,7 +426,7 @@ impl CredentialVault {
             #[cfg(any(debug_assertions, feature = "devtools"))]
             VaultBackend::TestFile(path) => {
                 let read = || -> Result<Option<String>> {
-                    let _lock = test_file_lock(path)?;
+                    let _lock = try_vault_read_lock(&test_file_lock_path(path))?;
                     let secrets: ScopedSecrets = read_json_map(path)?;
                     Ok(secrets.get(scope).and_then(|keys| keys.get(key)).cloned())
                 };
@@ -364,13 +437,43 @@ impl CredentialVault {
             }
             VaultBackend::System => {
                 let read = || -> Result<Option<String>> {
-                    let _lock = vault_lock(&system_dir()?.join("vault.lock"))?;
+                    let _lock = try_vault_read_lock(&system_dir()?.join("vault.lock"))?;
                     os_store::get(scope, key).map_err(anyhow::Error::msg)
                 };
                 read().unwrap_or_else(|e| {
                     log_read_error(e);
                     None
                 })
+            }
+        }
+    }
+
+    /// Strict reads distinguish an absent key from a locked or unavailable
+    /// vault. Callers must run this on a background worker.
+    pub fn try_get_secret(&self, scope: &str, key: &str) -> Result<Option<String>> {
+        let scope = validate_id_part("scope", scope)?;
+        let key = validate_id_part("key", key)?;
+        match &self.backend {
+            VaultBackend::InMemory(store) => Ok(store
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(scope)
+                .and_then(|entries| entries.get(key))
+                .cloned()),
+            #[cfg(any(debug_assertions, feature = "devtools"))]
+            VaultBackend::TestFile(path) => {
+                let _lock = try_vault_read_lock(&test_file_lock_path(path))?
+                    .ok_or_else(|| vault_err(VaultErrorKind::Busy, "credential vault is busy"))?;
+                let secrets: ScopedSecrets = read_json_map(path)?;
+                Ok(secrets
+                    .get(scope)
+                    .and_then(|entries| entries.get(key))
+                    .cloned())
+            }
+            VaultBackend::System => {
+                let _lock = try_vault_read_lock(&system_dir()?.join("vault.lock"))?
+                    .ok_or_else(|| vault_err(VaultErrorKind::Busy, "credential vault is busy"))?;
+                os_store::get(scope, key).map_err(|e| vault_err(VaultErrorKind::Backend, e))
             }
         }
     }
@@ -382,12 +485,27 @@ impl CredentialVault {
         if let Some(s) = secret
             && s.len() > MAX_SECRET_BYTES
         {
-            bail!("secret exceeds maximum size ({MAX_SECRET_BYTES} bytes)");
+            return Err(vault_err(
+                VaultErrorKind::QuotaExceeded,
+                format!("secret exceeds maximum size ({MAX_SECRET_BYTES} bytes)"),
+            ));
         }
 
         match &self.backend {
             VaultBackend::InMemory(store) => {
                 let mut guard = store.lock().unwrap_or_else(|e| e.into_inner());
+                if secret.is_some()
+                    && guard
+                        .get(scope)
+                        .is_some_and(|m| !m.contains_key(key) && m.len() >= MAX_SECRETS_PER_SCOPE)
+                {
+                    return Err(vault_err(
+                        VaultErrorKind::QuotaExceeded,
+                        format!(
+                            "credential scope '{scope}' exceeds maximum key count ({MAX_SECRETS_PER_SCOPE})"
+                        ),
+                    ));
+                }
                 apply_secret_edit(&mut guard, scope, key, secret);
                 Ok(())
             }
@@ -395,6 +513,18 @@ impl CredentialVault {
             VaultBackend::TestFile(path) => {
                 let _lock = test_file_lock(path)?;
                 let mut secrets: ScopedSecrets = read_json_map(path)?;
+                if secret.is_some()
+                    && secrets
+                        .get(scope)
+                        .is_some_and(|m| !m.contains_key(key) && m.len() >= MAX_SECRETS_PER_SCOPE)
+                {
+                    return Err(vault_err(
+                        VaultErrorKind::QuotaExceeded,
+                        format!(
+                            "credential scope '{scope}' exceeds maximum key count ({MAX_SECRETS_PER_SCOPE})"
+                        ),
+                    ));
+                }
                 apply_secret_edit(&mut secrets, scope, key, secret);
                 write_json_private(path, &secrets)
             }
@@ -405,15 +535,37 @@ impl CredentialVault {
                 let mut index: CredentialIndex = read_json_map(&path)?;
                 match secret {
                     Some(val) => {
-                        // Reserve the index entry first. A crash or an OS write
-                        // error may leave a missing secret, but cannot orphan one.
-                        if update_index(&mut index, scope, key, true) {
+                        if index
+                            .get(scope)
+                            .is_some_and(|k| !k.contains(key) && k.len() >= MAX_SECRETS_PER_SCOPE)
+                        {
+                            return Err(vault_err(
+                                VaultErrorKind::QuotaExceeded,
+                                format!(
+                                    "credential scope '{scope}' exceeds maximum key count ({MAX_SECRETS_PER_SCOPE})"
+                                ),
+                            ));
+                        }
+                        // Reserve the index entry first so a crash cannot orphan an
+                        // unindexed secret; if the OS write fails cleanly without
+                        // creating the entry, roll back the reservation under lock.
+                        let added = update_index(&mut index, scope, key, true);
+                        if added {
                             write_json_private(&path, &index)?;
                         }
-                        os_store::set(scope, key, val).map_err(anyhow::Error::msg)?;
+                        if let Err(err) = os_store::set(scope, key, val) {
+                            if added
+                                && matches!(os_store::get(scope, key), Ok(None))
+                                && update_index(&mut index, scope, key, false)
+                            {
+                                let _ = write_json_private(&path, &index);
+                            }
+                            return Err(vault_err(VaultErrorKind::Backend, err));
+                        }
                     }
                     None => {
-                        os_store::delete(scope, key).map_err(anyhow::Error::msg)?;
+                        os_store::delete(scope, key)
+                            .map_err(|e| vault_err(VaultErrorKind::Backend, e))?;
                         if update_index(&mut index, scope, key, false) {
                             write_json_private(&path, &index)?;
                         }
@@ -437,7 +589,7 @@ impl CredentialVault {
             #[cfg(any(debug_assertions, feature = "devtools"))]
             VaultBackend::TestFile(path) => {
                 let read = || -> Result<BTreeMap<String, String>> {
-                    let _lock = test_file_lock(path)?;
+                    let _lock = try_vault_read_lock(&test_file_lock_path(path))?;
                     let secrets: ScopedSecrets = read_json_map(path)?;
                     Ok(secrets.get(scope).cloned().unwrap_or_default())
                 };
@@ -449,7 +601,7 @@ impl CredentialVault {
             VaultBackend::System => {
                 let read = || -> Result<BTreeMap<String, String>> {
                     let dir = system_dir()?;
-                    let _lock = vault_lock(&dir.join("vault.lock"))?;
+                    let _lock = try_vault_read_lock(&dir.join("vault.lock"))?;
                     let mut index: CredentialIndex = read_json_map(&index_path(&dir))?;
                     let mut out = BTreeMap::new();
                     for key in index.remove(scope).into_iter().flatten() {
@@ -521,6 +673,7 @@ mod tests {
         };
         assert!(read_json_map::<CredentialIndex>(&path).unwrap().is_empty());
         std::fs::write(&path, b"broken JSON").unwrap();
+        assert!(vault.try_get_secret("scope", "key").is_err());
         assert!(
             vault
                 .set_secret("scope", "key", Some("replacement"))
@@ -532,6 +685,12 @@ mod tests {
         let previous = br#"{"scope":{"old_key":"saved"}}"#;
         std::fs::write(&path, previous).unwrap();
         let lock = test_file_lock(&path).unwrap();
+        // Contended reads still observe the atomic snapshot instead of logging out.
+        assert_eq!(
+            vault.get_secret("scope", "old_key").as_deref(),
+            Some("saved")
+        );
+        assert_eq!(vault.list_scope("scope").len(), 1);
         assert!(vault.set_secret("scope", "new_key", Some("new")).is_err());
         assert_eq!(std::fs::read(&path).unwrap(), previous);
         drop(lock);
@@ -589,5 +748,20 @@ mod tests {
         assert!(vault.set_secret("", "k", Some("v")).is_err());
         assert!(vault.set_secret("bad\nscope", "k", Some("v")).is_err());
         assert!(vault.set_secret("scope", "bad\0key", Some("v")).is_err());
+
+        // Per-scope 64-key quota allows updates/deletes at capacity but blocks a 65th key.
+        for i in 0..MAX_SECRETS_PER_SCOPE {
+            vault
+                .set_secret("quota.scope", &format!("k{i}"), Some("v"))
+                .unwrap();
+        }
+        vault
+            .set_secret("quota.scope", "k0", Some("updated"))
+            .unwrap();
+        assert!(
+            vault
+                .set_secret("quota.scope", "k_overflow", Some("v"))
+                .is_err()
+        );
     }
 }

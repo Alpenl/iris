@@ -6,8 +6,12 @@ use gpui::{
     AnyElement, Context, FontWeight, InteractiveElement, IntoElement, ParentElement, SharedString,
     StatefulInteractiveElement, Styled, div, prelude::FluentBuilder, px,
 };
-use iris_api::{Permission, SourceDescriptor, SourceManageAction};
-use iris_core::plugin::{PluginInfo, PluginSource, PluginStatus, plugins_dir};
+use iris_api::SourceManageAction;
+use iris_api::v2::{Capability, source::SourceDescriptor};
+use iris_core::plugin_v2::{
+    hub::{PluginInfo, PluginStatus},
+    product::plugins_dir,
+};
 use iris_core::preset::{PresetCaptureScope, WorkspacePreset};
 
 use super::super::IrisWindow;
@@ -61,6 +65,8 @@ fn render_preset_card(
                 chip_button(("preset-del", ix), "删除", false, t).on_click(cx.listener(
                     move |this, _, w, cx| {
                         if this.presets.delete_custom(&pid_delete) {
+                            this.keymap.reset_binding(&format!("preset:{pid_delete}"));
+                            crate::ui::rebind_keys(cx, &this.keymap);
                             if this.settings.active_preset == pid_delete {
                                 this.activate_preset("default", w, cx);
                             }
@@ -197,15 +203,15 @@ impl IrisWindow {
             .unwrap_or_else(|| "未知".into());
 
         let cards: Vec<AnyElement> = list
-            .into_iter()
+            .iter()
             .enumerate()
             .map(|(i, info)| {
                 let plugin_sources: Vec<SourceDescriptor> = active_sources
                     .iter()
-                    .filter(|(p, _)| p == &info.manifest.id)
+                    .filter(|(p, _)| p == &info.id)
                     .map(|(_, d)| d.clone())
                     .collect();
-                Self::render_plugin_card(i, info, plugin_sources, t, cx)
+                Self::render_plugin_card(i, info.clone(), plugin_sources, t, cx)
             })
             .collect();
 
@@ -238,6 +244,11 @@ impl IrisWindow {
                         hstack(6.)
                             .flex_none()
                             .child(
+                                bordered_button("install-plugin", "安装插件包", true, t).on_click(
+                                    cx.listener(|this, _, _, cx| this.choose_plugin_package(cx)),
+                                ),
+                            )
+                            .child(
                                 bordered_button("reload-plugins", "重新扫描", false, t).on_click(
                                     cx.listener(|this, _, _, cx| this.reload_plugins(cx)),
                                 ),
@@ -254,6 +265,7 @@ impl IrisWindow {
                     ),
             )
             .children(cards)
+            .child(self.settings_tools(t, cx))
     }
 
     fn render_plugin_card(
@@ -263,36 +275,48 @@ impl IrisWindow {
         t: ThemeTokens,
         cx: &Context<Self>,
     ) -> AnyElement {
-        let pid = info.manifest.id;
+        let pid = info.id.clone();
         let pid_toggle = pid.clone();
+        let is_official = pid.to_ascii_lowercase().starts_with("iris.");
         let enabled = info.enabled;
-        let is_declarative =
-            info.manifest.entry.is_none() && matches!(info.source, PluginSource::External(_));
-        let has_theme_spec = info.manifest.theme.is_some() || info.manifest.chrome.is_some();
-        let source_tag = match info.source {
-            PluginSource::Builtin => "内置",
-            PluginSource::External(_) if is_declarative => "声明式主题",
-            PluginSource::External(_) => "外部进程",
+        let manifest = info.binding.as_ref().map(|b| b.manifest.as_ref());
+        let has_theme_spec = manifest.is_some_and(|m| m.theme.is_some() || m.chrome.is_some());
+        let source_tag = if is_official {
+            "官方 Wasm"
+        } else if manifest.is_some_and(|m| m.entry.is_none()) {
+            "声明式主题"
+        } else {
+            "Wasm 沙箱"
         };
         let (status_text, status_accent) = match &info.status {
-            PluginStatus::Running => ("运行中".to_string(), false),
-            PluginStatus::Disabled => ("已禁用".to_string(), false),
-            PluginStatus::Error(err) => (format!("错误: {err}"), true),
+            PluginStatus::Dormant => ("等待窗口".to_owned(), false),
+            PluginStatus::Loading => ("加载中".to_owned(), false),
+            PluginStatus::Ready => ("运行中".to_owned(), false),
+            PluginStatus::Stopping => ("正在停止".to_owned(), false),
+            PluginStatus::Disabled => ("已禁用".to_owned(), false),
+            PluginStatus::Failed(error) => (format!("错误: {error:?}"), true),
         };
-        let provider = info.manifest.source_provider;
-
+        let provider = manifest.and_then(|m| m.source_provider.clone());
+        let name = manifest.map_or_else(|| pid.clone(), |m| m.name.clone());
+        let name_for_del = name.clone();
+        let version = manifest.map_or_else(String::new, |m| m.version.clone());
+        let description = manifest.map_or_else(String::new, |m| m.description.clone());
         let source_rows: Vec<AnyElement> = plugin_sources
             .into_iter()
             .enumerate()
             .map(|(si, src)| Self::render_plugin_source_row(pid.clone(), si, enabled, src, t, cx))
             .collect();
-        let perm_pills = info.manifest.permissions.into_iter().map(|perm| {
-            let hi = matches!(
-                perm,
-                Permission::UiTheme | Permission::MediaSource | Permission::Secrets
-            );
-            badge_pill(perm.label(), hi, t)
-        });
+        let perm_pills = info
+            .binding
+            .iter()
+            .flat_map(|b| b.installed.grants.iter().copied())
+            .map(|perm| {
+                let hi = matches!(
+                    perm,
+                    Capability::UiTheme | Capability::MediaSource | Capability::Secrets
+                );
+                badge_pill(perm.label(), hi, t)
+            });
 
         vstack(6.)
             .id(("plugin-card", i))
@@ -314,14 +338,14 @@ impl IrisWindow {
                                     .text_size(px(12.))
                                     .font_weight(FontWeight::MEDIUM)
                                     .text_color(t.text)
-                                    .child(info.manifest.name),
+                                    .child(name),
                             )
                             .child(
                                 div()
                                     .font_family(FONT_MONO)
                                     .text_size(px(10.))
                                     .text_color(t.text_faint)
-                                    .child(format!("v{}", info.manifest.version)),
+                                    .child(format!("v{}", version)),
                             )
                             .child(badge_pill(source_tag, false, t))
                             .when(has_theme_spec, |d| d.child(badge_pill("主题皮肤", true, t)))
@@ -354,6 +378,39 @@ impl IrisWindow {
                                     )),
                                 )
                             })
+                            .when(has_theme_spec && enabled, |d| {
+                                let theme = pid.clone();
+                                d.child(
+                                    chip_button(("plugin-theme", i), "应用主题", false, t)
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.settings.theme_id = format!("plugin:{theme}");
+                                            this.sync_theme_tokens(cx);
+                                            this.persist_user_settings();
+                                            cx.notify();
+                                        })),
+                                )
+                            })
+                            .when(
+                                !is_official && !matches!(info.status, PluginStatus::Stopping),
+                                |d| {
+                                    let pid_del = pid.clone();
+                                    d.child(
+                                        chip_button(("plugin-del", i), "删除", false, t).on_click(
+                                            cx.listener(move |this, _, w, cx| {
+                                                this.open_builtin_dialog(
+                                                    BuiltinDialog::ConfirmUninstallPlugin {
+                                                        plugin_id: pid_del.clone(),
+                                                        plugin_name: name_for_del.clone(),
+                                                        keep_data: true,
+                                                    },
+                                                    w,
+                                                    cx,
+                                                );
+                                            }),
+                                        ),
+                                    )
+                                },
+                            )
                             .child(toggle(
                                 ("plugin-toggle", i),
                                 enabled,
@@ -364,12 +421,12 @@ impl IrisWindow {
                             )),
                     ),
             )
-            .when(!info.manifest.description.is_empty(), |d| {
+            .when(!description.is_empty(), |d| {
                 d.child(
                     div()
                         .text_size(px(11.))
                         .text_color(t.text_dim)
-                        .child(info.manifest.description),
+                        .child(description),
                 )
             })
             .when(!source_rows.is_empty(), |d| {
@@ -418,7 +475,7 @@ impl IrisWindow {
                 el.child(
                     hstack(5.)
                         .flex_none()
-                        .when_some(auth_cmd, |row, cmd_id| {
+                        .when_some(auth_cmd.filter(|_| src.requires_auth), |row, cmd_id| {
                             let pid_auth = pid_s.clone();
                             row.child(
                                 chip_button(("pl-src-auth", row_ix), "登录", true, t).on_click(

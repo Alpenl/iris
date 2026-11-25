@@ -40,6 +40,7 @@ pub struct Photo {
     /// EXIF value before decoder-owned orientation is applied.
     pub exif_orientation: Option<u16>,
     pub(crate) heif: bool,
+    pub(crate) filter_orientation: bool,
     pub exif: Option<ExifSummary>,
 }
 
@@ -48,9 +49,16 @@ impl Photo {
         self.heif
     }
 
+    /// Returns whether `vf` (`hflip`/`vflip` + `format=rotate=...`) owns orientation
+    /// instead of relying on `libavcodec`'s `DISPLAYMATRIX`.
+    pub(crate) fn uses_filter_orientation(&self) -> bool {
+        self.filter_orientation
+            || (self.heif && (self.size.is_some() || self.rotate_cw != 0 || self.mirror.is_some()))
+    }
+
     /// Clockwise orientation of the displayed photo, before user rotation.
     pub fn display_rotation(&self) -> u16 {
-        if self.is_heif() {
+        if self.uses_filter_orientation() || self.is_heif() {
             self.rotate_cw
         } else {
             match self.exif_orientation {
@@ -64,7 +72,12 @@ impl Photo {
 
     /// Video filter chain with an optional extra clockwise rotation (`0/90/180/270`).
     pub(crate) fn vf_chain(&self, extra_rotate_cw: u16) -> Option<String> {
-        self.vf_chain_with_transforms(extra_rotate_cw, false, false, self.is_heif())
+        self.vf_chain_with_transforms(
+            extra_rotate_cw,
+            false,
+            false,
+            self.uses_filter_orientation(),
+        )
     }
 
     /// Combines user flips expressed in source space with a HEIF source mirror.
@@ -97,7 +110,7 @@ impl Photo {
         let colour = self.colour.and_then(|c| c.mpv_format());
         let mut format: Vec<String> = colour.into_iter().collect();
         let rot = (self.rotate_cw + extra_rotate_cw % 360) % 360;
-        if set_filter_rotation && (rot != 0 || self.rotate_cw != 0) {
+        if set_filter_rotation && (rot != 0 || self.rotate_cw != 0 || self.mirror.is_some()) {
             format.push(format!("rotate={rot}"));
         }
         if !format.is_empty() {
@@ -119,7 +132,20 @@ impl Photo {
     }
 }
 
-fn finish_header(h: Header, fmt: PhotoFormat) -> Photo {
+fn exif_to_source_transform(exif_orientation: u16) -> (Option<Mirror>, u16) {
+    match exif_orientation {
+        2 => (Some(Mirror::Horizontal), 0),
+        3 => (None, 180),
+        4 => (Some(Mirror::Vertical), 0),
+        5 => (Some(Mirror::Vertical), 90),
+        6 => (None, 90),
+        7 => (Some(Mirror::Vertical), 270),
+        8 => (None, 270),
+        _ => (None, 0),
+    }
+}
+
+fn finish_header(mut h: Header, fmt: PhotoFormat) -> Photo {
     let colour = match h.colour {
         Some(ColourTag::Icc(raw)) => icc::classify_icc(&raw),
         Some(ColourTag::Nclx {
@@ -128,13 +154,27 @@ fn finish_header(h: Header, fmt: PhotoFormat) -> Photo {
         }) => icc::classify_nclx(primaries, transfer),
         None => None,
     };
+    let heif = fmt == PhotoFormat::Heif;
+    let mut filter_orientation =
+        heif && (h.size.is_some() || h.rotate_cw != 0 || h.mirror.is_some());
+    match (fmt, h.exif_orientation) {
+        (PhotoFormat::Webp | PhotoFormat::Tiff | PhotoFormat::Png, Some(orient @ 2..=8))
+        | (PhotoFormat::Jpeg, Some(orient @ (2 | 4 | 5 | 7))) => {
+            let (mirror, rotate_cw) = exif_to_source_transform(orient);
+            h.mirror = mirror;
+            h.rotate_cw = rotate_cw;
+            filter_orientation = true;
+        }
+        _ => {}
+    }
     Photo {
         colour,
         size: h.size,
         mirror: h.mirror,
         rotate_cw: h.rotate_cw,
         exif_orientation: h.exif_orientation,
-        heif: fmt == PhotoFormat::Heif,
+        heif,
+        filter_orientation,
         exif: h.exif.filter(|e| !e.is_empty()),
     }
 }
@@ -143,15 +183,15 @@ fn run_probe<R: Read + Seek>(r: &mut R, fmt: PhotoFormat) -> Header {
     let mut h = Header::default();
     match fmt {
         PhotoFormat::Jpeg => containers::jpeg(r, &mut h, false),
-        PhotoFormat::Png => containers::png(r, &mut h),
-        PhotoFormat::Webp => containers::webp(r, &mut h),
+        PhotoFormat::Png => containers::png(r, &mut h, false),
+        PhotoFormat::Webp => containers::webp(r, &mut h, false),
         PhotoFormat::Heif => heif::probe(r, &mut h),
         PhotoFormat::Tiff => exif::tiff(r, &mut h, exif::Mode::Image),
     };
     h
 }
 
-/// Reads EXIF orientation (`1..=8`) from a JPEG or TIFF file header using
+/// Reads EXIF orientation (`1..=8`) from a JPEG, TIFF, WebP, or PNG file header using
 /// magic-byte sniffing first and extension fallback. Returns `1` on unknown/absent.
 pub fn exif_orientation(path: &Path) -> u16 {
     let Ok(file) = File::open(path) else {
@@ -168,10 +208,16 @@ pub fn exif_orientation(path: &Path) -> u16 {
         PhotoFormat::Jpeg => {
             let _ = containers::jpeg(&mut r, &mut h, true);
         }
+        PhotoFormat::Png => {
+            let _ = containers::png(&mut r, &mut h, true);
+        }
+        PhotoFormat::Webp => {
+            let _ = containers::webp(&mut r, &mut h, true);
+        }
         PhotoFormat::Tiff => {
             let _ = exif::tiff(&mut r, &mut h, exif::Mode::Orientation);
         }
-        _ => return 1,
+        PhotoFormat::Heif => return 1,
     }
     h.exif_orientation.unwrap_or(1)
 }
@@ -334,6 +380,48 @@ mod tests {
         let tiff_file = dir.join("raw_tiff");
         std::fs::write(&tiff_file, &tiff_exif).unwrap();
         assert_eq!(exif_orientation(&tiff_file), 6);
+        assert_eq!(
+            probe(&tiff_file).vf_chain(0).as_deref(),
+            Some("format=rotate=90")
+        );
+
+        // PNG with `eXIf` orientation=6 and JPEG with mirrored EXIF=2 / EXIF=5.
+        let mut png_bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+        png_bytes.extend_from_slice(&13u32.to_be_bytes());
+        png_bytes.extend_from_slice(b"IHDR");
+        png_bytes.extend_from_slice(&200u32.to_be_bytes());
+        png_bytes.extend_from_slice(&100u32.to_be_bytes());
+        png_bytes.extend_from_slice(&[8, 2, 0, 0, 0, 0, 0, 0, 0]);
+        png_bytes.extend_from_slice(&(tiff_exif.len() as u32).to_be_bytes());
+        png_bytes.extend_from_slice(b"eXIf");
+        png_bytes.extend_from_slice(&tiff_exif);
+        png_bytes.extend_from_slice(&[0, 0, 0, 0]);
+        png_bytes.extend_from_slice(&0u32.to_be_bytes());
+        png_bytes.extend_from_slice(b"IEND");
+        png_bytes.extend_from_slice(&[0, 0, 0, 0]);
+
+        let png_file = dir.join("oriented.png");
+        std::fs::write(&png_file, &png_bytes).unwrap();
+        assert_eq!(exif_orientation(&png_file), 6);
+        let probed_png = probe(&png_file);
+        assert_eq!(probed_png.display_rotation(), 90);
+        assert_eq!(probed_png.vf_chain(0).as_deref(), Some("format=rotate=90"));
+
+        // Mirrored JPEG EXIF 2 must override mjpegdec's 180-deg displaymatrix with hflip + rotate=0.
+        let mut tiff_o2 = tiff_exif.clone();
+        tiff_o2[18..20].copy_from_slice(&2u16.to_le_bytes());
+        let mut app1_o2 = b"Exif\0\0".to_vec();
+        app1_o2.extend_from_slice(&tiff_o2);
+        let mut jpeg_o2 = vec![0xFF, 0xD8, 0xFF, 0xE1];
+        jpeg_o2.extend_from_slice(&((app1_o2.len() + 2) as u16).to_be_bytes());
+        jpeg_o2.extend_from_slice(&app1_o2);
+        jpeg_o2.extend_from_slice(&[0xFF, 0xDA]);
+        let probed_o2 = probe_bytes(&jpeg_o2, Some("jpg"));
+        assert_eq!(probed_o2.display_rotation(), 0);
+        assert_eq!(
+            probed_o2.vf_chain(0).as_deref(),
+            Some("hflip,format=rotate=0")
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

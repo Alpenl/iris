@@ -4,24 +4,40 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+  schedule:
+    - cron: '41 3 * * 1'
 permissions:
   contents: read
+env:
+  IRIS_FUZZ_ITERATIONS: ${{ github.event_name == 'schedule' && '200000' || '2000' }}
+  IRIS_FUZZ_SEED: ${{ github.run_id }}
 jobs:
   macos:
-    runs-on: macos-15
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-15, macos-15-intel]
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: '3.12.9'
       - name: Install Rust toolchain
         shell: bash
         run: |
           set -euo pipefail
           rustup toolchain install 1.100.0 --profile minimal --component clippy --component rustfmt
           rustup default 1.100.0
+          rustup target add wasm32-unknown-unknown
       # Homebrew's libmpv is a GPL build; it only runs the tests and is never shipped.
       - run: brew install mpv
       - run: python3 scripts/check-project.py
       - run: cargo fmt --all -- --check
       - run: cargo test --locked --workspace --future-incompat-report
+      - run: python3 scripts/run-plugin-v2-ci.py
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - run: cargo clippy --locked --workspace --all-targets --release -- -D warnings
       - run: cargo clippy --locked --workspace --all-targets --features iris/devtools -- -D warnings
@@ -37,6 +53,11 @@ jobs:
     runs-on: windows-2025
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: '3.12.9'
       - uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756
         with:
           arch: x64
@@ -46,6 +67,7 @@ jobs:
           set -euo pipefail
           rustup toolchain install 1.100.0 --profile minimal --component clippy --component rustfmt
           rustup default 1.100.0
+          rustup target add wasm32-unknown-unknown
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
           name: media-sdk-windows-x86_64
@@ -59,6 +81,7 @@ jobs:
           "$env:RUNNER_TEMP\media-sdk\prefix\bin" >> $env:GITHUB_PATH
       - run: python scripts/check-project.py
       - run: cargo test --locked --workspace --future-incompat-report
+      - run: python scripts/run-plugin-v2-ci.py
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - run: cargo clippy --locked --workspace --all-targets --release -- -D warnings
       - run: cargo clippy --locked --workspace --all-targets --features iris/devtools -- -D warnings

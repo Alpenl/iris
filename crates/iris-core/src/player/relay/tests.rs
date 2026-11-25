@@ -292,7 +292,7 @@ fn saturated_relay_admits_seek_after_a_worker_releases_its_slot() {
     let local = Url::parse(&relay.url(&url).unwrap()).unwrap();
     let authority = relay.service.routes.authority;
     let mut occupied: Vec<_> = (0..RELAY_WORKERS)
-        .map(|_| relay.service.reserve_worker().unwrap())
+        .map(|_| relay.service.try_reserve_worker().unwrap())
         .collect();
 
     let mut client = TcpStream::connect(authority).unwrap();
@@ -353,4 +353,146 @@ fn relay_terminates_clean_chunks_only() {
         assert!(reply.contains("\r\n\r\n4\r\ndata\r\n"));
         assert_eq!(reply.ends_with("0\r\n\r\n"), clean);
     }
+}
+
+#[test]
+fn abandoned_slow_seeks_release_slots_and_keep_listener_alive() {
+    let origin = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+    origin.set_nonblocking(true).unwrap();
+    let url = Url::parse(&format!("http://{}/clip.mp4", origin.local_addr().unwrap())).unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_bg = Arc::clone(&stop);
+    let upstream = thread::spawn(move || {
+        while !stop_bg.load(Ordering::Relaxed) {
+            let Ok((mut socket, _)) = origin.accept() else {
+                thread::sleep(Duration::from_millis(2));
+                continue;
+            };
+            thread::spawn(move || {
+                let Ok(raw) = read_request(&mut socket, Duration::from_secs(2)) else {
+                    return;
+                };
+                let req = String::from_utf8(raw).unwrap();
+                if req.contains("Range: bytes=99-102") {
+                    let _ = socket.write_all(
+                        b"HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 99-102/200\r\nContent-Length: 4\r\n\r\ndone",
+                    );
+                } else {
+                    // Simulate a stalled TTFB until the relay cancels the abandoned upstream socket.
+                    let _ = socket.set_read_timeout(Some(Duration::from_secs(15)));
+                    let mut buf = [0u8; 1];
+                    let _ = socket.read(&mut buf);
+                }
+            });
+        }
+    });
+
+    let relay = PlaybackRelay::start(url.clone(), BTreeMap::new()).unwrap();
+    let local = Url::parse(&relay.url(&url).unwrap()).unwrap();
+    let authority = relay.service.routes.authority;
+
+    // Exceed RELAY_WORKERS (8) with abandoned slow Range requests.
+    for i in 0..(RELAY_WORKERS + 6) {
+        let mut client = TcpStream::connect(authority).unwrap();
+        write!(
+            client,
+            "GET {} HTTP/1.1\r\nHost: {authority}\r\nRange: bytes={i}-{}\r\n\r\n",
+            local.path(),
+            i + 3
+        )
+        .unwrap();
+        drop(client);
+    }
+
+    let mut final_seek = TcpStream::connect(authority).unwrap();
+    final_seek.set_read_timeout(Some(CLIENT_TIMEOUT)).unwrap();
+    write!(
+        final_seek,
+        "GET {} HTTP/1.1\r\nHost: {authority}\r\nRange: bytes=99-102\r\n\r\n",
+        local.path()
+    )
+    .unwrap();
+    let mut reply = String::new();
+    final_seek.read_to_string(&mut reply).unwrap();
+    stop.store(true, Ordering::Relaxed);
+    upstream.join().unwrap();
+    assert!(
+        reply.starts_with("HTTP/1.1 206"),
+        "unexpected reply: {reply}"
+    );
+    assert!(reply.ends_with("\r\n\r\ndone"));
+}
+
+#[test]
+fn playlist_probe_falls_back_when_range_rejected_and_subtitle_keeps_explicit_auth() {
+    let origin = Fixture::new(|path| match path {
+        "/live" => (
+            "200 OK",
+            "Content-Type: application/vnd.apple.mpegurl\r\n".into(),
+            b"#EXTM3U\n#EXT-X-VERSION:3\n".to_vec(),
+        ),
+        _ => ("404 Not Found", String::new(), Vec::new()),
+    });
+    // Non-Range server that rejects Range headers with 416.
+    let no_range = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let no_range_addr = no_range.local_addr().unwrap();
+    let upstream = thread::spawn(move || {
+        for _ in 0..2 {
+            let (mut sock, _) = no_range.accept().unwrap();
+            let req = String::from_utf8(read_request(&mut sock, CLIENT_TIMEOUT).unwrap()).unwrap();
+            if req.lines().any(|l| l.starts_with("Range:")) {
+                sock.write_all(
+                    b"HTTP/1.1 416 Range Not Satisfiable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+            } else {
+                sock.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 25\r\nConnection: close\r\n\r\n#EXTM3U\n#EXT-X-VERSION:3\n",
+                )
+                .unwrap();
+            }
+        }
+    });
+    let main = Url::parse(&format!("http://{no_range_addr}/stream")).unwrap();
+    let relay = PlaybackRelay::start(main.clone(), BTreeMap::new()).unwrap();
+    let media_route = relay.url(&main).unwrap();
+    let probed = relay.service.playlist_url(&media_route).unwrap();
+    upstream.join().unwrap();
+    assert!(
+        probed.is_some(),
+        "expected fallback GET probe to detect #EXTM3U"
+    );
+
+    // Same-origin subtitle with explicit userinfo must send its own Basic credentials.
+    let auth_srv = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let auth_addr = auth_srv.local_addr().unwrap();
+    let sub_upstream = thread::spawn(move || {
+        let (mut sock, _) = auth_srv.accept().unwrap();
+        let req = String::from_utf8(read_request(&mut sock, CLIENT_TIMEOUT).unwrap()).unwrap();
+        assert!(
+            req.lines()
+                .any(|l| l.eq_ignore_ascii_case("authorization: basic c3VidXNlcjpzdWJwYXNz")),
+            "expected subuser:subpass Basic header, got: {req}"
+        );
+        sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nhi")
+            .unwrap();
+    });
+    let main_with_auth = Url::parse(&format!("http://main:secret@{auth_addr}/video.mp4")).unwrap();
+    let sub_with_auth = Url::parse(&format!("http://subuser:subpass@{auth_addr}/sub.srt")).unwrap();
+    let auth_relay = PlaybackRelay::start(main_with_auth, BTreeMap::new()).unwrap();
+    let sub_local = Url::parse(&auth_relay.subtitle_url(&sub_with_auth).unwrap()).unwrap();
+    let authority = auth_relay.service.routes.authority;
+    let mut client = TcpStream::connect(authority).unwrap();
+    client.set_read_timeout(Some(CLIENT_TIMEOUT)).unwrap();
+    write!(
+        client,
+        "GET {} HTTP/1.1\r\nHost: {authority}\r\n\r\n",
+        sub_local.path()
+    )
+    .unwrap();
+    let mut sub_reply = String::new();
+    client.read_to_string(&mut sub_reply).unwrap();
+    sub_upstream.join().unwrap();
+    assert!(sub_reply.ends_with("\r\n\r\nhi"));
+    drop(origin);
 }

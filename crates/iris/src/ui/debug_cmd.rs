@@ -60,8 +60,9 @@ impl IrisWindow {
                 let fav = session
                     .current_media_uri()
                     .is_some_and(|u| self.store.is_favorite(&u));
+                let vp_size = window.viewport_size();
                 eprintln!(
-                    "[iris/control] state pos={:.2} dur={:.2} paused={} vol={} muted={} speed={:.2} loop={} aspect={:?} sub_delay={:.1} video={:?} hwdec={} dir={} dir_w={:.0} side={:?} popup={} settings={} info={} popover={:?} chrome={} fullscreen={} video_rect={:?} dock={:?} filter={:?} favorite={} renders={}",
+                    "[iris/control] state pos={:.2} dur={:.2} paused={} vol={} muted={} speed={:.2} loop={} aspect={:?} sub_delay={:.1} video={:?} hwdec={} dir={} dir_w={:.0} side={:?} popup={} settings={} info={} popover={:?} chrome={} fullscreen={} video_rect={:?} dock={:?} filter={:?} favorite={} renders={} win=({:.1},{:.1})",
                     state.time_pos,
                     state.duration,
                     state.paused,
@@ -92,6 +93,8 @@ impl IrisWindow {
                     self.catalog.filter,
                     fav,
                     self.chrome.render_count,
+                    f32::from(vp_size.width),
+                    f32::from(vp_size.height),
                 );
             }
             "ui" => {

@@ -175,7 +175,10 @@ fn platform_primary_workspace_keys_preserve_text_editing() {
         );
     }
     for key in ["secondary-p", "secondary-,", "secondary-o"] {
-        assert_eq!(effective_gpui_context("Workspace", key), Some("Workspace"));
+        assert_eq!(
+            effective_gpui_context("Workspace", key),
+            Some("Workspace && !Modal")
+        );
     }
     for key in [
         "secondary-v",
@@ -186,13 +189,55 @@ fn platform_primary_workspace_keys_preserve_text_editing() {
     ] {
         assert_eq!(
             effective_gpui_context("Workspace", key),
-            Some("Workspace && !TextInput")
+            Some("Workspace && !TextInput && !Modal")
         );
     }
     assert_eq!(
         reserved_shortcut("secondary-alt-shift-r").map(|(id, _)| id),
         Some("reset_appearance")
     );
+
+    // When a blocking modal is open (`[Workspace, Modal]`), single-key actions (`Tab`, `Enter`,
+    // `Q`) and background workspace chords (`Ctrl+F`, `Ctrl+O`) are blocked, while `Esc` and
+    // `Ctrl+Q` continue to work.
+    let modal_ctx = [
+        KeyContext::parse("Workspace").unwrap(),
+        KeyContext::parse("Modal").unwrap(),
+    ];
+    for action in [
+        &super::actions::ToggleDirectory as &dyn Action,
+        &super::actions::ToggleSearch,
+        &super::actions::OpenFile,
+        &TakeScreenshot,
+    ] {
+        let binding = bindings
+            .iter()
+            .find(|b| action.partial_eq(b.action()))
+            .unwrap();
+        assert!(binding.predicate().unwrap().depth_of(&modal_ctx).is_none());
+    }
+    let classic_quit = classic_bindings
+        .iter()
+        .find(|b| Quit.partial_eq(b.action()))
+        .unwrap();
+    assert!(
+        classic_quit
+            .predicate()
+            .unwrap()
+            .depth_of(&modal_ctx)
+            .is_none()
+    );
+    for allowed in [
+        &Quit as &dyn Action,
+        &super::actions::ExitFullscreen,
+        &super::actions::ResetAppearance,
+    ] {
+        let binding = bindings
+            .iter()
+            .find(|b| allowed.partial_eq(b.action()))
+            .unwrap();
+        assert!(binding.predicate().unwrap().depth_of(&modal_ctx).is_some());
+    }
 }
 
 #[test]

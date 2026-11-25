@@ -43,15 +43,14 @@ pub(crate) struct PinchEvent {
     pub(crate) position: [f64; 2],
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum MediaKey {
     Play,
     Pause,
-    #[cfg(target_os = "macos")]
     Toggle,
     Next,
     Prev,
-    #[cfg(target_os = "windows")]
     Seek(f64),
 }
 
@@ -142,6 +141,37 @@ fn decode_thumbnail_fallback(path: &Path, max_dim: u32) -> Option<Arc<RenderImag
     Some(Arc::new(RenderImage::new([image::Frame::new(rgba)])))
 }
 
+/// Network thumbnails never become native file paths or GPU-loaded URLs.
+pub(crate) fn decode_remote_thumbnail(bytes: &[u8]) -> Option<Arc<RenderImage>> {
+    if bytes.len() > 4 << 20 {
+        return None;
+    }
+    let format = image::guess_format(bytes).ok()?;
+    if !matches!(
+        format,
+        image::ImageFormat::Png | image::ImageFormat::Jpeg | image::ImageFormat::WebP
+    ) {
+        return None;
+    }
+    let mut reader = image::ImageReader::with_format(std::io::Cursor::new(bytes), format);
+    let mut limits = image::Limits::default();
+    limits.max_alloc = Some(64 << 20);
+    limits.max_image_width = Some(4096);
+    limits.max_image_height = Some(4096);
+    reader.limits(limits.clone());
+    let mut decoder = reader.into_decoder().ok()?;
+    limits.reserve(decoder.total_bytes()).ok()?;
+    decoder.set_limits(limits).ok()?;
+    let orientation = decoder.orientation().ok()?;
+    let mut decoded = image::DynamicImage::from_decoder(decoder).ok()?;
+    decoded.apply_orientation(orientation);
+    let mut rgba = decoded.thumbnail(64, 64).into_rgba8();
+    for pixel in rgba.as_chunks_mut::<4>().0 {
+        pixel.swap(0, 2);
+    }
+    Some(Arc::new(RenderImage::new([image::Frame::new(rgba)])))
+}
+
 pub(crate) fn apply_exif_orientation(
     img: image::DynamicImage,
     orientation: u16,
@@ -155,5 +185,28 @@ pub(crate) fn apply_exif_orientation(
         7 => img.rotate270().fliph(),
         8 => img.rotate270(),
         _ => img,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::decode_remote_thumbnail;
+    #[test]
+    fn network_thumbnail_decode_is_format_and_allocation_bounded() {
+        let encode = |width, height| {
+            let mut out = std::io::Cursor::new(Vec::new());
+            image::DynamicImage::new_rgba8(width, height)
+                .write_to(&mut out, image::ImageFormat::Png)
+                .unwrap();
+            out.into_inner()
+        };
+        assert!(decode_remote_thumbnail(&encode(2, 3)).is_some());
+        assert!(decode_remote_thumbnail(&encode(4097, 1)).is_none());
+        assert!(decode_remote_thumbnail(&vec![0; (4 << 20) + 1]).is_none());
+        assert!(
+            decode_remote_thumbnail(b"<svg><image href='http://127.0.0.1/private'/></svg>")
+                .is_none()
+        );
+        assert!(decode_remote_thumbnail(b"\x89PNG\r\n\x1a\ntruncated").is_none());
     }
 }

@@ -1,0 +1,123 @@
+{
+  "id": "community.bilibili",
+  "name": "哔哩哔哩 (BiliSail)",
+  "version": "0.0.1",
+  "author": "Iris Community",
+  "description": "参考 BiliSail 接口设计的哔哩哔哩 Wasm 插件：支持扫码与 Cookie 登录、WBI 签名、推荐/热门/动态/收藏/番剧/历史/直播浏览、DASH 分轨选流、CC/AI 字幕转换、章节与实时弹幕。",
+  "protocol": 2,
+  "abi": 2,
+  "entry": "plugin.wasm",
+  "permissions": [
+    "read_state",
+    "media_source",
+    "url_resolver",
+    "media_enhance",
+    "secrets",
+    "notifications",
+    "ui_sidebar",
+    "ui_status",
+    "ui_overlay",
+    "ui_modal",
+    "net_http"
+  ],
+  "network": {
+    "net_public": true,
+    "public_ports": [80, 443, 4480, 4482, 4483, 8000, 8080, 8082, 8090, 8443, 9000, 9102],
+    "net_hosts": [
+      {"host": "bilibili.com", "schemes": ["http", "https"], "ports": [80, 443]},
+      {"host": "*.bilibili.com", "schemes": ["http", "https"], "ports": [80, 443]},
+      {"host": "b23.tv", "schemes": ["http", "https"], "ports": [80, 443]},
+      {"host": "*.b23.tv", "schemes": ["http", "https"], "ports": [80, 443]},
+      {"host": "*.bilivideo.com", "schemes": ["http", "https"], "ports": [80, 443, 4480, 4482, 4483, 8000, 8080, 8082, 8090, 8443, 9000, 9102]},
+      {"host": "*.bilivideo.cn", "schemes": ["http", "https"], "ports": [80, 443, 4480, 4482, 4483, 8000, 8080, 8082, 8090, 8443, 9000, 9102]},
+      {"host": "*.hdslb.com", "schemes": ["http", "https"], "ports": [80, 443]},
+      {"host": "*.biliimg.com", "schemes": ["http", "https"], "ports": [80, 443]},
+      {"host": "*.akamaized.net", "schemes": ["http", "https"], "ports": [80, 443]}
+    ]
+  },
+  "sources": [
+    {
+      "id": "recommend",
+      "name": "B站 · 首页推荐",
+      "subtitle": "个性化推荐与全网视频/番剧/直播搜索",
+      "supports_search": true
+    },
+    {
+      "id": "popular",
+      "name": "B站 · 热门与排行",
+      "subtitle": "综合热门、入站必刷与分区排行榜",
+      "supports_search": true
+    },
+    {
+      "id": "dynamic",
+      "name": "B站 · 关注动态",
+      "subtitle": "已关注 UP 主最新视频动态",
+      "requires_auth": true,
+      "auth_command_id": "login"
+    },
+    {
+      "id": "favorites",
+      "name": "B站 · 我的收藏",
+      "subtitle": "云端收藏夹列表与夹内检索",
+      "supports_search": true,
+      "requires_auth": true,
+      "auth_command_id": "login"
+    },
+    {
+      "id": "bangumi",
+      "name": "B站 · 番剧与影视",
+      "subtitle": "追番追剧与番剧国创索引",
+      "supports_search": true
+    },
+    {
+      "id": "history",
+      "name": "B站 · 观看历史",
+      "subtitle": "云端观看历史游标浏览",
+      "requires_auth": true,
+      "auth_command_id": "login"
+    },
+    {
+      "id": "live",
+      "name": "B站 · 哔哩直播",
+      "subtitle": "热门直播与关注开播房间",
+      "supports_search": true
+    }
+  ],
+  "commands": [
+    {
+      "id": "login",
+      "title": "哔哩哔哩：扫码或 Cookie 登录…"
+    },
+    {
+      "id": "poll_qr",
+      "title": "哔哩哔哩：检查扫码登录状态"
+    },
+    {
+      "id": "open_target",
+      "title": "哔哩哔哩：输入 BV / av / ep / 直播间号播放…"
+    },
+    {
+      "id": "toggle_danmaku",
+      "title": "哔哩哔哩：开关弹幕叠加",
+      "context_menu": true
+    },
+    {
+      "id": "reload_danmaku",
+      "title": "哔哩哔哩：刷新当前视频弹幕与字幕",
+      "context_menu": true
+    },
+    {
+      "id": "logout",
+      "title": "哔哩哔哩：退出当前账号"
+    }
+  ],
+  "url_patterns": [
+    "https://www.bilibili.com/video/*",
+    "https://bilibili.com/video/*",
+    "https://m.bilibili.com/video/*",
+    "https://www.bilibili.com/bangumi/play/*",
+    "https://bilibili.com/bangumi/play/*",
+    "https://live.bilibili.com/*",
+    "https://b23.tv/*"
+  ]
+}

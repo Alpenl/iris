@@ -125,8 +125,18 @@ fn properties(
     }
     let boxes = children(r, iprp);
     let props = children(r, find(&boxes, b"ipco")?);
-    if let Some(id) = primary
-        && boxes.iter().any(|(k, _)| k == b"ipma")
+    let has_ipma = boxes.iter().any(|(k, _)| k == b"ipma");
+    let target_id = primary.or_else(|| {
+        boxes
+            .iter()
+            .filter(|(k, _)| k == b"ipma")
+            .find_map(|(_, span)| {
+                span.bytes(r, MAX_ITEM_TABLE)
+                    .and_then(|d| first_ipma_item(&d))
+            })
+    });
+    if let Some(id) = target_id
+        && has_ipma
     {
         for (_, span) in boxes.iter().filter(|(k, _)| k == b"ipma") {
             if let Some(data) = span.bytes(r, MAX_ITEM_TABLE)
@@ -134,21 +144,25 @@ fn properties(
             {
                 for i in indices {
                     if let Some(atom) = i.checked_sub(1).and_then(|i| props.get(i)) {
-                        property(r, *atom, h);
+                        property(r, *atom, h, true);
                     }
                 }
-                break;
             }
         }
-    } else {
+    } else if !has_ipma {
         for atom in props {
-            property(r, atom, h);
+            property(r, atom, h, false);
         }
     }
     Some(())
 }
 
-fn property(r: &mut (impl Read + Seek), (kind, body): Atom, h: &mut Header) -> Option<()> {
+fn property(
+    r: &mut (impl Read + Seek),
+    (kind, body): Atom,
+    h: &mut Header,
+    associated: bool,
+) -> Option<()> {
     match &kind {
         b"colr" => match &body.prefix::<4>(r)? {
             b"prof" | b"rICC" if !matches!(h.colour, Some(ColourTag::Icc(_))) => {
@@ -163,7 +177,7 @@ fn property(r: &mut (impl Read + Seek), (kind, body): Atom, h: &mut Header) -> O
             }
             _ => {}
         },
-        b"ispe" => {
+        b"ispe" if associated || h.size.is_none() => {
             let size = body.after(4)?.prefix::<8>(r)?;
             h.size = Some((be32(&size), be32(&size[4..])));
         }
@@ -192,6 +206,15 @@ fn number(buf: &mut &[u8], width: usize) -> Option<u64> {
     Some(u64::from_be_bytes(word))
 }
 
+fn first_ipma_item(mut buf: &[u8]) -> Option<u32> {
+    let flags = number(&mut buf, 4)?;
+    let version = flags >> 24;
+    if version > 1 || number(&mut buf, 4)? == 0 {
+        return None;
+    }
+    number(&mut buf, if version == 0 { 2 } else { 4 }).map(|v| v as u32)
+}
+
 fn property_indices(mut buf: &[u8], id: u32) -> Option<Vec<usize>> {
     let flags = number(&mut buf, 4)?;
     let version = flags >> 24;
@@ -200,19 +223,20 @@ fn property_indices(mut buf: &[u8], id: u32) -> Option<Vec<usize>> {
     }
     let wide = flags & 1 != 0;
     let width = if wide { 2 } else { 1 };
+    let mut matched = Vec::new();
     for _ in 0..number(&mut buf, 4)?.min(MAX_BOXES as u64) {
         let item = number(&mut buf, if version == 0 { 2 } else { 4 })?;
         let count = number(&mut buf, 1)? as usize;
         if item == u64::from(id) {
-            return (0..count)
-                .map(|_| {
-                    Some((number(&mut buf, width)? as usize) & if wide { 0x7fff } else { 0x7f })
-                })
-                .collect();
+            for _ in 0..count {
+                matched
+                    .push((number(&mut buf, width)? as usize) & if wide { 0x7fff } else { 0x7f });
+            }
+        } else {
+            buf = buf.get(count * width..)?;
         }
-        buf = buf.get(count * width..)?;
     }
-    None
+    (!matched.is_empty()).then_some(matched)
 }
 
 fn exif_item(

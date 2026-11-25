@@ -3,7 +3,7 @@ $ErrorActionPreference = 'Stop'
 $url = 'https://github.com/jrsoftware/issrc/releases/download/is-6_4_3/innosetup-6.4.3.exe'
 $expected = 'f3c42116542c4cc57263c5ba6c4feabfc49fe771f2f98a79d2f7628b8762723b'
 $download = Join-Path ([IO.Path]::GetTempPath()) 'iris-innosetup-6.4.3.exe'
-Invoke-WebRequest -Uri $url -OutFile $download
+Invoke-WebRequest -Uri $url -OutFile $download -UseBasicParsing
 if ((Get-FileHash -Algorithm SHA256 $download).Hash.ToLowerInvariant() -ne $expected) { throw 'Inno Setup download checksum mismatch' }
 $process = Start-Process -FilePath $download -ArgumentList @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/CURRENTUSER', "/DIR=`"$Destination`"") -Wait -PassThru
 if ($process.ExitCode -ne 0) { throw "Inno Setup installation failed: $($process.ExitCode)" }

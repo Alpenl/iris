@@ -1,0 +1,85 @@
+{
+  "id": "community.baidupan",
+  "name": "百度网盘 (BaiduNetdisk)",
+  "version": "0.0.1",
+  "author": "Iris Community",
+  "description": "参考 BaiduPCS-Rust 与 OpenList 接口设计的百度网盘 Wasm 插件：支持百度网盘 App 扫码、Cookie (BDUSS) 与开放平台 OAuth 登录；支持全盘目录浏览与搜索、视频/照片/音频分类视图、PCS Locate v4 / OpenAPI 原画多线路直链、云端转码 HLS（1080P/720P/480P）切换与同目录外挂字幕自动挂载。",
+  "protocol": 2,
+  "abi": 2,
+  "entry": "plugin.wasm",
+  "permissions": [
+    "read_state",
+    "media_source",
+    "media_enhance",
+    "secrets",
+    "notifications",
+    "ui_sidebar",
+    "ui_status",
+    "ui_modal",
+    "net_http"
+  ],
+  "network": {
+    "net_public": true,
+    "public_ports": [80, 443, 8080, 8443],
+    "net_hosts": [
+      {"host": "baidu.com", "schemes": ["http", "https"], "ports": [80, 443]},
+      {"host": "*.baidu.com", "schemes": ["http", "https"], "ports": [80, 443, 8080, 8443]},
+      {"host": "*.baidupcs.com", "schemes": ["http", "https"], "ports": [80, 443, 8080, 8443]},
+      {"host": "*.bdstatic.com", "schemes": ["http", "https"], "ports": [80, 443]},
+      {"host": "*.bcebos.com", "schemes": ["http", "https"], "ports": [80, 443]},
+      {"host": "*.bdimg.com", "schemes": ["http", "https"], "ports": [80, 443]}
+    ]
+  },
+  "sources": [
+    {
+      "id": "files",
+      "name": "百度网盘 · 全部文件",
+      "subtitle": "全盘目录层级浏览、自然排序与全盘递归搜索",
+      "supports_search": true,
+      "requires_auth": true,
+      "auth_command_id": "login"
+    },
+    {
+      "id": "videos",
+      "name": "百度网盘 · 全部视频",
+      "subtitle": "云盘视频聚合视图（原画多线路直链 / 云端转码 HLS）",
+      "supports_search": true,
+      "requires_auth": true,
+      "auth_command_id": "login"
+    },
+    {
+      "id": "photos",
+      "name": "百度网盘 · 全部照片",
+      "subtitle": "云盘照片与图库（广色域远程预览与缩略图）",
+      "supports_search": true,
+      "requires_auth": true,
+      "auth_command_id": "login"
+    },
+    {
+      "id": "audio",
+      "name": "百度网盘 · 全部音频",
+      "subtitle": "云盘无损音乐与音频文件直连播放",
+      "supports_search": true,
+      "requires_auth": true,
+      "auth_command_id": "login"
+    }
+  ],
+  "commands": [
+    {
+      "id": "login",
+      "title": "百度网盘：扫码 / Cookie / OAuth 登录…"
+    },
+    {
+      "id": "poll_qr",
+      "title": "百度网盘：检查扫码登录状态"
+    },
+    {
+      "id": "refresh_account",
+      "title": "百度网盘：刷新账号与空间配额"
+    },
+    {
+      "id": "logout",
+      "title": "百度网盘：退出当前账号"
+    }
+  ]
+}

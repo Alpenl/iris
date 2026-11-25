@@ -249,6 +249,24 @@ fn ffi_callback<T>(fallback: T, callback: impl FnOnce() -> T) -> T {
     })
 }
 
+extern "C" fn layer_init_with_layer(this: &mut Object, _: Sel, other: id) -> id {
+    ffi_callback(nil, || unsafe {
+        let initialized: id = msg_send![super(this, class!(CAOpenGLLayer)), initWithLayer: other];
+        if initialized != nil && other != nil {
+            let cls = layer_class();
+            let is_kind: BOOL = msg_send![other, isKindOfClass: cls];
+            if is_kind == YES {
+                let state: *mut c_void = *(*other).get_ivar("irisState");
+                if !state.is_null() {
+                    Arc::increment_strong_count(state.cast::<LayerState>());
+                    (*initialized).set_ivar("irisState", state);
+                }
+            }
+        }
+        initialized
+    })
+}
+
 extern "C" fn layer_dealloc(this: &Object, _: Sel) {
     ffi_callback((), || unsafe {
         let state: *mut c_void = *this.get_ivar("irisState");
@@ -334,6 +352,10 @@ fn layer_class() -> &'static Class {
             ClassDecl::new("IrisVideoLayer", class!(CAOpenGLLayer)).expect("IrisVideoLayer class");
         decl.add_ivar::<*mut c_void>("irisState");
         unsafe {
+            decl.add_method(
+                sel!(initWithLayer:),
+                layer_init_with_layer as extern "C" fn(&mut Object, Sel, id) -> id,
+            );
             decl.add_method(sel!(dealloc), layer_dealloc as extern "C" fn(&Object, Sel));
             decl.add_method(
                 sel!(copyCGLPixelFormatForDisplayMask:),
@@ -465,7 +487,9 @@ impl VideoSurface {
                             });
                         }
                     }
-                    let _: () = msg_send![layer.0, release];
+                    autoreleasepool(|| {
+                        let _: () = msg_send![layer.0, release];
+                    });
                 });
             let worker = match worker {
                 Ok(worker) => worker,
@@ -489,7 +513,12 @@ impl VideoSurface {
                 CGColorSpaceRelease(p3);
             }
             let ns_window: id = msg_send![gpui_view, window];
-            let scale: f64 = msg_send![ns_window, backingScaleFactor];
+            let raw_scale: f64 = msg_send![ns_window, backingScaleFactor];
+            let scale = if raw_scale.is_finite() && raw_scale > 0. {
+                raw_scale
+            } else {
+                1.
+            };
             let _: () = msg_send![layer, setContentsScale: scale];
             let content: id = msg_send![ns_window, contentView];
             let frame: NSRect = msg_send![content, bounds];
@@ -501,7 +530,12 @@ impl VideoSurface {
             let _: () = msg_send![content, addSubview: view positioned: NS_WINDOW_BELOW relativeTo: gpui_view];
 
             state.drawable.store(
-                frame.size.width > 0. && frame.size.height > 0.,
+                frame.origin.x.is_finite()
+                    && frame.origin.y.is_finite()
+                    && frame.size.width.is_finite()
+                    && frame.size.height.is_finite()
+                    && frame.size.width > 0.
+                    && frame.size.height > 0.,
                 Ordering::Release,
             );
             let cb_tx = tx.clone();
@@ -541,6 +575,19 @@ impl VideoSurface {
     pub(crate) fn set_frame(&self, x: f64, y: f64, w: f64, h: f64) {
         // Publish visibility without reading mutable layer geometry on CA threads.
         self.state.drawable.store(false, Ordering::Release);
+        if !x.is_finite()
+            || !y.is_finite()
+            || !w.is_finite()
+            || !h.is_finite()
+            || w <= 0.
+            || h <= 0.
+        {
+            unsafe {
+                let _: () = msg_send![self.view, setHidden: YES];
+            }
+            self.request_redraw();
+            return;
+        }
         unsafe {
             let superview: id = msg_send![self.view, superview];
             if superview == nil {
@@ -553,6 +600,11 @@ impl VideoSurface {
             } else {
                 bounds.size.height - (y + h)
             };
+            if !ay.is_finite() {
+                let _: () = msg_send![self.view, setHidden: YES];
+                self.request_redraw();
+                return;
+            }
             let frame = NSRect::new(
                 cocoa::foundation::NSPoint::new(x, ay),
                 cocoa::foundation::NSSize::new(w, h),
@@ -561,16 +613,18 @@ impl VideoSurface {
             let _: () = msg_send![class!(CATransaction), begin];
             let _: () = msg_send![class!(CATransaction), setDisableActions: YES];
             let _: () = msg_send![self.view, setFrame: frame];
+            let _: () = msg_send![self.view, setHidden: NO];
             let _: () = msg_send![class!(CATransaction), commit];
         }
-        self.state
-            .drawable
-            .store(w > 0. && h > 0., Ordering::Release);
+        self.state.drawable.store(true, Ordering::Release);
         self.request_redraw();
     }
 
     /// Keeps the layer at the window's backing scale (Retina vs. non-Retina screens).
     pub(crate) fn set_scale(&mut self, scale: f64) {
+        if !scale.is_finite() || scale <= 0. {
+            return;
+        }
         if (scale - self.scale).abs() > f64::EPSILON {
             self.scale = scale;
             unsafe {

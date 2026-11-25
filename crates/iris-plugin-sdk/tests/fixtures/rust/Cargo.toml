@@ -1,0 +1,17 @@
+[package]
+name = "iris-v2-contract-guest"
+version = "0.0.1"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+iris-plugin-sdk = { path = "../../.." }
+
+[workspace]
+
+[profile.release]
+panic = "abort"
+opt-level = "s"

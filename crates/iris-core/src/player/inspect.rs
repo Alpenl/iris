@@ -70,7 +70,7 @@ impl Session {
                 .ok()
                 .and_then(|s| s.parse::<i64>().ok())
         };
-        let (w, h) = self.display_size();
+        let (w, h) = self.source_pixel_size();
         MediaStats {
             file_name,
             file_size,
@@ -105,7 +105,7 @@ impl Session {
                 .ok()
                 .and_then(|s| s.parse::<i64>().ok())
         };
-        let (w, h) = self.display_size();
+        let (w, h) = self.source_pixel_size();
         stats.resolution = (w > 0 && h > 0).then_some((w, h));
         stats.hwdec.clone_from(&self.state.hwdec);
         match self.kind {
@@ -122,7 +122,29 @@ impl Session {
         }
     }
 
+    fn source_pixel_size(&self) -> (i64, i64) {
+        let prop_i64 = |name: &str| {
+            self.mpv
+                .get_property_string(name)
+                .ok()
+                .and_then(|s| s.parse::<i64>().ok())
+                .filter(|&v| v > 0)
+        };
+        if let (Some(w), Some(h)) = (prop_i64("video-params/w"), prop_i64("video-params/h")) {
+            if self.display_axes_swapped() {
+                (h, w)
+            } else {
+                (w, h)
+            }
+        } else {
+            self.display_size()
+        }
+    }
+
     pub(super) fn refresh_chapters(&mut self) {
+        if self.plugin_timeline.is_some() {
+            return;
+        }
         let Ok(raw) = self.mpv.get_property_string("chapter-list") else {
             self.state.chapters.clear();
             return;

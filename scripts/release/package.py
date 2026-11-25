@@ -22,11 +22,13 @@ import struct
 import subprocess
 import sys
 import tarfile
+import tempfile
 import tomllib
 import zipfile
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.dont_write_bytecode = True
+os.environ.setdefault("NoDefaultCurrentDirectoryInExePath", "1")
 sys.path.insert(0, str(Path(__file__).parent))
 from importlib.util import spec_from_file_location, module_from_spec
 _spec = spec_from_file_location("media_recipe", Path(__file__).with_name("build-media.py"))
@@ -40,12 +42,16 @@ SIGNING_ENV = ("IRIS_WINDOWS_PFX", "IRIS_WINDOWS_PFX_PASSWORD", "IRIS_TIMESTAMP_
 # Versions verified to ship an SPDX declaration without a standalone notice file.
 # Keep the corresponding checked Cargo.toml in their notice directory.
 METADATA_LICENSES = frozenset("""
-block@0.1.6 convert_case@0.4.0 dtor@0.0.6 dtor-proc-macro@0.0.5 dwrote@0.11.5 gloo-timers@0.3.0
-hexf-parse@0.2.1 leak@0.1.2 leaky-cow@0.1.1 lyon@1.0.19 lyon_algorithms@1.0.22 lyon_geom@1.0.20
-lyon_path@1.0.19 lyon_tessellation@1.0.23 mac@0.1.1 malloc_buf@0.0.6 naga@25.0.1 pathfinder_geometry@0.5.1
-pathfinder_simd@0.5.6 profiling@1.0.18 profiling-procmacros@1.0.18 r-efi@5.3.0 r-efi@6.0.0 seahash@4.1.0
-simd_helpers@0.1.0 stacksafe@0.1.4 stacksafe-macro@0.1.4 svg_fmt@0.4.5 taffy@0.9.0 winapi-i686-pc-windows-gnu@0.4.0
-winapi-x86_64-pc-windows-gnu@0.4.0 zune-inflate@0.2.54
+block@0.1.6 convert_case@0.4.0 cranelift-assembler-x64@0.138.0 cranelift-assembler-x64-meta@0.138.0
+cranelift-bitset@0.138.0 cranelift-isle@0.138.0 cranelift-srcgen@0.138.0 dtor@0.0.6 dtor-proc-macro@0.0.5
+dwrote@0.11.5 gloo-timers@0.3.0 hexf-parse@0.2.1 leak@0.1.2 leaky-cow@0.1.1 lyon@1.0.19
+lyon_algorithms@1.0.22 lyon_geom@1.0.20 lyon_path@1.0.19 lyon_tessellation@1.0.23 mac@0.1.1 malloc_buf@0.0.6
+naga@25.0.1 pathfinder_geometry@0.5.1 pathfinder_simd@0.5.6 profiling@1.0.18 profiling-procmacros@1.0.18
+pulley-interpreter@51.0.0 pulley-macros@51.0.0 r-efi@5.3.0 r-efi@6.0.0 seahash@4.1.0 simd_helpers@0.1.0
+stacksafe@0.1.4 stacksafe-macro@0.1.4 svg_fmt@0.4.5 taffy@0.9.0 wasmtime-internal-component-util@51.0.0
+wasmtime-internal-core@51.0.0 wasmtime-internal-jit-debug@51.0.0 wasmtime-internal-jit-icache-coherence@51.0.0
+wasmtime-internal-versioned-export-macros@51.0.0 winapi-i686-pc-windows-gnu@0.4.0 winapi-x86_64-pc-windows-gnu@0.4.0
+zune-inflate@0.2.54
 """.split())
 
 
@@ -87,6 +93,8 @@ def verify_vendor_archive(path):
     with tarfile.open(path, mode="r|gz") as archive:
         for member in archive:
             if not member.isfile():
+                if not member.isdir():
+                    raise RuntimeError(f"Unexpected non-file entry in vendored archive: {member.name}")
                 continue
             file = archive.extractfile(member)
             if member.name.endswith("/.cargo-checksum.json"):
@@ -95,7 +103,7 @@ def verify_vendor_archive(path):
                 expected.update({base + "/" + name: digest for name, digest in checksum["files"].items()})
             else:
                 actual[member.name] = hashlib.file_digest(file, "sha256").hexdigest()
-    if not expected or any(actual.get(name) != digest for name, digest in expected.items()):
+    if not expected or actual != expected:
         raise RuntimeError("Archived vendored source checksum mismatch")
 
 
@@ -228,7 +236,7 @@ def _mac_sdk_dylibs(prefix, files, arch):
     return paths, by_id, by_name, origins, identities
 
 
-def mac_dependencies(executable, prefix, manifest, frameworks, arch):
+def mac_dependencies(executable, prefix, manifest, frameworks, arch, root_source=None):
     paths, by_id, by_name, origins, identities = _mac_sdk_dylibs(prefix, manifest["files"], arch)
     current = PurePosixPath(prefix.as_posix())
 
@@ -260,8 +268,8 @@ def mac_dependencies(executable, prefix, manifest, frameworks, arch):
             raise RuntimeError("Ambiguous pinned SDK dylib: " + dep)
         return next(iter(candidates))
 
-    bundled = {}
-    queue = [(executable, None)]
+    bundled = {executable: root_source} if root_source is not None else {}
+    queue = [(executable, root_source)]
     graph = {}
     while queue:
         binary, source = queue.pop()
@@ -296,7 +304,8 @@ def mac_dependencies(executable, prefix, manifest, frameworks, arch):
         loads = run(["otool", "-arch", arch, "-l", binary])
         for rpath in re.findall(r"cmd LC_RPATH\s+cmdsize \d+\s+path (.*?) \(offset", loads):
             run(["install_name_tool", "-delete_rpath", rpath, binary])
-        run(["install_name_tool", "-add_rpath", "@executable_path/../Frameworks" if binary == executable else "@loader_path", binary])
+        rpath_target = "@executable_path/../Frameworks" if root_source is None and binary == executable else "@loader_path"
+        run(["install_name_tool", "-add_rpath", rpath_target, binary])
     return graph
 
 
@@ -339,22 +348,24 @@ def rust_notices(destination, env, checkpoint, state):
         files = []
         for file in directory.rglob("*"):
             if file.is_file() and re.match(r"(?i)(licen[sc]e|copying|copyright|notice)([.\-_].*)?$", file.name):
-                target = notices / directory.name / file.relative_to(directory)
+                rel_notice = file.relative_to(directory)
+                target = notices / directory.name / rel_notice
                 target.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(file, target)
-                files.append(str(file.relative_to(directory)))
+                files.append(rel_notice.as_posix())
         if package["license_file"]:
             custom = Path(package["license_file"])
             if custom.is_absolute() or ".." in custom.parts:
                 raise RuntimeError(f"Declared license must be within the vendored crate: {directory}: {custom}")
             original = directory / custom
-            if custom.as_posix() not in checksums["files"] or not original.is_file():
+            custom_posix = custom.as_posix()
+            if custom_posix not in checksums["files"] or not original.is_file():
                 raise RuntimeError(f"Declared license missing from verified vendor files: {original}")
-            if str(custom) not in files:
+            if custom_posix not in files:
                 target = notices / directory.name / custom
                 target.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(original, target)
-                files.append(str(custom))
+                files.append(custom_posix)
         upstream_notice = bool(files)
         if not files:
             crate = f"{package['name']}@{package['version']}"
@@ -445,28 +456,90 @@ def stage_payload(payload, built, windows, version):
     return executable, frameworks
 
 
+def _run_capture(args):
+    command = list(map(str, args))
+    print("+", subprocess.list2cmdline(command), flush=True)
+    return subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+
 def notarize(submission, target, evidence):
     profile = ["--keychain-profile", os.environ["IRIS_NOTARY_PROFILE"]]
     if os.environ.get("IRIS_NOTARY_KEYCHAIN"):
         profile += ["--keychain", os.environ["IRIS_NOTARY_KEYCHAIN"]]
-    result = json.loads(run(["xcrun", "notarytool", "submit", submission, *profile, "--wait", "--output-format", "json"]))
+    completed = _run_capture(["xcrun", "notarytool", "submit", submission, *profile, "--wait", "--output-format", "json"])
+    try:
+        parsed = json.loads(completed.stdout) if completed.stdout.strip() else {}
+        result = parsed if isinstance(parsed, dict) else {"raw": parsed}
+    except json.JSONDecodeError as error:
+        result = {"status": "InvalidJSON", "parse_error": str(error), "stdout": completed.stdout}
+    if completed.stderr.strip():
+        result["stderr"] = completed.stderr.strip()
+    if completed.returncode != 0:
+        result["returncode"] = completed.returncode
+    accepted = completed.returncode == 0 and result.get("status") == "Accepted"
+    submission_id = result.get("id")
+    if not accepted and isinstance(submission_id, str) and submission_id:
+        log_result = _run_capture(["xcrun", "notarytool", "log", submission_id, *profile])
+        if log_result.stdout.strip():
+            try:
+                result["notary_log"] = json.loads(log_result.stdout)
+            except json.JSONDecodeError:
+                result["notary_log"] = log_result.stdout
+        if log_result.stderr.strip():
+            result["notary_log_stderr"] = log_result.stderr.strip()
     evidence.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
-    if result.get("status") != "Accepted":
-        raise RuntimeError(f"Apple notarization did not accept {target}")
+    if not accepted:
+        raise RuntimeError(f"Apple notarization did not accept {target} (status={result.get('status')!r})")
     run(["xcrun", "stapler", "staple", target])
     run(["xcrun", "stapler", "validate", target])
 
+
+def _which_trusted(name):
+    old_no_cwd = os.environ.get("NoDefaultCurrentDirectoryInExePath")
+    old_path = os.environ.get("PATH")
+    os.environ["NoDefaultCurrentDirectoryInExePath"] = "1"
+    if old_path is not None:
+        os.environ["PATH"] = os.pathsep.join(
+            entry for entry in old_path.split(os.pathsep) if entry and Path(entry).is_absolute()
+        )
+    try:
+        found = shutil.which(name)
+    finally:
+        if old_no_cwd is None:
+            os.environ.pop("NoDefaultCurrentDirectoryInExePath", None)
+        else:
+            os.environ["NoDefaultCurrentDirectoryInExePath"] = old_no_cwd
+        if old_path is not None:
+            os.environ["PATH"] = old_path
+    if not found:
+        return None
+    candidate = Path(found)
+    if not candidate.is_absolute():
+        return None
+    return candidate.resolve()
+
+
 def _windows_signer():
-    host = shutil.which("pwsh.exe")
-    if host:
-        host = Path(host).resolve()
-    else:
+    host = _which_trusted("pwsh.exe")
+    if not host:
         system_root = os.environ.get("SystemRoot")
         host = Path(system_root) / "System32/WindowsPowerShell/v1.0/powershell.exe" if system_root else None
         if host is None or not host.is_file():
             raise RuntimeError("Windows signing requires pwsh.exe or inbox Windows PowerShell")
     script = Path(__file__).resolve().with_name("sign-windows.ps1")
     return [host, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script, "-File"]
+
+
+def check_plugin_runtime(payload, windows, output):
+    executable = payload / ("iris.exe" if windows else "Contents/MacOS/iris")
+    with tempfile.TemporaryDirectory() as run_dir:
+        smoke = subprocess.run([str(executable), "--check-plugin-runtime"], cwd=run_dir,
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=180, check=True)
+    receipt = json.loads(smoke.stdout)
+    identities = [row.get("plugin") for row in receipt.get("plugins", [])]
+    if receipt.get("status") != "ok" or receipt.get("protocol") != 2 or receipt.get("abi") != 2 or sorted(identities) != ["iris.guides", "iris.webdav"]:
+        raise RuntimeError("Packaged plugin runtime smoke test failed")
+    (output / "plugin-runtime-check.json").write_text(json.dumps(receipt, indent=2) + "\n", encoding="utf-8")
 
 
 def sign_payload(payload, executable, frameworks, notices, graph, target, mode, version, windows, output):
@@ -490,24 +563,35 @@ def sign_payload(payload, executable, frameworks, notices, graph, target, mode, 
             record["notarization"] = "required; see accompanying build manifest for result"
     (notices / "package-manifest.json").write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
     if not windows:
-        run(["codesign", "--force", "--sign", identity, *signing, payload])
+        # Locked Wasmtime 51 uses mmap + mprotect for code, not MAP_JIT.
+        # Do not disable library validation or general executable page protection.
+        entitlements = ROOT / "Resources/Iris.entitlements"
+        run(["codesign", "--force", "--sign", identity, *signing, "--entitlements", entitlements, payload])
         run(["codesign", "--verify", "--deep", "--strict", payload])
+        signed = run(["codesign", "--display", "--entitlements", ":-", payload])
+        begin, end = signed.find("<?xml"), signed.rfind("</plist>")
+        if begin < 0 or end < begin or plistlib.loads(signed[begin:end + len("</plist>")].encode()) != plistlib.loads(entitlements.read_bytes()):
+            raise RuntimeError("Signed plugin JIT entitlements differ from the reviewed policy")
         if release:
             details = run(["codesign", "--display", "--verbose=4", payload])
             if "Authority=Developer ID Application:" not in details or "runtime" not in details:
                 raise RuntimeError("Developer ID hardened runtime verification failed")
-            submission = output / "notary-submission.zip"
-            submission.unlink(missing_ok=True)
-            run(["ditto", "-c", "-k", "--keepParent", payload, submission])
-            notarize(submission, payload, output / "notary-result.json")
-            run(["spctl", "--assess", "--type", "execute", "--verbose=2", payload])
-            submission.unlink()
-            record["notarization"] = "accepted-and-stapled"
     return record
 
 
+def notarize_payload(payload, record, windows, release, output):
+    if not windows and release:
+        submission = output / "notary-submission.zip"
+        submission.unlink(missing_ok=True)
+        run(["ditto", "-c", "-k", "--keepParent", payload, submission])
+        notarize(submission, payload, output / "notary-result.json")
+        run(["spctl", "--assess", "--type", "execute", "--verbose=2", payload])
+        submission.unlink()
+        record["notarization"] = "accepted-and-stapled"
+
+
 def build_installer(payload, output, artifact, version, release):
-    iscc = shutil.which("ISCC")
+    iscc = _which_trusted("ISCC")
     if not iscc:
         installed = Path(os.environ["LOCALAPPDATA"]) / "Programs/Inno Setup 6/ISCC.exe"
         if not installed.is_file():
@@ -622,8 +706,8 @@ def main():
     env["PKG_CONFIG_PATH"] = str(prefix / "lib/pkgconfig")
     target = {"windows-x86_64": "x86_64-pc-windows-msvc", "macos-arm64": "aarch64-apple-darwin", "macos-x86_64": "x86_64-apple-darwin"}[manifest["target"]]
     if windows:
-        # Avoid shipping an untracked VCRUNTIME DLL; this affects Iris, not the replaceable media DLLs.
-        env["RUSTFLAGS"] = "-C target-feature=+crt-static"
+        # Avoid shipping an untracked VCRUNTIME DLL; strip host absolute PDB path from PE debug directory.
+        env["RUSTFLAGS"] = "-C target-feature=+crt-static -C link-arg=/PDBALTPATH:%_PDB%"
     else:
         # Header padding is required for install_name_tool to rewrite load commands.
         env["RUSTFLAGS"] = "-C link-arg=-Wl,-headerpad_max_install_names"
@@ -631,6 +715,7 @@ def main():
     env["CARGO_TARGET_DIR"] = str(cargo_target)
     built = output / "unsigned" / ("iris.exe" if windows else "iris")
     if not state.get("build"):
+        run([sys.executable, "-B", ROOT / "scripts/build-official-plugins.py", "--verify-embedded", "--output", ROOT / "Resources/Plugins"], ROOT, env)
         run(["cargo", "build", "--locked", "--release", "--target", target, "-p", "iris"], ROOT, env)
         built.parent.mkdir(exist_ok=True)
         shutil.copy2(cargo_target / target / "release" / built.name, built)
@@ -717,8 +802,14 @@ def main():
             executable, prefix, manifest, frameworks, manifest["target"].removeprefix("macos-"))
         package = sign_payload(payload, executable, frameworks, packaged_notices, graph,
                                target, args.mode, args.version, windows, output)
+        # Execute the actual staged/signed host before notarizing or checkpointing.
+        # A codesign verification alone cannot prove that JIT mappings are permitted.
+        check_plugin_runtime(payload, windows, output)
+        notarize_payload(payload, package, windows, release, output)
         state.update(payload=tree_hashes(stage), manifest=package)
         save_checkpoint(checkpoint, state)
+    if state.get("payload") and not (output / "plugin-runtime-check.json").is_file():
+        check_plugin_runtime(payload, windows, output)
     zip_path = output / (artifact + ".zip")
     if not completed_file(state, zip_path):
         zip_path.unlink(missing_ok=True)

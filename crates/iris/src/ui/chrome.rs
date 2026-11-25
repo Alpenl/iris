@@ -18,6 +18,7 @@ use crate::platform;
 use crate::theme::ThemeTokens;
 
 const SEEK_DRAG_INTERVAL: Duration = Duration::from_millis(40);
+const FULLSCREEN_WAKE_DISTANCE: f32 = 2.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum DirectoryPopup {
@@ -121,6 +122,7 @@ pub(super) struct WindowChromeState {
     pub(super) last_activity: Instant,
     pub(super) hide_armed: bool,
     pub(super) mouse_pos: Option<Point<Pixels>>,
+    pub(super) last_pointer_pos: Option<Point<Pixels>>,
     pub(super) toast: Option<SharedString>,
     pub(super) toast_seq: u64,
     pub(super) osd: Option<SharedString>,
@@ -149,6 +151,7 @@ impl WindowChromeState {
             last_activity: now,
             hide_armed: false,
             mouse_pos: None,
+            last_pointer_pos: None,
             toast: None,
             toast_seq: 0,
             osd: None,
@@ -196,7 +199,9 @@ impl IrisWindow {
         }
         self.chrome.fullscreen = fs;
         self.overlays.dir_popup = DirectoryPopup::Hidden;
-        self.chrome.mouse_pos = Some(window.mouse_position());
+        let pos = window.mouse_position();
+        self.chrome.mouse_pos = Some(pos);
+        self.chrome.last_pointer_pos = Some(pos);
         if !self.sidebar_is_visible() && self.text_inputs.search_focus.is_focused(window) {
             self.focus.focus(window);
         }
@@ -218,6 +223,10 @@ impl IrisWindow {
             self.chrome.chrome_visible = true;
             cx.notify();
         }
+        self.arm_fullscreen_hide(cx);
+    }
+
+    fn arm_fullscreen_hide(&mut self, cx: &mut Context<Self>) {
         if self.chrome.fullscreen && !self.chrome.hide_armed {
             self.chrome.hide_armed = true;
             cx.spawn(async move |this, cx| {
@@ -250,6 +259,9 @@ impl IrisWindow {
             }
             self.chrome.chrome_visible = false;
             self.chrome.scrub.timeline_hover = false;
+            if let Some(pos) = self.chrome.mouse_pos {
+                self.chrome.last_pointer_pos = Some(pos);
+            }
             cx.notify();
         }
         self.chrome.hide_armed = false;
@@ -429,6 +441,8 @@ impl IrisWindow {
             self.overlays.dir_popup = DirectoryPopup::Hidden;
             self.bump_activity(cx);
             cx.notify();
+        } else if self.chrome.fullscreen && self.chrome.chrome_visible {
+            self.arm_fullscreen_hide(cx);
         }
     }
 
@@ -439,6 +453,14 @@ impl IrisWindow {
         cx: &mut Context<Self>,
     ) {
         let previous = self.chrome.mouse_pos.replace(ev.position);
+        let wake_fullscreen = should_wake_fullscreen_chrome(
+            self.chrome.last_pointer_pos,
+            ev.position,
+            ev.pressed_button.is_some(),
+        );
+        if wake_fullscreen {
+            self.chrome.last_pointer_pos = Some(ev.position);
+        }
         let t = ThemeTokens::of(cx);
         if self.chrome.fullscreen
             && ev.pressed_button.is_none()
@@ -502,6 +524,7 @@ impl IrisWindow {
         }
         if self.chrome.scrub.seeking {
             if ev.pressed_button == Some(MouseButton::Left) {
+                self.chrome.scrub.seek_dragged = true;
                 self.update_seek_preview(ev.position.x);
                 if self.chrome.scrub.last_seek_drag.elapsed() >= SEEK_DRAG_INTERVAL {
                     self.chrome.scrub.last_seek_drag = Instant::now();
@@ -550,7 +573,7 @@ impl IrisWindow {
                 cx.notify();
             }
         }
-        if self.chrome.fullscreen {
+        if self.chrome.fullscreen && wake_fullscreen {
             self.bump_activity(cx);
         }
     }
@@ -609,8 +632,11 @@ impl IrisWindow {
         if !std::mem::take(&mut self.chrome.scrub.seeking) {
             return;
         }
-        self.update_seek_preview(x);
-        self.seek_to_x(x, true);
+        let dragged = std::mem::take(&mut self.chrome.scrub.seek_dragged);
+        if dragged {
+            self.update_seek_preview(x);
+            self.seek_to_x(x, true);
+        }
         self.chrome.scrub.seek_preview_timeout = Some(cx.spawn(async move |this, cx| {
             cx.background_executor()
                 .timer(Duration::from_millis(350))
@@ -631,11 +657,39 @@ fn pointer_distance(a: Point<Pixels>, b: Point<Pixels>) -> f32 {
     f32::from(a.x - b.x).hypot(f32::from(a.y - b.y))
 }
 
+fn should_wake_fullscreen_chrome(
+    last: Option<Point<Pixels>>,
+    current: Point<Pixels>,
+    pressed: bool,
+) -> bool {
+    pressed || last.is_none_or(|prev| pointer_distance(prev, current) >= FULLSCREEN_WAKE_DISTANCE)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{DirectoryPopup, DirectoryZone};
+    use super::{DirectoryPopup, DirectoryZone, should_wake_fullscreen_chrome};
     use gpui::px;
     use iris_core::settings::Side;
+
+    #[test]
+    fn fullscreen_chrome_ignores_synthetic_zero_distance_mouse_moves() {
+        let origin = gpui::point(px(640.), px(360.));
+        assert!(should_wake_fullscreen_chrome(None, origin, false));
+        // Synthetic WM_MOUSEMOVE / cursor-hide refreshes at the same spot or sub-pixel DPI jitter.
+        assert!(!should_wake_fullscreen_chrome(Some(origin), origin, false));
+        assert!(!should_wake_fullscreen_chrome(
+            Some(origin),
+            gpui::point(px(640.6), px(360.4)),
+            false,
+        ));
+        // Real user pointer motion or drag immediately wakes fullscreen chrome.
+        assert!(should_wake_fullscreen_chrome(
+            Some(origin),
+            gpui::point(px(643.), px(360.)),
+            false,
+        ));
+        assert!(should_wake_fullscreen_chrome(Some(origin), origin, true));
+    }
 
     #[test]
     fn fullscreen_directory_edges_use_viewport_coordinates_and_exclude_the_dock() {

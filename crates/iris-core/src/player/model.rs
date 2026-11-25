@@ -270,6 +270,8 @@ pub struct MediaStats {
 
 #[derive(Debug)]
 pub enum SessionEvent {
+    Seek,
+    CommandReply { id: u64, error: i32 },
     Position(f64),
     Duration(f64),
     Paused(bool),
@@ -287,6 +289,8 @@ pub enum SessionEvent {
     Rotation(i64),
     SourceRotation(i64),
     LoopFile(bool),
+    AbStart(Option<f64>),
+    AbEnd(Option<f64>),
     Chapter(i64),
     ChaptersChanged,
     TracksChanged,
@@ -294,6 +298,7 @@ pub enum SessionEvent {
     CacheDuration(f64),
     Loaded,
     Reconfigured,
+    QueueOverflow,
     Error(i32),
 }
 
@@ -320,6 +325,8 @@ pub struct PlaybackState {
     pub audio: String,
     pub rotation: i64,
     pub loop_file: bool,
+    pub ab_start: Option<f64>,
+    pub ab_end: Option<f64>,
     pub aspect: AspectMode,
     pub hflip: bool,
     pub vflip: bool,
@@ -356,6 +363,8 @@ impl Default for PlaybackState {
             audio: String::new(),
             rotation: 0,
             loop_file: false,
+            ab_start: None,
+            ab_end: None,
             aspect: AspectMode::Original,
             hflip: false,
             vflip: false,
@@ -401,6 +410,12 @@ pub enum Command {
     SelectAudio(Option<i64>),
     SetAudioDevice(String),
     SetLoop(bool),
+    SetAbLoop {
+        start: f64,
+        end: f64,
+    },
+    CycleAbLoop,
+    ClearAbLoop,
     SetAspect(AspectMode),
     SetVideoEq {
         brightness: i64,

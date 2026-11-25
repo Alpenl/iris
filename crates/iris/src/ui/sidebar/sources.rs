@@ -6,7 +6,8 @@ use gpui::{
     Context, InteractiveElement, IntoElement, MouseButton, ParentElement,
     StatefulInteractiveElement, Styled, div, prelude::FluentBuilder, px,
 };
-use iris_api::{SourceDescriptor, SourceManageAction};
+use iris_api::SourceManageAction;
+use iris_api::v2::source::SourceDescriptor;
 use iris_core::media_uri::MediaUri;
 use iris_core::vfs::PinnedBookmark;
 

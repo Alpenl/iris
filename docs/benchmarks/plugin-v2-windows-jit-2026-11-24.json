@@ -1,0 +1,230 @@
+{
+  "scope": "fresh host processes; cold in-process module cache, then one cache hit; filesystem cache not flushed",
+  "limitations": "RSS sampled every 20ms (Windows OS peak working set); CPU sample may omit final interval. No playback, GPU, UI frame time or allocation counts.",
+  "platform": "Windows-11-10.0.26300-SP0",
+  "machine": "AMD64",
+  "cpu": "Intel64 Family 6 Model 154 Stepping 3, GenuineIntel",
+  "logical_cpus": 16,
+  "executable_sha256": "464809fa272f28565c12d98ffe364fb7a1f9539f40792fc77c92e568137d461e",
+  "wall_ms": {
+    "p50": 1718.9999999827705,
+    "p95_nearest_rank": 1795.9999999729916
+  },
+  "peak_rss_bytes": {
+    "p50": 57335808,
+    "p95_nearest_rank": 57421824
+  },
+  "plugins": {
+    "iris.guides": {
+      "compile_ms": {
+        "p50": 496.8965,
+        "p95_nearest_rank": 538.8404999999999
+      },
+      "cache_hit_ms": {
+        "p50": 0.3462,
+        "p95_nearest_rank": 0.5175
+      },
+      "instantiate_ms": {
+        "p50": 0.1975,
+        "p95_nearest_rank": 0.2379
+      },
+      "callback_ms": {
+        "p50": 0.0761,
+        "p95_nearest_rank": 0.0914
+      }
+    },
+    "iris.webdav": {
+      "compile_ms": {
+        "p50": 1060.8694,
+        "p95_nearest_rank": 1080.2059
+      },
+      "cache_hit_ms": {
+        "p50": 0.7035,
+        "p95_nearest_rank": 0.8479
+      },
+      "instantiate_ms": {
+        "p50": 0.1624,
+        "p95_nearest_rank": 0.178
+      },
+      "callback_ms": {
+        "p50": 0.043000000000000003,
+        "p95_nearest_rank": 0.0448
+      }
+    }
+  },
+  "samples": [
+    {
+      "wall_ms": 1795.9999999729916,
+      "peak_rss_bytes": 57421824,
+      "cpu_seconds_sampled": 1.609375,
+      "receipt": {
+        "status": "ok",
+        "protocol": 2,
+        "abi": 2,
+        "os": "windows",
+        "arch": "x86_64",
+        "debug": false,
+        "plugins": [
+          {
+            "plugin": "iris.guides",
+            "content_sha256": "db79acef2cb9b92991a9d9522ba020ddd617ac055ce21e1096ace5d50efa337b",
+            "wasm_bytes": 704534,
+            "compile_ms": 488.13230000000004,
+            "cache_hit_ms": 0.3461,
+            "instantiate_ms": 0.2379,
+            "callback_ms": 0.0914
+          },
+          {
+            "plugin": "iris.webdav",
+            "content_sha256": "2b4b46d7abf4507047ea393394944ec2a680195cf9a23db0299810b124a2e302",
+            "wasm_bytes": 1398587,
+            "compile_ms": 1080.2059,
+            "cache_hit_ms": 0.696,
+            "instantiate_ms": 0.1682,
+            "callback_ms": 0.0448
+          }
+        ]
+      }
+    },
+    {
+      "wall_ms": 1735.0000000442378,
+      "peak_rss_bytes": 57274368,
+      "cpu_seconds_sampled": 1.640625,
+      "receipt": {
+        "status": "ok",
+        "protocol": 2,
+        "abi": 2,
+        "os": "windows",
+        "arch": "x86_64",
+        "debug": false,
+        "plugins": [
+          {
+            "plugin": "iris.guides",
+            "content_sha256": "db79acef2cb9b92991a9d9522ba020ddd617ac055ce21e1096ace5d50efa337b",
+            "wasm_bytes": 704534,
+            "compile_ms": 538.8404999999999,
+            "cache_hit_ms": 0.34640000000000004,
+            "instantiate_ms": 0.1975,
+            "callback_ms": 0.0761
+          },
+          {
+            "plugin": "iris.webdav",
+            "content_sha256": "2b4b46d7abf4507047ea393394944ec2a680195cf9a23db0299810b124a2e302",
+            "wasm_bytes": 1398587,
+            "compile_ms": 1062.8953000000001,
+            "cache_hit_ms": 0.7035,
+            "instantiate_ms": 0.1371,
+            "callback_ms": 0.038
+          }
+        ]
+      }
+    },
+    {
+      "wall_ms": 1718.9999999827705,
+      "peak_rss_bytes": 57417728,
+      "cpu_seconds_sampled": 1.484375,
+      "receipt": {
+        "status": "ok",
+        "protocol": 2,
+        "abi": 2,
+        "os": "windows",
+        "arch": "x86_64",
+        "debug": false,
+        "plugins": [
+          {
+            "plugin": "iris.guides",
+            "content_sha256": "db79acef2cb9b92991a9d9522ba020ddd617ac055ce21e1096ace5d50efa337b",
+            "wasm_bytes": 704534,
+            "compile_ms": 497.371,
+            "cache_hit_ms": 0.3462,
+            "instantiate_ms": 0.1794,
+            "callback_ms": 0.0662
+          },
+          {
+            "plugin": "iris.webdav",
+            "content_sha256": "2b4b46d7abf4507047ea393394944ec2a680195cf9a23db0299810b124a2e302",
+            "wasm_bytes": 1398587,
+            "compile_ms": 1060.5934,
+            "cache_hit_ms": 0.8479,
+            "instantiate_ms": 0.1428,
+            "callback_ms": 0.043000000000000003
+          }
+        ]
+      }
+    },
+    {
+      "wall_ms": 1702.999999979511,
+      "peak_rss_bytes": 57176064,
+      "cpu_seconds_sampled": 1.53125,
+      "receipt": {
+        "status": "ok",
+        "protocol": 2,
+        "abi": 2,
+        "os": "windows",
+        "arch": "x86_64",
+        "debug": false,
+        "plugins": [
+          {
+            "plugin": "iris.guides",
+            "content_sha256": "db79acef2cb9b92991a9d9522ba020ddd617ac055ce21e1096ace5d50efa337b",
+            "wasm_bytes": 704534,
+            "compile_ms": 489.421,
+            "cache_hit_ms": 0.5175,
+            "instantiate_ms": 0.2092,
+            "callback_ms": 0.0766
+          },
+          {
+            "plugin": "iris.webdav",
+            "content_sha256": "2b4b46d7abf4507047ea393394944ec2a680195cf9a23db0299810b124a2e302",
+            "wasm_bytes": 1398587,
+            "compile_ms": 1042.1194,
+            "cache_hit_ms": 0.7052999999999999,
+            "instantiate_ms": 0.1624,
+            "callback_ms": 0.0402
+          }
+        ]
+      }
+    },
+    {
+      "wall_ms": 1703.0000000377186,
+      "peak_rss_bytes": 57335808,
+      "cpu_seconds_sampled": 1.578125,
+      "receipt": {
+        "status": "ok",
+        "protocol": 2,
+        "abi": 2,
+        "os": "windows",
+        "arch": "x86_64",
+        "debug": false,
+        "plugins": [
+          {
+            "plugin": "iris.guides",
+            "content_sha256": "db79acef2cb9b92991a9d9522ba020ddd617ac055ce21e1096ace5d50efa337b",
+            "wasm_bytes": 704534,
+            "compile_ms": 496.8965,
+            "cache_hit_ms": 0.3461,
+            "instantiate_ms": 0.18919999999999998,
+            "callback_ms": 0.06899999999999999
+          },
+          {
+            "plugin": "iris.webdav",
+            "content_sha256": "2b4b46d7abf4507047ea393394944ec2a680195cf9a23db0299810b124a2e302",
+            "wasm_bytes": 1398587,
+            "compile_ms": 1060.8694,
+            "cache_hit_ms": 0.6863,
+            "instantiate_ms": 0.178,
+            "callback_ms": 0.043000000000000003
+          }
+        ]
+      }
+    }
+  ],
+  "source_commit": "9c0c859bf737f7305eb0903a9d49927284b44cb4",
+  "source_dirty": false,
+  "rustc": "rustc 1.100.0 (0ef1bc386 2026-11-09)",
+  "regression_budget": {
+    "scope": "same machine, OS and build profile; 5-run pilot; p95 is nearest rank, not a population estimate",
+    "wall_p95_ms": 2244.9999999662396,
+    "rss_p95_bytes": 71777280
+  }
+}

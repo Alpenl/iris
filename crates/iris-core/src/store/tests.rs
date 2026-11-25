@@ -1,3 +1,4 @@
+use super::recent::MAX_RECENT;
 use super::*;
 
 fn hex_str(s: &str) -> String {
@@ -348,5 +349,66 @@ fn windows_legacy_unc_record_migrates_to_local_path_encoding() {
             .unwrap()
             .starts_with(&hex_str(&expected.to_uri_string()))
     );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn recent_titles_persist_sanitize_preserve_and_backfill_legacy_entries() {
+    let dir = test_dir("recent-titles");
+    let bv1 = MediaUri::Plugin {
+        plugin_id: "community.bilibili".into(),
+        source_id: "recommend".into(),
+        entry_id: "BV1nqyBzqEgd".into(),
+    };
+    let bv2 = MediaUri::Plugin {
+        plugin_id: "community.bilibili".into(),
+        source_id: "popular".into(),
+        entry_id: "BV1EmykzjEU3".into(),
+    };
+
+    // Seed legacy 1-column `recent.tsv` without titles (exact format from older Iris versions).
+    std::fs::write(
+        dir.join("recent.tsv"),
+        format!(
+            "{}\n{}\n",
+            hex_str(&bv1.to_uri_string()),
+            hex_str(&bv2.to_uri_string())
+        ),
+    )
+    .unwrap();
+
+    let mut store = Store::load_from_dir(&dir);
+    assert_eq!(store.recent(), &[bv1.clone(), bv2.clone()]);
+    assert_eq!(store.recent_title(&bv1), None);
+    assert_eq!(store.recent_display_name(&bv1), "BV1nqyBzqEgd");
+
+    // Backfilling from a catalog page (even another source like "history") populates titles
+    // without reordering recency.
+    assert!(store.backfill_plugin_recent_titles(
+        "community.bilibili",
+        "history",
+        [("BV1EmykzjEU3", "  【4K】实拍\t演示\u{202E}\n视频  ")],
+    ));
+    assert_eq!(store.recent(), &[bv1.clone(), bv2.clone()]);
+    assert_eq!(store.recent_display_name(&bv2), "【4K】实拍 演示 视频");
+
+    // Opening BV1 records its title even when it is already at index 0.
+    store.push_recent_with_title(&bv1, Some("第一个测试标题"));
+    assert_eq!(store.recent_display_name(&bv1), "第一个测试标题");
+
+    // Re-pushing without a title preserves the previously known title.
+    store.push_recent(&bv1);
+    assert_eq!(store.recent_display_name(&bv1), "第一个测试标题");
+
+    // Reloading from disk round-trips both titles cleanly.
+    let mut reopened = Store::load_from_dir(&dir);
+    assert_eq!(reopened.recent(), &[bv1.clone(), bv2.clone()]);
+    assert_eq!(reopened.recent_display_name(&bv1), "第一个测试标题");
+    assert_eq!(reopened.recent_display_name(&bv2), "【4K】实拍 演示 视频");
+
+    // Clearing recent clears both URIs and titles.
+    reopened.clear_recent();
+    assert!(reopened.recent().is_empty());
+    assert_eq!(reopened.recent_title(&bv1), None);
     std::fs::remove_dir_all(dir).unwrap();
 }

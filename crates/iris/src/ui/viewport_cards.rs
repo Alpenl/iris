@@ -96,7 +96,17 @@ impl IrisWindow {
         t: ThemeTokens,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let recents: Vec<MediaUri> = self.store.recent().iter().take(6).cloned().collect();
+        let recents: Vec<(MediaUri, Option<String>, String)> = self
+            .store
+            .recent()
+            .iter()
+            .take(6)
+            .map(|uri| {
+                let stored_title = self.store.recent_title(uri).map(str::to_owned);
+                let label = self.store.recent_display_name(uri);
+                (uri.clone(), stored_title, label)
+            })
+            .collect();
         let open_local_key = self.key_hint("open_file");
         let open_url_key = self.key_hint("open_stream_url");
 
@@ -141,6 +151,7 @@ impl IrisWindow {
         div()
             .absolute()
             .size_full()
+            .bg(t.window_bg)
             .flex()
             .flex_col()
             .items_center()
@@ -241,55 +252,56 @@ impl IrisWindow {
                                         })),
                                 ),
                         )
-                        .children(recents.into_iter().enumerate().map(|(i, uri)| {
-                            let label = uri.display_name();
-                            let (glyph, badge, remote) = match &uri {
-                                MediaUri::Local(p) => {
-                                    let g = match library::kind_of(p) {
-                                        Some(Kind::Video) => Icon::Video,
-                                        Some(Kind::Photo) => Icon::Photo,
-                                        Some(Kind::Audio) => Icon::Music,
-                                        None => Icon::Folder,
-                                    };
-                                    (g, None, false)
-                                }
-                                MediaUri::Plugin { plugin_id, .. } => (
-                                    if plugin_id == "iris.webdav" {
-                                        Icon::Globe
-                                    } else {
-                                        Icon::Puzzle
-                                    },
-                                    Some(if plugin_id == "iris.webdav" {
-                                        "WebDAV"
-                                    } else {
-                                        "插件源"
-                                    }),
-                                    true,
-                                ),
-                                MediaUri::HttpUrl(_) => (Icon::Link, Some("网络流"), true),
-                            };
-                            div()
-                                .id(("recent-item", i))
-                                .h(px(26.))
-                                .px(px(10.))
-                                .flex()
-                                .items_center()
-                                .gap(px(8.))
-                                .cursor_pointer()
-                                .text_size(px(12.))
-                                .text_color(t.text_muted)
-                                .hover(|s| s.bg(t.hover).text_color(t.text))
-                                .child(icon(
-                                    glyph,
-                                    13.,
-                                    if remote { t.accent } else { t.text_faint },
-                                ))
-                                .child(div().flex_1().min_w(px(0.)).truncate().child(label))
-                                .when_some(badge, |r, b| r.child(badge_pill(b, false, t)))
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.open_media_uri(&uri, None, cx);
-                                }))
-                        })),
+                        .children(recents.into_iter().enumerate().map(
+                            |(i, (uri, stored_title, label))| {
+                                let (glyph, badge, remote) = match &uri {
+                                    MediaUri::Local(p) => {
+                                        let g = match library::kind_of(p) {
+                                            Some(Kind::Video) => Icon::Video,
+                                            Some(Kind::Photo) => Icon::Photo,
+                                            Some(Kind::Audio) => Icon::Music,
+                                            None => Icon::Folder,
+                                        };
+                                        (g, None, false)
+                                    }
+                                    MediaUri::Plugin { plugin_id, .. } => (
+                                        if plugin_id == "iris.webdav" {
+                                            Icon::Globe
+                                        } else {
+                                            Icon::Puzzle
+                                        },
+                                        Some(if plugin_id == "iris.webdav" {
+                                            "WebDAV"
+                                        } else {
+                                            "插件源"
+                                        }),
+                                        true,
+                                    ),
+                                    MediaUri::HttpUrl(_) => (Icon::Link, Some("网络流"), true),
+                                };
+                                div()
+                                    .id(("recent-item", i))
+                                    .h(px(26.))
+                                    .px(px(10.))
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(8.))
+                                    .cursor_pointer()
+                                    .text_size(px(12.))
+                                    .text_color(t.text_muted)
+                                    .hover(|s| s.bg(t.hover).text_color(t.text))
+                                    .child(icon(
+                                        glyph,
+                                        13.,
+                                        if remote { t.accent } else { t.text_faint },
+                                    ))
+                                    .child(div().flex_1().min_w(px(0.)).truncate().child(label))
+                                    .when_some(badge, |r, b| r.child(badge_pill(b, false, t)))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.open_media_uri(&uri, stored_title.clone(), cx);
+                                    }))
+                            },
+                        )),
                 )
             })
     }

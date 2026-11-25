@@ -23,6 +23,7 @@ import urllib.parse
 import urllib.request
 import zipfile
 
+sys.dont_write_bytecode = True
 ROOT = Path(__file__).resolve().parents[2]
 LOCK = ROOT / "scripts/release/sources.lock.json"
 SOURCE_LICENSES = frozenset({
@@ -202,7 +203,10 @@ def main():
     else:
         cc, cxx = "clang", "clang++"
         env["MACOSX_DEPLOYMENT_TARGET"] = "11.0"
-        cmake_platform = ["-DCMAKE_OSX_ARCHITECTURES=" + arch, "-DCMAKE_OSX_DEPLOYMENT_TARGET=11.0"]
+        env["LDFLAGS"] = "-Wl,-headerpad_max_install_names"
+        cmake_platform = ["-DCMAKE_OSX_ARCHITECTURES=" + arch, "-DCMAKE_OSX_DEPLOYMENT_TARGET=11.0",
+                          "-DCMAKE_INSTALL_NAME_DIR=@rpath",
+                          "-DCMAKE_SHARED_LINKER_FLAGS=-Wl,-headerpad_max_install_names"]
         ff_platform = ["--arch=" + ("aarch64" if arch == "arm64" else arch), "--cc=clang", "--cxx=clang++",
                        "--enable-videotoolbox", "--enable-audiotoolbox", "--enable-securetransport",
                        "--install-name-dir=@rpath"]
@@ -219,6 +223,14 @@ def main():
         download(pin, archive)
         if not (src / name).exists():
             extract(archive, src / name)
+    # Prevent mpv's macOS meson.build from injecting /usr/local/lib ahead of our pinned SDK prefix.
+    mpv_meson = src / "mpv/meson.build"
+    mpv_meson_text = mpv_meson.read_text(encoding="utf-8")
+    patched_mpv_meson = mpv_meson_text.replace(", '-L/usr/local/lib'", "")
+    if patched_mpv_meson != mpv_meson_text:
+        mpv_meson.write_text(patched_mpv_meson, encoding="utf-8")
+    elif "'-L/usr/local/lib'" in mpv_meson_text:
+        raise RuntimeError("Unexpected -L/usr/local/lib flag in mpv/meson.build")
     # Explicit vendoring, not network-capable Meson/CMake fallback downloads.
     for name, destination in (("fast-float", "fast_float"), ("glad", "glad"), ("jinja", "jinja"), ("markupsafe", "markupsafe"), ("vulkan-headers", "Vulkan-Headers")):
         target = src / "libplacebo/3rdparty" / destination
@@ -235,6 +247,8 @@ def main():
                    "--auto-features=disabled", *meson_platform, *options]
         if windows:
             command += ["-Dc_link_args=['-static-libstdc++','-static-libgcc']", "-Dcpp_link_args=['-static-libstdc++','-static-libgcc']"]
+        else:
+            command += ["-Dc_link_args=['-Wl,-headerpad_max_install_names']", "-Dcpp_link_args=['-Wl,-headerpad_max_install_names']"]
         execute(command)
         if name == "libplacebo":
             # Required even with Vulkan disabled: its public ABI includes Vulkan types.
@@ -290,7 +304,8 @@ def main():
              "--disable-autodetect", "--disable-programs", "--disable-doc", "--disable-avdevice",
              "--disable-debug", "--enable-pic", "--disable-chromaprint", "--enable-libdav1d", "--enable-zlib",
              "--pkg-config=pkg-config", "--extra-cflags=-I" + str(prefix / "include"),
-             "--extra-ldflags=-L" + str(prefix / "lib"), *ff_platform], ffbuild)
+             "--extra-ldflags=-L" + str(prefix / "lib") + ("" if windows else " -Wl,-headerpad_max_install_names"),
+             *ff_platform], ffbuild)
     config = (ffbuild / "config.h").read_text()
     for flag in ("GPL", "VERSION3", "NONFREE", "CHROMAPRINT"):
         if not re.search(r"^#define CONFIG_" + flag + r" 0$", config, re.M):
@@ -321,7 +336,7 @@ def main():
         options += ["-Dwin32-threads=enabled", "-Dwasapi=enabled", "-Dd3d11=enabled", "-Dshaderc=enabled",
                     "-Dspirv-cross=enabled", "-Dd3d-hwaccel=enabled", "-Dgl-win32=enabled"]
     else:
-        options += ["-Dcoreaudio=enabled", "-Dgl-cocoa=enabled", "-Dcocoa=enabled", "-Dvideotoolbox-gl=enabled"]
+        options += ["-Dswift-build=enabled", "-Dcoreaudio=enabled", "-Dgl-cocoa=enabled", "-Dcocoa=enabled", "-Dvideotoolbox-gl=enabled"]
     meson("mpv", options)
     mpvoptions = json.loads((work / "build/mpv/meson-info/intro-buildoptions.json").read_text())
     values = {entry["name"]: entry["value"] for entry in mpvoptions}
@@ -348,6 +363,17 @@ def main():
         definition = prefix / "lib/mpv.def"
         definition.write_text("LIBRARY " + dlls[0].name + "\nEXPORTS\n" + "\n".join(exports) + "\n")
         execute(["llvm-dlltool", "-m", "i386:x86-64", "-d", str(definition), "-l", str(prefix / "lib/mpv.lib")])
+    else:
+        prefix_root = prefix.as_posix().rstrip("/") + "/"
+        for dylib in sorted((prefix / "lib").rglob("*.dylib")):
+            if dylib.is_symlink() or not dylib.is_file():
+                continue
+            deps = [line.strip().rsplit(" (compatibility version ", 1)[0]
+                    for line in execute(["otool", "-arch", arch, "-L", str(dylib)]).splitlines()[1:]]
+            for dep in deps:
+                if not (dep.startswith((prefix_root, "@rpath/", "@loader_path/", "/System/Library/", "/usr/lib/"))
+                        or ("/" not in dep and (prefix / "lib" / dep).is_file())):
+                    raise RuntimeError(f"External dylib leak in {dylib}: {dep}")
     licenses = evidence / "licenses"
     licenses.mkdir(exist_ok=args.resume)
     for name in needed:

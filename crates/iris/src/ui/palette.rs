@@ -11,6 +11,7 @@ use iris_core::preset::{PresetCaptureScope, SidebarMode};
 use iris_core::vfs::PinnedBookmark;
 
 use super::IrisWindow;
+use super::actions::{ClearAbLoop, CycleAbLoop};
 use super::actions::{
     CycleAspect, CyclePreset, OpenFile, RefreshDirectory, RotateCw, TakeScreenshot,
     ToggleDirectory, ToggleInfo, ToggleLoop, ToggleMute, TogglePause, ToggleSearch,
@@ -97,6 +98,20 @@ impl IrisWindow {
                 badge: "内核".into(),
                 shortcut: live_key("toggle_loop"),
                 target: PaletteTarget::Host("toggle_loop"),
+            },
+            PaletteEntry {
+                title: "设置 A / B 点或清除区间".into(),
+                subtitle: None,
+                badge: "内核".into(),
+                shortcut: live_key("cycle_ab_loop"),
+                target: PaletteTarget::Host("cycle_ab_loop"),
+            },
+            PaletteEntry {
+                title: "清除 A-B 循环".into(),
+                subtitle: None,
+                badge: "内核".into(),
+                shortcut: live_key("clear_ab_loop"),
+                target: PaletteTarget::Host("clear_ab_loop"),
             },
             PaletteEntry {
                 title: "切换画面比例 / 铺满裁剪".into(),
@@ -335,6 +350,8 @@ impl IrisWindow {
                 "toggle_pause" => self.toggle_pause(&TogglePause, window, cx),
                 "toggle_mute" => self.toggle_mute(&ToggleMute, window, cx),
                 "toggle_loop" => self.toggle_loop(&ToggleLoop, window, cx),
+                "cycle_ab_loop" => self.cycle_ab_loop(&CycleAbLoop, window, cx),
+                "clear_ab_loop" => self.clear_ab_loop(&ClearAbLoop, window, cx),
                 "cycle_aspect" => self.cycle_aspect(&CycleAspect, window, cx),
                 "rotate_cw" => self.rotate_cw(&RotateCw, window, cx),
                 "screenshot" => self.take_screenshot(&TakeScreenshot, window, cx),

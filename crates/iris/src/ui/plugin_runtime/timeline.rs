@@ -1,0 +1,93 @@
+use super::super::IrisWindow;
+use crate::theme::ThemeTokens;
+use gpui::{
+    AnyElement, Context, InteractiveElement, IntoElement, MouseButton, StatefulInteractiveElement,
+    Styled, div, px, relative,
+};
+use iris_api::v2::{
+    HostCommand,
+    enhance::{HeatRange, SkipRange},
+};
+use iris_core::player::Command;
+
+impl IrisWindow {
+    fn timeline_ranges(&self) -> Option<(&[HeatRange], &[SkipRange])> {
+        let (owner, update, index) = self.plugin_view.enhance.timeline.as_ref()?;
+        if update.is_cancelled() || !self.plugin_view.enhance.bindings.get(owner)?.is_live() {
+            return None;
+        }
+        match &update.commands[*index] {
+            HostCommand::SetTimelineMeta { heat, skip, .. } => Some((heat, skip)),
+            _ => None,
+        }
+    }
+
+    pub(in crate::ui) fn plugin_timeline_ranges(
+        &self,
+        duration: f64,
+        t: ThemeTokens,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        if !duration.is_finite() || duration <= 0. {
+            return Vec::new();
+        }
+        let Some((heat, skip)) = self.timeline_ranges() else {
+            return Vec::new();
+        };
+        let ratio = |ms: u64| ((ms as f64 / 1000.) / duration).clamp(0., 1.) as f32;
+        let mut marks = Vec::new();
+        for range in heat {
+            let (start, end) = (ratio(range.start_ms.0), ratio(range.end_ms.0));
+            if end <= start {
+                continue;
+            }
+            let mut color = t.accent;
+            color.a = range.intensity as f32 / 100.;
+            marks.push(
+                div()
+                    .absolute()
+                    .top(px(3.))
+                    .left(relative(start))
+                    .w(relative(end - start))
+                    .h(px(2.))
+                    .bg(color)
+                    .into_any_element(),
+            );
+        }
+        let media = self.plugin_view.enhance.sequence;
+        let generation = self.plugins.generation();
+        for (index, range) in skip.iter().enumerate() {
+            let (start, end) = (ratio(range.start_ms.0), ratio(range.end_ms.0));
+            if end <= start {
+                continue;
+            }
+            let target = (range.end_ms.0 as f64 / 1000.).min(duration);
+            marks.push(
+                div()
+                    .id(("plugin-skip", index))
+                    .absolute()
+                    .top(px(10.))
+                    .left(relative(start))
+                    .w(relative(end - start))
+                    .h(px(4.))
+                    .bg(t.text_muted)
+                    .cursor_pointer()
+                    .tooltip(crate::ui::kit::tip(format!("跳过 · {}", range.label), None))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            if this.plugin_view.enhance.sequence == media
+                                && this.plugins.generation() == generation
+                                && this.timeline_ranges().is_some()
+                            {
+                                this.command(Command::SeekAbsolute(target), cx);
+                            }
+                        }),
+                    )
+                    .into_any_element(),
+            );
+        }
+        marks
+    }
+}

@@ -31,7 +31,13 @@ impl IrisWindow {
     ) -> impl IntoElement {
         let t = ThemeTokens::of(cx);
         let mode = self.catalog.sidebar_mode;
-        let width = self.settings.directory_width;
+        let vw = f32::from(window.viewport_size().width);
+        let max_w = if floating {
+            (vw - 48.).max(180.)
+        } else {
+            (vw - 220.).max(180.)
+        };
+        let width = self.settings.directory_width.min(max_w);
         let side = self.settings.directory_side;
         let queue_len = self.queue.len();
 
@@ -125,7 +131,7 @@ impl IrisWindow {
             SidebarMode::Files => self.render_sidebar_files(window, cx).into_any_element(),
             SidebarMode::Sources => self.render_sidebar_sources(cx).into_any_element(),
             SidebarMode::Queue => self.render_sidebar_queue(cx).into_any_element(),
-            SidebarMode::Plugins => self.render_plugin_sidebar(cx).into_any_element(),
+            SidebarMode::Plugins => self.render_plugin_sidebar(window, cx).into_any_element(),
         };
 
         div()
@@ -211,9 +217,8 @@ impl IrisWindow {
                     .cursor(CursorStyle::ResizeLeftRight)
                     .on_mouse_down(
                         MouseButton::Left,
-                        cx.listener(|this, ev: &MouseDownEvent, _, cx| {
-                            this.chrome.resizing_dir =
-                                Some((f32::from(ev.position.x), this.settings.directory_width));
+                        cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
+                            this.chrome.resizing_dir = Some((f32::from(ev.position.x), width));
                             cx.stop_propagation();
                             cx.notify();
                         }),

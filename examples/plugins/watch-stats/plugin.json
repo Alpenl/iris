@@ -1,22 +1,20 @@
 {
   "id": "example.watch-stats",
-  "name": "观影计时统计",
+  "name": "窗口观影计时",
   "version": "0.0.1",
-  "author": "Iris Examples",
-  "description": "外部进程插件示例：记录累计实际播放时长并跨会话持久化，在底栏与侧栏展示统计并注册命令面板动作。",
-  "protocol": 1,
-  "entry": "main.py",
+  "protocol": 2,
+  "abi": 2,
+  "entry": "plugin.wasm",
+  "description": "公开 SDK Wasm 示例：各窗口独立计时与状态栏重置；不持久化。",
   "permissions": [
     "read_state",
-    "ui_sidebar",
-    "ui_status",
-    "notifications"
+    "ui_status"
   ],
   "commands": [
     {
       "id": "reset",
-      "title": "统计：重置观影计时",
-      "subtitle": "将累计播放时长归零"
+      "title": "重置当前窗口观影计时",
+      "context_menu": true
     }
   ]
 }

@@ -237,11 +237,16 @@ impl IrisWindow {
         let floating_dock = fullscreen || self.effective_floating_dock();
         let dock_h = f32::from(t.dock_h);
         let has_media = session.current().is_some() || session.current_uri().is_some();
+        let has_visual_surface =
+            has_media && session.state().loaded && matches!(kind, Some(Kind::Video | Kind::Photo));
         let is_photo_zoomed = kind == Some(Kind::Photo) && self.image_can_pan();
         let panning = vp.drag_origin.is_some();
         let show_filmstrip = kind == Some(Kind::Photo)
             && self.settings.photo_filmstrip
-            && (!fullscreen || self.chrome.chrome_visible);
+            && (!fullscreen || self.chrome.chrome_visible)
+            && session
+                .current()
+                .is_some_and(|cur| self.catalog.photo_paths.iter().any(|p| p == cur));
 
         let top_pill = self
             .chrome
@@ -265,6 +270,7 @@ impl IrisWindow {
             .min_h(px(0.))
             .w_full()
             .overflow_hidden()
+            .when(!has_visual_surface, |d| d.bg(t.window_bg))
             .when(self.chrome_shown() && is_photo_zoomed && panning, |d| {
                 d.cursor(CursorStyle::ClosedHand)
             })
@@ -390,6 +396,7 @@ impl IrisWindow {
                 d.child(self.render_audio_card(t))
             })
             .children(self.render_plugin_overlay(cx))
+            .children(self.render_timed_overlay(cx))
             .when(fullscreen && self.chrome.chrome_visible, |d| {
                 let name = session
                     .current()
@@ -474,7 +481,6 @@ impl IrisWindow {
                     .absolute()
                     .top_0()
                     .bottom(px(dock_h))
-                    .w(px(self.settings.directory_width))
                     .overflow_hidden()
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
@@ -509,7 +515,7 @@ impl IrisWindow {
                 )
             })
             .when_some(self.overlays.popover, |d, pop| {
-                d.child(self.render_popover(pop, fullscreen, cx))
+                d.child(self.render_popover(pop, fullscreen, window, cx))
             })
     }
 }

@@ -1,9 +1,10 @@
 name: Release recipe policy
 on:
+  workflow_dispatch:
   pull_request:
-    paths: ['scripts/release/**', '.github/workflows/release-*.yml', '.github/workflows/media-sdk.yml', 'LICENSE-*', 'Cargo.toml', 'Cargo.lock', 'crates/**/Cargo.toml', 'deny.toml']
+    paths: ['scripts/release/**', 'scripts/build-official-plugins.py', 'scripts/test_package.py', 'scripts/check-project.py', 'scripts/check-windows-installer.py', '.github/workflows/release-*.yml', '.github/workflows/media-sdk.yml', 'Resources/**', 'LICENSE-*', 'Cargo.toml', 'Cargo.lock', 'crates/**/Cargo.toml', 'deny.toml']
   push:
-    paths: ['scripts/release/**', '.github/workflows/release-*.yml', '.github/workflows/media-sdk.yml', 'LICENSE-*', 'Cargo.toml', 'Cargo.lock', 'crates/**/Cargo.toml', 'deny.toml']
+    paths: ['scripts/release/**', 'scripts/build-official-plugins.py', 'scripts/test_package.py', 'scripts/check-project.py', 'scripts/check-windows-installer.py', '.github/workflows/release-*.yml', '.github/workflows/media-sdk.yml', 'Resources/**', 'LICENSE-*', 'Cargo.toml', 'Cargo.lock', 'crates/**/Cargo.toml', 'deny.toml']
 permissions:
   contents: read
 jobs:
@@ -11,6 +12,8 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
         with:
           python-version: '3.12.9'
@@ -18,7 +21,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python - <<'PY'
+          python -B -m unittest scripts/test_package.py
+          python -B - <<'PY'
           import ast, pathlib, runpy, json
           root = pathlib.Path('scripts/release')
           for path in root.glob('*.py'):

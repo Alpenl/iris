@@ -1,0 +1,818 @@
+{
+  "platform": "Windows-11-10.0.26300-SP0",
+  "cpu": "Intel64 Family 6 Model 154 Stepping 3, GenuineIntel",
+  "machine": "AMD64",
+  "logical_cpus": 16,
+  "rustc": "rustc 1.100.0 (0ef1bc386 2026-11-09)",
+  "source_commit": "7680e39a92bcc20d90cad081ab144432f11410d5",
+  "source_dirty": false,
+  "test_executable_sha256": "147651cfdae9aa20b2ee05e021d03c25b6482166c09a9bf329577ccd6725065f",
+  "fixture": {
+    "sha256": "07f8fb30ee3a9e3d37033c219e82a160b030a5c8d2d165bcc79e45fc51bad8db",
+    "bytes": 16252655,
+    "width": 3840,
+    "height": 2160,
+    "codec": "h264",
+    "frame_rate": "24/1",
+    "format": {
+      "nb_streams": 2,
+      "nb_programs": 0,
+      "nb_stream_groups": 0,
+      "format_name": "mov,mp4,m4a,3gp,3g2,mj2",
+      "format_long_name": "QuickTime / MOV",
+      "start_time": "0.000000",
+      "duration": "10.000000",
+      "size": "16252655",
+      "bit_rate": "13002124",
+      "probe_score": 100,
+      "tags": {
+        "major_brand": "isom",
+        "minor_version": "512",
+        "compatible_brands": "isomiso2avc1mp41",
+        "encoder": "Lavf62.3.100"
+      }
+    },
+    "peak_one_second_bytes": 2470894,
+    "peak_definition": "packet bytes, including audio, in fixed one-second DTS bins starting at first DTS; not sliding-window or instantaneous frame peak",
+    "packet_bytes_per_second": {
+      "0": 2470894,
+      "1": 1517285,
+      "2": 1624531,
+      "3": 1459339,
+      "4": 1635223,
+      "5": 1490578,
+      "6": 1608652,
+      "7": 1429030,
+      "8": 1606976,
+      "9": 1400509,
+      "10": 1253
+    },
+    "ffmpeg_command": [
+      "-hide_banner",
+      "-loglevel",
+      "error",
+      "-nostdin",
+      "-y",
+      "-f",
+      "lavfi",
+      "-i",
+      "testsrc2=size=3840x2160:rate=24:duration=10",
+      "-f",
+      "lavfi",
+      "-i",
+      "sine=frequency=440:sample_rate=48000:duration=10",
+      "-c:v",
+      "libx264",
+      "-threads",
+      "4",
+      "-preset",
+      "veryfast",
+      "-g",
+      "48",
+      "-sc_threshold",
+      "0",
+      "-pix_fmt",
+      "yuv420p",
+      "-b:v",
+      "12M",
+      "-minrate",
+      "12M",
+      "-maxrate",
+      "12M",
+      "-bufsize",
+      "24M",
+      "-x264-params",
+      "nal-hrd=cbr:force-cfr=1",
+      "-c:a",
+      "aac",
+      "-b:a",
+      "128k",
+      "-movflags",
+      "+faststart",
+      "reference.mp4"
+    ],
+    "ffmpeg_sha256": "5af82a0d4fe2b9eae211b967332ea97edfc51c6b328ca35b827e73eac560dc0d",
+    "ffprobe_sha256": "192a1d6899059765ac8c39764fc3148d4e6049955956dc2029f81f4bd6a8972d",
+    "ffmpeg_version": "ffmpeg version 8.0.1-essentials_build-www.gyan.dev Copyright (c) 2000-2025 the FFmpeg developers"
+  },
+  "sampling": "20ms; Windows OS peak working set and sampled process CPU (last interval may be absent); no allocation count",
+  "cache": "RAM origin and warmed filesystem; complete sample is repeatedly transferred; no WAN latency injection",
+  "exit_code": 0,
+  "peak_rss_bytes": 39243776,
+  "cpu_seconds_sampled": 29.40625,
+  "output": "\nrunning 1 test\ntest player::scoped::tests::adaptive::transport::sustained_4k_scoped_transport ... transport: 63s, 13 reads, 0 deadline misses\ntransport: 121s, 24 reads, 0 deadline misses\ntransport: 184s, 36 reads, 0 deadline misses\ntransport: 242s, 47 reads, 0 deadline misses\ntransport: 300s, 58 reads, 0 deadline misses\ntransport: 363s, 70 reads, 0 deadline misses\ntransport: 421s, 81 reads, 0 deadline misses\ntransport: 484s, 93 reads, 0 deadline misses\ntransport: 542s, 104 reads, 0 deadline misses\ntransport: 600s, 115 reads, 0 deadline misses\nIRIS_V2_TRANSPORT_RECEIPT={\"cleanup_ms\":6.0219000000000005,\"deadline_misses\":0,\"debug\":true,\"elapsed_seconds\":600.2480198,\"paced_bytes_per_second\":3113805.066150424,\"sampled_host_ledger_bytes\":7936036,\"samples\":[{\"bytes\":16252655,\"bytes_per_second\":83101097.31773026,\"deadline_missed\":false,\"fetch_ms\":195.5769},{\"bytes\":16252655,\"bytes_per_second\":54586388.41224564,\"deadline_missed\":false,\"fetch_ms\":297.7419},{\"bytes\":16252655,\"bytes_per_second\":75328273.3362471,\"deadline_missed\":false,\"fetch_ms\":215.7577},{\"bytes\":16252655,\"bytes_per_second\":57883535.981651254,\"deadline_missed\":false,\"fetch_ms\":280.782},{\"bytes\":16252655,\"bytes_per_second\":58571313.24983811,\"deadline_missed\":false,\"fetch_ms\":277.4849},{\"bytes\":16252655,\"bytes_per_second\":63695286.84846447,\"deadline_missed\":false,\"fetch_ms\":255.16260000000003},{\"bytes\":16252655,\"bytes_per_second\":68448515.12043917,\"deadline_missed\":false,\"fetch_ms\":237.4435},{\"bytes\":16252655,\"bytes_per_second\":62995006.571728356,\"deadline_missed\":false,\"fetch_ms\":257.9991},{\"bytes\":16252655,\"bytes_per_second\":49431899.74840992,\"deadline_missed\":false,\"fetch_ms\":328.7888},{\"bytes\":16252655,\"bytes_per_second\":71632721.24173659,\"deadline_missed\":false,\"fetch_ms\":226.8887},{\"bytes\":16252655,\"bytes_per_second\":72576129.97087605,\"deadline_missed\":false,\"fetch_ms\":223.9394},{\"bytes\":16252655,\"bytes_per_second\":53917092.04449739,\"deadline_missed\":false,\"fetch_ms\":301.43789999999996},{\"bytes\":16252655,\"bytes_per_second\":55613191.82629892,\"deadline_missed\":false,\"fetch_ms\":292.24460000000005},{\"bytes\":16252655,\"bytes_per_second\":70079286.61023007,\"deadline_missed\":false,\"fetch_ms\":231.91809999999998},{\"bytes\":16252655,\"bytes_per_second\":52024561.18449377,\"deadline_missed\":false,\"fetch_ms\":312.4035},{\"bytes\":16252655,\"bytes_per_second\":57853000.49620866,\"deadline_missed\":false,\"fetch_ms\":280.9302},{\"bytes\":16252655,\"bytes_per_second\":65960878.80440782,\"deadline_missed\":false,\"fetch_ms\":246.39839999999998},{\"bytes\":16252655,\"bytes_per_second\":68766480.10371253,\"deadline_missed\":false,\"fetch_ms\":236.3456},{\"bytes\":16252655,\"bytes_per_second\":52743392.90037378,\"deadline_missed\":false,\"fetch_ms\":308.1458},{\"bytes\":16252655,\"bytes_per_second\":75869910.66085202,\"deadline_missed\":false,\"fetch_ms\":214.2174},{\"bytes\":16252655,\"bytes_per_second\":67775536.56945837,\"deadline_missed\":false,\"fetch_ms\":239.8012},{\"bytes\":16252655,\"bytes_per_second\":54492335.102955244,\"deadline_missed\":false,\"fetch_ms\":298.2558},{\"bytes\":16252655,\"bytes_per_second\":49282234.33710152,\"deadline_missed\":false,\"fetch_ms\":329.7873},{\"bytes\":16252655,\"bytes_per_second\":52012806.821429364,\"deadline_missed\":false,\"fetch_ms\":312.47409999999996},{\"bytes\":16252655,\"bytes_per_second\":51719857.817492135,\"deadline_missed\":false,\"fetch_ms\":314.244},{\"bytes\":16252655,\"bytes_per_second\":65174756.10577679,\"deadline_missed\":false,\"fetch_ms\":249.3704},{\"bytes\":16252655,\"bytes_per_second\":57522522.139898814,\"deadline_missed\":false,\"fetch_ms\":282.54420000000005},{\"bytes\":16252655,\"bytes_per_second\":64498476.29879703,\"deadline_missed\":false,\"fetch_ms\":251.98510000000002},{\"bytes\":16252655,\"bytes_per_second\":87068432.10816364,\"deadline_missed\":false,\"fetch_ms\":186.6653},{\"bytes\":16252655,\"bytes_per_second\":44980460.912137754,\"deadline_missed\":false,\"fetch_ms\":361.327},{\"bytes\":16252655,\"bytes_per_second\":50723147.10524254,\"deadline_missed\":false,\"fetch_ms\":320.4189},{\"bytes\":16252655,\"bytes_per_second\":53119639.87825987,\"deadline_missed\":false,\"fetch_ms\":305.9632},{\"bytes\":16252655,\"bytes_per_second\":72998757.20267747,\"deadline_missed\":false,\"fetch_ms\":222.6429},{\"bytes\":16252655,\"bytes_per_second\":59359435.531026766,\"deadline_missed\":false,\"fetch_ms\":273.8007},{\"bytes\":16252655,\"bytes_per_second\":65239401.533296965,\"deadline_missed\":false,\"fetch_ms\":249.1233},{\"bytes\":16252655,\"bytes_per_second\":59084063.06893202,\"deadline_missed\":false,\"fetch_ms\":275.0768},{\"bytes\":16252655,\"bytes_per_second\":52422068.375594206,\"deadline_missed\":false,\"fetch_ms\":310.0346},{\"bytes\":16252655,\"bytes_per_second\":51537925.87551803,\"deadline_missed\":false,\"fetch_ms\":315.3533},{\"bytes\":16252655,\"bytes_per_second\":59157720.75055791,\"deadline_missed\":false,\"fetch_ms\":274.73429999999996},{\"bytes\":16252655,\"bytes_per_second\":66586236.80425164,\"deadline_missed\":false,\"fetch_ms\":244.0843},{\"bytes\":16252655,\"bytes_per_second\":76173870.2096806,\"deadline_missed\":false,\"fetch_ms\":213.36260000000001},{\"bytes\":16252655,\"bytes_per_second\":53198125.24426225,\"deadline_missed\":false,\"fetch_ms\":305.5118},{\"bytes\":16252655,\"bytes_per_second\":51986420.48640466,\"deadline_missed\":false,\"fetch_ms\":312.6327},{\"bytes\":16252655,\"bytes_per_second\":52540746.37051242,\"deadline_missed\":false,\"fetch_ms\":309.3343},{\"bytes\":16252655,\"bytes_per_second\":44713942.17079476,\"deadline_missed\":false,\"fetch_ms\":363.4807},{\"bytes\":16252655,\"bytes_per_second\":69964498.27936974,\"deadline_missed\":false,\"fetch_ms\":232.2986},{\"bytes\":16252655,\"bytes_per_second\":51914053.95304861,\"deadline_missed\":false,\"fetch_ms\":313.06850000000003},{\"bytes\":16252655,\"bytes_per_second\":84819192.41313194,\"deadline_missed\":false,\"fetch_ms\":191.6153},{\"bytes\":16252655,\"bytes_per_second\":82541596.7082202,\"deadline_missed\":false,\"fetch_ms\":196.9026},{\"bytes\":16252655,\"bytes_per_second\":58832416.180217154,\"deadline_missed\":false,\"fetch_ms\":276.2534},{\"bytes\":16252655,\"bytes_per_second\":53270765.977308065,\"deadline_missed\":false,\"fetch_ms\":305.09520000000003},{\"bytes\":16252655,\"bytes_per_second\":57315569.23224495,\"deadline_missed\":false,\"fetch_ms\":283.5644},{\"bytes\":16252655,\"bytes_per_second\":52546148.188262306,\"deadline_missed\":false,\"fetch_ms\":309.30249999999995},{\"bytes\":16252655,\"bytes_per_second\":48976158.68455557,\"deadline_missed\":false,\"fetch_ms\":331.8483},{\"bytes\":16252655,\"bytes_per_second\":50364845.31686553,\"deadline_missed\":false,\"fetch_ms\":322.6984},{\"bytes\":16252655,\"bytes_per_second\":86249258.37754765,\"deadline_missed\":false,\"fetch_ms\":188.4382},{\"bytes\":16252655,\"bytes_per_second\":51274329.63850404,\"deadline_missed\":false,\"fetch_ms\":316.9745},{\"bytes\":16252655,\"bytes_per_second\":50529886.4211533,\"deadline_missed\":false,\"fetch_ms\":321.6444},{\"bytes\":16252655,\"bytes_per_second\":65347315.50842561,\"deadline_missed\":false,\"fetch_ms\":248.7119},{\"bytes\":16252655,\"bytes_per_second\":66871052.937998645,\"deadline_missed\":false,\"fetch_ms\":243.0447},{\"bytes\":16252655,\"bytes_per_second\":50418998.74609045,\"deadline_missed\":false,\"fetch_ms\":322.3518},{\"bytes\":16252655,\"bytes_per_second\":49632747.13146682,\"deadline_missed\":false,\"fetch_ms\":327.4583},{\"bytes\":16252655,\"bytes_per_second\":57224615.87429682,\"deadline_missed\":false,\"fetch_ms\":284.0151},{\"bytes\":16252655,\"bytes_per_second\":56459216.703362055,\"deadline_missed\":false,\"fetch_ms\":287.86539999999997},{\"bytes\":16252655,\"bytes_per_second\":51968883.23844033,\"deadline_missed\":false,\"fetch_ms\":312.7382},{\"bytes\":16252655,\"bytes_per_second\":67216782.34336086,\"deadline_missed\":false,\"fetch_ms\":241.7946},{\"bytes\":16252655,\"bytes_per_second\":63998320.17086531,\"deadline_missed\":false,\"fetch_ms\":253.95440000000002},{\"bytes\":16252655,\"bytes_per_second\":47818508.24153434,\"deadline_missed\":false,\"fetch_ms\":339.88210000000004},{\"bytes\":16252655,\"bytes_per_second\":56237365.96067142,\"deadline_missed\":false,\"fetch_ms\":289.00100000000003},{\"bytes\":16252655,\"bytes_per_second\":45351605.8821888,\"deadline_missed\":false,\"fetch_ms\":358.37},{\"bytes\":16252655,\"bytes_per_second\":78978505.80555122,\"deadline_missed\":false,\"fetch_ms\":205.7858},{\"bytes\":16252655,\"bytes_per_second\":39683082.84986887,\"deadline_missed\":false,\"fetch_ms\":409.5613},{\"bytes\":16252655,\"bytes_per_second\":42065819.01711476,\"deadline_missed\":false,\"fetch_ms\":386.3625},{\"bytes\":16252655,\"bytes_per_second\":54016061.25384532,\"deadline_missed\":false,\"fetch_ms\":300.88559999999995},{\"bytes\":16252655,\"bytes_per_second\":66489478.99173415,\"deadline_missed\":false,\"fetch_ms\":244.4395},{\"bytes\":16252655,\"bytes_per_second\":49570378.89677717,\"deadline_missed\":false,\"fetch_ms\":327.8703},{\"bytes\":16252655,\"bytes_per_second\":50211642.254922256,\"deadline_missed\":false,\"fetch_ms\":323.683},{\"bytes\":16252655,\"bytes_per_second\":53317093.68595818,\"deadline_missed\":false,\"fetch_ms\":304.8301},{\"bytes\":16252655,\"bytes_per_second\":51126277.31899221,\"deadline_missed\":false,\"fetch_ms\":317.8924},{\"bytes\":16252655,\"bytes_per_second\":45311120.850249045,\"deadline_missed\":false,\"fetch_ms\":358.6902},{\"bytes\":16252655,\"bytes_per_second\":37924678.25875526,\"deadline_missed\":false,\"fetch_ms\":428.5509},{\"bytes\":16252655,\"bytes_per_second\":56319603.990588374,\"deadline_missed\":false,\"fetch_ms\":288.57899999999995},{\"bytes\":16252655,\"bytes_per_second\":45556487.40337646,\"deadline_missed\":false,\"fetch_ms\":356.75829999999996},{\"bytes\":16252655,\"bytes_per_second\":44818886.82004999,\"deadline_missed\":false,\"fetch_ms\":362.6296},{\"bytes\":16252655,\"bytes_per_second\":48992634.82153165,\"deadline_missed\":false,\"fetch_ms\":331.7367},{\"bytes\":16252655,\"bytes_per_second\":71682291.58856411,\"deadline_missed\":false,\"fetch_ms\":226.73180000000002},{\"bytes\":16252655,\"bytes_per_second\":39977397.39724474,\"deadline_missed\":false,\"fetch_ms\":406.5461},{\"bytes\":16252655,\"bytes_per_second\":52184855.76375071,\"deadline_missed\":false,\"fetch_ms\":311.4439},{\"bytes\":16252655,\"bytes_per_second\":65773034.70913441,\"deadline_missed\":false,\"fetch_ms\":247.10209999999998},{\"bytes\":16252655,\"bytes_per_second\":50832245.961607754,\"deadline_missed\":false,\"fetch_ms\":319.7312},{\"bytes\":16252655,\"bytes_per_second\":56212449.73266267,\"deadline_missed\":false,\"fetch_ms\":289.12910000000005},{\"bytes\":16252655,\"bytes_per_second\":45354896.412385866,\"deadline_missed\":false,\"fetch_ms\":358.344},{\"bytes\":16252655,\"bytes_per_second\":60322119.45836988,\"deadline_missed\":false,\"fetch_ms\":269.43109999999996},{\"bytes\":16252655,\"bytes_per_second\":49915572.0050405,\"deadline_missed\":false,\"fetch_ms\":325.6029},{\"bytes\":16252655,\"bytes_per_second\":75391309.75292853,\"deadline_missed\":false,\"fetch_ms\":215.5773},{\"bytes\":16252655,\"bytes_per_second\":48281389.06481898,\"deadline_missed\":false,\"fetch_ms\":336.6236},{\"bytes\":16252655,\"bytes_per_second\":49229599.33046566,\"deadline_missed\":false,\"fetch_ms\":330.1399},{\"bytes\":16252655,\"bytes_per_second\":90446336.79829977,\"deadline_missed\":false,\"fetch_ms\":179.69389999999999},{\"bytes\":16252655,\"bytes_per_second\":54183228.74622488,\"deadline_missed\":false,\"fetch_ms\":299.9573},{\"bytes\":16252655,\"bytes_per_second\":54051989.8525237,\"deadline_missed\":false,\"fetch_ms\":300.6856},{\"bytes\":16252655,\"bytes_per_second\":39806527.791928895,\"deadline_missed\":false,\"fetch_ms\":408.2912},{\"bytes\":16252655,\"bytes_per_second\":44966560.02802135,\"deadline_missed\":false,\"fetch_ms\":361.4387},{\"bytes\":16252655,\"bytes_per_second\":43760608.5311977,\"deadline_missed\":false,\"fetch_ms\":371.3992},{\"bytes\":16252655,\"bytes_per_second\":61417081.96726267,\"deadline_missed\":false,\"fetch_ms\":264.62760000000003},{\"bytes\":16252655,\"bytes_per_second\":58274840.92670904,\"deadline_missed\":false,\"fetch_ms\":278.8966},{\"bytes\":16252655,\"bytes_per_second\":49370499.854646616,\"deadline_missed\":false,\"fetch_ms\":329.1977},{\"bytes\":16252655,\"bytes_per_second\":44817440.81548351,\"deadline_missed\":false,\"fetch_ms\":362.6413},{\"bytes\":16252655,\"bytes_per_second\":41395066.004793406,\"deadline_missed\":false,\"fetch_ms\":392.623},{\"bytes\":16252655,\"bytes_per_second\":61132473.68159736,\"deadline_missed\":false,\"fetch_ms\":265.8596},{\"bytes\":16252655,\"bytes_per_second\":47731760.78223834,\"deadline_missed\":false,\"fetch_ms\":340.4998},{\"bytes\":16252655,\"bytes_per_second\":60436563.316573754,\"deadline_missed\":false,\"fetch_ms\":268.9209},{\"bytes\":16252655,\"bytes_per_second\":51903576.035259284,\"deadline_missed\":false,\"fetch_ms\":313.1317},{\"bytes\":16252655,\"bytes_per_second\":47241201.201271035,\"deadline_missed\":false,\"fetch_ms\":344.0356},{\"bytes\":16252655,\"bytes_per_second\":48046625.105980925,\"deadline_missed\":false,\"fetch_ms\":338.26840000000004},{\"bytes\":16252655,\"bytes_per_second\":57044273.16408868,\"deadline_missed\":false,\"fetch_ms\":284.913}],\"scope\":\"DirectHttp local RAM origin + authorized relay; repeated complete 4K sample; no decoder, display, Wasm transformation or WAN; deadline misses are transport-budget misses, not player underruns\",\"target_bytes_per_second\":3088617.5,\"total_bytes\":1869055325}\nok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 204 filtered out; finished in 600.29s\n\n",
+  "transport": {
+    "cleanup_ms": 6.0219000000000005,
+    "deadline_misses": 0,
+    "debug": true,
+    "elapsed_seconds": 600.2480198,
+    "paced_bytes_per_second": 3113805.066150424,
+    "sampled_host_ledger_bytes": 7936036,
+    "samples": [
+      {
+        "bytes": 16252655,
+        "bytes_per_second": 83101097.31773026,
+        "deadline_missed": false,
+        "fetch_ms": 195.5769
+      },
+      {
+        "bytes": 16252655,
+        "bytes_per_second": 54586388.41224564,
+        "deadline_missed": false,
+        "fetch_ms": 297.7419
+      },
+      {
+        "bytes": 16252655,
+        "bytes_per_second": 75328273.3362471,
+        "deadline_missed": false,
+        "fetch_ms": 215.7577
+      },
+      {
+        "bytes": 16252655,
+        "bytes_per_second": 57883535.981651254,
+        "deadline_missed": false,
+        "fetch_ms": 280.782
+      },
+      {
+        "bytes": 16252655,
+        "bytes_per_second": 58571313.24983811,
+        "deadline_missed": false,
+        "fetch_ms": 277.4849
+      },
+      {
+        "bytes": 16252655,
+        "bytes_per_second": 63695286.84846447,
+        "deadline_missed": false,
+        "fetch_ms": 255.16260000000003
+      },
+      {
+        "bytes": 16252655,
+        "bytes_per_second": 68448515.12043917,
+        "deadline_missed": false,
+        "fetch_ms": 237.4435
+      },
+      {
+        "bytes": 16252655,
+        "bytes_per_second": 62995006.571728356,
+        "deadline_missed": false,
+        "fetch_ms": 257.9991
+      },
+      {
+        "bytes": 16252655,
+        "bytes_per_second": 49431899.74840992,
+        "deadline_missed": false,
+        "fetch_ms": 328.7888
+      },
+      {
+        "bytes": 16252655,
+        "bytes_per_second": 71632721.24173659,
+        "deadline_missed": false,
+        "fetch_ms": 226.8887
+      },
+      {
+        "bytes": 16252655,
+        "bytes_per_second": 72576129.97087605,
+        "deadline_missed": false,
+        "fetch_ms": 223.9394
+      },
+      {
+        "bytes": 16252655,
+        "bytes_per_second": 53917092.04449739,
+        "deadline_missed": false,
+        "fetch_ms": 301.43789999999996
+      },
+      {
+        "bytes": 16252655,
+        "bytes_per_second": 55613191.82629892,
+        "deadline_missed": false,
+        "fetch_ms": 292.24460000000005
+      },
+      {
+        "bytes": 16252655,
+        "bytes_per_second": 70079286.61023007,
+        "deadline_missed": false,
+        "fetch_ms": 231.91809999999998
+      },
+      {
+        "bytes": 16252655,
+        "bytes_per_second": 52024561.18449377,
+        "deadline_missed": false,
+        "fetch_ms": 312.4035
+      },
+      {
+        "bytes": 16252655,
+        "bytes_per_second": 57853000.49620866,
+        "deadline_missed": false,
+        "fetch_ms": 280.9302
+      },
+      {
+        "bytes": 16252655,
+        "bytes_per_second": 65960878.80440782,
+        "deadline_missed": false,
+        "fetch_ms": 246.39839999999998
+      },
+      {
+        "bytes": 16252655,
+        "bytes_per_second": 68766480.10371253,
+        "deadline_missed": false,
+        "fetch_ms": 236.3456
+      },
+      {
+        "bytes": 16252655,
+        "bytes_per_second": 52743392.90037378,
+        "deadline_missed": false,
+        "fetch_ms": 308.1458
+      },
+      {
+        "bytes": 16252655,
+        "bytes_per_second": 75869910.66085202,
+        "deadline_missed": false,
+        "fetch_ms": 214.2174
+      },
+      {
+        "bytes": 16252655,
+        "bytes_per_second": 67775536.56945837,
+        "deadline_missed": false,
+        "fetch_ms": 239.8012
+      },
+      {
+        "bytes": 16252655,
+        "bytes_per_second": 54492335.102955244,
+        "deadline_missed": false,
+        "fetch_ms": 298.2558
+      },
+      {
+        "bytes": 16252655,
+        "bytes_per_second": 49282234.33710152,
+        "deadline_missed": false,
+        "fetch_ms": 329.7873
+      },
+      {
+        "bytes": 16252655,
+        "bytes_per_second": 52012806.821429364,
+        "deadline_missed": false,
+        "fetch_ms": 312.47409999999996
+      },
+      {
+        "bytes": 16252655,
+        "bytes_per_second": 51719857.817492135,
+        "deadline_missed": false,
+        "fetch_ms": 314.244
+      },
+      {
+        "bytes": 16252655,
+        "bytes_per_second": 65174756.10577679,
+        "deadline_missed": false,
+        "fetch_ms": 249.3704
+      },
+      {
+        "bytes": 16252655,
+        "bytes_per_second": 57522522.139898814,
+        "deadline_missed": false,
+        "fetch_ms": 282.54420000000005
+      },
+      {
+        "bytes": 16252655,
+        "bytes_per_second": 64498476.29879703,
+        "deadline_missed": false,
+        "fetch_ms": 251.98510000000002
+      },
+      {
+        "bytes": 16252655,
+        "bytes_per_second": 87068432.10816364,
+        "deadline_missed": false,
+        "fetch_ms": 186.6653
+      },
+      {
+        "bytes": 16252655,
+        "bytes_per_second": 44980460.912137754,
+        "deadline_missed": false,
+        "fetch_ms": 361.327
+      },
+      {
+        "bytes": 16252655,
+        "bytes_per_second": 50723147.10524254,
+        "deadline_missed": false,
+        "fetch_ms": 320.4189
+      },
+      {
+        "bytes": 16252655,
+        "bytes_per_second": 53119639.87825987,
+        "deadline_missed": false,
+        "fetch_ms": 305.9632
+      },
+      {
+        "bytes": 16252655,
+        "bytes_per_second": 72998757.20267747,
+        "deadline_missed": false,
+        "fetch_ms": 222.6429
+      },
+      {
+        "bytes": 16252655,
+        "bytes_per_second": 59359435.531026766,
+        "deadline_missed": false,
+        "fetch_ms": 273.8007
+      },
+      {
+        "bytes": 16252655,
+        "bytes_per_second": 65239401.533296965,
+        "deadline_missed": false,
+        "fetch_ms": 249.1233
+      },
+      {
+        "bytes": 16252655,
+        "bytes_per_second": 59084063.06893202,
+        "deadline_missed": false,
+        "fetch_ms": 275.0768
+      },
+      {
+        "bytes": 16252655,
+        "bytes_per_second": 52422068.375594206,
+        "deadline_missed": false,
+        "fetch_ms": 310.0346
+      },
+      {
+        "bytes": 16252655,
+        "bytes_per_second": 51537925.87551803,
+        "deadline_missed": false,
+        "fetch_ms": 315.3533
+      },
+      {
+        "bytes": 16252655,
+        "bytes_per_second": 59157720.75055791,
+        "deadline_missed": false,
+        "fetch_ms": 274.73429999999996
+      },
+      {
+        "bytes": 16252655,
+        "bytes_per_second": 66586236.80425164,
+        "deadline_missed": false,
+        "fetch_ms": 244.0843
+      },
+      {
+        "bytes": 16252655,
+        "bytes_per_second": 76173870.2096806,
+        "deadline_missed": false,
+        "fetch_ms": 213.36260000000001
+      },
+      {
+        "bytes": 16252655,
+        "bytes_per_second": 53198125.24426225,
+        "deadline_missed": false,
+        "fetch_ms": 305.5118
+      },
+      {
+        "bytes": 16252655,
+        "bytes_per_second": 51986420.48640466,
+        "deadline_missed": false,
+        "fetch_ms": 312.6327
+      },
+      {
+        "bytes": 16252655,
+        "bytes_per_second": 52540746.37051242,
+        "deadline_missed": false,
+        "fetch_ms": 309.3343
+      },
+      {
+        "bytes": 16252655,
+        "bytes_per_second": 44713942.17079476,
+        "deadline_missed": false,
+        "fetch_ms": 363.4807
+      },
+      {
+        "bytes": 16252655,
+        "bytes_per_second": 69964498.27936974,
+        "deadline_missed": false,
+        "fetch_ms": 232.2986
+      },
+      {
+        "bytes": 16252655,
+        "bytes_per_second": 51914053.95304861,
+        "deadline_missed": false,
+        "fetch_ms": 313.06850000000003
+      },
+      {
+        "bytes": 16252655,
+        "bytes_per_second": 84819192.41313194,
+        "deadline_missed": false,
+        "fetch_ms": 191.6153
+      },
+      {
+        "bytes": 16252655,
+        "bytes_per_second": 82541596.7082202,
+        "deadline_missed": false,
+        "fetch_ms": 196.9026
+      },
+      {
+        "bytes": 16252655,
+        "bytes_per_second": 58832416.180217154,
+        "deadline_missed": false,
+        "fetch_ms": 276.2534
+      },
+      {
+        "bytes": 16252655,
+        "bytes_per_second": 53270765.977308065,
+        "deadline_missed": false,
+        "fetch_ms": 305.09520000000003
+      },
+      {
+        "bytes": 16252655,
+        "bytes_per_second": 57315569.23224495,
+        "deadline_missed": false,
+        "fetch_ms": 283.5644
+      },
+      {
+        "bytes": 16252655,
+        "bytes_per_second": 52546148.188262306,
+        "deadline_missed": false,
+        "fetch_ms": 309.30249999999995
+      },
+      {
+        "bytes": 16252655,
+        "bytes_per_second": 48976158.68455557,
+        "deadline_missed": false,
+        "fetch_ms": 331.8483
+      },
+      {
+        "bytes": 16252655,
+        "bytes_per_second": 50364845.31686553,
+        "deadline_missed": false,
+        "fetch_ms": 322.6984
+      },
+      {
+        "bytes": 16252655,
+        "bytes_per_second": 86249258.37754765,
+        "deadline_missed": false,
+        "fetch_ms": 188.4382
+      },
+      {
+        "bytes": 16252655,
+        "bytes_per_second": 51274329.63850404,
+        "deadline_missed": false,
+        "fetch_ms": 316.9745
+      },
+      {
+        "bytes": 16252655,
+        "bytes_per_second": 50529886.4211533,
+        "deadline_missed": false,
+        "fetch_ms": 321.6444
+      },
+      {
+        "bytes": 16252655,
+        "bytes_per_second": 65347315.50842561,
+        "deadline_missed": false,
+        "fetch_ms": 248.7119
+      },
+      {
+        "bytes": 16252655,
+        "bytes_per_second": 66871052.937998645,
+        "deadline_missed": false,
+        "fetch_ms": 243.0447
+      },
+      {
+        "bytes": 16252655,
+        "bytes_per_second": 50418998.74609045,
+        "deadline_missed": false,
+        "fetch_ms": 322.3518
+      },
+      {
+        "bytes": 16252655,
+        "bytes_per_second": 49632747.13146682,
+        "deadline_missed": false,
+        "fetch_ms": 327.4583
+      },
+      {
+        "bytes": 16252655,
+        "bytes_per_second": 57224615.87429682,
+        "deadline_missed": false,
+        "fetch_ms": 284.0151
+      },
+      {
+        "bytes": 16252655,
+        "bytes_per_second": 56459216.703362055,
+        "deadline_missed": false,
+        "fetch_ms": 287.86539999999997
+      },
+      {
+        "bytes": 16252655,
+        "bytes_per_second": 51968883.23844033,
+        "deadline_missed": false,
+        "fetch_ms": 312.7382
+      },
+      {
+        "bytes": 16252655,
+        "bytes_per_second": 67216782.34336086,
+        "deadline_missed": false,
+        "fetch_ms": 241.7946
+      },
+      {
+        "bytes": 16252655,
+        "bytes_per_second": 63998320.17086531,
+        "deadline_missed": false,
+        "fetch_ms": 253.95440000000002
+      },
+      {
+        "bytes": 16252655,
+        "bytes_per_second": 47818508.24153434,
+        "deadline_missed": false,
+        "fetch_ms": 339.88210000000004
+      },
+      {
+        "bytes": 16252655,
+        "bytes_per_second": 56237365.96067142,
+        "deadline_missed": false,
+        "fetch_ms": 289.00100000000003
+      },
+      {
+        "bytes": 16252655,
+        "bytes_per_second": 45351605.8821888,
+        "deadline_missed": false,
+        "fetch_ms": 358.37
+      },
+      {
+        "bytes": 16252655,
+        "bytes_per_second": 78978505.80555122,
+        "deadline_missed": false,
+        "fetch_ms": 205.7858
+      },
+      {
+        "bytes": 16252655,
+        "bytes_per_second": 39683082.84986887,
+        "deadline_missed": false,
+        "fetch_ms": 409.5613
+      },
+      {
+        "bytes": 16252655,
+        "bytes_per_second": 42065819.01711476,
+        "deadline_missed": false,
+        "fetch_ms": 386.3625
+      },
+      {
+        "bytes": 16252655,
+        "bytes_per_second": 54016061.25384532,
+        "deadline_missed": false,
+        "fetch_ms": 300.88559999999995
+      },
+      {
+        "bytes": 16252655,
+        "bytes_per_second": 66489478.99173415,
+        "deadline_missed": false,
+        "fetch_ms": 244.4395
+      },
+      {
+        "bytes": 16252655,
+        "bytes_per_second": 49570378.89677717,
+        "deadline_missed": false,
+        "fetch_ms": 327.8703
+      },
+      {
+        "bytes": 16252655,
+        "bytes_per_second": 50211642.254922256,
+        "deadline_missed": false,
+        "fetch_ms": 323.683
+      },
+      {
+        "bytes": 16252655,
+        "bytes_per_second": 53317093.68595818,
+        "deadline_missed": false,
+        "fetch_ms": 304.8301
+      },
+      {
+        "bytes": 16252655,
+        "bytes_per_second": 51126277.31899221,
+        "deadline_missed": false,
+        "fetch_ms": 317.8924
+      },
+      {
+        "bytes": 16252655,
+        "bytes_per_second": 45311120.850249045,
+        "deadline_missed": false,
+        "fetch_ms": 358.6902
+      },
+      {
+        "bytes": 16252655,
+        "bytes_per_second": 37924678.25875526,
+        "deadline_missed": false,
+        "fetch_ms": 428.5509
+      },
+      {
+        "bytes": 16252655,
+        "bytes_per_second": 56319603.990588374,
+        "deadline_missed": false,
+        "fetch_ms": 288.57899999999995
+      },
+      {
+        "bytes": 16252655,
+        "bytes_per_second": 45556487.40337646,
+        "deadline_missed": false,
+        "fetch_ms": 356.75829999999996
+      },
+      {
+        "bytes": 16252655,
+        "bytes_per_second": 44818886.82004999,
+        "deadline_missed": false,
+        "fetch_ms": 362.6296
+      },
+      {
+        "bytes": 16252655,
+        "bytes_per_second": 48992634.82153165,
+        "deadline_missed": false,
+        "fetch_ms": 331.7367
+      },
+      {
+        "bytes": 16252655,
+        "bytes_per_second": 71682291.58856411,
+        "deadline_missed": false,
+        "fetch_ms": 226.73180000000002
+      },
+      {
+        "bytes": 16252655,
+        "bytes_per_second": 39977397.39724474,
+        "deadline_missed": false,
+        "fetch_ms": 406.5461
+      },
+      {
+        "bytes": 16252655,
+        "bytes_per_second": 52184855.76375071,
+        "deadline_missed": false,
+        "fetch_ms": 311.4439
+      },
+      {
+        "bytes": 16252655,
+        "bytes_per_second": 65773034.70913441,
+        "deadline_missed": false,
+        "fetch_ms": 247.10209999999998
+      },
+      {
+        "bytes": 16252655,
+        "bytes_per_second": 50832245.961607754,
+        "deadline_missed": false,
+        "fetch_ms": 319.7312
+      },
+      {
+        "bytes": 16252655,
+        "bytes_per_second": 56212449.73266267,
+        "deadline_missed": false,
+        "fetch_ms": 289.12910000000005
+      },
+      {
+        "bytes": 16252655,
+        "bytes_per_second": 45354896.412385866,
+        "deadline_missed": false,
+        "fetch_ms": 358.344
+      },
+      {
+        "bytes": 16252655,
+        "bytes_per_second": 60322119.45836988,
+        "deadline_missed": false,
+        "fetch_ms": 269.43109999999996
+      },
+      {
+        "bytes": 16252655,
+        "bytes_per_second": 49915572.0050405,
+        "deadline_missed": false,
+        "fetch_ms": 325.6029
+      },
+      {
+        "bytes": 16252655,
+        "bytes_per_second": 75391309.75292853,
+        "deadline_missed": false,
+        "fetch_ms": 215.5773
+      },
+      {
+        "bytes": 16252655,
+        "bytes_per_second": 48281389.06481898,
+        "deadline_missed": false,
+        "fetch_ms": 336.6236
+      },
+      {
+        "bytes": 16252655,
+        "bytes_per_second": 49229599.33046566,
+        "deadline_missed": false,
+        "fetch_ms": 330.1399
+      },
+      {
+        "bytes": 16252655,
+        "bytes_per_second": 90446336.79829977,
+        "deadline_missed": false,
+        "fetch_ms": 179.69389999999999
+      },
+      {
+        "bytes": 16252655,
+        "bytes_per_second": 54183228.74622488,
+        "deadline_missed": false,
+        "fetch_ms": 299.9573
+      },
+      {
+        "bytes": 16252655,
+        "bytes_per_second": 54051989.8525237,
+        "deadline_missed": false,
+        "fetch_ms": 300.6856
+      },
+      {
+        "bytes": 16252655,
+        "bytes_per_second": 39806527.791928895,
+        "deadline_missed": false,
+        "fetch_ms": 408.2912
+      },
+      {
+        "bytes": 16252655,
+        "bytes_per_second": 44966560.02802135,
+        "deadline_missed": false,
+        "fetch_ms": 361.4387
+      },
+      {
+        "bytes": 16252655,
+        "bytes_per_second": 43760608.5311977,
+        "deadline_missed": false,
+        "fetch_ms": 371.3992
+      },
+      {
+        "bytes": 16252655,
+        "bytes_per_second": 61417081.96726267,
+        "deadline_missed": false,
+        "fetch_ms": 264.62760000000003
+      },
+      {
+        "bytes": 16252655,
+        "bytes_per_second": 58274840.92670904,
+        "deadline_missed": false,
+        "fetch_ms": 278.8966
+      },
+      {
+        "bytes": 16252655,
+        "bytes_per_second": 49370499.854646616,
+        "deadline_missed": false,
+        "fetch_ms": 329.1977
+      },
+      {
+        "bytes": 16252655,
+        "bytes_per_second": 44817440.81548351,
+        "deadline_missed": false,
+        "fetch_ms": 362.6413
+      },
+      {
+        "bytes": 16252655,
+        "bytes_per_second": 41395066.004793406,
+        "deadline_missed": false,
+        "fetch_ms": 392.623
+      },
+      {
+        "bytes": 16252655,
+        "bytes_per_second": 61132473.68159736,
+        "deadline_missed": false,
+        "fetch_ms": 265.8596
+      },
+      {
+        "bytes": 16252655,
+        "bytes_per_second": 47731760.78223834,
+        "deadline_missed": false,
+        "fetch_ms": 340.4998
+      },
+      {
+        "bytes": 16252655,
+        "bytes_per_second": 60436563.316573754,
+        "deadline_missed": false,
+        "fetch_ms": 268.9209
+      },
+      {
+        "bytes": 16252655,
+        "bytes_per_second": 51903576.035259284,
+        "deadline_missed": false,
+        "fetch_ms": 313.1317
+      },
+      {
+        "bytes": 16252655,
+        "bytes_per_second": 47241201.201271035,
+        "deadline_missed": false,
+        "fetch_ms": 344.0356
+      },
+      {
+        "bytes": 16252655,
+        "bytes_per_second": 48046625.105980925,
+        "deadline_missed": false,
+        "fetch_ms": 338.26840000000004
+      },
+      {
+        "bytes": 16252655,
+        "bytes_per_second": 57044273.16408868,
+        "deadline_missed": false,
+        "fetch_ms": 284.913
+      }
+    ],
+    "scope": "DirectHttp local RAM origin + authorized relay; repeated complete 4K sample; no decoder, display, Wasm transformation or WAN; deadline misses are transport-budget misses, not player underruns",
+    "target_bytes_per_second": 3088617.5,
+    "total_bytes": 1869055325
+  },
+  "fetch_bytes_per_second": {
+    "p05_nearest_rank": 42065819.01711476,
+    "p50": 54051989.8525237,
+    "minimum": 37924678.25875526
+  },
+  "regression_budget": {
+    "minimum_supply_bytes_per_second": 3088617.5,
+    "max_transport_deadline_misses": 0,
+    "max_peak_rss_bytes": 49054720,
+    "scope": "single ten-minute pilot, same machine/toolchain/profile/fixture; no decoder/UI acceptance"
+  }
+}

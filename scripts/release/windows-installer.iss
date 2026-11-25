@@ -33,6 +33,8 @@ LicenseFile={#LicenseFile}
 CloseApplications=yes
 RestartApplications=no
 ChangesAssociations=yes
+[InstallDelete]
+Type: files; Name: "{app}\*.dll"
 [Files]
 Source: "{#Payload}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 [Registry]
@@ -40,11 +42,13 @@ Root: HKCU; Subkey: "Software\Classes\Iris.Media"; ValueType: string; ValueData:
 Root: HKCU; Subkey: "Software\Classes\Iris.Media\DefaultIcon"; ValueType: string; ValueData: "{app}\iris.exe,0"
 Root: HKCU; Subkey: "Software\Classes\Iris.Media\shell\open\command"; ValueType: string; ValueData: """{app}\iris.exe"" ""%1"""
 Root: HKCU; Subkey: "Software\RegisteredApplications"; ValueType: string; ValueName: "Iris"; ValueData: "Software\Iris\Capabilities"; Flags: uninsdeletevalue
+Root: HKCU; Subkey: "Software\Iris"; Flags: uninsdeletekeyifempty
 Root: HKCU; Subkey: "Software\Iris\Capabilities"; ValueType: string; ValueName: "ApplicationName"; ValueData: "Iris"; Flags: uninsdeletekey
 Root: HKCU; Subkey: "Software\Iris\Capabilities"; ValueType: string; ValueName: "ApplicationDescription"; ValueData: "Iris media player"
 Root: HKCU; Subkey: "Software\Iris\Capabilities"; ValueType: string; ValueName: "ApplicationIcon"; ValueData: "{app}\iris.exe,0"
 #define Extensions "mp4 m4v mkv mov webm avi ts m2ts flv wmv mpg mpeg jpg jpeg png webp gif heic heif avif tif tiff bmp mp3 flac wav m4a aac ogg opus alac aiff wma "
 #sub RegisterExtension
+Root: HKCU; Subkey: "Software\Classes\.{#Copy(Extensions, 1, Pos(" ", Extensions) - 1)}"; Flags: uninsdeletekeyifempty
 Root: HKCU; Subkey: "Software\Classes\.{#Copy(Extensions, 1, Pos(" ", Extensions) - 1)}\OpenWithProgids"; ValueType: string; ValueName: "Iris.Media"; ValueData: ""; Flags: uninsdeletevalue uninsdeletekeyifempty
 Root: HKCU; Subkey: "Software\Iris\Capabilities\FileAssociations"; ValueType: string; ValueName: ".{#Copy(Extensions, 1, Pos(" ", Extensions) - 1)}"; ValueData: "Iris.Media"
 #endsub

@@ -47,6 +47,7 @@ impl IrisWindow {
                 })
         };
         let pinned = self.settings.always_on_top;
+        let modal_open = self.has_active_modal();
 
         let preset_open = self.overlays.popover == Some(PopoverKind::Presets);
         let non_default =
@@ -114,18 +115,20 @@ impl IrisWindow {
                     })
                     .when(preset_open, |d| d.bg(t.selected))
                     .when(!preset_open, |d| {
-                        d.bg(t.panel)
-                            .hover(|s| s.bg(t.hover).border_color(t.line_strong))
+                        d.bg(t.panel).when(!modal_open, |d| {
+                            d.hover(|s| s.bg(t.hover).border_color(t.line_strong))
+                        })
                     })
-                    .cursor_pointer()
                     .tooltip(tip(
                         "工作区预设 · 点击切换或保存当前布局",
                         self.key_hint("cycle_preset"),
                     ))
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.toggle_popover(PopoverKind::Presets, cx);
-                    }))
+                    .when(!modal_open, |d| {
+                        d.cursor_pointer().on_click(cx.listener(|this, _, _, cx| {
+                            this.toggle_popover(PopoverKind::Presets, cx);
+                        }))
+                    })
                     .child(
                         icon(
                             Icon::Layers,
@@ -164,10 +167,9 @@ impl IrisWindow {
             .border_1()
             .border_color(if pinned { t.accent } else { t.line })
             .when(pinned, |d| d.bg(t.selected))
-            .when(!pinned, |d| {
+            .when(!pinned && !modal_open, |d| {
                 d.hover(|s| s.bg(t.hover).border_color(t.line_strong))
             })
-            .cursor_pointer()
             .tooltip(tip(
                 if pinned {
                     "取消窗口置顶"
@@ -177,9 +179,11 @@ impl IrisWindow {
                 self.key_hint("toggle_always_on_top"),
             ))
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .on_click(
-                cx.listener(|this, _, w, cx| this.toggle_always_on_top(&ToggleAlwaysOnTop, w, cx)),
-            )
+            .when(!modal_open, |d| {
+                d.cursor_pointer().on_click(cx.listener(|this, _, w, cx| {
+                    this.toggle_always_on_top(&ToggleAlwaysOnTop, w, cx)
+                }))
+            })
             .child(
                 icon(Icon::Pin, 12., if pinned { t.accent } else { t.text_dim })
                     .group_hover("win-pin", move |s| {

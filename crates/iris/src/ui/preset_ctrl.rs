@@ -2,7 +2,7 @@
 //! persistence, effective chrome queries, and `ResetAppearance` guardrail.
 
 use gpui::{Context, Window, px, size};
-use iris_api::{HostEvent, Permission};
+use iris_api::v2::{Capability, HostEvent};
 use iris_core::library::{SortBy, SortOrder};
 use iris_core::player::Command;
 use iris_core::preset::{PresetCaptureScope, PresetLayout, PresetManager, SidebarMode};
@@ -13,7 +13,13 @@ use crate::platform;
 use crate::theme::ThemeTokens;
 
 impl IrisWindow {
-    pub(super) fn sync_theme_tokens(&self, cx: &mut Context<Self>) {
+    pub(super) fn sync_theme_tokens(&mut self, cx: &mut Context<Self>) {
+        let desired = self
+            .settings
+            .theme_id
+            .strip_prefix("plugin:")
+            .map(str::to_owned);
+        let _ = self.plugins.select_theme(desired);
         let (plugin_theme, _) = self.plugins.active_ui_overrides();
         let tokens = ThemeTokens::resolve(&self.settings.theme_id, plugin_theme.as_ref());
         cx.set_global(tokens);
@@ -76,15 +82,21 @@ impl IrisWindow {
         let theme_plugin_ids: Vec<String> = self
             .plugins
             .list()
-            .into_iter()
-            .filter(|p| p.enabled && p.manifest.has_permission(Permission::UiTheme))
-            .map(|p| p.manifest.id)
+            .iter()
+            .filter(|p| {
+                p.enabled
+                    && p.binding
+                        .as_ref()
+                        .is_some_and(|b| b.installed.grants.contains(&Capability::UiTheme))
+            })
+            .map(|p| p.id.clone())
             .collect();
         let snap = self.plugin_snapshot();
         for pid in theme_plugin_ids {
             if !self.settings.disabled_plugins.iter().any(|d| d == &pid) {
                 self.settings.disabled_plugins.push(pid.clone());
             }
+            self.text_inputs.clear_plugin_sidebar_fields(&pid);
             let report = self
                 .plugins
                 .set_enabled_with_snapshot(&pid, false, snap.clone());
@@ -94,6 +106,7 @@ impl IrisWindow {
             let plugin = plugin.to_owned();
             self.plugins.dismiss_modal(&plugin);
         }
+        self.reconcile_active_source();
         self.overlays.plugin_modal_focus_pending = true;
         self.sync_plugin_modal_focus(window);
         self.settings.theme_id = "graphite".into();
@@ -160,32 +173,35 @@ impl IrisWindow {
                 &pid,
                 HostEvent::Command {
                     id: cmd_id,
-                    snapshot: snap,
+                    snapshot: Some(snap),
                 },
             );
             self.apply_poll_report(report, Some(window), cx);
         }
 
         if prev_disabled != self.settings.disabled_plugins {
-            let all_ids: Vec<String> = self
-                .plugins
-                .list()
-                .into_iter()
-                .map(|p| p.manifest.id)
-                .collect();
+            let all_ids: Vec<String> = self.plugins.list().iter().map(|p| p.id.clone()).collect();
             let snap = self.plugin_snapshot();
             for pid in all_ids {
                 let enable = !self.settings.disabled_plugins.iter().any(|d| d == &pid);
+                if enable == !prev_disabled.iter().any(|d| d == &pid) {
+                    continue;
+                }
+                if !enable {
+                    self.text_inputs.clear_plugin_sidebar_fields(&pid);
+                }
                 let report = self
                     .plugins
                     .set_enabled_with_snapshot(&pid, enable, snap.clone());
                 self.apply_poll_report(report, Some(window), cx);
             }
+            self.reconcile_active_source();
         }
 
         for (pid, cmd_id) in trans.plugin_commands {
-            self.invoke_plugin_command(&pid, &cmd_id, window, cx);
+            self.plugin_view.deferred.push((pid, cmd_id));
         }
+        self.run_deferred_plugin_commands(window, cx);
 
         if let Some(mode) = trans.sidebar_mode {
             self.catalog.sidebar_mode = mode;
@@ -221,9 +237,7 @@ impl IrisWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let vp = window.viewport_size();
-        let win_sz =
-            (!self.chrome.fullscreen).then_some((f32::from(vp.width), f32::from(vp.height)));
+        let win_sz = self.current_preset_layout(window).window_size;
         let st = self.active().session.state();
         let preset = PresetManager::capture_from_current(
             String::new(),
@@ -254,9 +268,7 @@ impl IrisWindow {
         window: &Window,
         cx: &mut Context<Self>,
     ) {
-        let vp = window.viewport_size();
-        let win_sz =
-            (!self.chrome.fullscreen).then_some((f32::from(vp.width), f32::from(vp.height)));
+        let win_sz = self.current_preset_layout(window).window_size;
         let st = self.active().session.state();
         if self.presets.update_from_current(
             id,
@@ -268,6 +280,12 @@ impl IrisWindow {
             st.speed,
             st.aspect,
         ) {
+            if self.settings.active_preset == id
+                && let Some(updated) = self.presets.get(id).cloned()
+            {
+                self.preset_rt
+                    .sync_updated_active_preset(&updated, &self.settings);
+            }
             self.show_toast("已将当前状态更新至预设", cx);
         } else {
             self.show_toast("内置预设不可直接覆盖，请另存为新预设", cx);

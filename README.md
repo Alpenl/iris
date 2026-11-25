@@ -24,7 +24,7 @@ Iris 是一个以 [mpv](https://mpv.io) 为播放核心的高性能跨平台照�
   - `settings.conf` 始终保护用户的纯净个人日常基线，切换预设自动通过内存 `PresetRevert` 回正上个预设改动的参数并触发退出指令，手动微调实时感知且绝不误启无关禁用插件。
 - **多方案可录制快捷键系统（Keymap）**：
   - 内置 **Iris 默认 / mpv 经典 / PotPlayer 风格** 三套零冲突键位方案一键热切换，内置 `!TextInput` 打字安全防火墙（单键快捷键绝不干扰搜索框与表单输入），全局按钮悬停提示随当前键位方案实时联动。
-- **高自由度主题与正交插件系统（`iris-api`，`protocol: 1`）**：
+- **高自由度主题与正交插件系统（`iris-api`，`protocol: 2`）**：
   - GPUI 全局 `ThemeTokens` 引擎（内置 **石墨模块 / OLED 纯黑暗房 / 胶片暖灰审片 / 冰川高对比** 四套色板）。
   - 插件可在受控权限内动态扩展多实例数据源（`SetSources`）、定制配色/圆角/栏高与无标题栏影院窗（`hide_titlebar`，宿主内置顶缘悬浮唤醒、视口拖拽与「恢复默认外观」三重安全护栏）、挂载 13 类同构声明式 `Widget` 侧栏/弹窗以及 7 类视口 `OverlayNode` 交互式矢量 HUD。详见 [插件开发指南](docs/PLUGINS.md)。
 
@@ -84,20 +84,21 @@ cargo clippy --locked --workspace --all-targets -- -D warnings
 - `keymap.json`：快捷键方案与自定义按键映射
 - `locations.json`：常驻位置书签
 - `records.tsv` / `recent.tsv`：保存收藏、续播进度与最近打开记录。包含用户信息、查询或片段的 HTTP(S) 直链仅用于当前会话；具有稳定条目 ID 的插件媒体仍可收藏与续播。
-- `plugin_state/<id>.json`：各内置/外部插件私有非敏感配置（含 `iris.webdav` 服务器列表；敏感密码分桶加密存于系统凭据库）
+- `plugin-v2-state/`：按安装身份保存非敏感配置；敏感凭据保存在系统凭据库。旧 `plugin_state/` 为官方迁移输入，成功前保留旧资料。
 - `credential_index.json` 仅索引凭据的作用域和键名。密钥正文保存在系统凭据库。
-- `plugins/`：外部插件目录（支持 `IRIS_PLUGINS` 覆盖）
+- `plugins-v2/`：审核后的 Wasm 包与安装授权（支持 `IRIS_PLUGINS_V2` 开发覆盖）；`plugin-v2-temp/` 为有配额的临时产物。
+- `plugin-tool-bindings.json`：用户显式批准的可信原生工具与模型绑定。
 
 ## 代码结构
 
 ```
 crates/
   iris-mpv/            libmpv 手写 Rust FFI（client API + mpv_node 结构化传参 + RenderHandle 窄能力封装）
-  iris-api/            无头插件协议（protocol: 1，拆分为 manifest / source / workbench / overlay / wire）
+  iris-api/            无头插件协议（protocol: 2 / ABI: 2，版本化 v2 与公共 UI 类型）
   iris-core/           无头内核（零 GPUI 依赖）
     src/player/        视口会话状态机、HTTP(S) 会话转发、后台准备器与媒体检查器
     src/photo/         魔数优先单遍照片头解析（JPEG/PNG/WebP/HEIF/TIFF）、EXIF 与 ICC 色彩匹配
-    src/plugin/        插件管理器、外部 stdio 进程引擎、DirtySlots 脏检测、内置插件与标准 iris.webdav
+    src/plugin_v2/     Wasm 运行时、安装授权、网络/流、资源账本与官方包自举
     src/keymap/        三方案动作目录、文本输入保护与冲突检测
     src/vfs/           常驻书签与有界 HTTP 控制面客户端（含跨源凭据剥离与 30x 回环 SSRF 拦截）
     src/{catalog,media_uri,vault,preset,store,settings,library,geometry,input,logging}.rs

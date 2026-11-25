@@ -48,7 +48,8 @@ impl IrisWindow {
             let _ = this.update(cx, |this, cx| {
                 let first = items.first().cloned();
                 let added = this.queue.extend(items);
-                let idle = this.active().session.current_media_uri().is_none();
+                let idle = this.active().session.current_media_uri().is_none()
+                    && !this.media_load_pending();
                 if idle && let Some(q) = first {
                     this.open_media_uri(&q.uri, Some(q.title), cx);
                 }
@@ -123,6 +124,7 @@ impl IrisWindow {
                             Some(media_row(
                                 ("q-row", ix),
                                 MediaRowSpec {
+                                    thumbnail: None,
                                     kind: item.kind,
                                     title: item.title.clone().into(),
                                     meta: badge,

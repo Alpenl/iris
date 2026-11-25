@@ -13,7 +13,7 @@ pub enum TextAlign {
 
 /// Normalized (`0.0..=1.0`) vector & HUD nodes drawn over the viewport (`Permission::UiOverlay`).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum OverlayNode {
     /// Unified box primitive supporting fill, border stroke, and corner radius.
     Box {

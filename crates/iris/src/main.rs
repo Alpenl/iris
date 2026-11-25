@@ -32,16 +32,28 @@ use iris_core::{
     settings::Settings,
 };
 
-const HELP: &str = "Iris 照片 / 视频播放器\n用法：iris [--] [本地文件或文件夹…]\n  --version  显示版本\n  --help     显示本说明";
+const HELP: &str = "Iris 照片 / 视频播放器\n用法：iris [--] [本地文件或文件夹…]\n  --version  显示版本\n  --help     显示本说明\n  --check-plugin-runtime  校验内嵌 Wasm 运行时";
 
 enum Invocation {
     Open(Vec<PathBuf>),
     Help,
     Version,
+    CheckPluginRuntime,
 }
 
 fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Invocation, String> {
     let mut args = args.into_iter().peekable();
+    if args
+        .peek()
+        .is_some_and(|arg| arg == "--check-plugin-runtime")
+    {
+        args.next();
+        return if args.next().is_some() {
+            Err("--check-plugin-runtime 必须单独使用".into())
+        } else {
+            Ok(Invocation::CheckPluginRuntime)
+        };
+    }
     if let Some("--help" | "--version") = args.peek().and_then(|arg| arg.to_str()) {
         let help = args.next().unwrap() == "--help";
         return if args.peek().is_some() {
@@ -58,6 +70,9 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Invocation, St
     for arg in args {
         if !literal && arg == "--" {
             literal = true;
+            continue;
+        }
+        if arg.is_empty() {
             continue;
         }
         if !literal && arg.as_encoded_bytes().starts_with(b"-") {
@@ -101,9 +116,19 @@ fn main() -> ExitCode {
         Ok(Invocation::Version) => {
             return print_cli_line(format_args!("Iris {}", env!("CARGO_PKG_VERSION")));
         }
+        Ok(Invocation::CheckPluginRuntime) => {
+            return match iris_core::plugin_v2::official::smoke::check() {
+                Ok(receipt) => print_cli_line(format_args!("{receipt}")),
+                Err(error) => {
+                    attach_parent_console(true);
+                    let _ = writeln!(io::stderr(), "Plugin runtime check failed: {error:?}");
+                    ExitCode::FAILURE
+                }
+            };
+        }
         Err(message) => {
             attach_parent_console(true);
-            eprintln!("Iris: {message}");
+            let _ = writeln!(io::stderr(), "Iris: {message}");
             return ExitCode::FAILURE;
         }
     };
@@ -117,7 +142,7 @@ fn main() -> ExitCode {
         if unsafe { SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_DEFAULT_DIRS) } == 0 {
             let error = std::io::Error::last_os_error();
             attach_parent_console(true);
-            eprintln!("Iris: initializing DLL search: {error}");
+            let _ = writeln!(io::stderr(), "Iris: initializing DLL search: {error}");
             return ExitCode::FAILURE;
         }
     }
@@ -163,7 +188,7 @@ fn run(initial: Vec<PathBuf>) -> ExitCode {
             instance::Claim::Forwarded => return ExitCode::SUCCESS,
             instance::Claim::Rejected => {
                 attach_parent_console(true);
-                eprintln!("Iris: 无法将打开请求交给正在运行的实例");
+                let _ = writeln!(io::stderr(), "Iris: 无法将打开请求交给正在运行的实例");
                 return ExitCode::FAILURE;
             }
         }
@@ -305,6 +330,7 @@ fn run(initial: Vec<PathBuf>) -> ExitCode {
         .detach();
         cx.activate(true);
     });
+    logging::shutdown();
     ExitCode::SUCCESS
 }
 
@@ -371,6 +397,11 @@ mod tests {
     fn cli_validates_all_options_and_preserves_literal_paths() {
         let parse = |args: &[&str]| parse_args(args.iter().copied().map(OsString::from));
         assert!(matches!(parse(&["--help"]), Ok(Invocation::Help)));
+        assert!(matches!(
+            parse(&["--check-plugin-runtime"]),
+            Ok(Invocation::CheckPluginRuntime)
+        ));
+        assert!(parse(&["--check-plugin-runtime", "clip.mp4"]).is_err());
         assert!(parse(&["--version", "clip.mp4"]).is_err());
         assert!(parse(&["clip.mp4", "--typo"]).is_err());
         assert!(parse(&["file://example.com/share/clip.mp4"]).is_err());
@@ -383,5 +414,9 @@ mod tests {
         assert!(parse(&[&format!("{url}?option=x")]).is_err());
         assert!(parse(&[&format!("{url}#fragment")]).is_err());
         assert!(MediaUri::local_file_uri_path("https://example.com/video.mp4").is_none());
+        let Ok(Invocation::Open(empty_skipped)) = parse(&[""]) else {
+            panic!("empty CLI arg must not fail");
+        };
+        assert!(empty_skipped.is_empty());
     }
 }

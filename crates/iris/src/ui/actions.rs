@@ -27,6 +27,8 @@ actions!(
         SpeedUp,
         ResetSpeed,
         ToggleLoop,
+        CycleAbLoop,
+        ClearAbLoop,
         ToggleDirectory,
         ToggleSearch,
         RefreshDirectory,
@@ -104,6 +106,8 @@ fn push_action_binding(out: &mut Vec<KeyBinding>, action_id: &str, key: &str, ct
         "speed_up" => KeyBinding::new(key, SpeedUp, Some(ctx)),
         "reset_speed" => KeyBinding::new(key, ResetSpeed, Some(ctx)),
         "toggle_loop" => KeyBinding::new(key, ToggleLoop, Some(ctx)),
+        "cycle_ab_loop" => KeyBinding::new(key, CycleAbLoop, Some(ctx)),
+        "clear_ab_loop" => KeyBinding::new(key, ClearAbLoop, Some(ctx)),
         "toggle_directory" => KeyBinding::new(key, ToggleDirectory, Some(ctx)),
         "toggle_search" => KeyBinding::new(key, ToggleSearch, Some(ctx)),
         "refresh_directory" => KeyBinding::new(key, RefreshDirectory, Some(ctx)),
@@ -173,7 +177,8 @@ pub(super) fn runtime_bindings(keymap: &Keymap) -> Vec<KeyBinding> {
         let context = match action {
             "exit_fullscreen" => "Workspace && !TextInput",
             "reset_appearance" => "Workspace || ShortcutRecorder",
-            _ => "Workspace",
+            "open_palette" => "Workspace && !Modal",
+            _ => "Workspace && !Modal",
         };
         push_action_binding(&mut bindings, action, key, context);
     }
@@ -257,6 +262,8 @@ impl IrisWindow {
             .on_action(cx.listener(Self::speed_up))
             .on_action(cx.listener(Self::reset_speed))
             .on_action(cx.listener(Self::toggle_loop))
+            .on_action(cx.listener(Self::cycle_ab_loop))
+            .on_action(cx.listener(Self::clear_ab_loop))
             .on_action(cx.listener(Self::toggle_directory))
             .on_action(cx.listener(Self::toggle_search))
             .on_action(cx.listener(Self::refresh_directory))

@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use gpui::Context;
-use iris_api::HostEvent;
+use iris_api::v2::HostEvent;
 use iris_core::library::{self, Kind, ScanResult};
 use iris_core::player::{self, Command, SessionEvent, SessionUpdate, TrackKind};
 use iris_core::settings::{OnEof, PhotoDefault};
@@ -68,6 +68,8 @@ impl IrisWindow {
         let was_ended = self.active().session.state().ended;
         let mut need_notify = false;
         let mut saw_position: Option<f64> = None;
+        let mut clock_changed = false;
+        let mut saw_seek = false;
         let mut saw_duration = false;
         let mut saw_pause_or_speed = false;
         let mut saw_loaded_or_reconfig = false;
@@ -82,7 +84,23 @@ impl IrisWindow {
             let Some(ev) = self.active_mut().session.apply_update(&update) else {
                 continue;
             };
+            clock_changed |= matches!(
+                ev,
+                SessionEvent::Position(_)
+                    | SessionEvent::Duration(_)
+                    | SessionEvent::Paused(_)
+                    | SessionEvent::Speed(_)
+                    | SessionEvent::Buffering(_)
+                    | SessionEvent::Ended(_)
+                    | SessionEvent::Error(_)
+                    | SessionEvent::Loaded
+            );
             match ev {
+                SessionEvent::Seek => {
+                    saw_seek = true;
+                    clock_changed = true;
+                    need_notify = true;
+                }
                 SessionEvent::Position(t) => saw_position = Some(*t),
                 SessionEvent::Duration(_) => {
                     saw_duration = true;
@@ -115,6 +133,20 @@ impl IrisWindow {
             }
         }
         self.active_mut().session.flush_deferred();
+        if clock_changed {
+            self.sync_overlay_clock();
+        }
+        if saw_seek {
+            self.advance_plugin_seek(cx);
+        }
+        if saw_loaded_or_reconfig && self.announce_plugin_media_if_loaded(cx) {
+            need_notify = true;
+        }
+        if saw_seek || saw_loaded_or_reconfig {
+            self.reconcile_enhancements(cx);
+        } else if clock_changed {
+            self.update_overlay_window(cx);
+        }
         if saw_loaded_or_reconfig
             && self.active().session.state().loaded
             && !self.media_load_pending()
@@ -125,7 +157,7 @@ impl IrisWindow {
         self.sleep_preventer
             .set_active(self.active().session.is_actively_playing_video());
         if self.last_save.elapsed() >= SAVE_EVERY {
-            self.save_progress_sync();
+            self.save_progress_periodic(cx);
         }
 
         if saw_loaded_or_reconfig && self.overlays.info_open {
@@ -170,6 +202,7 @@ impl IrisWindow {
                 self.last_plugin_tick = Instant::now();
                 let st = self.active().session.state();
                 let ev = HostEvent::Tick {
+                    generation: self.plugins.generation(),
                     position: st.time_pos,
                     duration: st.duration,
                     paused: st.paused,
@@ -221,7 +254,14 @@ impl IrisWindow {
 
         if saw_pause_or_speed {
             let snap = self.plugin_snapshot();
-            if self.broadcast_plugin_event(HostEvent::StateChanged { snapshot: snap }, None, cx) {
+            if self.broadcast_plugin_event(
+                HostEvent::StateChanged {
+                    generation: self.plugins.generation(),
+                    snapshot: snap,
+                },
+                None,
+                cx,
+            ) {
                 need_notify = true;
             }
         }
@@ -316,9 +356,43 @@ impl IrisWindow {
         self.last_save = Instant::now();
     }
 
+    fn save_progress_periodic(&mut self, cx: &mut Context<Self>) {
+        self.record_progress_memory();
+        self.last_save = Instant::now();
+        if !self.store.is_dirty() || self.store_flush.is_some() {
+            return;
+        }
+        let Some(flush) = self.store.prepare_progress_flush() else {
+            self.store.save();
+            return;
+        };
+        let work = cx.background_executor().spawn(async move { flush.run() });
+        self.store_flush = Some(cx.spawn(async move |this, cx| {
+            let applied = work.await;
+            let _ = this.update(cx, |this, _| {
+                this.store_flush = None;
+                this.store.finish_progress_flush(applied);
+            });
+        }));
+    }
+
     pub(super) fn finish_media_open(&mut self, cx: &mut Context<Self>) {
+        self.refresh_annotations(cx);
         if let Some(uri) = self.active().session.current_media_uri() {
-            self.store.push_recent(&uri);
+            if self.active().session.may_share_current_identity() {
+                let title = match &uri {
+                    iris_core::media_uri::MediaUri::Local(_) => None,
+                    iris_core::media_uri::MediaUri::Plugin { .. }
+                    | iris_core::media_uri::MediaUri::HttpUrl(_) => self
+                        .active()
+                        .session
+                        .current_title()
+                        .map(str::trim)
+                        .filter(|t| !t.is_empty() && *t != "插件媒体")
+                        .map(str::to_owned),
+                };
+                self.store.push_recent_with_title(&uri, title.as_deref());
+            }
         } else if let Some(dir) = self.active().session.folder().map(Path::to_path_buf)
             && self.catalog.active_source.is_local()
         {
@@ -341,17 +415,24 @@ impl IrisWindow {
         self.chrome.scrub.seek_preview_timeout = None;
         self.chrome.scrub.timeline_hover = false;
         self.rebuild_directory_rows();
+        self.scan_visible_favorites(cx);
         self.scroll_directory_to_current();
         self.ensure_filmstrip_thumbnails(cx);
         self.sync_now_playing(true);
-        let snap = self.plugin_snapshot();
-        let _ = self.broadcast_plugin_event(HostEvent::MediaOpened { snapshot: snap }, None, cx);
+        let _ = self.announce_plugin_media_if_loaded(cx);
         if self.overlays.info_open {
             self.active_mut().refresh_cached_stats(true);
         }
     }
 
     pub(crate) fn open_paths(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
+        let (packages, paths): (Vec<_>, Vec<_>) = paths.into_iter().partition(|p| {
+            p.extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("irisplugin"))
+        });
+        for package in packages.into_iter().take(2) {
+            self.review_plugin_path(package, cx);
+        }
         let (paths, subtitles) = split_open_paths(paths);
         match paths.as_slice() {
             [] => {}
@@ -372,12 +453,7 @@ impl IrisWindow {
     pub(super) fn media_load_pending(&self) -> bool {
         self.active().pending_path.is_some()
             || self.catalog.remote_load.is_some()
-            || self.catalog.pending_source.as_ref().is_some_and(|request| {
-                matches!(
-                    request.operation,
-                    super::state::SourceOperation::Resolve { .. }
-                )
-            })
+            || self.catalog.pending_resolve.is_some()
     }
 
     fn flush_pending_subtitles(&mut self, cx: &mut Context<Self>) {
@@ -413,7 +489,11 @@ impl IrisWindow {
     }
 
     pub(crate) fn open_path(&mut self, path: &Path, cx: &mut Context<Self>) {
-        self.cancel_remote_requests();
+        self.cancel_media_loads();
+        self.close_plugin_browse();
+        if !self.advance_plugin_media(cx) {
+            return;
+        }
         self.save_progress_sync();
         self.overlays.close_menus();
         self.catalog.active_source = ActiveSource::Local;
@@ -487,6 +567,7 @@ impl IrisWindow {
                     }
                     Err(e) => {
                         this.active_mut().pending_subtitles.paths.clear();
+                        this.rebuild_directory_rows();
                         this.sync_now_playing(true);
                         this.show_toast(format!("无法打开 · {e}"), cx);
                     }
@@ -499,7 +580,11 @@ impl IrisWindow {
     }
 
     fn open_multi_queue(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
-        self.cancel_remote_requests();
+        self.cancel_media_loads();
+        self.close_plugin_browse();
+        if !self.advance_plugin_media(cx) {
+            return;
+        }
         self.save_progress_sync();
         self.overlays.close_menus();
         self.catalog.active_source = ActiveSource::Local;
@@ -528,6 +613,7 @@ impl IrisWindow {
                 }
                 let Some(prepared) = prepared else {
                     this.active_mut().pending_subtitles.paths.clear();
+                    this.rebuild_directory_rows();
                     this.show_toast("所选项目中没有可播放的媒体", cx);
                     return;
                 };
@@ -548,6 +634,7 @@ impl IrisWindow {
                         this.show_toast(format!("已加入播放队列 · {count} 个文件"), cx);
                     }
                     Err(e) => {
+                        this.rebuild_directory_rows();
                         this.sync_now_playing(true);
                         this.active_mut().pending_subtitles.paths.clear();
                         this.show_toast(format!("无法打开 · {e}"), cx);

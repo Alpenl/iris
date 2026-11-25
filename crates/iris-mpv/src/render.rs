@@ -132,13 +132,16 @@ impl VideoRecovery {
             } if self.entry == Some(playlist_entry_id) => {
                 self.entry = None;
             }
-            Event::QueueOverflow => self.entry = None,
-            Event::Shutdown => {
+            Event::QueueOverflow | Event::Shutdown => {
                 self.entry = None;
                 self.reply(None);
             }
             _ => (),
         }
+    }
+
+    pub(crate) fn set_entry(&mut self, entry: Option<i64>) {
+        self.entry = entry;
     }
 
     pub(crate) fn reply(&mut self, vid: Option<i64>) {
@@ -165,6 +168,20 @@ fn recovery_discards_track_from_replaced_file() {
     recovery.reply(Some(3));
     woke.try_recv().expect("video worker notified");
     assert!(rx.try_recv().expect("query completed").is_none());
+
+    let (wake2, woke2) = mpsc::sync_channel(1);
+    let (tx2, rx2) = mpsc::channel();
+    let mut overflow = VideoRecovery {
+        entry: Some(8),
+        pending: Some(VideoTrackRequest {
+            entry: 8,
+            tx: tx2,
+            wake: wake2,
+        }),
+    };
+    overflow.on_event(&Event::QueueOverflow);
+    woke2.try_recv().expect("overflow unblocks video worker");
+    assert!(rx2.try_recv().expect("overflow completes query").is_none());
 }
 
 type UpdateFn = Box<dyn Fn() + Send + Sync>;

@@ -14,7 +14,7 @@ use super::super::IrisWindow;
 use super::super::state::ActiveSource;
 use super::DirRow;
 
-fn fav_uri_to_catalog_item(uri: MediaUri) -> CatalogItem {
+fn fav_uri_to_catalog_item((uri, known_title): (MediaUri, Option<String>)) -> CatalogItem {
     match &uri {
         MediaUri::Local(p) if p.is_dir() => CatalogItem::from_local_folder(&FolderEntry {
             name: uri.display_name(),
@@ -37,9 +37,15 @@ fn fav_uri_to_catalog_item(uri: MediaUri) -> CatalogItem {
                 })
         }
         _ => {
-            let name = uri.display_name();
-            let kind =
-                CatalogItemKind::Media(library::kind_of(Path::new(&name)).unwrap_or(Kind::Video));
+            let fallback_name = uri.display_name();
+            let name = known_title
+                .filter(|t| !t.trim().is_empty())
+                .unwrap_or_else(|| fallback_name.clone());
+            let kind = CatalogItemKind::Media(
+                library::kind_of(Path::new(&fallback_name))
+                    .or_else(|| library::kind_of(Path::new(&name)))
+                    .unwrap_or(Kind::Video),
+            );
             CatalogItem {
                 uri,
                 name,
@@ -154,15 +160,18 @@ impl IrisWindow {
     }
 
     pub(in crate::ui) fn scan_visible_favorites(&mut self, cx: &mut Context<Self>) {
-        if !self.sidebar_is_visible()
-            || self.catalog.sidebar_mode != iris_core::preset::SidebarMode::Files
-            || self.catalog.filter != MediaFilter::FavoritesOnly
+        if self.catalog.filter != MediaFilter::FavoritesOnly
             || self.catalog.favorite_scan.is_some()
             || self.catalog.favorite_uris.is_empty()
         {
             return;
         }
-        let uris = self.catalog.favorite_uris.clone();
+        let uris: Vec<(MediaUri, Option<String>)> = self
+            .catalog
+            .favorite_uris
+            .iter()
+            .map(|u| (u.clone(), self.store.recent_title(u).map(str::to_owned)))
+            .collect();
         let scan = cx
             .background_executor()
             .spawn(async move { uris.into_iter().map(fav_uri_to_catalog_item).collect() });

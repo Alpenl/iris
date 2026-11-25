@@ -1,0 +1,354 @@
+//! One application coordinator, many window clients. UI entry points only perform
+//! bounded validation/enqueue; compilation, disk and playback setup use workers.
+mod client;
+mod dispatch;
+mod jobs;
+mod offline;
+mod origin;
+mod worker;
+use super::{
+    actor::{Status, Update},
+    installation::{ArchivedIdentity, Installed, Installer, Review},
+    ledger::{Reservation, Resource},
+    pool::WorkPool,
+    requests::{AcceptedPage, RequestTicket, SourceRequests},
+    runtime::{Control, PreparedWindow, Setup},
+    stream::prepare::Playback,
+};
+pub use client::Client;
+use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
+use iris_api::v2::{
+    Capability, ErrorCode, Generation, HostEvent, Id, Manifest,
+    source::{PlaybackSnapshot, PlaylistEntry, SourceDescriptor},
+};
+pub use origin::OriginSummary;
+use std::{
+    collections::{BTreeMap, BTreeSet, VecDeque},
+    path::PathBuf,
+    sync::{
+        Arc, Condvar, Mutex, Weak,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::{Duration, Instant},
+};
+
+pub struct Config {
+    pub installer: Installer,
+    pub bootstrap: Option<super::official::Bootstrap>,
+    pub runtime: Setup,
+    pub disabled: BTreeSet<String>,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PluginStatus {
+    Dormant,
+    Loading,
+    Ready,
+    Disabled,
+    Stopping,
+    Failed(ErrorCode),
+}
+/// Revocation is observable even after a batch left the coordinator/UI queue.
+pub struct Binding {
+    pub installed: Installed,
+    pub manifest: Arc<Manifest>,
+    alive: AtomicBool,
+    _lease: Reservation,
+}
+impl Binding {
+    pub fn is_live(&self) -> bool {
+        self.alive.load(Ordering::Acquire)
+    }
+}
+#[derive(Clone)]
+pub struct PluginInfo {
+    pub id: String,
+    pub enabled: bool,
+    pub status: PluginStatus,
+    pub binding: Option<Arc<Binding>>,
+    pub sources: Option<Arc<SourceSnapshot>>,
+}
+pub struct SourceSnapshot {
+    pub sources: Vec<SourceDescriptor>,
+    _lease: Reservation,
+}
+pub struct Catalog {
+    pub revision: u64,
+    pub plugins: Vec<PluginInfo>,
+}
+pub struct ReviewSummary {
+    pub id: Id,
+    pub manifest: Manifest,
+    pub digest: [u8; 32],
+    pub previous: Option<Installed>,
+    pub archived: Option<ArchivedIdentity>,
+    _lease: Reservation,
+}
+pub struct Commands {
+    pub binding: Arc<Binding>,
+    pub update: Arc<Update>,
+    /// Source results are consumed by the coordinator; only these indices may
+    /// be applied by the UI. The Arc retains all decoded-message reservations.
+    pub indices: Vec<usize>,
+}
+pub enum Notice {
+    Commands(Commands),
+    Page {
+        binding: Arc<Binding>,
+        generation: Generation,
+        request: Id,
+        page: Arc<AcceptedPage>,
+    },
+    Playback {
+        binding: Arc<Binding>,
+        generation: Generation,
+        ticket: Arc<RequestTicket>,
+        playback: Playback,
+        playlist: Vec<PlaylistEntry>,
+        _memory: Reservation,
+    },
+    Error {
+        plugin: Option<String>,
+        request: Option<Id>,
+        code: ErrorCode,
+        message: Option<String>,
+    },
+    Review(Arc<ReviewSummary>),
+    Origin(Arc<OriginSummary>),
+    OriginClosed(Id),
+    Installed(Installed),
+    Uninstalled(String),
+    Browser {
+        binding: Arc<Binding>,
+        generation: Generation,
+        transaction: Id,
+        url: String,
+    },
+}
+struct Inbox {
+    id: Id,
+    generation: Mutex<Generation>,
+    ready: Mutex<BTreeSet<String>>,
+    access: Mutex<BTreeMap<String, super::runtime::WindowAccess>>,
+    requests: Mutex<SourceRequests>,
+    cancelled: Mutex<BTreeMap<String, BTreeSet<Id>>>,
+    faults: Mutex<BTreeMap<String, ErrorCode>>,
+    notices: Mutex<VecDeque<Notice>>,
+    closed: AtomicBool,
+    wake_pending: AtomicBool,
+    wake: UnboundedSender<()>,
+    _lease: Reservation,
+}
+impl Inbox {
+    fn notify(&self) {
+        if !self.closed.load(Ordering::Acquire) && !self.wake_pending.swap(true, Ordering::AcqRel) {
+            let _ = self.wake.unbounded_send(());
+        }
+    }
+    fn push(&self, notice: Notice) -> Result<(), ErrorCode> {
+        let mut notices = self.notices.lock().unwrap_or_else(|e| e.into_inner());
+        if self.closed.load(Ordering::Acquire) {
+            return Err(ErrorCode::Cancelled);
+        }
+        if notices.len() >= 32 {
+            return Err(ErrorCode::Backpressure);
+        }
+        notices.push_back(notice);
+        drop(notices);
+        self.notify();
+        Ok(())
+    }
+    fn generation(&self) -> Generation {
+        *self.generation.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+enum Command {
+    Snapshot {
+        window: Id,
+        snapshot: PlaybackSnapshot,
+    },
+    Open {
+        inbox: Arc<Inbox>,
+        snapshot: Option<PlaybackSnapshot>,
+    },
+    Advance {
+        window: Id,
+        generation: Generation,
+    },
+    Send {
+        window: Id,
+        plugin: String,
+        event: HostEvent<serde_json::Value>,
+        generation: Generation,
+        request: Option<Arc<RequestTicket>>,
+    },
+    Enabled {
+        plugin: String,
+        enabled: bool,
+    },
+    Uninstall {
+        window: Id,
+        plugin: String,
+        keep_data: bool,
+    },
+    Reload,
+    Review {
+        window: Id,
+        id: Id,
+        path: PathBuf,
+    },
+    Approve {
+        window: Id,
+        id: Id,
+        grants: BTreeSet<Capability>,
+        keep_identity: bool,
+    },
+    DismissReview {
+        window: Id,
+        id: Id,
+    },
+    ConfirmOrigin {
+        window: Id,
+        id: Id,
+        allow: bool,
+        insecure_auth: bool,
+    },
+}
+#[derive(Default)]
+struct Gate {
+    wake: bool,
+    shutdown: bool,
+    commands: VecDeque<Command>,
+    completed: VecDeque<jobs::Completed>,
+    windows: BTreeMap<Id, Weak<Inbox>>,
+}
+struct Shared {
+    gate: Mutex<Gate>,
+    changed: Condvar,
+    catalog: Mutex<Arc<Catalog>>,
+    ledger: super::ledger::Ledger,
+    _lease: Reservation,
+}
+impl Shared {
+    fn signal(&self) {
+        let mut gate = self.gate.lock().unwrap_or_else(|e| e.into_inner());
+        gate.wake = true;
+        self.changed.notify_one();
+    }
+    fn enqueue(&self, command: Command) -> Result<(), ErrorCode> {
+        let mut gate = self.gate.lock().unwrap_or_else(|e| e.into_inner());
+        if gate.shutdown {
+            return Err(ErrorCode::Cancelled);
+        }
+        if gate.commands.len() >= 64 {
+            return Err(ErrorCode::Backpressure);
+        }
+        gate.commands.push_back(command);
+        gate.wake = true;
+        self.changed.notify_one();
+        Ok(())
+    }
+}
+struct Connection(Arc<Shared>);
+impl Drop for Connection {
+    fn drop(&mut self) {
+        let mut gate = self.0.gate.lock().unwrap_or_else(|e| e.into_inner());
+        gate.shutdown = true;
+        gate.wake = true;
+        self.0.changed.notify_one();
+    }
+}
+#[derive(Clone)]
+pub struct Hub(Arc<Connection>);
+impl Hub {
+    pub fn new(mut config: Config) -> Result<Self, ErrorCode> {
+        let ledger = config.runtime.resources.ledger.clone();
+        let lease = ledger.reserve("host-coordinator", &[(Resource::HostBytes, 32 << 20)])?;
+        let shared = Arc::new(Shared {
+            gate: Mutex::new(Gate::default()),
+            changed: Condvar::new(),
+            catalog: Mutex::new(Arc::new(Catalog {
+                revision: 0,
+                plugins: Vec::new(),
+            })),
+            ledger,
+            _lease: lease,
+        });
+        let weak = Arc::downgrade(&shared);
+        config.runtime.wake = Arc::new(move || {
+            if let Some(shared) = weak.upgrade() {
+                shared.signal();
+            }
+        });
+        let worker = worker::Worker::new(shared.clone(), config)?;
+        std::thread::Builder::new()
+            .name("iris-plugin-coordinator".into())
+            .spawn(move || worker.run())
+            .map_err(|_| ErrorCode::Internal)?;
+        Ok(Self(Arc::new(Connection(shared))))
+    }
+    pub fn open_window(
+        &self,
+        generation: Generation,
+        snapshot: Option<PlaybackSnapshot>,
+    ) -> Result<(Client, UnboundedReceiver<()>), ErrorCode> {
+        if let Some(snapshot) = &snapshot {
+            iris_plugin_sdk::json::encode(snapshot, iris_api::v2::MESSAGE_LIMIT - 1024)?;
+        }
+        let shared = &self.0.0;
+        let id = Control::new_window_id()?;
+        let lease = shared
+            .ledger
+            .reserve("host-coordinator", &[(Resource::HostBytes, 4 << 20)])?;
+        let (wake, rx) = unbounded();
+        let inbox = Arc::new(Inbox {
+            id,
+            generation: Mutex::new(generation),
+            ready: Mutex::new(BTreeSet::new()),
+            access: Mutex::new(BTreeMap::new()),
+            requests: Mutex::new(SourceRequests::new(shared.ledger.clone())),
+            cancelled: Mutex::new(BTreeMap::new()),
+            faults: Mutex::new(BTreeMap::new()),
+            notices: Mutex::new(VecDeque::new()),
+            closed: AtomicBool::new(false),
+            wake_pending: AtomicBool::new(false),
+            wake,
+            _lease: lease,
+        });
+        let mut gate = shared.gate.lock().unwrap_or_else(|e| e.into_inner());
+        gate.windows.retain(|_, w| {
+            w.upgrade()
+                .is_some_and(|w| !w.closed.load(Ordering::Acquire))
+        });
+        if gate.shutdown {
+            return Err(ErrorCode::Cancelled);
+        }
+        if gate.windows.len() >= 4 || gate.commands.len() >= 64 {
+            return Err(ErrorCode::Backpressure);
+        }
+        gate.windows.insert(id, Arc::downgrade(&inbox));
+        gate.commands.push_back(Command::Open {
+            inbox: inbox.clone(),
+            snapshot,
+        });
+        gate.wake = true;
+        shared.changed.notify_one();
+        Ok((
+            Client {
+                hub: self.clone(),
+                inbox,
+            },
+            rx,
+        ))
+    }
+    pub fn catalog(&self) -> Arc<Catalog> {
+        self.0
+            .0
+            .catalog
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+}
+
+#[cfg(test)]
+mod tests;

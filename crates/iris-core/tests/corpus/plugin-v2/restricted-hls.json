@@ -1,0 +1,1 @@
+{"resources": [{"id": "seg", "kind": "media", "extension": "ts", "size": "1000", "source": {"transport": "guest", "resource_id": "seg"}}], "text": "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:1\n#EXTINF:1.000,\nseg\n#EXT-X-ENDLIST\n"}

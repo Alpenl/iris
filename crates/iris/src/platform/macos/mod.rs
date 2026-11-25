@@ -169,13 +169,19 @@ impl SleepPreventer {
                     c"Iris video playback".as_ptr(),
                     0x0800_0100,
                 );
-                let mut id_out: u32 = 0;
-                // kIOPMAssertionLevelOn = 255.
-                if IOPMAssertionCreateWithName(cf_ty, 255, cf_reason, &mut id_out) == 0 {
-                    self.assertion_id = Some(id_out);
+                if !cf_ty.is_null() && !cf_reason.is_null() {
+                    let mut id_out: u32 = 0;
+                    // kIOPMAssertionLevelOn = 255.
+                    if IOPMAssertionCreateWithName(cf_ty, 255, cf_reason, &mut id_out) == 0 {
+                        self.assertion_id = Some(id_out);
+                    }
                 }
-                CFRelease(cf_reason);
-                CFRelease(cf_ty);
+                if !cf_reason.is_null() {
+                    CFRelease(cf_reason);
+                }
+                if !cf_ty.is_null() {
+                    CFRelease(cf_ty);
+                }
             }
         } else if !active && let Some(id_val) = self.assertion_id.take() {
             unsafe {
@@ -447,14 +453,16 @@ impl MediaKeyBridge {
         unsafe {
             for (selector, _) in media_commands() {
                 let cmd: id = msg_send![self.command_center, performSelector: selector];
-                let _: () = msg_send![cmd, setEnabled: enabled];
+                if cmd != nil {
+                    let _: () = msg_send![cmd, setEnabled: enabled];
+                }
             }
         }
     }
 
     pub(crate) fn update_now_playing(&mut self, media: Option<NowPlaying<'_>>) {
         self.set_commands_enabled(media.is_some());
-        unsafe {
+        objc::rc::autoreleasepool(|| unsafe {
             let Some(info_cls) = Class::get("MPNowPlayingInfoCenter") else {
                 return;
             };
@@ -468,26 +476,48 @@ impl MediaKeyBridge {
                 return;
             };
             let dict: id = msg_send![class!(NSMutableDictionary), dictionary];
-            let ns_cstr = |ptr: *const c_char| -> id {
-                msg_send![class!(NSString), stringWithUTF8String: ptr]
+            if dict == nil {
+                return;
+            }
+            let set_obj = |val: id, key: *const c_char| {
+                let k: id = msg_send![class!(NSString), stringWithUTF8String: key];
+                if val != nil && k != nil {
+                    let _: () = msg_send![dict, setObject: val forKey: k];
+                }
             };
             let ns_num = |v: f64| -> id { msg_send![class!(NSNumber), numberWithDouble: v] };
             let state = media.state;
             let title = NSString::alloc(nil).init_str(&media.title);
-            let _: () = msg_send![dict, setObject: title forKey: ns_cstr(c"title".as_ptr())];
-            let _: () = msg_send![title, release];
-            let media_type = if media.is_video { 2. } else { 1. };
-            let _: () = msg_send![dict, setObject: ns_num(media_type) forKey: ns_cstr(c"MPNowPlayingInfoPropertyMediaType".as_ptr())];
-            if state.duration > 0. {
-                let _: () = msg_send![dict, setObject: ns_num(state.duration) forKey: ns_cstr(c"playbackDuration".as_ptr())];
-                let _: () = msg_send![dict, setObject: ns_num(state.time_pos.max(0.)) forKey: ns_cstr(c"MPNowPlayingInfoPropertyElapsedPlaybackTime".as_ptr())];
+            if title != nil {
+                set_obj(title, c"title".as_ptr());
+                let _: () = msg_send![title, release];
             }
-            let rate = if state.paused || state.ended {
+            let media_type = if media.is_video { 2. } else { 1. };
+            set_obj(
+                ns_num(media_type),
+                c"MPNowPlayingInfoPropertyMediaType".as_ptr(),
+            );
+            if state.duration.is_finite() && state.duration > 0. {
+                set_obj(ns_num(state.duration), c"playbackDuration".as_ptr());
+                let elapsed = if state.time_pos.is_finite() {
+                    state.time_pos.max(0.)
+                } else {
+                    0.
+                };
+                set_obj(
+                    ns_num(elapsed),
+                    c"MPNowPlayingInfoPropertyElapsedPlaybackTime".as_ptr(),
+                );
+            }
+            let rate = if state.paused || state.ended || !state.speed.is_finite() {
                 0.
             } else {
                 state.speed
             };
-            let _: () = msg_send![dict, setObject: ns_num(rate) forKey: ns_cstr(c"MPNowPlayingInfoPropertyPlaybackRate".as_ptr())];
+            set_obj(
+                ns_num(rate),
+                c"MPNowPlayingInfoPropertyPlaybackRate".as_ptr(),
+            );
             let _: () = msg_send![center, setNowPlayingInfo: dict];
             let pb_state: usize = if state.ended {
                 3
@@ -497,7 +527,7 @@ impl MediaKeyBridge {
                 1
             };
             let _: () = msg_send![center, setPlaybackState: pb_state];
-        }
+        });
     }
 }
 
@@ -507,7 +537,9 @@ impl Drop for MediaKeyBridge {
         unsafe {
             for (selector, _) in media_commands() {
                 let cmd: id = msg_send![self.command_center, performSelector: selector];
-                let _: () = msg_send![cmd, removeTarget: self.target];
+                if cmd != nil {
+                    let _: () = msg_send![cmd, removeTarget: self.target];
+                }
             }
             let _: () = msg_send![self.target, release];
         }

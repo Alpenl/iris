@@ -6,7 +6,7 @@ mod tracks;
 
 use gpui::{
     Context, InteractiveElement, IntoElement, MouseButton, ParentElement, SharedString,
-    StatefulInteractiveElement, Styled, div, prelude::FluentBuilder, px,
+    StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder, px,
 };
 use iris_core::player::{Command, SPEED_STEPS};
 
@@ -47,25 +47,68 @@ impl IrisWindow {
         &self,
         kind: PopoverKind,
         fullscreen: bool,
+        window: &Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let t = ThemeTokens::of(cx);
         let floating_dock = fullscreen || self.effective_floating_dock();
         let is_top_anchored = kind == PopoverKind::Presets;
 
-        let pop_w = match kind {
+        let base_pop_w: f32 = match kind {
             PopoverKind::Speed => 172.,
             PopoverKind::Variants => 204.,
             PopoverKind::More => 276.,
             PopoverKind::Subtitles | PopoverKind::Audio => 284.,
             PopoverKind::Presets => 304.,
         };
-        let max_h = match kind {
+        let base_max_h: f32 = match kind {
             PopoverKind::More | PopoverKind::Audio | PopoverKind::Presets => 440.,
             _ => 360.,
         };
 
         let vp_rect = self.active().rect.get().map(|r| r.0);
+        let win_sz = window.viewport_size();
+        let vw_vp = vp_rect
+            .map(|r| r[2] as f32)
+            .filter(|&w| w > 0.)
+            .unwrap_or_else(|| f32::from(win_sz.width));
+        let vh_vp = vp_rect
+            .map(|r| r[3] as f32)
+            .filter(|&h| h > 0.)
+            .unwrap_or_else(|| {
+                let chrome_h = if fullscreen {
+                    0.
+                } else {
+                    let tb = if self.effective_hide_titlebar() {
+                        0.
+                    } else {
+                        f32::from(t.titlebar_h)
+                    };
+                    let dk = if floating_dock {
+                        0.
+                    } else {
+                        f32::from(t.dock_h)
+                    };
+                    tb + dk
+                };
+                (f32::from(win_sz.height) - chrome_h).max(0.)
+            });
+        let pop_w = base_pop_w.min((vw_vp - 16.).max(140.));
+        let margin_v = if is_top_anchored {
+            if fullscreen {
+                FLOAT_GAP
+            } else if self.effective_hide_titlebar() {
+                f32::from(t.titlebar_h) + 6.
+            } else {
+                8.
+            }
+        } else if floating_dock {
+            f32::from(t.dock_h) + 8.
+        } else {
+            8.
+        };
+        let max_h = base_max_h.min((vh_vp - margin_v - 8.).max(96.));
+
         let anchor = if is_top_anchored && fullscreen {
             None
         } else {
@@ -106,26 +149,14 @@ impl IrisWindow {
             .child(content);
 
         if is_top_anchored {
-            let top = if fullscreen {
-                FLOAT_GAP
-            } else if self.effective_hide_titlebar() {
-                f32::from(t.titlebar_h) + 6.
-            } else {
-                8.
-            };
-            base = base.top(px(top));
+            base = base.top(px(margin_v));
             if let Some(left) = left_px {
                 base.left(px(left))
             } else {
                 base.right(px(if fullscreen { FLOAT_GAP } else { 12. }))
             }
         } else {
-            let bottom = if floating_dock {
-                f32::from(t.dock_h) + 8.
-            } else {
-                8.
-            };
-            base = base.bottom(px(bottom));
+            base = base.bottom(px(margin_v));
             if let Some(left) = left_px {
                 base.left(px(left))
             } else {
@@ -164,10 +195,22 @@ impl IrisWindow {
 
         div()
             .w_full()
+            .flex_1()
+            .min_h(px(0.))
             .flex()
             .flex_col()
             .child(popover_header("播放速度", self.key_hint("speed_up"), t))
-            .child(div().py(px(4.)).flex().flex_col().children(rows))
+            .child(
+                div()
+                    .id("speed-list")
+                    .flex_1()
+                    .min_h(px(0.))
+                    .overflow_y_scroll()
+                    .py(px(4.))
+                    .flex()
+                    .flex_col()
+                    .children(rows),
+            )
     }
 
     fn render_variants_popover(&self, t: ThemeTokens, cx: &mut Context<Self>) -> impl IntoElement {
@@ -216,12 +259,16 @@ impl IrisWindow {
 
         div()
             .w_full()
+            .flex_1()
+            .min_h(px(0.))
             .flex()
             .flex_col()
             .child(popover_header("清晰度与线路", None, t))
             .child(
                 div()
                     .id("variants-list")
+                    .flex_1()
+                    .min_h(px(0.))
                     .max_h(px(240.))
                     .overflow_y_scroll()
                     .py(px(4.))

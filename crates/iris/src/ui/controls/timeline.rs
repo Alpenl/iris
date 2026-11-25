@@ -1,4 +1,4 @@
-//! 60fps scrubbable timeline: live stream indicator, buffered segment,
+//! Scrubbable timeline: live stream indicator, buffered segment,
 //! chapter tick marks, and hover timestamp/chapter preview bubble.
 
 use std::time::Instant;
@@ -89,6 +89,21 @@ impl IrisWindow {
         let active = self.chrome.scrub.timeline_hover || self.chrome.scrub.seeking;
         let track = if active { 4. } else { 2. };
 
+        let ab_marks: Vec<AnyElement> = [state.ab_start, state.ab_end]
+            .into_iter()
+            .flatten()
+            .filter(|time| duration > 0. && *time <= duration)
+            .map(|time| {
+                div()
+                    .absolute()
+                    .top(px(SEAM_ABOVE - 3.))
+                    .left(relative((time / duration) as f32))
+                    .w(px(3.))
+                    .h(px(track + 6.))
+                    .bg(t.text)
+                    .into_any_element()
+            })
+            .collect();
         let chapter_marks: Vec<AnyElement> = if duration > 0. {
             state
                 .chapters
@@ -110,6 +125,26 @@ impl IrisWindow {
             Vec::new()
         };
 
+        let annotation_marks: Vec<AnyElement> = session
+            .current_media_uri()
+            .filter(|_| session.may_share_current_identity() && duration > 0.)
+            .and_then(|uri| self.store.annotations(&uri))
+            .into_iter()
+            .flat_map(|a| a.markers.values())
+            .filter(|m| m.position_ms.0 as f64 / 1000. <= duration)
+            .map(|marker| {
+                div()
+                    .absolute()
+                    .top(px(SEAM_ABOVE - 2.))
+                    .left(relative(
+                        (marker.position_ms.0 as f64 / 1000. / duration) as f32,
+                    ))
+                    .w(px(2.))
+                    .h(px(track + 4.))
+                    .bg(t.accent)
+                    .into_any_element()
+            })
+            .collect();
         let label = active
             .then(|| {
                 let b = self.chrome.probes.progress_bounds.get()?;
@@ -182,6 +217,7 @@ impl IrisWindow {
                     }
                     this.chrome.scrub.seek_preview_timeout = None;
                     this.chrome.scrub.seeking = true;
+                    this.chrome.scrub.seek_dragged = false;
                     this.chrome.scrub.last_seek_drag = Instant::now();
                     this.update_seek_preview(ev.position.x);
                     this.seek_to_x(ev.position.x, true);
@@ -224,6 +260,9 @@ impl IrisWindow {
                     .bg(t.accent),
             )
             .children(chapter_marks)
+            .children(self.plugin_timeline_ranges(duration, t, cx))
+            .children(annotation_marks)
+            .children(ab_marks)
             .child(
                 div()
                     .absolute()

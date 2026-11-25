@@ -456,10 +456,16 @@ impl Settings {
         }
         text.push_str(&format!("remember_speed = {}\n", self.remember_speed));
         text.push_str(&format!("on_eof = {on_eof}\n"));
-        text.push_str(&format!(
-            "seek_step = {:.0}\n",
-            self.seek_step.clamp(1., 60.)
-        ));
+        let step = if self.seek_step.is_finite() {
+            (self.seek_step.clamp(1., 60.) * 100.).round() / 100.
+        } else {
+            5.
+        };
+        if step.fract() == 0. {
+            text.push_str(&format!("seek_step = {step:.0}\n"));
+        } else {
+            text.push_str(&format!("seek_step = {step}\n"));
+        }
         text.push_str(&format!("hwdec = {hwdec}\n"));
         text.push_str(&format!("resume_playback = {}\n", self.resume_playback));
         text.push_str(&format!("sub_lang = {sub_lang}\n"));

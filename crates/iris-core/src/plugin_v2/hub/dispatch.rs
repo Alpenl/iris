@@ -1,0 +1,619 @@
+use super::jobs::{Work, guarded};
+use super::worker::{Window, Worker};
+use super::*;
+use iris_api::v2::{HostCommand, Role};
+
+impl Worker {
+    pub fn command(&mut self, command: Command) {
+        if self.shutdown {
+            return;
+        }
+        match command {
+            Command::Snapshot { window, snapshot } => {
+                if let Some(window) = self.windows.get_mut(&window) {
+                    window.snapshot = Some(snapshot);
+                }
+            }
+            Command::Open { inbox, snapshot } => {
+                if inbox.closed.load(Ordering::Acquire) {
+                    return;
+                }
+                let generation = inbox.generation();
+                self.windows.insert(
+                    inbox.id,
+                    Window {
+                        inbox,
+                        snapshot,
+                        generation,
+                    },
+                );
+                self.dirty = true;
+            }
+            Command::Advance { window, generation } => {
+                let Some(state) = self.windows.get_mut(&window) else {
+                    return;
+                };
+                state.generation = generation;
+                let mut failed = Vec::new();
+                for (id, plugin) in &mut self.plugins {
+                    if plugin.attached.contains(&window)
+                        && let Some(control) = &mut plugin.control
+                    {
+                        match control
+                            .advance_window(window, generation)
+                            .and_then(|_| control.window_access(window))
+                        {
+                            Ok(access) => {
+                                state
+                                    .inbox
+                                    .access
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .insert(access.owner.clone(), access);
+                            }
+                            Err(error) => failed.push((id.clone(), error)),
+                        }
+                    }
+                }
+                for (id, error) in failed {
+                    self.fail_plugin(&id, error);
+                }
+                if let Some(state) = self.windows.get(&window) {
+                    state.inbox.notify();
+                }
+            }
+            Command::Send {
+                window,
+                plugin,
+                event,
+                generation,
+                request,
+            } => {
+                let request_id = request.as_ref().map(|r| r.id);
+                let result = self.send(window, &plugin, event, generation, request.as_ref());
+                if let Err(error) = result {
+                    let was_cancelled = request.as_ref().is_some_and(|r| r.cancel.is_cancelled());
+                    if let Some(request) = request {
+                        request.cancel.cancel();
+                        if let Some(window) = self.windows.get(&window) {
+                            let _ = window
+                                .inbox
+                                .requests
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .fail(&request.owner, request.id, request.generation);
+                        }
+                    }
+                    // Stale/cancelled non-request events (e.g. a Tick or StateChanged
+                    // racing with Advance) are expected and should not toast errors.
+                    if !(matches!(error, ErrorCode::StaleHandle | ErrorCode::Cancelled)
+                        && (request_id.is_none() || was_cancelled))
+                    {
+                        self.error(window, Some(plugin), request_id, error, None);
+                    }
+                }
+            }
+            Command::Enabled { plugin, enabled } => {
+                if let Some(state) = self.plugins.get_mut(&plugin) {
+                    state.enabled = enabled;
+                    state.restart = enabled;
+                    if enabled {
+                        state.failure = None;
+                    }
+                    if !enabled {
+                        state.stop();
+                        self.config.disabled.insert(plugin);
+                    } else {
+                        self.config.disabled.remove(&plugin);
+                    }
+                    self.dirty = true;
+                }
+            }
+            Command::Uninstall {
+                window,
+                plugin,
+                keep_data,
+            } => {
+                if self.config.installer.is_bundled(&plugin) {
+                    self.error(
+                        window,
+                        Some(plugin),
+                        None,
+                        ErrorCode::Denied,
+                        Some("官方内置插件不可删除".into()),
+                    );
+                    return;
+                }
+                if self.uninstalling.contains(&plugin) {
+                    return;
+                }
+                if let Some(state) = self.plugins.get_mut(&plugin) {
+                    state.stop();
+                    state.enabled = false;
+                    state.restart = false;
+                    state.status = PluginStatus::Stopping;
+                    if let Ok(record) = &state.record {
+                        for win in self.windows.values() {
+                            win.inbox
+                                .requests
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .cancel_owner(&record.installation_id);
+                        }
+                    }
+                    self.dirty = true;
+                }
+                self.config.disabled.remove(&plugin);
+                let installer = self.config.installer.clone();
+                let setup = self.config.runtime.clone();
+                let target = plugin.clone();
+                match self.submit(false, "uninstall", move || {
+                    let result = guarded(|| {
+                        let removed = installer.uninstall(&target, keep_data)?;
+                        if !keep_data && let Some(installed) = removed {
+                            super::jobs::remove_installation_data(
+                                &setup,
+                                &installed.installation_id,
+                            );
+                        }
+                        Ok(())
+                    });
+                    Work::Uninstalled {
+                        window,
+                        plugin: target,
+                        result,
+                    }
+                }) {
+                    Ok(()) => {
+                        self.uninstalling.insert(plugin);
+                    }
+                    Err(error) => {
+                        self.error(window, Some(plugin), None, error, None);
+                    }
+                }
+            }
+            Command::Reload => {
+                for plugin in self.plugins.values_mut() {
+                    plugin.stop();
+                    plugin.restart = plugin.enabled;
+                }
+                self.rescan = true;
+                self.dirty = true;
+            }
+            Command::Review { window, id, path } => {
+                if let Err(error) = self.review(window, id, path) {
+                    self.error(window, None, Some(id), error, None);
+                }
+            }
+            Command::Approve {
+                window,
+                id,
+                grants,
+                keep_identity,
+            } => {
+                let result = self.approve(window, id, grants, keep_identity);
+                if let Err(error) = result {
+                    self.error(window, None, Some(id), error, None);
+                }
+            }
+            Command::DismissReview { window, id } => {
+                if self.reviews.get(&id).is_some_and(|r| r.window == window)
+                    && let Some(review) = self.reviews.remove(&id)
+                {
+                    if review.review.is_some() {
+                        self.review_slots.remove(&id);
+                    }
+                    review.cancel.store(true, Ordering::Release);
+                }
+            }
+            Command::ConfirmOrigin {
+                window,
+                id,
+                allow,
+                insecure_auth,
+            } => {
+                if let Err(error) = self.confirm_origin(window, id, allow, insecure_auth) {
+                    self.error(window, None, Some(id), error, None);
+                }
+            }
+        }
+    }
+    fn send(
+        &mut self,
+        window: Id,
+        plugin: &str,
+        event: HostEvent<serde_json::Value>,
+        generation: Generation,
+        request: Option<&Arc<RequestTicket>>,
+    ) -> Result<(), ErrorCode> {
+        let state = self
+            .windows
+            .get_mut(&window)
+            .ok_or(ErrorCode::StaleHandle)?;
+        if generation != state.generation
+            || generation != state.inbox.generation()
+            || state.inbox.closed.load(Ordering::Acquire)
+        {
+            return Err(ErrorCode::StaleHandle);
+        }
+        if let HostEvent::MediaOpened { snapshot, .. } | HostEvent::StateChanged { snapshot, .. } =
+            &event
+        {
+            state.snapshot = Some(snapshot.clone());
+        }
+        let plugin = self.plugins.get(plugin).ok_or(ErrorCode::StaleHandle)?;
+        if !plugin.enabled || !plugin.attached.contains(&window) {
+            return Err(ErrorCode::Backpressure);
+        }
+        let control = plugin.control.as_ref().ok_or(ErrorCode::Backpressure)?;
+        if let Some(request) = request {
+            if request.owner != control.installed().installation_id || request.cancel.is_cancelled()
+            {
+                return Err(ErrorCode::StaleHandle);
+            }
+            control.send_cancellable(window, event, request.cancel.clone())
+        } else {
+            control.send(window, event)
+        }
+    }
+    fn approve(
+        &mut self,
+        window: Id,
+        id: Id,
+        grants: BTreeSet<Capability>,
+        keep: bool,
+    ) -> Result<(), ErrorCode> {
+        let pending = self.reviews.get(&id).ok_or(ErrorCode::StaleHandle)?;
+        if pending.window != window {
+            return Err(ErrorCode::Denied);
+        }
+        if pending.expires <= Instant::now() || !self.windows.contains_key(&window) {
+            return Err(ErrorCode::StaleHandle);
+        }
+        if pending.review.is_none() {
+            return Err(ErrorCode::Backpressure);
+        }
+        let lease = self.reserve_job_lease()?;
+        let review = self.reviews.remove(&id).unwrap().review.unwrap();
+        let mut installer = self.config.installer.clone();
+        let setup = self.config.runtime.clone();
+        let result = self.submit_reserved(false, "install", lease, move || Work::Installed {
+            window,
+            id,
+            result: guarded(|| {
+                let (installed, superseded_archived) =
+                    review.approve_with_cleanup(&mut installer, grants, keep)?;
+                if let Some(old_id) = superseded_archived {
+                    super::jobs::remove_installation_data(&setup, &old_id);
+                }
+                Ok(installed)
+            }),
+        });
+        if result.is_err() {
+            self.review_slots.remove(&id);
+        }
+        result
+    }
+    pub fn cancellations(&mut self) {
+        let mut failed = Vec::new();
+        for (window_id, window) in &self.windows {
+            failed.extend(std::mem::take(
+                &mut *window
+                    .inbox
+                    .faults
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()),
+            ));
+            let all = std::mem::take(
+                &mut *window
+                    .inbox
+                    .cancelled
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()),
+            );
+            for (plugin_id, ids) in all {
+                let Some(plugin) = self.plugins.get(&plugin_id) else {
+                    continue;
+                };
+                let Some(control) = &plugin.control else {
+                    continue;
+                };
+                if !plugin.attached.contains(window_id) {
+                    continue;
+                }
+                for id in ids {
+                    let result = if id == Id(0) {
+                        Err(ErrorCode::Backpressure)
+                    } else {
+                        control.send(*window_id, HostEvent::RequestCancelled { request_id: id })
+                    };
+                    if let Err(error) = result {
+                        failed.push((plugin_id.clone(), error));
+                        break;
+                    }
+                }
+            }
+        }
+        for (id, error) in failed {
+            self.fail_plugin(&id, error);
+        }
+    }
+    pub fn deliver(&mut self, plugin: &str, update: Update) {
+        if update.is_cancelled() {
+            return;
+        }
+        let Some(binding) = self.plugins[plugin].binding.clone().filter(|b| b.is_live()) else {
+            return;
+        };
+        let update = Arc::new(update);
+        let targets = update
+            .window
+            .map_or_else(|| self.windows.keys().copied().collect(), |w| vec![w]);
+        for window in targets {
+            let Some(state) = self.windows.get(&window) else {
+                continue;
+            };
+            let current_gen = state.generation;
+            if update.window.is_some() && update.generation.context != current_gen.context {
+                continue;
+            }
+            let same_media = update.window.is_none() || update.generation == current_gen;
+            let mut indices = Vec::new();
+            for (index, command) in update.commands.iter().enumerate() {
+                let result = match command {
+                    HostCommand::SetSources { .. } => Ok(()), // shared catalog owns this global slot
+                    HostCommand::RequestOrigin { request_id, origin } => {
+                        if !same_media {
+                            Err(ErrorCode::StaleHandle)
+                        } else {
+                            self.request_origin(
+                                window,
+                                binding.clone(),
+                                update.generation,
+                                *request_id,
+                                origin,
+                            )
+                        }
+                    }
+                    HostCommand::ProvideSourcePage { request_id, page } => self.source_page(
+                        window,
+                        binding.clone(),
+                        update.generation,
+                        *request_id,
+                        (**page).clone(),
+                    ),
+                    HostCommand::ResolveStream { request_id, media } => {
+                        if !same_media {
+                            Err(ErrorCode::StaleHandle)
+                        } else {
+                            self.playback(
+                                window,
+                                binding.clone(),
+                                update.clone(),
+                                *request_id,
+                                media,
+                            )
+                        }
+                    }
+                    HostCommand::SourceError {
+                        request_id,
+                        message,
+                    } => {
+                        let state = &self.windows[&window];
+                        let result = state
+                            .inbox
+                            .requests
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .fail(
+                                &binding.installed.installation_id,
+                                *request_id,
+                                update.generation.context,
+                            );
+                        if result.is_ok() {
+                            self.error(
+                                window,
+                                Some(plugin.into()),
+                                Some(*request_id),
+                                ErrorCode::IoError,
+                                Some(message.clone()),
+                            );
+                        }
+                        result
+                    }
+                    _ => {
+                        if same_media || is_slot_command(command) {
+                            indices.push(index);
+                        }
+                        Ok(())
+                    }
+                };
+                if let Err(error) = result {
+                    if matches!(
+                        error,
+                        ErrorCode::Denied | ErrorCode::InvalidArgument | ErrorCode::BadState
+                    ) {
+                        self.fail_plugin(plugin, error);
+                        return;
+                    }
+                    // Late/cancelled source responses are discarded, not allowed
+                    // to replace a newer view or to start unsolicited playback.
+                    if !matches!(error, ErrorCode::StaleHandle | ErrorCode::Cancelled) {
+                        if let HostCommand::RequestOrigin { request_id, origin } = command {
+                            let notified = self
+                                .plugins
+                                .get(plugin)
+                                .and_then(|p| p.control.as_ref())
+                                .is_some_and(|control| {
+                                    control
+                                        .send(
+                                            window,
+                                            HostEvent::OriginGranted {
+                                                request_id: *request_id,
+                                                origin: origin.clone(),
+                                                grant: None,
+                                                insecure_auth: false,
+                                            },
+                                        )
+                                        .is_ok()
+                                });
+                            self.error(
+                                window,
+                                Some(plugin.into()),
+                                (!notified).then_some(*request_id),
+                                error,
+                                None,
+                            );
+                        } else {
+                            let request = match command {
+                                HostCommand::ProvideSourcePage { request_id, .. }
+                                | HostCommand::ResolveStream { request_id, .. } => {
+                                    Some(*request_id)
+                                }
+                                _ => None,
+                            };
+                            self.error(window, Some(plugin.into()), request, error, None);
+                        }
+                    }
+                }
+            }
+            if !indices.is_empty()
+                && self.windows[&window]
+                    .inbox
+                    .push(Notice::Commands(Commands {
+                        binding: binding.clone(),
+                        update: update.clone(),
+                        indices,
+                    }))
+                    .is_err()
+            {
+                self.fail_plugin(plugin, ErrorCode::Backpressure);
+                return;
+            }
+        }
+    }
+    fn source_page(
+        &self,
+        window: Id,
+        binding: Arc<Binding>,
+        generation: Generation,
+        request: Id,
+        page: iris_api::v2::source::SourcePage,
+    ) -> Result<(), ErrorCode> {
+        let inbox = &self.windows[&window].inbox;
+        let page = inbox
+            .requests
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .accept_page(
+                &binding.installed.installation_id,
+                request,
+                generation.context,
+                page,
+            )?;
+        inbox.push(Notice::Page {
+            binding,
+            generation,
+            request,
+            page: Arc::new(page),
+        })
+    }
+    fn playback(
+        &self,
+        window: Id,
+        binding: Arc<Binding>,
+        update: Arc<Update>,
+        request: Id,
+        media: &iris_api::v2::source::ResolvedMedia,
+    ) -> Result<(), ErrorCode> {
+        let inbox = self.windows[&window].inbox.clone();
+        let owner = binding.installed.installation_id.clone();
+        let ticket = inbox
+            .requests
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take(&owner, request, update.generation.context)?;
+        if !matches!(
+            ticket.target,
+            super::super::requests::RequestTarget::Resolve { .. }
+                | super::super::requests::RequestTarget::Url { .. }
+        ) {
+            return Err(ErrorCode::Denied);
+        }
+        let control = self.plugins[&binding.installed.plugin_id]
+            .control
+            .as_ref()
+            .ok_or(ErrorCode::StaleHandle)?;
+        let permit = control.playback_permit(window, update.generation)?;
+        let memory = self.shared.ledger.reserve(
+            &owner,
+            &[(Resource::HostBytes, 2 << 20), (Resource::Task, 1)],
+        )?;
+        let media = media.clone();
+        let shared = Arc::downgrade(&self.shared);
+        self.config.runtime.resources.io.submit(
+            Role::Stream,
+            &owner,
+            Box::new(move || {
+                let result =
+                    guarded(|| permit.prepare(&media.stream, &update.blobs, &ticket.cancel));
+                if !binding.is_live()
+                    || ticket.cancel.is_cancelled()
+                    || inbox.generation() != update.generation
+                {
+                    return;
+                }
+                let notice = match result {
+                    Ok(playback) => Notice::Playback {
+                        binding,
+                        generation: update.generation,
+                        ticket,
+                        playback,
+                        playlist: media.playlist,
+                        _memory: memory,
+                    },
+                    Err(code) => Notice::Error {
+                        plugin: Some(binding.installed.plugin_id.clone()),
+                        request: Some(request),
+                        code,
+                        message: None,
+                    },
+                };
+                let id = binding_id(&notice);
+                if inbox.push(notice) == Err(ErrorCode::Backpressure)
+                    && let Some(id) = id
+                {
+                    inbox
+                        .faults
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(id, ErrorCode::Backpressure);
+                    if let Some(shared) = shared.upgrade() {
+                        shared.signal();
+                    }
+                }
+            }),
+        )
+    }
+}
+
+fn binding_id(notice: &Notice) -> Option<String> {
+    match notice {
+        Notice::Playback { binding, .. } => Some(binding.installed.plugin_id.clone()),
+        Notice::Error { plugin, .. } => plugin.clone(),
+        _ => None,
+    }
+}
+
+pub(super) fn is_slot_command(command: &HostCommand) -> bool {
+    matches!(
+        command,
+        HostCommand::SetSidebar { .. }
+            | HostCommand::SetStatus { .. }
+            | HostCommand::SetToolbar { .. }
+            | HostCommand::SetOverlay { .. }
+            | HostCommand::OpenModal { .. }
+            | HostCommand::CloseModal { .. }
+            | HostCommand::SetTheme { .. }
+    )
+}

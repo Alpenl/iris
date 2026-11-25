@@ -4,6 +4,7 @@ use gpui::{Context, Window};
 use iris_core::player::{self, Command, TrackKind};
 
 use super::IrisWindow;
+use super::actions::{ClearAbLoop, CycleAbLoop};
 use super::actions::{
     CycleAudio, CycleSub, FrameBack, FrameForward, NextChapter, OpenNextMedia, OpenPreviousMedia,
     PrevChapter, ResetSpeed, SeekBackwardExact, SeekBackwardLarge, SeekForwardExact,
@@ -13,6 +14,24 @@ use super::actions::{
 };
 
 impl IrisWindow {
+    pub(super) fn cycle_ab_loop(
+        &mut self,
+        _: &CycleAbLoop,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Native mpv owns both endpoints and looping. State observations drive
+        // the readout; a UI timer never performs the repeat seek.
+        self.command(Command::CycleAbLoop, cx);
+    }
+    pub(super) fn clear_ab_loop(
+        &mut self,
+        _: &ClearAbLoop,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.command(Command::ClearAbLoop, cx);
+    }
     pub(super) fn toggle_pause(&mut self, _: &TogglePause, _: &mut Window, cx: &mut Context<Self>) {
         let st = self.active().session.state();
         let next_paused = !st.paused && !st.ended;

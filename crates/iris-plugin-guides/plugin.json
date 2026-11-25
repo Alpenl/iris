@@ -1,0 +1,46 @@
+{
+  "id": "iris.guides",
+  "name": "构图辅助线",
+  "version": "0.0.1",
+  "author": "Iris",
+  "description": "三分线、黄金分割、中心十字、电影画幅与安全区参考线",
+  "protocol": 2,
+  "abi": 2,
+  "entry": "plugin.wasm",
+  "permissions": [
+    "ui_overlay",
+    "ui_status",
+    "ui_sidebar",
+    "notifications"
+  ],
+  "commands": [
+    {
+      "id": "cycle",
+      "title": "构图：切换辅助线模式"
+    },
+    {
+      "id": "thirds",
+      "title": "构图：显示三分线"
+    },
+    {
+      "id": "golden",
+      "title": "构图：显示黄金分割线"
+    },
+    {
+      "id": "cross",
+      "title": "构图：显示中心十字"
+    },
+    {
+      "id": "cinema",
+      "title": "构图：显示 2.39:1 参考框"
+    },
+    {
+      "id": "safe",
+      "title": "构图：显示安全区"
+    },
+    {
+      "id": "off",
+      "title": "构图：清除辅助线"
+    }
+  ]
+}

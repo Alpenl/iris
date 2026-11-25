@@ -280,9 +280,9 @@ impl QueueItem {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlayQueue {
     items: Vec<QueueItem>,
-    /// Insertion point left by the most recent removal, for a still-playing item.
+    /// Insertion points left by recent removals, preserving the active item's anchor across consecutive deletes.
     #[serde(skip)]
-    removed: Option<(MediaUri, usize)>,
+    removed: Vec<(MediaUri, usize)>,
 }
 
 impl PlayQueue {
@@ -364,18 +364,27 @@ impl PlayQueue {
             return None;
         }
         let item = self.items.remove(index);
-        self.removed = Some((item.uri.clone(), index));
+        for (_, saved_ix) in &mut self.removed {
+            if index < *saved_ix {
+                *saved_ix -= 1;
+            }
+        }
+        self.removed.retain(|(u, _)| u != &item.uri);
+        if self.removed.len() >= 16 {
+            self.removed.remove(0);
+        }
+        self.removed.push((item.uri.clone(), index));
         Some(item)
     }
 
     pub fn clear(&mut self) {
         self.items.clear();
-        self.removed = None;
+        self.removed.clear();
     }
 
     pub fn dedup(&mut self) {
         dedup_suffix(&mut self.items, 0, |item| &item.uri);
-        self.removed = None;
+        self.removed.clear();
     }
 
     pub fn sort_by_title(&mut self, ascending: bool) {
@@ -383,7 +392,7 @@ impl PlayQueue {
             let ord = natural_cmp(&a.title, &b.title);
             if ascending { ord } else { ord.reverse() }
         });
-        self.removed = None;
+        self.removed.clear();
     }
 
     /// Steps relative to the current item or to the gap left by its removal.
@@ -397,9 +406,7 @@ impl PlayQueue {
             (index, delta)
         } else if delta == 0 {
             return None;
-        } else if let Some((uri, index)) = &self.removed
-            && uri == current
-        {
+        } else if let Some((_, index)) = self.removed.iter().rfind(|(uri, _)| uri == current) {
             (*index, delta - isize::from(delta > 0))
         } else if delta < 0 {
             return self.items.last();

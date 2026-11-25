@@ -37,7 +37,7 @@ pub enum MediaKind {
     Audio,
 }
 
-/// Read-only playback state snapshot delivered to plugins with [`crate::Permission::ReadState`].
+/// Read-only playback state snapshot delivered to plugins with [`crate::v2::Capability::ReadState`].
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct PlaybackSnapshot {
     /// Canonical media URI (`file://...`, `webdav://...`, `plugin://...`, or `https://...`).

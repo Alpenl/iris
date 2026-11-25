@@ -1,0 +1,19 @@
+{
+  "id": "example.virtual-audio",
+  "name": "虚拟音频数据源",
+  "version": "0.0.1",
+  "protocol": 2,
+  "abi": 2,
+  "entry": "plugin.wasm",
+  "description": "独立 StreamStore 提供三秒 PCM 音频，演示 read_at、短读与 EOF；不联网。",
+  "permissions": [
+    "media_source"
+  ],
+  "sources": [
+    {
+      "id": "audio",
+      "name": "虚拟 PCM 音频",
+      "supports_search": true
+    }
+  ]
+}

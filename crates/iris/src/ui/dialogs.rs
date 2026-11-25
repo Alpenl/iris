@@ -33,23 +33,33 @@ impl IrisWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.plugins.active_modal().is_some() {
+        if self.has_host_consent() || self.plugins.active_modal().is_some() {
             return;
         }
         match &dialog {
             BuiltinDialog::OpenUrl => {
                 self.set_form_value("url", "");
+                self.set_form_value("url-resolver", "auto");
                 self.text_inputs.active_form_key = Some("url".into());
                 self.text_inputs.form_focus.focus(window);
+                self.overlays.open_dialog(dialog);
             }
             BuiltinDialog::SavePreset { .. } => {
                 self.set_form_value("preset_name", "");
                 self.set_form_value("preset_desc", "");
                 self.text_inputs.active_form_key = Some("preset_name".into());
                 self.text_inputs.form_focus.focus(window);
+                self.overlays.open_dialog(dialog);
+            }
+            BuiltinDialog::ConfirmUninstallPlugin { .. } => {
+                self.overlays.popover = None;
+                self.overlays.context_menu = None;
+                self.overlays.palette_open = false;
+                self.text_inputs.active_form_key = None;
+                self.focus.focus(window);
+                self.overlays.dialog = Some(dialog);
             }
         }
-        self.overlays.open_dialog(dialog);
         cx.notify();
     }
 
@@ -115,10 +125,13 @@ impl IrisWindow {
                         this.show_toast("请输入网络流或媒体地址", cx);
                         return;
                     }
+                    let resolver = this.form_value("url-resolver").to_owned();
+                    if !this.open_user_url(&url, &resolver, cx) {
+                        return;
+                    }
                     this.overlays.dialog = None;
                     this.text_inputs.active_form_key = None;
                     this.focus.focus(w);
-                    this.open_direct_stream_url(&url, None, cx);
                 });
                 let enter_cb: FormEnterCallback = submit.clone();
                 let inp = self.render_text_field(
@@ -149,6 +162,7 @@ impl IrisWindow {
                             .child("支持 HTTP / HTTPS 视频、HLS (.m3u8)、音频与远程图片直链"),
                     )
                     .child(inp)
+                    .child(self.render_url_resolver_choice(cx))
                     .into_any_element();
                 ("打开网络流 / 远程媒体", "打开播放", content, submit)
             }
@@ -280,6 +294,60 @@ impl IrisWindow {
                     )
                     .into_any_element();
                 ("保存当前状态为工作区预设", "保存预设", content, submit)
+            }
+            BuiltinDialog::ConfirmUninstallPlugin {
+                plugin_id,
+                plugin_name,
+                keep_data,
+            } => {
+                let target_id = plugin_id.clone();
+                let pid_toggle = plugin_id.clone();
+                let name_toggle = plugin_name.clone();
+                let submit: ModalCallback = Rc::new(move |this, w, cx| {
+                    this.overlays.dialog = None;
+                    this.text_inputs.active_form_key = None;
+                    this.focus.focus(w);
+                    this.uninstall_plugin(&target_id, keep_data, cx);
+                });
+                let desc = if keep_data {
+                    "将立即停止并移除该插件包；登录凭据与偏好设置将保留在本地，重新安装插件包时可由你选择是否恢复。"
+                } else {
+                    "将立即停止该插件并彻底清除其安装包、登录凭据、本地状态与网络授权记录。"
+                };
+                let content = div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(8.))
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .text_color(t.text)
+                            .child(format!("确定要删除插件「{plugin_name}」吗？")),
+                    )
+                    .child(
+                        div()
+                            .font_family(crate::theme::FONT_MONO)
+                            .text_size(px(11.))
+                            .text_color(t.text_muted)
+                            .child(plugin_id),
+                    )
+                    .child(checkbox(
+                        "uninstall-keep-data",
+                        keep_data,
+                        "保留登录凭据与偏好设置（供后续重装恢复）",
+                        t,
+                        cx.listener(move |this, _, _, cx| {
+                            this.overlays.dialog = Some(BuiltinDialog::ConfirmUninstallPlugin {
+                                plugin_id: pid_toggle.clone(),
+                                plugin_name: name_toggle.clone(),
+                                keep_data: !keep_data,
+                            });
+                            cx.notify();
+                        }),
+                    ))
+                    .child(div().text_size(px(11.)).text_color(t.text_dim).child(desc))
+                    .into_any_element();
+                ("删除插件", "确认删除", content, submit)
             }
         };
 

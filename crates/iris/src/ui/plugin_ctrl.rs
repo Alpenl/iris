@@ -2,21 +2,46 @@
 //! validation & focus synchronization, and `HostCommand` execution.
 
 use gpui::{Context, Window};
-use iris_api::{HostCommand, HostEvent, PlaybackSnapshot, SourcePage};
+use iris_api::v2::{HostCommand, HostEvent, source::PlaybackSnapshot};
 use iris_core::player::Command;
-use iris_core::plugin::{self, PollReport};
+use iris_core::plugin_v2::ui::{self as plugin, PollReport};
 use iris_core::preset::SidebarMode;
 
 use super::IrisWindow;
-use super::state::{ActiveSource, SourceOperation};
+use super::state::{ActiveSource, SourceErrorKind};
 
 impl IrisWindow {
+    pub(super) fn has_active_modal(&self) -> bool {
+        self.has_host_consent()
+            || self.overlays.settings_open
+            || self.overlays.palette_open
+            || self.overlays.dialog.is_some()
+            || self.plugins.active_modal().is_some()
+    }
+
+    pub(super) fn reconcile_active_source(&mut self) {
+        let ActiveSource::Plugin(ps) = &self.catalog.active_source else {
+            return;
+        };
+        let still_active = self
+            .plugins
+            .media_sources()
+            .into_iter()
+            .any(|(pid, _, src)| pid == ps.plugin_id && src.id == ps.source_id);
+        if !still_active {
+            let (pid, sid) = (ps.plugin_id.clone(), ps.source_id.clone());
+            self.cancel_plugin_requests(Some(&pid), Some(&sid));
+            self.catalog.active_source = ActiveSource::Local;
+            self.rebuild_directory_rows();
+        }
+    }
+
     pub(super) fn plugin_snapshot(&self) -> PlaybackSnapshot {
         let session = &self.active().session;
         let fav = session
             .current_media_uri()
             .is_some_and(|u| self.store.is_favorite(&u));
-        plugin::snapshot_from_session(session, fav)
+        plugin::snapshot_from_session(session, fav, self.plugin_media_id())
     }
 
     pub(super) fn sidebar_is_visible(&self) -> bool {
@@ -31,17 +56,21 @@ impl IrisWindow {
     /// newly opened modals and only notifying GPUI when `PollReport::should_notify_ui` holds.
     pub(super) fn poll_plugins(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let report = self.plugins.poll();
+        self.bind_plugin_current_file();
+        self.reconcile_plugin_lifetimes(cx);
         if self.apply_poll_report(report, Some(window), cx) {
             cx.notify();
         }
+        self.run_deferred_plugin_commands(window, cx);
     }
 
     pub(super) fn broadcast_plugin_event(
         &mut self,
-        event: HostEvent,
+        event: plugin::Event,
         window: Option<&mut Window>,
         cx: &mut Context<Self>,
     ) -> bool {
+        self.bind_plugin_current_file();
         let report = self.plugins.broadcast(&event);
         self.apply_poll_report(report, window, cx)
     }
@@ -60,17 +89,28 @@ impl IrisWindow {
             self.sidebar_is_visible() && self.catalog.sidebar_mode == SidebarMode::Plugins,
         );
         let PollReport {
-            commands, dirty, ..
+            actions,
+            notices,
+            dirty,
+            ..
         } = report;
 
-        for (pid, cmd) in commands {
-            self.execute_one_host_command(&pid, cmd, cx);
+        for action in actions {
+            if action.is_live(self.plugins.generation()) {
+                self.execute_one_host_command(&action, cx);
+            }
+        }
+        for notice in notices {
+            self.apply_plugin_notice(notice, cx);
         }
         if dirty.theme {
             self.sync_theme_tokens(cx);
         }
-        if dirty.sources && !self.catalog.active_source.is_local() {
-            self.rebuild_directory_rows();
+        if dirty.sources {
+            self.reconcile_active_source();
+            if !self.catalog.active_source.is_local() {
+                self.rebuild_directory_rows();
+            }
         }
         if dirty.modal {
             self.overlays.submitting_plugin_modal = None;
@@ -79,10 +119,18 @@ impl IrisWindow {
                 self.sync_plugin_modal_focus(window);
             }
         }
+        self.sync_qr_poll_timer(cx);
         should_notify
     }
 
     pub(super) fn sync_plugin_modal_focus(&mut self, window: &mut Window) {
+        if self.has_host_consent() {
+            self.text_inputs.active_form_key = None;
+            if !self.focus.is_focused(window) {
+                self.focus.focus(window);
+            }
+            return;
+        }
         if !std::mem::take(&mut self.overlays.plugin_modal_focus_pending) {
             return;
         }
@@ -105,8 +153,13 @@ impl IrisWindow {
         }
     }
 
-    fn execute_one_host_command(&mut self, pid: &str, cmd: HostCommand, cx: &mut Context<Self>) {
-        match cmd {
+    fn execute_one_host_command(
+        &mut self,
+        action: &iris_core::plugin_v2::ui::Action,
+        cx: &mut Context<Self>,
+    ) {
+        let pid = &action.binding.installed.plugin_id;
+        match action.command().clone() {
             HostCommand::TogglePlayback => self.command(Command::TogglePlayback, cx),
             HostCommand::SeekRelative { seconds } => {
                 self.command(Command::SeekRelative(seconds), cx);
@@ -120,31 +173,26 @@ impl IrisWindow {
             HostCommand::OpenNext => self.step(1, true, cx),
             HostCommand::OpenPrevious => self.step(-1, true, cx),
             HostCommand::ToggleFavorite => {
-                if let Some(uri) = self.active().session.current_media_uri() {
+                if self.active().session.may_share_current_identity()
+                    && let Some(uri) = self.active().session.current_media_uri()
+                {
                     self.store.toggle_favorite(&uri);
                     self.rebuild_directory_rows();
+                    self.scan_visible_favorites(cx);
                 }
             }
             HostCommand::ShowToast { message } => {
                 self.overlays.clear_submitting_for_plugin(pid);
                 self.show_toast(message, cx);
             }
-            HostCommand::ProvideSourcePage { request_id, page } => {
-                self.handle_plugin_source_page(pid, &request_id, *page);
+            HostCommand::SetAbLoop { start, end } => {
+                self.command(Command::SetAbLoop { start, end }, cx)
             }
-            HostCommand::ResolveStream { request_id, stream } => {
-                self.handle_plugin_resolved_stream(pid, request_id, *stream, cx);
-            }
-            HostCommand::SourceError {
-                request_id,
-                message,
-            } => self.handle_source_error(pid, &request_id, message, cx),
+            HostCommand::ClearAbLoop => self.command(Command::ClearAbLoop, cx),
             HostCommand::RefreshSource { source_id } => {
                 self.refresh_plugin_source(pid, &source_id, cx);
             }
-            HostCommand::SetState { .. }
-            | HostCommand::SetSecret { .. }
-            | HostCommand::SetSidebar { .. }
+            HostCommand::SetSidebar { .. }
             | HostCommand::SetStatus { .. }
             | HostCommand::SetOverlay { .. }
             | HostCommand::SetToolbar { .. }
@@ -152,6 +200,7 @@ impl IrisWindow {
             | HostCommand::CloseModal { .. }
             | HostCommand::SetTheme { .. }
             | HostCommand::SetSources { .. } => {}
+            _ => self.apply_plugin_enhancement(action, cx),
         }
     }
 
@@ -162,6 +211,9 @@ impl IrisWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.has_host_consent() {
+            return;
+        }
         let Some((pid, modal)) = self
             .plugins
             .active_modal()
@@ -219,12 +271,13 @@ impl IrisWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.grant_current_annotations(plugin_id, cx);
         let snap = self.plugin_snapshot();
         let report = self.plugins.send_to(
             plugin_id,
             HostEvent::Command {
                 id: command_id.to_string(),
-                snapshot: snap,
+                snapshot: Some(snap),
             },
         );
         self.apply_poll_report(report, Some(window), cx);
@@ -239,13 +292,14 @@ impl IrisWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.grant_current_annotations(plugin_id, cx);
         let snap = self.plugin_snapshot();
         let report = self.plugins.send_to(
             plugin_id,
             HostEvent::Action {
                 id: action_id.to_string(),
                 value,
-                snapshot: snap,
+                snapshot: Some(snap),
             },
         );
         self.apply_poll_report(report, Some(window), cx);
@@ -270,70 +324,69 @@ impl IrisWindow {
     ) {
         self.preset_rt
             .set_plugin_enabled(&mut self.settings, id, enabled);
-        if !enabled && self.catalog.has_remote_work_for(id, None) {
-            self.cancel_remote_requests();
+        if !enabled {
+            self.text_inputs.clear_plugin_sidebar_fields(id);
+            self.cancel_plugin_requests(Some(id), None);
         }
         let snap = self.plugin_snapshot();
         let report = self.plugins.set_enabled_with_snapshot(id, enabled, snap);
         self.apply_poll_report(report, None, cx);
-        if !enabled
-            && matches!(
-                &self.catalog.active_source,
-                ActiveSource::Plugin(ps) if ps.plugin_id == id
-            )
-        {
-            self.catalog.active_source = ActiveSource::Local;
-            self.rebuild_directory_rows();
+        self.reconcile_active_source();
+        cx.notify();
+    }
+
+    pub(super) fn uninstall_plugin(&mut self, id: &str, keep_data: bool, cx: &mut Context<Self>) {
+        if id.to_ascii_lowercase().starts_with("iris.") {
+            self.show_toast("官方内置插件不可删除", cx);
+            return;
         }
+        self.preset_rt
+            .set_plugin_enabled(&mut self.settings, id, true);
+        self.text_inputs.clear_plugin_sidebar_fields(id);
+        self.cancel_plugin_requests(Some(id), None);
+        self.plugins.dismiss_modal(id);
+        if self.settings.theme_id == format!("plugin:{id}") {
+            self.settings.theme_id = "graphite".into();
+            self.persist_user_settings();
+            self.sync_theme_tokens(cx);
+        }
+        if let Some(session) = self.active().session.plugin_session() {
+            let owner_matches = self
+                .plugins
+                .list()
+                .iter()
+                .find(|p| p.id == id)
+                .and_then(|p| p.binding.as_ref())
+                .is_some_and(|b| b.installed.installation_id == session.factory.owner());
+            if owner_matches {
+                let _ = self.active_mut().session.stop();
+                self.active_mut().session.release_scoped();
+            }
+        }
+        let report = self.plugins.uninstall(id, keep_data);
+        self.apply_poll_report(report, None, cx);
+        self.reconcile_active_source();
         cx.notify();
     }
 
     pub(super) fn reload_plugins(&mut self, cx: &mut Context<Self>) {
-        if self.catalog.pending_source.is_some()
-            || self
-                .catalog
-                .remote_load
-                .as_ref()
-                .is_some_and(|load| load.plugin_id.is_some())
-        {
-            self.cancel_remote_requests();
-        }
+        self.cancel_plugin_requests(None, None);
         let snap = self.plugin_snapshot();
         let report = self
             .plugins
             .reload_with_snapshot(&self.settings.disabled_plugins, snap);
         self.apply_poll_report(report, None, cx);
+        let enabled_ids: Vec<String> = self
+            .plugins
+            .list()
+            .iter()
+            .filter(|p| p.enabled)
+            .map(|p| p.id.clone())
+            .collect();
+        self.text_inputs
+            .retain_enabled_sidebar_fields(|pid| enabled_ids.iter().any(|id| id == pid));
+        self.reconcile_active_source();
         self.show_toast("插件列表已重新扫描", cx);
-    }
-
-    pub(super) fn handle_plugin_source_page(
-        &mut self,
-        plugin_id: &str,
-        req_id: &str,
-        page: SourcePage,
-    ) {
-        let Some(append) = self.catalog.take_page(plugin_id, req_id, &page.source_id) else {
-            return;
-        };
-        if let ActiveSource::Plugin(ps) = &mut self.catalog.active_source
-            && ps.plugin_id == plugin_id
-            && ps.source_id == page.source_id
-        {
-            let appending = append && ps.folder_id == page.folder_id;
-            ps.error = None;
-            ps.folder_id = page.folder_id;
-            ps.parent_id = page.parent_id;
-            ps.title = page.title;
-            ps.authenticated = page.authenticated;
-            ps.auth_hint = page.auth_hint;
-            ps.next_page = page.next_page;
-            if appending {
-                ps.entries.extend(page.entries);
-            } else {
-                ps.entries = page.entries;
-            }
-            self.rebuild_directory_rows();
-        }
     }
 
     pub(super) fn handle_source_error(
@@ -343,17 +396,20 @@ impl IrisWindow {
         message: String,
         cx: &mut Context<Self>,
     ) {
-        let Some(pending) = self.catalog.take_reply(plugin_id, request_id, |_| true) else {
+        let Some(kind) = self.catalog.take_error(plugin_id, request_id) else {
             return;
         };
-        match pending.operation {
-            SourceOperation::Resolve { .. } => {
+        match kind {
+            SourceErrorKind::Resolve => {
                 let vp = self.active_mut();
                 vp.loading_visible = false;
                 vp.pending_subtitles.clear();
             }
-            SourceOperation::Browse { .. } => {
-                if let ActiveSource::Plugin(ps) = &mut self.catalog.active_source {
+            SourceErrorKind::Browse { source_id } => {
+                if let ActiveSource::Plugin(ps) = &mut self.catalog.active_source
+                    && ps.plugin_id == plugin_id
+                    && ps.source_id == source_id
+                {
                     ps.error = Some(message.clone());
                     self.rebuild_directory_rows();
                 }

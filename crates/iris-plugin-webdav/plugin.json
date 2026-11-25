@@ -1,0 +1,13 @@
+{
+  "id": "iris.webdav",
+  "name": "WebDAV 远程存储",
+  "version": "0.0.1",
+  "author": "Iris",
+  "description": "异步浏览 NAS 与云盘 WebDAV 目录；每个服务器由宿主独立授权",
+  "protocol": 2,
+  "abi": 2,
+  "entry": "plugin.wasm",
+  "permissions": ["media_source", "net_http", "secrets", "ui_modal", "notifications"],
+  "source_provider": {"label": "WebDAV 远程存储", "add_command_id": "add_server"},
+  "commands": [{"id": "add_server", "title": "添加 WebDAV 服务器…"}]
+}

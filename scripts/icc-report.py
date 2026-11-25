@@ -11,7 +11,7 @@ from PIL import Image, ImageCms, ImageStat
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("outdir", type=Path)
-    parser.add_argument("--window-width", type=float, default=1440.0)
+    parser.add_argument("--window-width", type=float, default=None)
     parser.add_argument("--fixture-dir", type=Path,
                         default=Path(__file__).resolve().parents[1] / "test-media/photo/icc")
     output = parser.add_mutually_exclusive_group()
@@ -60,7 +60,8 @@ def main():
                                                 ImageCms.Intent.RELATIVE_COLORIMETRIC)
             expected = ImageCms.applyTransform(Image.new("RGB", (1, 1), pixel), transform).getpixel((0, 0))
             x, y, width, height = result["rect"]
-            scale = image.width / args.window_width
+            logical_width = args.window_width or result.get("window_width") or (x * 2 + width if x > 0 else 1440.0)
+            scale = image.width / logical_width
             cx, cy = round((x + width / 2) * scale), round((y + height / 2) * scale)
             radius = min(50, int(min(width, height) * scale / 2), cx, cy, image.width - cx, image.height - cy)
             if radius <= 0:

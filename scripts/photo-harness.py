@@ -213,6 +213,15 @@ def video_rect(state_line):
     return nums[:4]  # x, y, w, h in window points
 
 
+def window_width(state_line):
+    m = re.search(r"win=\((-?\d+(?:\.\d+)?),", state_line)
+    if m:
+        return float(m.group(1))
+    # Fallback to docked full-width bar bounds when present.
+    m = re.search(r"dir=false .*? dock=Some\(\(0(?:\.0+)?,\s*-?\d+(?:\.\d+)?,\s*(\d+(?:\.\d+)?)", state_line)
+    return float(m.group(1)) if m else None
+
+
 def props(iris, names):
     return {n: iris.get(n)[0] for n in names}
 
@@ -276,7 +285,7 @@ try:
             snap = os.path.join(OUT, f"icc-{name}.png")
             if load is None or not iris.snap(snap):
                 raise RuntimeError(f"Could not load or capture ICC fixture {f}")
-            r[name] = dict(load=load, rect=video_rect(st), snap=snap, source=f,
+            r[name] = dict(load=load, rect=video_rect(st), window_width=window_width(st), snap=snap, source=f,
                            **props(iris, ["video-params/primaries", "video-params/gamma",
                                           "video-params/colormatrix"]),
                            mpv=list(iris.mpv_msgs))

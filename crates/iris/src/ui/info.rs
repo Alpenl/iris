@@ -1,5 +1,6 @@
 //! Media details & playback stats inspector overlay (`I` / `⌘I`).
 
+use gpui::prelude::FluentBuilder;
 use gpui::{
     Context, InteractiveElement, IntoElement, MouseButton, ParentElement,
     StatefulInteractiveElement, Styled, div, px,
@@ -192,7 +193,11 @@ impl IrisWindow {
                                     .child(v),
                             )
                     }),
-                ));
+                ))
+                .when_some(
+                    self.render_personal_annotations(t, cx),
+                    |view, annotations| view.child(annotations),
+                );
 
         let place_left = if fullscreen {
             self.settings.directory_side == Side::Right

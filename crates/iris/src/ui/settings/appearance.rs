@@ -152,6 +152,7 @@ impl IrisWindow {
         let has_plugin_override = ovr_theme.is_some() || ovr_chrome.is_some();
         let cfg_path = settings_path();
         let log_file = logging::log_path();
+        let events_file = logging::events_log_path();
         let cfg_text = cfg_path
             .as_ref()
             .map(|p| p.display().to_string())
@@ -237,9 +238,20 @@ impl IrisWindow {
                 let disp = lp.display().to_string();
                 d.child(reveal_path_row(
                     "reveal-log",
-                    "运行日志",
+                    "运行日志（自动轮转）",
                     disp,
                     Some(lp),
+                    t,
+                    cx,
+                ))
+            })
+            .when_some(events_file, |d, ep| {
+                let disp = ep.display().to_string();
+                d.child(reveal_path_row(
+                    "reveal-events-log",
+                    "结构化诊断事件（JSONL）",
+                    disp,
+                    Some(ep),
                     t,
                     cx,
                 ))

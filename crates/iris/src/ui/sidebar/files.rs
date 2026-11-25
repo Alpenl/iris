@@ -120,6 +120,7 @@ impl IrisWindow {
                                         })),
                                 ),
                         )
+                        .child(self.render_source_filters(cx))
                         .when(loading, |d| {
                             d.child(
                                 div()
@@ -272,6 +273,7 @@ impl IrisWindow {
                                     .into_any_element()
                             }
                             DirRow::Item(item) => {
+                                let thumbnail = this.plugin_thumbnail(&item.uri, cx);
                                 let kind = item.media_kind().unwrap_or(Kind::Video);
                                 let is_cur = cur_uri.as_ref() == Some(&item.uri);
                                 let is_fav = this.store.is_favorite(&item.uri);
@@ -296,6 +298,7 @@ impl IrisWindow {
                                 media_row(
                                     ("dir-media", ix),
                                     MediaRowSpec {
+                                        thumbnail,
                                         kind,
                                         title: item.name.clone().into(),
                                         meta: item_meta(&item),

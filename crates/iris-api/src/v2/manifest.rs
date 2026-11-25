@@ -1,0 +1,159 @@
+use super::source::SourceDescriptor;
+use crate::{ChromeLayoutSpec, CommandSpec, SourceProviderSpec, UiThemeSpec};
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Capability {
+    ReadState,
+    ControlPlayback,
+    MediaSource,
+    UrlResolver,
+    MediaEnhance,
+    Annotations,
+    ExportFiles,
+    ExternalTool,
+    Secrets,
+    Notifications,
+    UiSidebar,
+    UiStatus,
+    UiOverlay,
+    UiToolbar,
+    UiModal,
+    UiTheme,
+    NetHttp,
+    NetWs,
+    NetTcp,
+}
+impl Capability {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::ReadState => "读取播放状态与媒体身份",
+            Self::ControlPlayback => "控制播放",
+            Self::MediaSource => "媒体数据源",
+            Self::UrlResolver => "解析媒体网址",
+            Self::MediaEnhance => "添加媒体增强",
+            Self::Annotations => "编辑已授权的标注",
+            Self::ExportFiles => "请求导出文件",
+            Self::ExternalTool => "受限外部工具任务",
+            Self::Secrets => "私有凭据",
+            Self::Notifications => "通知",
+            Self::UiSidebar => "侧栏",
+            Self::UiStatus => "状态栏",
+            Self::UiOverlay => "画面叠加",
+            Self::UiToolbar => "工具栏",
+            Self::UiModal => "插件表单",
+            Self::UiTheme => "主题与布局",
+            Self::NetHttp => "HTTP 网络",
+            Self::NetWs => "WebSocket 网络",
+            Self::NetTcp => "TCP 网络",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NetworkDeclaration {
+    #[serde(default)]
+    pub net_public: bool,
+    #[serde(default)]
+    pub net_hosts: Vec<HostRule>,
+    #[serde(default)]
+    pub public_ports: Vec<u16>,
+    #[serde(default)]
+    pub tcp_targets: Vec<HostRule>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostRule {
+    pub host: String,
+    pub schemes: Vec<String>,
+    pub ports: Vec<u16>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Manifest {
+    pub id: String,
+    pub name: String,
+    pub version: String,
+    pub protocol: u32,
+    pub abi: u32,
+    #[serde(default)]
+    pub author: String,
+    #[serde(default)]
+    pub description: String,
+    pub entry: Option<String>,
+    #[serde(default)]
+    pub permissions: Vec<Capability>,
+    #[serde(default)]
+    pub network: NetworkDeclaration,
+    #[serde(default)]
+    pub commands: Vec<CommandSpec>,
+    #[serde(default)]
+    pub sources: Vec<SourceDescriptor>,
+    #[serde(default)]
+    pub source_provider: Option<SourceProviderSpec>,
+    #[serde(default)]
+    pub theme: Option<UiThemeSpec>,
+    #[serde(default)]
+    pub chrome: Option<ChromeLayoutSpec>,
+    #[serde(default)]
+    pub url_patterns: Vec<String>,
+}
+
+impl Manifest {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.protocol != crate::PROTOCOL_VERSION || self.abi != 2 {
+            return Err("unsupported protocol or ABI");
+        }
+        if !crate::is_valid_id(&self.id)
+            || self.name.trim().is_empty()
+            || self.name.len() > 256
+            || self.version.is_empty()
+            || self.version.len() > 64
+        {
+            return Err("invalid plugin identity");
+        }
+        if self
+            .entry
+            .as_deref()
+            .is_some_and(|entry| entry != "plugin.wasm")
+        {
+            return Err("entry must be plugin.wasm");
+        }
+        if self.entry.is_none() && self.theme.is_none() && self.chrome.is_none() {
+            return Err("missing module or declarative theme");
+        }
+        let unique: std::collections::BTreeSet<_> = self.permissions.iter().collect();
+        if unique.len() != self.permissions.len() {
+            return Err("duplicate permission");
+        }
+        if self.commands.len() > 256
+            || self.url_patterns.len() > 64
+            || self.network.net_hosts.len() > 128
+            || self.network.tcp_targets.len() > 32
+            || self.network.public_ports.len() > 32
+        {
+            return Err("too many manifest contributions");
+        }
+        SourceDescriptor::validate_all(&self.sources)?;
+        let mut commands = std::collections::BTreeSet::new();
+        for cmd in &self.commands {
+            if !crate::is_valid_id(&cmd.id)
+                || cmd.title.trim().is_empty()
+                || cmd.title.len() > 256
+                || cmd.subtitle.as_ref().is_some_and(|v| v.len() > 512)
+                || cmd.shortcut_hint.as_ref().is_some_and(|v| v.len() > 64)
+                || !commands.insert(&cmd.id)
+            {
+                return Err("invalid command");
+            }
+        }
+        if self.commands.iter().filter(|v| v.context_menu).count() > 16 {
+            return Err("too many context menu commands");
+        }
+        Ok(())
+    }
+}

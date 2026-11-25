@@ -4,8 +4,11 @@
 use std::collections::BTreeMap;
 use std::io::{self, BufRead, BufReader, Cursor, Read, Write};
 mod connection;
+pub(crate) mod raw;
 
 pub(crate) use connection::NetworkScope;
+pub(crate) use connection::doh;
+pub(crate) use connection::duplex;
 pub use connection::{HttpCancel, validate_stream_url};
 use connection::{SocketRegistration, connect_transport, remaining_timeout};
 use std::time::{Duration, Instant};
@@ -18,12 +21,6 @@ const IO_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_REDIRECTS: usize = 5;
 const MAX_RESPONSE_HEADER_BYTES: usize = 64 * 1024;
 const MAX_CHUNK_LINE_BYTES: usize = 4 * 1024;
-
-#[derive(Clone, Debug)]
-pub(crate) struct HttpBytesResponse {
-    pub status: u16,
-    pub body: Vec<u8>,
-}
 
 fn is_tchar(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b)
@@ -84,6 +81,22 @@ fn header_ci<'a>(headers: &'a BTreeMap<String, String>, name: &str) -> Option<&'
         .iter()
         .find(|(k, _)| k.eq_ignore_ascii_case(name))
         .map(|(_, v)| v.as_str())
+}
+
+fn parse_decimal_u64(raw: &str) -> Option<u64> {
+    (!raw.is_empty() && raw.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| raw.parse::<u64>().ok())
+        .flatten()
+}
+
+fn ensure_identity_headers(headers: &BTreeMap<String, String>) -> Result<()> {
+    if headers
+        .get("content-encoding")
+        .is_some_and(|v| !v.eq_ignore_ascii_case("identity"))
+    {
+        bail!("unsupported HTTP content encoding");
+    }
+    Ok(())
 }
 
 type ResponseReader = io::Chain<Cursor<Vec<u8>>, connection::Transport>;
@@ -415,9 +428,8 @@ fn open_stream_with_credentials(
         transport.set_body_deadline(deadline)?;
         let content_len = resp_headers
             .get("content-length")
-            .map(|s| s.parse::<u64>())
-            .transpose()
-            .context("invalid HTTP Content-Length")?;
+            .map(|s| parse_decimal_u64(s).context("invalid HTTP Content-Length"))
+            .transpose()?;
         let mut prefix = Cursor::new(raw);
         prefix.set_position(header_end as u64);
         let chained = prefix.chain(transport);
@@ -463,7 +475,7 @@ fn read_bounded(
     let declared = stream
         .headers
         .get("content-length")
-        .and_then(|v| v.parse::<u64>().ok());
+        .and_then(|v| parse_decimal_u64(v));
     if !truncate && declared.is_some_and(|n| n > max as u64) {
         bail!("HTTP body exceeds byte limit");
     }
@@ -490,40 +502,6 @@ fn read_bounded(
     Ok(out)
 }
 
-pub(crate) fn request_bytes_cancellable(
-    method: &str,
-    url: &str,
-    headers: &BTreeMap<String, String>,
-    body: Option<&[u8]>,
-    max_bytes: usize,
-    cancel: &HttpCancel,
-) -> Result<HttpBytesResponse> {
-    let url = validate_stream_url(url)?;
-    let scope = NetworkScope::new(url.clone());
-    let deadline = Instant::now() + CONNECT_TIMEOUT + IO_TIMEOUT;
-    let mut response = open_stream(
-        Request {
-            method,
-            url,
-            headers,
-            body,
-            range: None,
-        },
-        &scope,
-        cancel,
-        Some(deadline),
-    )?;
-    let body = if method.eq_ignore_ascii_case("HEAD") || matches!(response.status, 204 | 304) {
-        Vec::new()
-    } else {
-        read_bounded(&mut response, max_bytes, false, deadline)?
-    };
-    Ok(HttpBytesResponse {
-        status: response.status,
-        body,
-    })
-}
-
 pub(crate) fn fetch_subtitle_bytes(
     url: Url,
     headers: &BTreeMap<String, String>,
@@ -548,13 +526,7 @@ pub(crate) fn fetch_subtitle_bytes(
     if response.status != 200 {
         bail!("subtitle HTTP fetch failed with status {}", response.status);
     }
-    if response
-        .headers
-        .get("content-encoding")
-        .is_some_and(|v| !v.eq_ignore_ascii_case("identity"))
-    {
-        bail!("unsupported subtitle content encoding");
-    }
+    ensure_identity_headers(&response.headers)?;
     read_bounded(&mut response, 8 * 1024 * 1024, false, deadline)
 }
 
@@ -584,7 +556,10 @@ pub fn fetch_head_bytes(
         Some(deadline),
     )?;
     match resp.status {
-        200 | 206 => read_bounded(&mut resp, max_bytes, true, deadline),
+        200 | 206 => {
+            ensure_identity_headers(&resp.headers)?;
+            read_bounded(&mut resp, max_bytes, true, deadline)
+        }
         416 => Ok(Vec::new()),
         s => bail!("upstream HTTP status {s} while probing header bytes"),
     }
@@ -616,13 +591,7 @@ pub(crate) fn fetch_range(
         cancel,
         Some(deadline),
     )?;
-    if response
-        .headers
-        .get("content-encoding")
-        .is_some_and(|v| !v.eq_ignore_ascii_case("identity"))
-    {
-        bail!("encoded byte range");
-    }
+    ensure_identity_headers(&response.headers)?;
     if response.status == 200 && start == 0 {
         return Ok((read_bounded(&mut response, len, true, deadline)?, None));
     }
@@ -639,9 +608,9 @@ pub(crate) fn fetch_range(
         .context("invalid Content-Range")?;
     let (first, last) = bounds.split_once('-').context("invalid Content-Range")?;
     let (first, last, total) = (
-        first.parse::<u64>()?,
-        last.parse::<u64>()?,
-        total.parse::<u64>()?,
+        parse_decimal_u64(first).context("invalid Content-Range")?,
+        parse_decimal_u64(last).context("invalid Content-Range")?,
+        parse_decimal_u64(total).context("invalid Content-Range")?,
     );
     if first != start || last < first || last > end || last >= total {
         bail!("unexpected Content-Range");
@@ -708,6 +677,8 @@ mod tests {
             b"HTTP/1.1 206 OK\r\nContent-Range: bytes 4-5/6\r\n\r\na",
             b"HTTP/1.1 206 OK\r\nContent-Range: bytes 4-5/6\r\n\r\nabc",
             b"HTTP/1.1 206 OK\r\nContent-Range: bytes 4-5/6\r\nContent-Encoding: gzip\r\n\r\nab",
+            b"HTTP/1.1 206 OK\r\nContent-Range: bytes 4-5/6\r\nContent-Length: +2\r\n\r\nab",
+            b"HTTP/1.1 206 OK\r\nContent-Range: bytes +4-5/6\r\nContent-Length: 2\r\n\r\nab",
         ] {
             assert!(read_range(invalid, 4, 2).is_err());
         }

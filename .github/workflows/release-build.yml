@@ -68,7 +68,7 @@ jobs:
           set -euo pipefail
           rustup toolchain install 1.100.0 --profile minimal
           rustup default 1.100.0
-          rustup target add '${{ matrix.rust }}'
+          rustup target add '${{ matrix.rust }}' wasm32-unknown-unknown
           cargo install cargo-deny --version 0.22.0 --locked
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
@@ -159,7 +159,7 @@ jobs:
         run: |
           set -euo pipefail
           : "${CERT_BASE64:?required}" "${CERT_PASSWORD:?required}" "${KEYCHAIN_PASSWORD:?required}" "${APPLE_ID:?required}" "${APPLE_PASSWORD:?required}" "${TEAM_ID:?required}"
-          printf '%s' "$CERT_BASE64" | base64 --decode > "$RUNNER_TEMP/signing.p12"
+          printf '%s' "$CERT_BASE64" | tr -d '[:space:]' | base64 --decode > "$RUNNER_TEMP/signing.p12"
           security create-keychain -p "$KEYCHAIN_PASSWORD" "$RUNNER_TEMP/iris-signing.keychain-db"
           security set-keychain-settings -lut 21600 "$RUNNER_TEMP/iris-signing.keychain-db"
           security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$RUNNER_TEMP/iris-signing.keychain-db"
@@ -219,3 +219,12 @@ jobs:
             ${{ runner.temp }}/iris-dist/SHA256SUMS
           if-no-files-found: error
           retention-days: 30
+      - name: Preserve notarization diagnostics on failure
+        if: failure() && runner.os == 'macOS'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: notary-diagnostics-${{ matrix.target }}
+          path: |
+            ${{ runner.temp }}/iris-dist/notary-*-result.json
+            ${{ runner.temp }}/iris-dist/notary-result.json
+          if-no-files-found: warn

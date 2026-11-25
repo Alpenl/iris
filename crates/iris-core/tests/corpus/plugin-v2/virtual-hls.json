@@ -1,0 +1,1 @@
+{"resources": [{"id": "seg", "kind": "media", "extension": "ts", "size": "1000", "source": {"transport": "guest", "resource_id": "seg"}}], "tracks": [{"id": "video", "kind": "video", "label": "Test", "lang": null, "codec": null, "sequence": "0", "segments": [{"resource": {"resource_id": "seg", "range": null}, "duration_ms": "1000", "init": null, "key": null}]}]}

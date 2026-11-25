@@ -355,6 +355,36 @@ impl TextInputBuffers {
         }
     }
 
+    pub(in crate::ui) fn clear_plugin_sidebar_fields(&mut self, plugin_id: &str) {
+        let prefix = format!("sb:{plugin_id}:");
+        self.form_fields.retain(|k, _| !k.starts_with(&prefix));
+        if self
+            .active_form_key
+            .as_deref()
+            .is_some_and(|k| k.starts_with(&prefix))
+        {
+            self.active_form_key = None;
+        }
+    }
+
+    pub(in crate::ui) fn retain_enabled_sidebar_fields(
+        &mut self,
+        mut is_enabled: impl FnMut(&str) -> bool,
+    ) {
+        self.form_fields.retain(|k, _| {
+            let Some(rest) = k.strip_prefix("sb:") else {
+                return true;
+            };
+            rest.split_once(':').is_some_and(|(pid, _)| is_enabled(pid))
+        });
+        if let Some(active) = self.active_form_key.as_deref()
+            && let Some(rest) = active.strip_prefix("sb:")
+            && !rest.split_once(':').is_some_and(|(pid, _)| is_enabled(pid))
+        {
+            self.active_form_key = None;
+        }
+    }
+
     pub(in crate::ui) fn sync_plugin_modal(
         &mut self,
         active: Option<(&str, &PluginModal)>,

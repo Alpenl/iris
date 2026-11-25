@@ -10,6 +10,7 @@ use std::ptr;
 use std::sync::Mutex;
 
 pub mod render;
+mod reply;
 pub(crate) mod sys;
 
 pub use render::RenderHandle;
@@ -22,8 +23,10 @@ pub struct Error {
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Clamp `i32::MIN` before FFI: `mpv_error_string` negates `error` in C (`client.c`).
+        let safe_code = self.code.max(-1024);
         // SAFETY: `mpv_error_string` always returns a valid static NUL-terminated string.
-        let msg = unsafe { CStr::from_ptr(sys::mpv_error_string(self.code)) };
+        let msg = unsafe { CStr::from_ptr(sys::mpv_error_string(safe_code)) };
         write!(
             f,
             "mpv error {} ({}): {}",
@@ -112,6 +115,10 @@ pub enum EndReason {
 #[derive(Debug, Clone)]
 pub enum Event {
     Shutdown,
+    CommandReply {
+        id: u64,
+        error: i32,
+    },
     Log {
         prefix: String,
         level: String,
@@ -475,6 +482,26 @@ impl Mpv {
         unsafe { sys::mpv_wakeup(self.handle) }
     }
 
+    /// Unblocks any pending device-recovery video track query if shutdown skips normal events.
+    pub fn abort_video_recovery(&self) {
+        #[cfg(target_os = "windows")]
+        self.video_recovery
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .on_event(&Event::Shutdown);
+    }
+
+    /// Restores the active playlist entry ID in `VideoRecovery` after `Event::QueueOverflow`.
+    pub fn reseed_video_recovery(&self, entry: Option<i64>) {
+        #[cfg(target_os = "windows")]
+        self.video_recovery
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .set_entry(entry);
+        #[cfg(not(target_os = "windows"))]
+        let _ = entry;
+    }
+
     /// Waits for the next event. `timeout < 0` waits forever. Returns `None` on timeout.
     pub fn wait_event(&self, timeout: f64) -> Option<Event> {
         let _wait = self.wait_lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -515,6 +542,10 @@ impl Mpv {
         let event = match ev.event_id {
             sys::MPV_EVENT_NONE => return None,
             sys::MPV_EVENT_SHUTDOWN => Event::Shutdown,
+            sys::MPV_EVENT_COMMAND_REPLY if ev.reply_userdata != 0 => Event::CommandReply {
+                id: ev.reply_userdata,
+                error: ev.error,
+            },
             sys::MPV_EVENT_LOG_MESSAGE => {
                 // SAFETY: For `MPV_EVENT_LOG_MESSAGE`, `ev.data` points to `mpv_event_log_message`
                 // whose string fields are valid NUL-terminated C strings.
@@ -685,6 +716,17 @@ mod tests {
         let long_with_nul = format!("{}\0{}", "x".repeat(100), "y".repeat(100));
         let expected_long = format!("{}{}", "x".repeat(100), "y".repeat(100));
         assert_eq!(roundtrip_with_cstr(&long_with_nul), expected_long);
+    }
+
+    #[test]
+    fn error_display_clamps_i32_min_without_c_negation_overflow() {
+        let err = Error {
+            code: i32::MIN,
+            context: "min-code".into(),
+        };
+        let rendered = err.to_string();
+        assert!(rendered.contains(&i32::MIN.to_string()));
+        assert!(rendered.contains("min-code"));
     }
 
     #[test]

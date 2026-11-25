@@ -1,223 +1,99 @@
-# Iris 插件系统与开发指南（`iris-api` 协议 `protocol: 1`）
+# Iris 插件开发指南（protocol: 2 / ABI: 2）
 
-Iris 的插件架构从第一性原理出发，围绕四根支柱构建单一、正交的控制面协议（`PROTOCOL_VERSION = 1`）：
+当前源码使用 Wasm 插件协议 2，应用版本仍为 `0.0.1`。旧 Python/stdio 插件和 `BuiltinPlugin` 已退役；不自动执行旧插件目录中的程序。完整契约、配额与验收项见 [架构规范](PLUGIN_V2_ARCHITECTURE.md)，实际测试和未验证范围见 [实施证据](PLUGIN_V2_IMPLEMENTATION.md)。协议切换不代表已完成跨平台发布或性能验收。
 
-1. **远程数据源（`media_source`）**：插件通过 `MediaSource` 提供目录、搜索、分页、多服务器、授权、播放线路和外挂字幕。稳定的 `source_id` 与 `entry_id` 维持收藏和续播关联。HTTP(S) 播放经过会话专属的本地转发器，凭据只发给授权源。插件也可提供高端口回环流。远程照片从 256 KiB 前缀起步，在请求和字节预算内读取后置元数据。
-2. **高自由度参数化工作台与统一声明式控件树（`UiTheme` / `UiToolbar` / `UiSidebar` / `UiModal` / `UiStatus` / `UiOverlay`）**：本体默认保持方向 C 视觉一致，但不限制插件自由度——UI 插件可动态接管全套主题配色令牌（`#RRGGBB[AA]`）、圆角与栏高尺度、无边框影院窗口（`hide_titlebar`，宿主自动提供顶缘叠层唤醒标题栏、视口拖拽与最低对比度逃生护栏）、悬浮控制栏（`floating_dock`）与底栏常驻按钮显隐；侧栏面板（`SidebarPanel`）与非破坏性异步校验弹窗（`PluginModal`）共用同一套 13 种声明式 `Widget` 控件；视口层通过归一化 `OverlayNode` 绘制边框/填充卡片、辅助线、时间码/字幕文本、频谱柱状条与可点击 HUD 按钮。
-3. **原子握手、状态持久化与分桶加密凭据库（`SetState` / `SetSecret`）**：非敏感偏好键值（`state`）由宿主自动落盘，敏感密码/令牌（`secrets`，单条上限 2048B）按 `builtin.<id>` / `ext.<id>` 物理隔离存入系统凭据库（macOS Keychain / Windows Credential Manager，失败显式报错，绝不降级明文文件），并在插件启动时通过单次原子 `Init` 事件连同当前播放快照一并注入。
-4. **像素与安全严格隔离**：解码、色彩空间转换与原生交换链由内核独占，插件绝不经手实时像素数据，且通过 `DirtySlots` 值相等脏检测守住全屏隐藏控制栏下的 `0 Hz` 空转防线。
+## 1. 安装与官方插件
 
-协议定义位于无头 crate [`crates/iris-api`](../crates/iris-api/src/lib.rs)，宿主运行时与内置插件位于 [`crates/iris-core/src/plugin/`](../crates/iris-core/src/plugin/mod.rs)，系统凭据库位于 [`crates/iris-core/src/vault.rs`](../crates/iris-core/src/vault.rs)。
+在「设置 → 插件 → 安装」选择 `.irisplugin`，审核宿主显示的身份、摘要、能力和网络范围后安装。宿主先校验不可变包快照和 Wasm，不在批准前执行模块。更新增加能力需重新授权；失败保留已安装版本。禁用/卸载撤销该安装的窗口、流、网络、工具和 UI 贡献，后台资源结束后释放配额。
 
----
+| 包/功能 | 实现 |
+|---|---|
+| `iris.guides` | 官方 Rust/SDK Wasm：构图参考线与交互叠层 |
+| `iris.webdav` | 官方 Rust/SDK Wasm：多连接、授权 Origin、凭据、分页目录、播放与外挂字幕 |
+| A-B 循环 | 原生 Session 能力；不再依赖计时插件 |
+| `example.watch-stats` | 窗口计时、状态栏和右键重置；不持久化 |
+| `example.virtual-audio` | 独立 StreamStore 的 RandomAccess PCM 示例，无外网请求 |
+| `example.cinema-ui` | 纯声明式主题，无 Wasm 实例 |
 
-## 1. 内置官方插件与外部参考插件
+官方包来自 `crates/iris-plugin-guides`、`crates/iris-plugin-webdav`，在构建前生成到 `Resources/Plugins/` 并嵌入宿主。宿主使用编译时摘要验证身份；第三方包不能自称 `iris.*`。官方包遵守同样的能力与资源检查。
 
-### 内置官方插件（编译进内核，`iris.*` 保留命名空间，可在「设置 → 插件」启停）
-1. **WebDAV 远程存储（`iris.webdav`）**：支持多台 NAS 管理、Basic/Bearer 认证、有界的后台 `PROPFIND`、同目录外挂字幕和广色域原图。用户名和口令使用独立字段，凭据存入系统凭据库。向非回环 `http://` 地址发送口令需要用户确认。
-2. **构图辅助线（`iris.guides`）**：三分线（3×3）、黄金分割线、中心十字、2.39:1 电影画幅框与 90%/80% 安全区；可被「审片与选片」工作区预设联动开启并在退出预设时自动关闭。
-3. **A-B 循环与标记（`iris.ab-loop`）**：视频/音频 A-B 区间循环与时间点书签（同时支持本地与远程插件流 `MediaUri`）。
+用户包存放于应用数据目录 `plugins-v2/`（开发时可用 `IRIS_PLUGINS_V2` 指定受管安装目录）；不要手工修改其中的安装授权记录。状态位于 `plugin-v2-state/`，临时产物位于 `plugin-v2-temp/`，可信工具绑定位于 `plugin-tool-bindings.json`。敏感凭据按安装身份保存在系统凭据库，不降级写明文。旧 `plugin_state/` 仅作为官方迁移输入，成功前保留旧资料和凭据；第三方插件不能借同 ID 领取旧凭据。
 
-### 外部进程参考插件（位于 `examples/plugins/`）
-1. **云盘与视频源参考插件（[`examples/plugins/cloud-media-demo/`](../examples/plugins/cloud-media-demo/)）**
-   - 完整演示网盘 / 视频源插件形态：扫码二维码 + Token 登录弹窗（`ui_modal`）、加密凭据存取（`set_secret` + `init.secrets`）、目录树浏览、关键词搜索、清晰度切换（1080P / 720P）以及带自定义请求头的流解析（`resolve_stream`）。
-2. **Cinema UI 自由定制参考插件（[`examples/plugins/cinema-ui/`](../examples/plugins/cinema-ui/)）**
-   - 完整演示高自由度 UI 插件形态：注册底栏快捷按钮（`ui_toolbar`）、实时热切换多套皮肤、无标题栏无边框窗口（`hide_titlebar`）与悬浮控制栏布局（`ui_theme`）、视口可交互 SMPTE 时间码与动态频谱 HUD（`ui_overlay`），以及含滑块、输入框、开关、选择器的交互式侧栏。
-3. **观影计时统计（[`examples/plugins/watch-stats/`](../examples/plugins/watch-stats/)）**
-   - 轻量级 `read_state` + `ui_sidebar` + `ui_status` + `set_state` 外部进程插件示例。
+## 2. 从公开 SDK 开始
 
----
+```text
+rustup target add wasm32-unknown-unknown
+python -B scripts/build-example-plugins.py
+python -B scripts/test-plugin-v2-examples.py
+```
 
-## 2. 外部插件目录与零进程声明式主题插件
+输出为 `target/plugin-v2/examples/*.irisplugin`。源代码见 [examples/plugins](../examples/plugins/README.md)。Rust Guest 使用 `iris-plugin-sdk` 的 `export_plugin!`、`guest` 与 `client`，目标为 `wasm32-unknown-unknown`，无 WASI。C 的最小 ABI 夹具见 `crates/iris-plugin-sdk/tests/fixtures/contract.c`。官方 WebDAV 展示完整异步任务、Origin 确认、凭据、状态保存和目录分页。
 
-将插件目录放入应用数据目录的 `plugins/<插件目录>/plugin.json`，在 **设置 → 插件** 点击「重新扫描」即可加载：
-
-- **macOS**：`~/Library/Application Support/Iris/plugins/<插件目录>/plugin.json`
-- **Windows**：`%APPDATA%\Iris\plugins\<插件目录>\plugin.json`
-- **测试隔离**：环境变量 `IRIS_PLUGINS=/自定义路径`
-
-> **纯声明式 UI 主题插件（零子进程开销）**：仅需定制配色、圆角、栏高或无边框/悬浮控制栏骨架时，在 `plugin.json` 中声明 `"permissions": ["ui_theme"]` 并直接填写 `"theme": { ... }` 与 `"chrome": { ... }`，无需提供 `"entry"` 可执行脚本，宿主直接以零进程开销挂载生效。
-
----
-
-## 3. 权限模型（`Permission`）
-
-`SetState` 用于持久化插件自己的非敏感配置，单插件最多 512 KiB。其余命令与事件受 `plugin.json` 权限白名单门控。
-
-| 权限名 | 说明 | 允许接收的事件 / 发送的命令 |
-|---|---|---|
-| `read_state` | 读取播放快照与播放进度 | 接收 `init.snapshot`、`media_opened`、`state_changed`、`tick`（含 `uri`、`title`、`is_live`、`buffering`） |
-| `control_playback` | 控制传输、倍速、音量与收藏 | `toggle_playback`、`seek_relative`、`seek_absolute`、`set_speed`、`set_volume`、`toggle_mute`、`open_next`、`open_previous`、`toggle_favorite` |
-| `ui_sidebar` | 交互式侧栏面板 | `set_sidebar`（`SidebarPanel` → `SidebarSection` → 统一 `Widget` 列表） |
-| `ui_status` | 底栏状态槽紧凑徽章 | `set_status`（`StatusBadge`） |
-| `ui_overlay` | 视口归一化矢量与 HUD 叠层 | `set_overlay`（`nodes: Vec<OverlayNode>`，空数组即清空叠层） |
-| `ui_toolbar` | 底栏自定义工具按钮 | `set_toolbar`（`buttons: Vec<ToolbarButton>`） |
-| `ui_modal` | 交互式配置、OAuth 与扫码弹窗 | `open_modal`、`close_modal`（`PluginModal`，与侧栏共用统一 `Widget` 列表） |
-| `ui_theme` | 动态主题令牌与窗口/底栏结构定制 | 清单静态声明或运行时发送 `set_theme`（`UiThemeSpec` + `ChromeLayoutSpec`） |
-| `media_source` | 虚拟数据源与加密凭据（自动隐含 `secrets`） | 清单声明 `sources` 或 `source_provider`；接收 `source_browse`、`source_resolve`、`source_manage`；发送 `set_sources`、`refresh_source`、`provide_source_page`、`resolve_stream`、`source_error`、`set_secret` |
-| `secrets` | 独立使用系统加密凭据库 | 接收 `init.secrets`；发送 `set_secret`（无需声明 `sources`） |
-| `notifications` | 顶部轻提示 | `show_toast` |
-
----
-
-## 4. 消息线协议（JSON-lines over stdio）
-
-外部插件进程从 `stdin` 按行读取 `HostMessage`，向 `stdout` 按行输出 `PluginMessage`（单行上限 **2 MiB**，支撑大目录分页返回；外部插件禁止使用保留前缀 `iris.*`）：
-
-### 4.1 宿主 → 插件事件（`HostEvent`）
-
-1. **原子启动握手（`init`）**：一次性注入协议版本、持久化非敏感 `state`、解密后的 `secrets`（需 `secrets` 或 `media_source` 权限）与当前播放快照：
-   ```json
-   {
-     "type": "event",
-     "payload": {
-       "event": "init",
-       "protocol": 1,
-       "host_version": "0.0.1",
-       "state": { "skin": "neon" },
-       "secrets": { "access_token": "tok_xxx" },
-       "snapshot": { "uri": null, "title": null, "kind": null, "position": 0.0, "duration": 0.0, "paused": true, "volume": 100.0, "muted": false, "speed": 1.0, "favorite": false, "chapter": -1, "is_live": false, "buffering": false }
-     }
-   }
-   ```
-2. **播放生命周期**：`media_opened { snapshot }`、`state_changed { snapshot }`、`tick { position, duration, paused }`。
-3. **命令与统一控件交互**：
-   - 命令面板或快捷键触发：`{"event": "command", "id": "login", "snapshot": { ... }}`
-   - 任意侧栏 / 底栏按钮 / 状态徽章 / 视口 HUD / 滑块 / 输入框 / 开关 / 选择器触发统一 `action` 事件（`input`、`select`、`toggle`、`slider` 通过 `value` 携带新值，纯按钮点击 `value` 为 `null`）：
-     ```json
-     {"event": "action", "id": "set_opacity", "value": "0.85", "snapshot": { ... }}
-     ```
-4. **非破坏性弹窗交互**：用户点击确认时宿主保持弹窗开启（保留已输入内容）并发送 `modal_submit { id, values }`，插件校验成功后显式发送 `close_modal` 关闭弹窗（校验失败仅发 `show_toast` 或更新同 `id` 弹窗即可原地提示）；用户按 `Esc` 或取消时宿主强制立即关窗并发送 `modal_cancel { id }`。
-5. **虚拟数据源请求**：`source_browse` 和 `source_resolve` 的应答须回传收到的 `request_id`。只接受当前插件当前请求的一次应答；浏览和解析请求 30 秒超时。插件主动打开媒体时省略 `resolve_stream.request_id`。`source_manage` 处理服务器配置与移除。
-6. **退出清理**：插件应在 `shutdown` 或 stdin EOF 时关闭自己的子进程和监听端口。Windows 在创建进程时就把插件加入宿主持有的 Job，宿主异常退出时由系统回收。Unix 宿主停止插件时清理插件进程组。自行创建新会话的辅助进程由插件负责回收。
-   禁用、重新扫描和退出插件时，宿主继续读取受限的 stdout 队列，处理其中的 `set_state` 和 `set_secret`，并丢弃 UI 更新。退出宿主时，状态文件有独立的刷盘时限。
-
-- `refresh_source` 携带 `source_id`，通知宿主为当前显示的该数据源重新发起浏览请求，例如登录完成后刷新列表。插件使用新 `source_browse` 事件中的 `request_id` 回包。
-
-外部插件以当前用户身份运行。消息权限控制它可以请求的 Iris 功能。只安装来源可信的插件。
-
-### 4.2 统一声明式控件 `Widget`（侧栏与弹窗同构复用）
-
-`SidebarSection.widgets` 与 `PluginModal.widgets` 完全共用以下 13 种 `Widget`（`"kind"` 标签）：
-
-- `label`：`{ text, muted, mono }`
-- `stat`：`{ label, value, accent }`
-- `progress`：`{ label, ratio }`
-- `slider`：`{ id, label, value, min, max, step, unit, action_id }`（带 `-` / 数值单位 / `+` 步进器与进度轨）
-- `button`：`{ label, action_id, icon, accent }`（`icon` 支持内置 SVG 名称，如 `"play"`、`"globe"`、`"sliders"`、`"layers"` 等）
-- `button_group`：`{ buttons: [{ label, action_id, icon, accent }, ...] }`
-- `input`：`{ id, label, value, placeholder, secret, action_id }`（支持中英文 IME 与剪贴板；侧栏中回车或点「提交」触发 `action`；弹窗中随 `modal_submit.values` 一并提交）
-- `toggle`：`{ id, label, checked, action_id }`
-- `select`：`{ id, label, selected, options: [{ value, label }], action_id }`
-- `list_item`：`{ id, title, subtitle, badge, active, action_id }`
-- `qr_code`：`{ label, data, matrix, hint }`（高清点阵二维码渲染 + 一键复制内容）
-- `link`：`{ label, url, button_text }`
-- `divider`：分隔线
-
-`set_sidebar`、`open_modal`、`set_toolbar`、`set_status` 每次更新最多接受 256 个 UI 元素，序列化后的 JSON 数据最多 64 KiB。元素数包括侧栏分组、控件和展开后的子项（例如按钮组的按钮、选择项和二维码点阵行）。超限更新会保留上一次有效内容。
-
-`set_theme` 的 `chrome.hidden_dock_buttons` 最多接受 64 项，`chrome` 序列化后最多 64 KiB。
-
-### 4.3 视口叠层节点 `OverlayNode` 与统一色彩 `Color`
-
-所有颜色字段统一使用 `Color`：语义令牌 `"white"`、`"muted"`、`"dim"`、`"dark"`、`"accent"`，或十六进制 `"#RRGGBB"` / `"#RRGGBBAA"`。`OverlayNode` 支持 7 种归一化（`0.0..=1.0`）节点：
-
-单个插件最多提交 64 个节点，展开后最多 512 个绘制元素；每帧全部插件合计最多 2,048 个。超限更新保留上一次有效叠层。播放快照只对具备 `read_state` 的插件开放，适用于 `init`、`command` 和 `action`。
-
-- `box`：`{ x, y, w, h, fill, border, border_width, radius, opacity }`
-- `line`：`{ x1, y1, x2, y2, color, width, opacity }`
-- `grid`：`{ cols, rows, color, opacity }`
-- `crosshair`：`{ x, y, size, color, opacity }`
-- `text`：`{ x, y, text, size, color, bg, mono, align, opacity }`（`align` 支持 `"left"` | `"center"` | `"right"`）
-- `bars`：`{ x, y, w, h, values, color, opacity }`
-- `button`：`{ id, x, y, label, icon, accent, action_id }`（宿主精确路由回所属插件，点击不抢视口键盘焦点）
-
----
-
-## 5. 网盘 / 视频源插件与无边框影院 UI 示例
-
-### 5.1 `plugin.json` 与 `resolve_stream`（`StreamSpec`）
+包为 ZIP（Stored/Deflate）：根目录 `plugin.json`、可选 `plugin.wasm` 和 `assets/`。可执行 entry 必须为 `plugin.wasm`；纯主题不需要 entry。包校验拒绝路径穿越、链接、重复路径、ZIP64、过大条目及不支持的 ABI。安装容量、压缩/展开限制以架构规范为准。
 
 ```json
 {
-  "id": "acme.cloud-drive",
-  "name": "示例网盘插件",
+  "id": "example.timer",
+  "name": "窗口计时",
   "version": "0.0.1",
-  "protocol": 1,
-  "entry": "main.py",
-  "permissions": ["media_source", "ui_modal", "notifications"],
-  "commands": [
-    { "id": "login", "title": "网盘：扫码或 Token 登录" }
-  ],
-  "sources": [
-    {
-      "id": "my-drive",
-      "name": "我的云盘",
-      "subtitle": "支持原画视频流与广色域照片直看",
-      "supports_search": true,
-      "requires_auth": true,
-      "auth_command_id": "login"
-    }
-  ]
+  "protocol": 2,
+  "abi": 2,
+  "entry": "plugin.wasm",
+  "permissions": ["read_state", "ui_status"],
+  "commands": [{"id":"reset","title":"重置计时","context_menu":true}]
 }
 ```
 
-解析播放地址（响应 `source_resolve` 时附带 `request_id`，主动推流时 `request_id` 可省略为 `null`）：
+命令面板、快捷键与当前视口右键共用声明的命令；每插件最多 16 个右键项，菜单总共最多 32 个。右键命令不自动获得文件列表选择或额外权限。没有 `read_state` 时，命令事件的播放快照仍为空。声明式 UI 使用 `Widget`、`OverlayNode`、`UiThemeSpec` 和 `ChromeLayoutSpec`；宿主保留对比度、恢复默认外观和无边框逃生入口。
 
-```json
-{
-  "type": "commands",
-  "commands": [
-    {
-      "command": "resolve_stream",
-      "request_id": "resolve-1",
-      "stream": {
-        "source_id": "my-drive",
-        "entry_id": "item-42",
-        "url": "https://cdn.example.com/media/42.mkv",
-        "headers": {
-          "Authorization": "Bearer tok_xxx",
-          "User-Agent": "MyDriveClient/1.0"
-        },
-        "title": "01-样片.mkv",
-        "kind": "video",
-        "is_live": false,
-        "variants": [
-          { "id": "4k", "label": "4K 原画" },
-          { "id": "1080p", "label": "1080P" }
-        ],
-        "active_variant": "4k",
-        "subtitles": []
-      }
-    }
-  ]
-}
+## 3. 运行时、ABI 与异步生命周期
+
+每个安装身份共享一个 ControlStore；宿主按窗口封装事件，最多四个活跃窗口。窗口共享同一插件内存，不是不同插件之间的隔离边界。每路需要 Guest 读取的播放会话有独立 StreamStore，共享已编译 Module；目录或工具等待不占播放 Store。
+
+控制面采用有界、严格 JSON；宿主导入 `host_submit` 立即返回请求 ID，后台完成以事件交付。回调不能阻塞等待网络、工具或用户。64 位 ID/长度以十进制字符串编码，`u64(ptr,len)` 为高 32 位指针、低 32 位长度。消息上限 64 KiB、单次 Blob 1 MiB，错误表及导出签名见 [ABI 规范](PLUGIN_V2_ARCHITECTURE.md#4-abi-v2控制编码字节与所有权)。
+
+Guest 输出和 Blob 需遵循转移/关闭约定；任何跨 Guest 调用保存 `Memory` 借用的实现都不符合契约。`memory.grow` 后必须重新取得范围。短读、EOF、取消各有明确返回值，不能把空缓冲当作未完成轮询。SDK 负责基础编解码与内存交接，但业务请求和资源仍须正确结束。
+
+请求、窗口、媒体、seek、流上下文分别有作用域与代次。普通 seek 取消旧流读取，保留同窗口的目录/配置请求；切集或关闭撤销媒体作用域。晚到结果在交付和应用前复核；取消中的作业仍占账本，直到实际退出。Epoch 是执行中断的墙钟机制，不能代替宿主 I/O 超时与取消。
+
+## 4. 网络、登录和文件权限
+
+网络同时需要传输能力（`net_http`/`net_ws`/`net_tcp`）与目的地授权（`net_hosts` 或 `net_public`）。`net_public` 仅允许公网，不自动允许私网。初始请求、每次重定向、DNS 解析后实际连接及宿主代发流/字幕/缩略图都使用所属插件的策略；公网请求不能借 NAS 授权跳进内网。
+
+NAS 等私有服务经宿主确认具体 Origin 与地址集合。HTTP 明文凭据另行确认，DNS 改变不能悄悄扩大授权。跨源时剥离敏感头；凭据、Cookie、OAuth state/PKCE 均受各自作用域、配额和期限约束。插件表单和域名匹配声明本身不算授权。
+
+`read_state` 仅授予播放快照及当前授权媒体指纹，不授予任意文件读取。annotations 仅操作用户选定媒体的应用标记。导出需用户在宿主选择目标，宿主负责受控临时文件与不覆盖源文件的提交；路径文本不能代替能力句柄。
+
+## 5. 三种流源与媒体增强
+
+| 流源 | 约定 |
+|---|---|
+| DirectHttp | 宿主拉取授权 HTTP 流，校验备用表示与范围语义，可附独立音轨 |
+| RandomAccess | Guest 根据 offset/len 提供有界字节，宿主处理 Range/HEAD/EOF |
+| VirtualManifest | 结构化 VirtualHls/VirtualDash 或受限 HLS；宿主生成仅含本会话能力 URL 的清单 |
+
+原始 `.m3u8`/`.mpd` 不能直接交给 libmpv；不支持的标签/格式明确失败，不回退未经清洗文本。会话令牌支持合法的重复 Range，不能跨会话复用。插件只负责字节和元数据，实际解复用、解码和硬件加速依赖媒体库与驱动。
+
+`media_enhance` 允许受限字幕、音轨、监看 LUT 与时间轴元数据。时间轴包含最多 1,000 个章节、256 个热力区间、64 个跳过区间；区间有序、不重叠，最多覆盖 7 天。跳过是用户点击操作，不会因提交元数据自动 seek。
+
+TimedOverlayTrack 使用宿主播放时钟和驻留窗口，默认过去 30 秒至未来 120 秒；每插件至多 10,000 条/4 MiB，窗口外提交返回明确错误。长节目通过窗口分页加载；暂停/空轨道不持续驱动自身动画。标记、评分和颜色写应用数据库，不修改媒体文件。60/120Hz 与 4K 吞吐需另有实测报告。
+
+## 6. 外部工具
+
+在设置中显式绑定可信原生程序/模型，宿主核对支持版本、文件摘要及辅助程序。`external_tool` 仅提供四种固定语义任务：无损切片、提取音轨、Whisper 转写、yt-dlp 元数据解析。插件不能传自由 argv、配置路径、shell、滤镜或任意输出。`QueryTools` 返回当前已绑定能力；读取当前本地媒体须另经 `RequestMediaInput` 的宿主确认，导出另需 ExportGrant。
+
+原生工具以当前用户权限运行；JobObject/进程组负责退出与回收，不构成 OS 文件/网络沙箱。固定语义适配器、受控代理和输入输出检查约束插件请求，不证明第三方工具二进制安全。支持版本、摘要、格式与实测限制见 [工具适配器](PLUGIN_V2_TOOLS.md)。
+
+## 7. 验证与贡献
+
+```text
+python -B scripts/check-project.py
+cargo test --locked --workspace --future-incompat-report
+cargo clippy --locked --workspace --all-targets -- -D warnings
+python -B scripts/test-plugin-v2.py --zig <Zig-0.14.1可执行文件>
+python -B scripts/test-plugin-v2-official.py
+python -B scripts/test-plugin-v2-examples.py
+iris --check-plugin-runtime
 ```
 
-### 5.2 动态主题与无边框影院窗口（`set_theme`）
-
-```json
-{
-  "type": "commands",
-  "commands": [
-    {
-      "command": "set_theme",
-      "theme": {
-        "name": "Borderless Cinema",
-        "window_bg": "#050608",
-        "panel": "#0D1017",
-        "accent": "#00E5FF",
-        "corner_radius": 6.0,
-        "dock_height": 44.0
-      },
-      "chrome": {
-        "hide_titlebar": true,
-        "floating_dock": true,
-        "show_titlebar_meta": false,
-        "compact_controls": false,
-        "hidden_dock_buttons": ["loop", "screenshot"]
-      }
-    }
-  ]
-}
-```
+最后一个命令校验嵌入包并在实际宿主进程执行 JIT/实例化/回调，输出 JSON；不启动 UI 或读取用户插件。CI 在 Windows、macOS Intel/ARM 上运行真实 Guest；发布脚本对签名后的实际产物重复执行冒烟检查。配置了流水线不等于平台已验证，详见实施证据与 [总 issue #2](https://github.com/Alpenl/iris/issues/2)。

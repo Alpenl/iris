@@ -8,6 +8,10 @@ use std::path::{Path, PathBuf};
 
 use crate::fs_util;
 use crate::media_uri::MediaUri;
+mod annotations;
+mod recent;
+pub use annotations::{AnnotationSnapshot, AnnotationTarget, Annotations};
+use recent::read_recent;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Record {
@@ -16,7 +20,6 @@ pub struct Record {
     pub duration: f64,
 }
 
-const MAX_RECENT: usize = 20;
 const MAX_RECORDS: usize = 4096;
 const MAX_RECORD_KEY: usize = 128 * 1024;
 const MAX_RECORD_BYTES: usize = 16 * 1024 * 1024;
@@ -26,11 +29,50 @@ const HEX: &[u8; 16] = b"0123456789abcdef";
 
 type Records = BTreeMap<String, Record>;
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 struct RecordEdit {
     favorite: Option<bool>,
     progress_before: Option<(f64, f64)>,
     progress: Option<(f64, f64)>,
+}
+
+pub struct ProgressFlush {
+    dir: PathBuf,
+    edits: BTreeMap<String, RecordEdit>,
+}
+
+impl ProgressFlush {
+    pub fn run(self) -> Option<BTreeMap<String, (f64, f64)>> {
+        let _lock = fs_util::lock_file(&self.dir.join("records.lock")).ok()?;
+        let path = self.dir.join("records.tsv");
+        let mut records = Records::new();
+        let (_, scrub) = Store::read_records(&path, &mut records).ok()?;
+        let mut changed = scrub;
+        let mut applied = BTreeMap::new();
+        for (key, edit) in &self.edits {
+            let Some((position, duration)) = edit.progress else {
+                continue;
+            };
+            let old = records.get(key).copied();
+            let mut record = old.unwrap_or_default();
+            if edit.matches_progress(record) {
+                record.position = position;
+                record.duration = duration;
+                applied.insert(key.clone(), (position, duration));
+            }
+            if record == Record::default() {
+                changed |= records.remove(key).is_some();
+            } else if old != Some(record) {
+                records.insert(key.clone(), record);
+                changed = true;
+            }
+        }
+        changed |= prune_records(&mut records, &self.edits);
+        if changed {
+            Store::write_records(&path, &records).ok()?;
+        }
+        Some(applied)
+    }
 }
 
 impl RecordEdit {
@@ -52,10 +94,14 @@ impl RecordEdit {
 
 #[derive(Default, Debug)]
 pub struct Store {
+    annotations: annotations::AnnotationStore,
     records: BTreeMap<String, Record>,
     recent: Vec<MediaUri>,
+    recent_titles: BTreeMap<String, String>,
     edits: BTreeMap<String, RecordEdit>,
-    recent_pushes: Vec<MediaUri>,
+    in_flight: BTreeMap<String, (f64, f64)>,
+    recent_pushes: Vec<(MediaUri, Option<String>)>,
+    recent_title_updates: BTreeMap<String, (String, bool)>,
     clear_all_progress: bool,
     clear_all_recent: bool,
     refresh_records: bool,
@@ -73,6 +119,7 @@ impl Store {
 
     pub fn load_from_dir(dir: &Path) -> Self {
         let mut store = Self {
+            annotations: annotations::AnnotationStore::load(dir),
             backing_dir: Some(dir.to_path_buf()),
             refresh_records: true,
             refresh_recent: true,
@@ -86,7 +133,11 @@ impl Store {
                 if let Err(e) = Self::read_records(&dir.join("records.tsv"), &mut store.records) {
                     log::error!("reading records during lock contention: {e}");
                 }
-                if let Err(e) = Self::read_recent(&dir.join("recent.tsv"), &mut store.recent) {
+                if let Err(e) = read_recent(
+                    &dir.join("recent.tsv"),
+                    &mut store.recent,
+                    &mut store.recent_titles,
+                ) {
                     log::error!("reading recent list during lock contention: {e}");
                 }
             }
@@ -102,9 +153,27 @@ impl Store {
     pub fn records(&self) -> &BTreeMap<String, Record> {
         &self.records
     }
-
-    pub fn recent(&self) -> &[MediaUri] {
-        &self.recent
+    pub fn annotations(&self, uri: &MediaUri) -> Option<&Annotations> {
+        self.annotations.get(uri)
+    }
+    pub fn annotation_target(&self) -> Result<AnnotationTarget, iris_api::v2::ErrorCode> {
+        Ok(AnnotationTarget::new(
+            self.target_dir().ok_or(iris_api::v2::ErrorCode::IoError)?,
+        ))
+    }
+    pub fn apply_annotation_snapshot(
+        &mut self,
+        snapshot: AnnotationSnapshot,
+    ) -> Result<(), iris_api::v2::ErrorCode> {
+        self.annotations.accept(snapshot)
+    }
+    /// The plugin manager must first resolve an explicit host selection grant.
+    pub fn edit_annotations(
+        &mut self,
+        uris: &[MediaUri],
+        edit: &iris_api::v2::enhance::AnnotationEdit,
+    ) -> Result<(), iris_api::v2::ErrorCode> {
+        self.annotations.edit(uris, edit)
     }
 
     pub fn favorites(&self) -> Vec<MediaUri> {
@@ -113,21 +182,6 @@ impl Store {
             .filter(|(_, r)| r.favorite)
             .map(|(k, _)| MediaUri::parse(k))
             .collect()
-    }
-
-    fn read_recent(path: &Path, out: &mut Vec<MediaUri>) -> io::Result<(bool, bool)> {
-        read_tsv(path, |line| {
-            let raw = line.trim();
-            let Some(uri) = decode_any_media_uri(raw) else {
-                return true;
-            };
-            if !uri.may_share_identity() || out.len() >= MAX_RECENT || out.contains(&uri) {
-                return true;
-            }
-            let migrated = !canonical_hex_matches(raw, &uri.to_uri_string());
-            out.push(uri);
-            migrated
-        })
     }
 
     fn read_records(path: &Path, out: &mut Records) -> io::Result<(bool, bool)> {
@@ -185,15 +239,6 @@ impl Store {
         })
     }
 
-    fn write_recent(path: &Path, recent: &[MediaUri]) -> io::Result<()> {
-        let mut text = String::with_capacity(recent.len() * 64);
-        for u in recent {
-            push_hex(u.to_uri_string().as_bytes(), &mut text);
-            text.push('\n');
-        }
-        fs_util::atomic_write(path, text)
-    }
-
     pub fn save(&mut self) {
         if !self.is_dirty() {
             return;
@@ -209,13 +254,73 @@ impl Store {
         self.sync(&dir);
     }
 
+    pub fn prepare_progress_flush(&mut self) -> Option<ProgressFlush> {
+        if self.annotations.dirty()
+            || self.refresh_records
+            || self.refresh_recent
+            || self.clear_all_progress
+            || self.clear_all_recent
+            || !self.recent_pushes.is_empty()
+            || !self.recent_title_updates.is_empty()
+            || self.edits.is_empty()
+            || self.edits.values().any(|e| e.favorite.is_some())
+            || self.dir_has_legacy()?
+        {
+            return None;
+        }
+        let dir = self.target_dir()?;
+        for (k, e) in &self.edits {
+            if let Some(prog) = e.progress {
+                self.in_flight.insert(k.clone(), prog);
+            }
+        }
+        Some(ProgressFlush {
+            dir,
+            edits: self.edits.clone(),
+        })
+    }
+
+    fn dir_has_legacy(&self) -> Option<bool> {
+        let dir = self.target_dir()?;
+        Some(dir.join("uri_records.tsv").exists())
+    }
+
+    pub fn finish_progress_flush(&mut self, applied: Option<BTreeMap<String, (f64, f64)>>) {
+        let Some(applied) = applied else {
+            self.in_flight.clear();
+            return;
+        };
+        for (key, done) in applied {
+            self.in_flight.remove(&key);
+            let remove = if let Some(edit) = self.edits.get_mut(&key) {
+                if edit.favorite.is_none() && edit.progress == Some(done) {
+                    true
+                } else {
+                    edit.progress_before = Some(done);
+                    false
+                }
+            } else {
+                false
+            };
+            if remove {
+                self.edits.remove(&key);
+            }
+        }
+    }
+
     fn sync(&mut self, dir: &Path) {
+        if self.annotations.save().is_err() {
+            log::warn!("personal annotation edits remain pending");
+        }
         if (self.refresh_records || self.clear_all_progress || !self.edits.is_empty())
             && let Err(e) = self.sync_records(dir)
         {
             log::error!("synchronizing records failed: {e}");
         }
-        if (self.refresh_recent || self.clear_all_recent || !self.recent_pushes.is_empty())
+        if (self.refresh_recent
+            || self.clear_all_recent
+            || !self.recent_pushes.is_empty()
+            || !self.recent_title_updates.is_empty())
             && let Err(e) = self.sync_recent(dir)
         {
             log::error!("synchronizing recent list failed: {e}");
@@ -223,12 +328,14 @@ impl Store {
     }
 
     pub fn is_dirty(&self) -> bool {
-        self.refresh_records
+        self.annotations.dirty()
+            || self.refresh_records
             || self.refresh_recent
             || self.clear_all_progress
             || self.clear_all_recent
             || !self.edits.is_empty()
             || !self.recent_pushes.is_empty()
+            || !self.recent_title_updates.is_empty()
     }
 
     fn sync_records(&mut self, dir: &Path) -> io::Result<()> {
@@ -255,7 +362,11 @@ impl Store {
                 record.favorite = favorite;
             }
             if let Some((position, duration)) = edit.progress
-                && edit.matches_progress(record)
+                && (edit.matches_progress(record)
+                    || self.in_flight.get(key).is_some_and(|&(pos, dur)| {
+                        (record.position - pos).abs() <= 0.000_501
+                            && (record.duration - dur).abs() <= 0.000_501
+                    }))
             {
                 record.position = position;
                 record.duration = duration;
@@ -273,36 +384,9 @@ impl Store {
         }
         self.records = records;
         self.edits.clear();
+        self.in_flight.clear();
         self.clear_all_progress = false;
         self.refresh_records = false;
-        Ok(())
-    }
-
-    fn sync_recent(&mut self, dir: &Path) -> io::Result<()> {
-        let path = dir.join("recent.tsv");
-        let legacy_path = dir.join("recent_uris.tsv");
-        let mut recent = Vec::new();
-        let (_, scrub) = Self::read_recent(&path, &mut recent)?;
-        let (legacy, _) = Self::read_recent(&legacy_path, &mut recent)?;
-        if legacy {
-            Self::write_recent(&path, &recent)?;
-            fs_util::retry_sharing_violation(|| std::fs::remove_file(&legacy_path))?;
-        }
-        let mut changed = scrub && !legacy;
-        if self.clear_all_recent && !recent.is_empty() {
-            recent.clear();
-            changed = true;
-        }
-        for uri in self.recent_pushes.iter().rev() {
-            changed |= promote_recent(&mut recent, uri);
-        }
-        if changed {
-            Self::write_recent(&path, &recent)?;
-        }
-        self.recent = recent;
-        self.recent_pushes.clear();
-        self.clear_all_recent = false;
-        self.refresh_recent = false;
         Ok(())
     }
 
@@ -319,25 +403,6 @@ impl Store {
             );
         }
         fs_util::atomic_write(path, text)
-    }
-
-    pub fn push_recent(&mut self, uri: &MediaUri) {
-        if uri.may_share_identity() && uri.to_uri_string().len() <= MAX_RECORD_KEY {
-            promote_recent(&mut self.recent, uri);
-            promote_recent(&mut self.recent_pushes, uri);
-            self.save();
-        }
-    }
-
-    pub fn push_recent_path(&mut self, path: &Path) {
-        self.push_recent(&MediaUri::Local(path.to_path_buf()));
-    }
-
-    pub fn clear_recent(&mut self) {
-        self.recent.clear();
-        self.recent_pushes.clear();
-        self.clear_all_recent = true;
-        self.save();
     }
 
     pub fn is_favorite(&self, uri: &MediaUri) -> bool {
@@ -437,20 +502,19 @@ impl Store {
         let before = previous.map_or((0., 0.), |r| (r.position, r.duration));
         if eof {
             let Some(r) = previous else { return false };
-            if r.favorite && r.position == 0. && (r.duration - duration).abs() <= 0.01 {
+            if r.favorite && r.position == 0. && r.duration == 0. {
                 return false;
             }
-            let remaining_duration = if r.favorite { duration } else { 0. };
             self.edits
                 .entry(key.clone())
                 .or_default()
-                .remember_progress(before, (0., remaining_duration));
+                .remember_progress(before, (0., 0.));
             if r.favorite {
                 self.records.insert(
                     key,
                     Record {
                         position: 0.,
-                        duration,
+                        duration: 0.,
                         ..r
                     },
                 );
@@ -605,16 +669,6 @@ fn prune_records(records: &mut Records, edits: &BTreeMap<String, RecordEdit>) ->
             break;
         }
     }
-    true
-}
-
-fn promote_recent(recent: &mut Vec<MediaUri>, uri: &MediaUri) -> bool {
-    if recent.first() == Some(uri) {
-        return false;
-    }
-    recent.retain(|existing| existing != uri);
-    recent.insert(0, uri.clone());
-    recent.truncate(MAX_RECENT);
     true
 }
 

@@ -2,10 +2,12 @@
 //! and encapsulated playback state transitions.
 
 mod backend;
+mod enhance;
 mod inspect;
 mod model;
 mod prepare;
 mod relay;
+mod scoped;
 
 use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
@@ -17,10 +19,12 @@ use iris_mpv::{Mpv, RenderHandle};
 use relay::PlaybackRelay;
 
 use crate::library::{self, Entry, FolderEntry, Kind, SortBy, SortOrder};
+use crate::logging;
 use crate::media_uri::MediaUri;
 use crate::photo::Photo;
 use crate::settings::{Hwdec, OnEof, Settings};
 use crate::vfs::{self, http_client::origin_headers};
+use serde_json::json;
 
 pub use model::{
     AspectMode, AudioDevice, Chapter, Command, MAX_SPEED, MIN_SPEED, MediaStats, PlaybackState,
@@ -40,12 +44,19 @@ pub struct Session {
     pub(super) current: Option<PathBuf>,
     pub(super) current_uri: Option<String>,
     pub(super) current_title: Option<String>,
+    pub(super) private_identity: bool,
     pub(super) kind: Option<Kind>,
     pub(super) photo_meta: Option<Photo>,
     pub(super) last_remote: Option<RemoteMediaRequest>,
     playlist_entry_id: Option<i64>,
     pending_remote_subs: Vec<String>,
     playback_relay: Option<PlaybackRelay>,
+    scoped_playback: Option<Arc<crate::plugin_v2::stream::prepare::Playback>>,
+    pending_scoped_tracks: Vec<crate::plugin_v2::stream::prepare::AttachmentView>,
+    plugin_tracks: enhance::TrackState,
+    plugin_timeline: Option<String>,
+    monitor_lut: Option<Arc<crate::plugin_v2::lut::MonitorLut>>,
+    retired_lut: Option<(u64, Arc<crate::plugin_v2::lut::MonitorLut>)>,
     pub(super) extra_rotate: u16,
     source_rotation: u16,
     pub(super) user_hwdec: Cell<Hwdec>,
@@ -70,12 +81,19 @@ impl Session {
             current: None,
             current_uri: None,
             current_title: None,
+            private_identity: false,
             kind: None,
             photo_meta: None,
             last_remote: None,
             playlist_entry_id: None,
             pending_remote_subs: Vec::new(),
             playback_relay: None,
+            scoped_playback: None,
+            pending_scoped_tracks: Vec::new(),
+            monitor_lut: None,
+            retired_lut: None,
+            plugin_tracks: enhance::TrackState::default(),
+            plugin_timeline: None,
             extra_rotate: 0,
             source_rotation: 0,
             user_hwdec: Cell::new(Hwdec::AutoSafe),
@@ -131,6 +149,17 @@ impl Session {
         self.current_title.as_deref()
     }
 
+    pub fn set_private_identity(&mut self, private: bool) {
+        self.private_identity = private;
+    }
+
+    pub fn may_share_current_identity(&self) -> bool {
+        !self.private_identity
+            && self
+                .current_media_uri()
+                .is_some_and(|u| u.may_share_identity())
+    }
+
     pub fn kind(&self) -> Option<Kind> {
         self.kind
     }
@@ -179,10 +208,16 @@ impl Session {
     }
 
     pub fn stop(&mut self) -> Result<()> {
+        self.execute(Command::ClearAbLoop)?;
+        self.set_monitor_lut(None)?;
         self.mpv.command_async(&["stop"])?;
+        self.discard_scoped();
+        self.plugin_tracks.clear();
+        self.plugin_timeline = None;
         self.current = None;
         self.current_uri = None;
         self.current_title = None;
+        self.private_identity = false;
         self.playlist_entry_id = None;
         self.pending_remote_subs.clear();
         self.playback_relay = None;
@@ -255,10 +290,17 @@ impl Session {
         self.current = current;
         self.current_uri = Some(current_uri);
         self.current_title = current_title;
+        self.private_identity = false;
         self.playlist_entry_id = Some(playlist_entry_id);
         self.pending_remote_subs = pending_remote_subs;
         self.kind = Some(kind);
         self.state.is_live = is_live;
+        self.state.ab_start = None;
+        self.state.ab_end = None;
+        self.monitor_lut = None;
+        self.retired_lut = None;
+        self.plugin_tracks.loading();
+        self.plugin_timeline = None;
         self.state.buffering = false;
         self.state.cache_duration = 0.;
         self.state.photo_colour = photo
@@ -313,6 +355,7 @@ impl Session {
         let playback_url = relay.url(&main_url)?;
         let mut owned_opts: Vec<(&'static str, String)> = Vec::new();
         owned_opts.push(("autoload-files", "no".into()));
+        owned_opts.push(("stream-lavf-o", "reconnect_on_http_error=503".into()));
         if let Some(photo) = &req.photo {
             owned_opts.extend(photo.mpv_options());
         } else if !req.is_live
@@ -352,6 +395,7 @@ impl Session {
             }
         };
         self.playback_relay = Some(relay);
+        self.discard_scoped();
         self.reset_for_load(
             None,
             req.uri.to_uri_string(),
@@ -363,6 +407,17 @@ impl Session {
             req.photo,
         );
         self.last_remote = Some(saved_remote);
+        logging::record_info(
+            "player",
+            "media_open",
+            json!({
+                "source": "remote",
+                "kind": format!("{:?}", req.kind),
+                "host": logging::url_host(main_url.as_str()),
+                "is_live": req.is_live,
+                "has_resume": resume > 0.,
+            }),
+        );
         Ok(())
     }
 
@@ -392,6 +447,7 @@ impl Session {
             .loadfile_with_options(&mpv_path, "replace", &opt_refs)?;
         self.playback_relay = None;
         self.event_pump.set_relay(Default::default());
+        self.discard_scoped();
         self.reset_for_load(
             Some(path.to_path_buf()),
             canonical_uri,
@@ -403,6 +459,16 @@ impl Session {
             photo,
         );
         self.last_remote = None;
+        logging::record_info(
+            "player",
+            "media_open",
+            json!({
+                "source": "local",
+                "kind": format!("{kind:?}"),
+                "is_live": false,
+                "has_resume": resume > 0.,
+            }),
+        );
         Ok(())
     }
 
@@ -418,7 +484,8 @@ impl Session {
 
     pub fn uri_progress(&self) -> Option<(&str, f64, f64, bool)> {
         let uri = self.current_uri.as_deref()?;
-        (!self.state.is_live
+        (!self.private_identity
+            && !self.state.is_live
             && matches!(self.kind, Some(Kind::Video | Kind::Audio))
             && self.state.loaded)
             .then_some((
@@ -443,7 +510,25 @@ impl Session {
 
     pub fn apply(&mut self, event: &SessionEvent) {
         match event {
-            SessionEvent::Position(v) => self.state.time_pos = *v,
+            SessionEvent::Seek => {
+                // Explicit seek commands already advance the stream generation synchronously;
+                // advancing again on delayed MPV_EVENT_SEEK would cancel the post-seek Range read.
+            }
+            SessionEvent::CommandReply { id, error } => {
+                if self
+                    .retired_lut
+                    .as_ref()
+                    .is_some_and(|(rid, _)| *rid == *id)
+                {
+                    self.retired_lut = None;
+                }
+                self.plugin_tracks.reply(&self.mpv, *id, *error);
+                self.tracks_dirty = true;
+            }
+            SessionEvent::Position(v) => {
+                self.state.time_pos = *v;
+                self.update_plugin_chapter();
+            }
             SessionEvent::Duration(v) => self.state.duration = *v,
             SessionEvent::Paused(v) => self.state.paused = *v,
             SessionEvent::Volume(v) => self.state.volume = *v,
@@ -451,7 +536,19 @@ impl Session {
             SessionEvent::Speed(v) => self.state.speed = *v,
             SessionEvent::Width(v) => self.state.video_size.0 = *v,
             SessionEvent::Height(v) => self.state.video_size.1 = *v,
-            SessionEvent::Hardware(v) => self.state.hwdec.clone_from(v),
+            SessionEvent::Hardware(v) => {
+                if self.state.hwdec != *v && self.state.loaded {
+                    logging::record_info(
+                        "player",
+                        "hwdec_changed",
+                        json!({
+                            "from": self.state.hwdec,
+                            "to": v,
+                        }),
+                    );
+                }
+                self.state.hwdec.clone_from(v);
+            }
             SessionEvent::Subtitles(v) => self.state.subs_visible = *v,
             SessionEvent::SubtitleTrack(v) => {
                 if self.state.tracks.is_empty() {
@@ -483,7 +580,13 @@ impl Session {
             SessionEvent::Rotation(v) => self.state.rotation = *v,
             SessionEvent::SourceRotation(v) => self.source_rotation = v.rem_euclid(360) as u16,
             SessionEvent::LoopFile(v) => self.state.loop_file = *v,
-            SessionEvent::Chapter(v) => self.state.current_chapter = *v,
+            SessionEvent::AbStart(v) => self.state.ab_start = *v,
+            SessionEvent::AbEnd(v) => self.state.ab_end = *v,
+            SessionEvent::Chapter(v) => {
+                if self.plugin_timeline.is_none() {
+                    self.state.current_chapter = *v;
+                }
+            }
             SessionEvent::ChaptersChanged => self.chapters_dirty = true,
             SessionEvent::TracksChanged => self.tracks_dirty = true,
             SessionEvent::Buffering(v) => self.state.buffering = *v,
@@ -491,21 +594,171 @@ impl Session {
                 self.state.cache_duration = if v.is_finite() { v.max(0.) } else { 0. };
             }
             SessionEvent::Loaded => {
+                self.plugin_tracks.loaded();
                 self.state.loaded = true;
+                self.sync_video_params();
+                if self.state.duration <= 0.
+                    && let Ok(v) = self.mpv.get_property_f64("duration")
+                    && v.is_finite()
+                    && v > 0.
+                {
+                    self.state.duration = v;
+                }
+                self.attach_scoped_tracks();
                 for sub_mem in std::mem::take(&mut self.pending_remote_subs) {
                     let _ = self.mpv.command_async(&["sub-add", &sub_mem, "auto"]);
                 }
                 self.tracks_dirty = true;
                 self.chapters_dirty = true;
+                let video_codec = self
+                    .mpv
+                    .get_property_string("video-codec")
+                    .unwrap_or_default();
+                let audio_codec = self
+                    .mpv
+                    .get_property_string("audio-codec-name")
+                    .unwrap_or_default();
+                logging::record_info(
+                    "player",
+                    "media_loaded",
+                    json!({
+                        "kind": self.kind.map(|k| format!("{k:?}")),
+                        "width": self.state.video_size.0,
+                        "height": self.state.video_size.1,
+                        "duration_s": self.state.duration,
+                        "hwdec": self.state.hwdec,
+                        "video_codec": video_codec,
+                        "audio_codec": audio_codec,
+                        "is_live": self.state.is_live,
+                    }),
+                );
             }
-            SessionEvent::Error(_) => {
+            SessionEvent::Reconfigured => self.sync_video_params(),
+            SessionEvent::QueueOverflow => self.resync_after_overflow(),
+            SessionEvent::Error(code) => {
+                logging::record_error(
+                    "player",
+                    "media_error",
+                    json!({
+                        "code": code,
+                        "kind": self.kind.map(|k| format!("{k:?}")),
+                        "time_pos_s": self.state.time_pos,
+                        "duration_s": self.state.duration,
+                        "hwdec": self.state.hwdec,
+                        "is_live": self.state.is_live,
+                    }),
+                );
+                self.discard_scoped();
+                self.plugin_tracks.clear();
+                self.plugin_timeline = None;
+                self.retired_lut = None;
                 self.pending_remote_subs.clear();
                 self.playback_relay = None;
                 self.event_pump.set_relay(Default::default());
                 self.state.loaded = false;
             }
-            _ => {}
         }
+    }
+
+    fn sync_video_params(&mut self) {
+        let i64_prop = |name: &str| {
+            self.mpv
+                .get_property_string(name)
+                .ok()
+                .and_then(|s| s.parse::<i64>().ok())
+        };
+        if let Some(w) = i64_prop("video-out-params/dw")
+            && w > 0
+        {
+            self.state.video_size.0 = w;
+        }
+        if let Some(h) = i64_prop("video-out-params/dh")
+            && h > 0
+        {
+            self.state.video_size.1 = h;
+        }
+        if let Some(r) = i64_prop("video-out-params/rotate") {
+            self.state.rotation = r;
+        }
+        if let Some(r) = i64_prop("video-dec-params/rotate") {
+            self.source_rotation = r.rem_euclid(360) as u16;
+        }
+        if let Ok(hw) = self.mpv.get_property_string("hwdec-current") {
+            self.state.hwdec = hw;
+        }
+    }
+
+    fn resync_after_overflow(&mut self) {
+        let active_id = backend::active_playlist_entry_id(&self.mpv);
+        if self.playlist_entry_id.is_some() && active_id != self.playlist_entry_id {
+            if self
+                .mpv
+                .get_property_string("idle-active")
+                .is_ok_and(|s| s == "yes")
+            {
+                self.plugin_tracks.clear();
+                self.plugin_timeline = None;
+                self.state.loaded = false;
+            }
+            return;
+        }
+        self.sync_video_params();
+        let f64_prop = |name: &str| {
+            self.mpv
+                .get_property_f64(name)
+                .ok()
+                .filter(|v| v.is_finite())
+        };
+        let flag_prop = |name: &str| {
+            self.mpv
+                .get_property_string(name)
+                .ok()
+                .map(|s| s == "yes" || s == "true")
+        };
+        if let Some(v) = f64_prop("time-pos") {
+            self.state.time_pos = v;
+        }
+        if let Some(v) = f64_prop("duration") {
+            self.state.duration = v;
+        }
+        if let Some(v) = flag_prop("pause") {
+            self.state.paused = v;
+        }
+        if let Some(v) = flag_prop("eof-reached") {
+            self.state.ended = v;
+        }
+        if let Some(v) = f64_prop("volume") {
+            self.state.volume = v;
+        }
+        if let Some(v) = flag_prop("mute") {
+            self.state.muted = v;
+        }
+        if let Some(v) = f64_prop("speed") {
+            self.state.speed = v;
+        }
+        if let Some(v) = flag_prop("paused-for-cache") {
+            self.state.buffering = v;
+        }
+        if let Some(v) = f64_prop("demuxer-cache-duration") {
+            self.state.cache_duration = v.max(0.);
+        }
+        self.state.ab_start = f64_prop("ab-loop-a").filter(|v| *v >= 0.);
+        self.state.ab_end = f64_prop("ab-loop-b").filter(|v| *v >= 0.);
+        if !self.state.loaded
+            && active_id.is_some()
+            && (self.state.duration > 0.
+                || self.state.video_size.0 > 0
+                || flag_prop("seeking") == Some(false))
+        {
+            self.plugin_tracks.loaded();
+            self.state.loaded = true;
+            self.attach_scoped_tracks();
+            for sub_mem in std::mem::take(&mut self.pending_remote_subs) {
+                let _ = self.mpv.command_async(&["sub-add", &sub_mem, "auto"]);
+            }
+        }
+        self.tracks_dirty = true;
+        self.chapters_dirty = true;
     }
 
     pub fn flush_deferred(&mut self) {
@@ -530,6 +783,9 @@ impl Session {
     }
 
     pub fn shutdown(&self) {
+        if let Some(playback) = &self.scoped_playback {
+            playback.relay.stop();
+        }
         if let Some(relay) = &self.playback_relay {
             relay.cancel();
         }
@@ -579,5 +835,49 @@ mod tests {
         ));
         assert!(session.state.loaded);
         assert!(session.pending_remote_subs.is_empty());
+    }
+
+    #[test]
+    fn switching_between_same_resolution_videos_preserves_video_size() {
+        use std::time::{Duration, Instant};
+
+        let mut session = Session::new().unwrap();
+        session.mpv.set_property_string("vo", "null").unwrap();
+        session.mpv.set_property_string("ao", "null").unwrap();
+        let mut events = session.events().unwrap();
+        let clip = format!(
+            "memory://YUV4MPEG2 W16 H16 F10:1 Ip A1:1 C420jpeg\n{}",
+            format!("FRAME\n{}", "x".repeat(384)).repeat(5)
+        );
+        for attempt in 0..2 {
+            let entry_id = session
+                .mpv
+                .loadfile_with_options(&clip, "replace", &[("pause", "yes")])
+                .unwrap();
+            session.reset_for_load(
+                None,
+                format!("https://example.invalid/clip-{attempt}"),
+                None,
+                entry_id,
+                Vec::new(),
+                Kind::Video,
+                false,
+                None,
+            );
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !session.state.loaded || session.state.video_size != (16, 16) {
+                while let Ok(update) = events.try_recv() {
+                    session.apply_update(&update);
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "attempt {attempt}: loaded={} video_size={:?}",
+                    session.state.loaded,
+                    session.state.video_size
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        session.shutdown();
     }
 }

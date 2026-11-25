@@ -264,6 +264,21 @@ impl IrisWindow {
             )
             .when(!tiny, |d| d.child(self.step_button("next", 1, t, cx)))
             .child(readout)
+            .when(state.ab_start.is_some(), |d| {
+                let a = format_time(state.ab_start.unwrap_or(0.));
+                let label = state.ab_end.map_or_else(
+                    || format!("A {a}"),
+                    |b| format!("A-B {a}–{}", format_time(b)),
+                );
+                d.child(
+                    text_button("native-ab", label, t)
+                        .text_color(t.accent)
+                        .tooltip(tip("点击清除 A-B 循环", None))
+                        .on_click(cx.listener(|this, _, w, cx| {
+                            this.clear_ab_loop(&super::super::actions::ClearAbLoop, w, cx)
+                        })),
+                )
+            })
     }
 
     pub(super) fn video_fields(
@@ -384,21 +399,40 @@ impl IrisWindow {
         t: ThemeTokens,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let pos_str = self
-            .catalog
-            .current_playable_number
-            .map_or_else(|| "—".to_string(), |number| number.to_string());
+        let session = &self.active().session;
+        let standalone_remote = self.catalog.current_playable_number.is_none()
+            && session.current().is_none()
+            && self.catalog.active_source.is_local()
+            && self.catalog.filter != iris_core::catalog::MediaFilter::FavoritesOnly;
+        let (pos_str, total_str) = if standalone_remote {
+            if !self.queue.is_empty() {
+                let pos = session
+                    .current_media_uri()
+                    .and_then(|u| {
+                        (0..self.queue.len())
+                            .find(|&i| self.queue.get(i).is_some_and(|q| q.uri == u))
+                    })
+                    .map_or_else(|| "—".to_string(), |i| (i + 1).to_string());
+                (pos, self.queue.len().to_string())
+            } else if session.current_uri().is_some() {
+                ("1".to_string(), "1".to_string())
+            } else {
+                ("—".to_string(), "0".to_string())
+            }
+        } else {
+            let pos = self
+                .catalog
+                .current_playable_number
+                .map_or_else(|| "—".to_string(), |number| number.to_string());
+            (pos, self.catalog.playable_count.to_string())
+        };
         let counter = hstack(if compact { 4. } else { 6. })
             .pl(px(if compact { 6. } else { 10. }))
             .font_family(FONT_MONO)
             .text_size(px(12.))
             .child(div().text_color(t.text).child(pos_str))
             .child(div().text_color(t.text_faint).child("/"))
-            .child(
-                div()
-                    .text_color(t.text_dim)
-                    .child(self.catalog.playable_count.to_string()),
-            );
+            .child(div().text_color(t.text_dim).child(total_str));
         hstack(if compact { 1. } else { 2. })
             .child(self.step_button("prev", -1, t, cx))
             .child(self.step_button("next", 1, t, cx))

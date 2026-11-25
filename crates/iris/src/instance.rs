@@ -73,6 +73,7 @@ mod imp {
     use std::fs::{File, OpenOptions};
     use std::io::{self, Read, Write};
     use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    use std::os::windows::fs::OpenOptionsExt;
     use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
     use std::path::PathBuf;
     use std::ptr::null;
@@ -82,7 +83,7 @@ mod imp {
         ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, ERROR_NO_DATA, ERROR_PIPE_BUSY,
         ERROR_PIPE_CONNECTED, GetLastError,
     };
-    use windows_sys::Win32::Storage::FileSystem::{ReadFile, WriteFile};
+    use windows_sys::Win32::Storage::FileSystem::{ReadFile, SECURITY_SQOS_PRESENT, WriteFile};
     use windows_sys::Win32::System::Pipes::{
         ConnectNamedPipe, DisconnectNamedPipe, GetNamedPipeClientSessionId,
         GetNamedPipeServerProcessId, GetNamedPipeServerSessionId, PIPE_NOWAIT, PIPE_WAIT,
@@ -93,7 +94,7 @@ mod imp {
 
     use super::wire::{MAX_BATCH_UNITS, MAX_PATHS, MAX_UNITS, read_batch};
 
-    const IO_TIMEOUT: Duration = Duration::from_secs(3);
+    pub(super) const IO_TIMEOUT: Duration = Duration::from_secs(3);
     const POLL_INTERVAL: Duration = Duration::from_millis(10);
     const ACCEPTED: u8 = 1;
     const REJECTED: u8 = 0;
@@ -117,7 +118,7 @@ mod imp {
         Rejected,
     }
 
-    fn session_id() -> io::Result<u32> {
+    pub(super) fn session_id() -> io::Result<u32> {
         let mut session = 0;
         // SAFETY: plain out-parameter call.
         if unsafe { ProcessIdToSessionId(GetCurrentProcessId(), &mut session) } == 0 {
@@ -184,16 +185,17 @@ mod imp {
         })
     }
 
-    fn forward(endpoint: &str, session: u32, paths: &[PathBuf]) -> io::Result<()> {
-        if paths.len() > MAX_PATHS {
+    pub(super) fn forward(endpoint: &str, session: u32, paths: &[PathBuf]) -> io::Result<()> {
+        let non_empty: Vec<&PathBuf> = paths.iter().filter(|p| !p.as_os_str().is_empty()).collect();
+        if non_empty.len() > MAX_PATHS {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "too many file paths",
             ));
         }
-        let mut message = (paths.len() as u32).to_le_bytes().to_vec();
+        let mut message = (non_empty.len() as u32).to_le_bytes().to_vec();
         let mut remaining = MAX_BATCH_UNITS;
-        for path in paths {
+        for path in non_empty {
             let path = std::path::absolute(path)?;
             let start = message.len();
             message.extend_from_slice(&[0; 4]);
@@ -213,7 +215,12 @@ mod imp {
         }
         let deadline = Instant::now() + IO_TIMEOUT;
         let pipe = loop {
-            match OpenOptions::new().read(true).write(true).open(endpoint) {
+            match OpenOptions::new()
+                .read(true)
+                .write(true)
+                .custom_flags(SECURITY_SQOS_PRESENT)
+                .open(endpoint)
+            {
                 Ok(pipe) => break pipe,
                 Err(e) if matches!(e.raw_os_error(), Some(code) if code == ERROR_PIPE_BUSY as i32 || code == ERROR_FILE_NOT_FOUND as i32) =>
                 {
@@ -267,7 +274,7 @@ mod imp {
         }
     }
 
-    fn serve_connection(
+    pub(super) fn serve_connection(
         pipe: &File,
         session: u32,
         opened: &mut Sender<OpenRequest>,
@@ -339,7 +346,7 @@ mod imp {
         Ok(())
     }
 
-    fn wait_for_io(deadline: Instant) -> io::Result<()> {
+    pub(super) fn wait_for_io(deadline: Instant) -> io::Result<()> {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             return Err(io::Error::new(
@@ -419,13 +426,24 @@ mod imp {
             Ok(())
         }
     }
+}
 
-    #[cfg(test)]
-    mod tests {
-        use super::*;
+#[cfg(target_os = "windows")]
+pub(crate) use imp::{Claim, OpenRequest, claim};
+
+#[cfg(test)]
+mod tests {
+    use super::wire::{MAX_PATHS, MAX_UNITS, read_batch};
+    use std::io::{self, Cursor};
+
+    #[cfg(target_os = "windows")]
+    mod win {
+        use super::super::imp::*;
         use futures::channel::mpsc::{self, Receiver, TryRecvError};
+        use std::io;
         use std::sync::mpsc as sync;
         use std::thread;
+        use std::time::{Duration, Instant};
 
         fn request_from(receiver: &mut Receiver<OpenRequest>) -> OpenRequest {
             let deadline = Instant::now() + IO_TIMEOUT;
@@ -482,15 +500,6 @@ mod imp {
             assert!(request.ack.send(()).is_err());
         }
     }
-}
-
-#[cfg(target_os = "windows")]
-pub(crate) use imp::{Claim, OpenRequest, claim};
-
-#[cfg(test)]
-mod tests {
-    use super::wire::{MAX_PATHS, MAX_UNITS, read_batch};
-    use std::io::{self, Cursor};
 
     fn encode_units(units: &[u16]) -> Vec<u8> {
         let mut buf = Vec::with_capacity(4 + units.len() * 2);

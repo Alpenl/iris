@@ -9,6 +9,7 @@ import winreg
 
 
 REGISTRATION = r"Software\RegisteredApplications"
+APP_ROOT = r"Software\Iris"
 CAPABILITIES = r"Software\Iris\Capabilities"
 PROGID = "Iris.Media"
 CLASSES = r"Software\Classes"
@@ -34,7 +35,7 @@ def key_exists(key):
 
 
 def residue():
-    keys = [key for key in (UNINSTALL, CAPABILITIES, rf"{CLASSES}\{PROGID}") if key_exists(key)]
+    keys = [key for key in (UNINSTALL, CAPABILITIES, APP_ROOT, rf"{CLASSES}\{PROGID}") if key_exists(key)]
     keys.extend(key for key in OPEN_WITH if value(key, PROGID) is not None)
     if value(REGISTRATION, "Iris") is not None:
         keys.append(REGISTRATION)

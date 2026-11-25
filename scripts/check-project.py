@@ -55,12 +55,20 @@ def is_under(path: Path, parent: Path) -> bool:
         return False
 
 
-# 1. Python syntax across scripts/ and examples/
+# 1. Python syntax across scripts/ and examples/ + packaging unit tests
 for directory in ("scripts", "examples"):
     base = ROOT / directory
     if base.is_dir():
         for script in sorted(base.rglob("*.py")):
             ast.parse(script.read_text(encoding="utf-8"), filename=str(script))
+subprocess.run(
+    [sys.executable, "-B", "-m", "unittest", "scripts/test_package.py"],
+    cwd=ROOT,
+    check=True,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.STDOUT,
+    text=True,
+)
 
 # 2. Recursive UI & app layer isolation (no raw mpv outside src/video/, no wildcard super, no UI target_os)
 iris_src = ROOT / "crates/iris/src"
@@ -86,7 +94,7 @@ for path in sorted(iris_src.rglob("*.rs")):
             assert needle not in code, f"{rel} breaks playback boundary via `{needle}`"
     if is_under(path, ui_dir):
         assert "use super::*;" not in code, f"{rel} uses forbidden wildcard `use super::*;`"
-        assert "cfg!(target_os" not in code, f"{rel} scatters `cfg!(target_os...)` in UI layer"
+        assert not re.search(r"\btarget_os\b", code), f"{rel} scatters `target_os` cfg in UI layer"
 
 # 3. Cargo metadata: devtools security gates, layer dependency boundaries & workspace lints
 metadata = json.loads(
@@ -135,13 +143,13 @@ assert mpv_normal == [], f"iris-mpv must stay zero-dependency, got {mpv_normal}"
 api_normal = [d["name"] for d in pkgs["iris-api"]["dependencies"] if d["kind"] is None]
 assert api_normal == ["serde"], f"iris-api normal deps must be ['serde'] only, got {api_normal}"
 
-forbidden_core = {"gpui", "cocoa", "objc", "objc2", "raw-window-handle", "winit", "image"}
+forbidden_core = {"gpui", "cocoa", "objc", "objc2", "raw-window-handle", "winit", "windows", "image"}
 core_deps = {d["name"] for d in pkgs["iris-core"]["dependencies"]}
 assert not (core_deps & forbidden_core), f"iris-core must stay headless, found {core_deps & forbidden_core}"
 
 # 4. File line-count budgets (prevent monolith regressions)
 soft_warnings = []
-for path in sorted((ROOT / "crates").rglob("*.rs")):
+for path in sorted([*(ROOT / "crates").rglob("*.rs"), *(ROOT / "examples/plugins").rglob("*.rs")]):
     rel = path.relative_to(ROOT)
     text = path.read_text(encoding="utf-8")
     total_lines = len(text.splitlines())
@@ -150,7 +158,21 @@ for path in sorted((ROOT / "crates").rglob("*.rs")):
             f"{rel} has {total_lines} lines (exceeds test file limit {TEST_FILE_HARD_MAX_LINES})"
         )
         continue
-    prod_part = re.split(r"(?m)^#\[cfg\(test\)\]", text, maxsplit=1)[0]
+    test_mod = re.search(
+        r"(?m)^[ \t]*#\[cfg\(test\)\]\s*(?:#\[[^\]]+\]\s*)*mod\s+\w+\s*(?:\{|;)",
+        text,
+    )
+    prod_part = text[: test_mod.start()] if test_mod else text
+    assert "#[cfg(test)]" not in prod_part, (
+        f"{rel} places `#[cfg(test)]` outside trailing `mod tests`"
+    )
+    if test_mod:
+        tail = text[test_mod.end() :]
+        assert "#[cfg(test)]" not in tail, f"{rel} has multiple `#[cfg(test)]` blocks"
+        if text[test_mod.end() - 1] == ";":
+            assert not tail.strip().strip("}").strip(), (
+                f"{rel} has production code after `mod tests;`"
+            )
     prod_lines = len(prod_part.splitlines())
     assert prod_lines <= PROD_HARD_MAX_LINES, (
         f"{rel} has {prod_lines} production lines (hard limit {PROD_HARD_MAX_LINES})"
@@ -177,10 +199,21 @@ for manifest_path in sorted((ROOT / "examples/plugins").glob("*/plugin.json")):
     pid = plugin_data.get("id", "")
     assert pid and not pid.startswith("iris."), f"{manifest_path}: invalid or reserved id `{pid}`"
     assert plugin_data.get("name", "").strip(), f"{manifest_path}: missing plugin name"
-    assert plugin_data.get("protocol") == 1, f"{manifest_path}: protocol must be 1"
+    assert plugin_data.get("protocol") == plugin_data.get("abi") == 2, f"{manifest_path}: protocol/abi must be 2"
     entry = plugin_data.get("entry")
     if entry is not None:
-        assert (manifest_path.parent / entry).is_file(), f"{manifest_path}: missing entry `{entry}`"
+        assert entry == "plugin.wasm", f"{manifest_path}: only Wasm entries are accepted"
+        assert (manifest_path.parent / "src/lib.rs").is_file() and (manifest_path.parent / "Cargo.toml").is_file(), f"{manifest_path}: missing SDK source"
+    else:
+        assert plugin_data.get("theme") or plugin_data.get("chrome"), f"{manifest_path}: missing declarative theme"
+assert "pub const PROTOCOL_VERSION: u32 = 2;" in (ROOT / "crates/iris-api/src/lib.rs").read_text(encoding="utf-8")
+assert not (ROOT / "crates/iris-core/src/plugin").exists(), "Legacy plugin runtime must not return"
+assert not list((ROOT / "examples/plugins").rglob("*.py")), "Python plugin examples must not return"
+for path in (ROOT / "crates").rglob("*.rs"):
+    code = strip_line_comments(path.read_text(encoding="utf-8"))
+    assert "BuiltinPlugin" not in code, f"{path}: native builtin plugin bypass"
+    assert not re.search(r"Module::deserialize|\.deserialize_file\(", code), f"{path}: forbidden machine-code cache"
+subprocess.run([sys.executable, "-B", str(ROOT / "scripts/build-official-plugins.py"), "--check", "--output", str(ROOT / "Resources/Plugins")], cwd=ROOT, check=True, stdout=subprocess.PIPE)
 
 # 7. Rust toolchain version sync across CI workflows
 tc_text = (ROOT / "rust-toolchain.toml").read_text(encoding="utf-8")

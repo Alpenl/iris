@@ -70,19 +70,28 @@ impl ActionEntry {
         match self.id {
             "toggle_pause" | "seek_back" | "seek_forward" | "seek_back_large"
             | "seek_forward_large" | "volume_up" | "volume_down" | "toggle_mute" | "speed_down"
-            | "speed_up" | "reset_speed" | "toggle_loop" => {
+            | "speed_up" | "reset_speed" | "toggle_loop" | "cycle_ab_loop" | "clear_ab_loop" => {
                 &["Viewport && media == video", "Viewport && media == audio"]
             }
             "rotate_cw" | "rotate_ccw" | "toggle_hflip" | "toggle_vflip" => {
                 &["Viewport && media == video", "Viewport && media == image"]
+            }
+            "quit" | "open_settings" | "open_palette" => {
+                match effective_gpui_context(self.context, keystroke) {
+                    Some("Workspace && !Modal") => &["Workspace"],
+                    Some("Workspace && !TextInput && !Modal") => {
+                        &["Workspace && !TextInput && !Modal"]
+                    }
+                    _ => &[],
+                }
             }
             _ => match effective_gpui_context(self.context, keystroke) {
                 Some("Viewport && media == video") => &["Viewport && media == video"],
                 Some("Viewport && media == image") => &["Viewport && media == image"],
                 Some("Viewport && media == audio") => &["Viewport && media == audio"],
                 Some("Viewport") => &["Viewport"],
-                Some("Workspace && !TextInput") => &["Workspace && !TextInput"],
-                Some("Workspace") => &["Workspace"],
+                Some("Workspace && !TextInput && !Modal") => &["Workspace && !TextInput && !Modal"],
+                Some("Workspace && !Modal") => &["Workspace && !Modal"],
                 _ => &[],
             },
         }
@@ -183,6 +192,24 @@ pub const ACTIONS: &[ActionEntry] = &[
         "l",
         "shift-l",
         "alt-l",
+    ),
+    act(
+        "cycle_ab_loop",
+        "设置 A / B 点或清除区间",
+        C_PLAY,
+        CTX_VID,
+        "ctrl-shift-l",
+        "ctrl-shift-l",
+        "ctrl-shift-l",
+    ),
+    act(
+        "clear_ab_loop",
+        "清除 A-B 循环",
+        C_PLAY,
+        CTX_VID,
+        "ctrl-alt-shift-l",
+        "ctrl-alt-shift-l",
+        "ctrl-alt-shift-l",
     ),
     act(
         "prev_chapter",

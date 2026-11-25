@@ -59,7 +59,7 @@ impl<'de> Deserialize<'de> for Color {
 
 /// Runtime visual theme palette (`#RRGGBB` / `#RRGGBBAA`) and layout metrics.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct UiThemeSpec {
     pub name: Option<String>,
     pub window_bg: Option<String>,
@@ -84,7 +84,7 @@ pub struct UiThemeSpec {
 /// Runtime window and control-bar structural customization (`hide_titlebar`,
 /// `floating_dock`, `show_titlebar_meta`, `compact_controls`, `hidden_dock_buttons`).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct ChromeLayoutSpec {
     pub hide_titlebar: Option<bool>,
     pub floating_dock: Option<bool>,
@@ -94,12 +94,14 @@ pub struct ChromeLayoutSpec {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SelectOption {
     pub value: String,
     pub label: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ButtonSpec {
     pub label: String,
     pub action_id: String,
@@ -111,7 +113,7 @@ pub struct ButtonSpec {
 
 /// Unified interactive widget tree used inside both [`SidebarPanel`] and [`PluginModal`].
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Widget {
     Label {
         text: String,
@@ -204,6 +206,8 @@ pub enum Widget {
         matrix: Vec<String>,
         #[serde(default)]
         hint: Option<String>,
+        #[serde(default)]
+        poll_action_id: Option<String>,
     },
     Link {
         label: String,
@@ -219,6 +223,7 @@ fn default_slider_step() -> f64 {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SidebarSection {
     pub heading: String,
     #[serde(default)]
@@ -226,6 +231,7 @@ pub struct SidebarSection {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SidebarPanel {
     pub title: String,
     #[serde(default)]
@@ -233,6 +239,7 @@ pub struct SidebarPanel {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PluginModal {
     pub id: String,
     pub title: String,
@@ -248,6 +255,7 @@ pub struct PluginModal {
 
 /// Compact badge rendered inside the control bar status slot (`Permission::UiStatus`).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StatusBadge {
     pub id: String,
     pub text: String,
@@ -261,6 +269,7 @@ pub struct StatusBadge {
 
 /// Custom button contributed onto the main control bar (`Permission::UiToolbar`).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ToolbarButton {
     pub id: String,
     pub label: String,

@@ -14,16 +14,14 @@ static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 /// - Other Unix: `$XDG_CONFIG_HOME/iris` or `~/.config/iris`.
 pub(crate) fn data_dir() -> Option<PathBuf> {
     if let Some(p) = std::env::var_os("IRIS_SETTINGS") {
-        return Path::new(&p)
-            .parent()
-            .map(|dir| {
-                if dir.as_os_str().is_empty() {
-                    Path::new(".")
-                } else {
-                    dir
-                }
-            })
-            .map(Path::to_path_buf);
+        let dir = Path::new(&p).parent()?;
+        return if dir.as_os_str().is_empty() {
+            std::env::current_dir().ok()
+        } else if dir.is_relative() {
+            std::env::current_dir().ok().map(|cwd| cwd.join(dir))
+        } else {
+            Some(dir.to_path_buf())
+        };
     }
     #[cfg(target_os = "macos")]
     {
@@ -45,6 +43,10 @@ pub(crate) fn data_dir() -> Option<PathBuf> {
 /// Keep the lock on a stable sibling: the data files themselves are replaced by rename.
 /// Closing the returned file releases the OS lock, including on process exit.
 pub(crate) fn lock_file(path: &Path) -> io::Result<std::fs::File> {
+    lock_file_with_timeout(path, Duration::from_millis(20))
+}
+
+pub(crate) fn lock_file_with_timeout(path: &Path, timeout: Duration) -> io::Result<std::fs::File> {
     create_parent(path)?;
     let lock = retry_sharing_violation(|| {
         std::fs::OpenOptions::new()
@@ -54,19 +56,20 @@ pub(crate) fn lock_file(path: &Path) -> io::Result<std::fs::File> {
             .truncate(false)
             .open(path)
     })?;
-    for attempt in 0.. {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
         match lock.try_lock() {
             Ok(()) => return Ok(lock),
-            Err(std::fs::TryLockError::WouldBlock) if attempt < 4 => {
-                std::thread::sleep(Duration::from_millis(5));
-            }
             Err(std::fs::TryLockError::WouldBlock) => {
-                return Err(io::Error::from(io::ErrorKind::WouldBlock));
+                let now = std::time::Instant::now();
+                if now >= deadline {
+                    return Err(io::Error::from(io::ErrorKind::WouldBlock));
+                }
+                std::thread::sleep(Duration::from_millis(5).min(deadline - now));
             }
             Err(std::fs::TryLockError::Error(e)) => return Err(e),
         }
     }
-    unreachable!()
 }
 
 pub(crate) fn create_parent(path: &Path) -> io::Result<()> {
@@ -108,6 +111,12 @@ pub(crate) fn atomic_write_private(path: &Path, bytes: impl AsRef<[u8]>) -> std:
 }
 
 fn write_impl(path: &Path, bytes: &[u8], private: bool) -> io::Result<()> {
+    let Some(base_name) = path.file_name().filter(|n| !n.is_empty()) else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "atomic write target has no file name",
+        ));
+    };
     create_parent(path)?;
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create_new(true);
@@ -117,14 +126,26 @@ fn write_impl(path: &Path, bytes: &[u8], private: bool) -> io::Result<()> {
         opts.mode(0o600);
     }
 
-    let (tmp, mut file) = loop {
+    let mut opened = None;
+    for _ in 0..64 {
         let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
-        let tmp = path.with_extension(format!("{}.{}.tmp", std::process::id(), seq));
+        let mut tmp_name = base_name.to_os_string();
+        tmp_name.push(format!(".{}.{}.tmp", std::process::id(), seq));
+        let tmp = path.with_file_name(tmp_name);
         match retry_sharing_violation(|| opts.open(&tmp)) {
-            Ok(file) => break (tmp, file),
+            Ok(file) => {
+                opened = Some((tmp, file));
+                break;
+            }
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(e) => return Err(e),
         }
+    }
+    let Some((tmp, mut file)) = opened else {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "exhausted atomic temp file retries",
+        ));
     };
     let write = file.write_all(bytes).and_then(|()| {
         if private {
@@ -188,5 +209,13 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn atomic_write_rejects_nameless_paths_immediately() {
+        for bad in ["", ".", "..", "/"] {
+            let err = atomic_write(Path::new(bad), b"x").unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{bad:?}");
+        }
     }
 }
