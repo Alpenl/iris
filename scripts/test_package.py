@@ -964,6 +964,34 @@ class CheckProjectHelperTests(unittest.TestCase):
             with self.assertRaisesRegex(AssertionError, "unwraps a lock result"):
                 check_project.check_lock_poisoning(rel, bad)
 
+    def test_future_incompat_gate_allows_only_known_dependency_warnings(self):
+        block = (
+            "The package `block v0.1.6` currently triggers the following future incompatibility lints:\n"
+            "> \x1b[1m\x1b[33mwarning\x1b[0m\x1b[1m: static of uninhabited type\x1b[0m\n"
+            ">   --> block-0.1.6/src/lib.rs:64:5\n"
+            ">    = warning: this was previously accepted by the compiler but is being phased out\n"
+        )
+        proc_macro = (
+            "The package `proc-macro-error2 v2.0.1` currently triggers the following future incompatibility lints:\n"
+            "> warning[E0365]: extern crate `proc_macro` is private and cannot be re-exported\n"
+        )
+
+        def check(per_package):
+            with tempfile.TemporaryDirectory() as directory:
+                report = Path(directory) / "report.json"
+                report.write_text(json.dumps({"version": 0, "reports": [{"id": 1, "per_package": per_package}]}), encoding="utf-8")
+                check_project.check_future_incompatibilities(report)
+
+        check({"block@0.1.6": block, "proc-macro-error2@2.0.1": proc_macro})
+        for bad in (
+            {"block@0.1.7": block},
+            {"block@0.1.6": block + "> warning: another lint\n"},
+            {"block@0.1.6": proc_macro},
+            {"proc-macro-error2@2.0.1": "nothing parsed\n"},
+        ):
+            with self.assertRaisesRegex(RuntimeError, "Unexpected Cargo future incompatibility"):
+                check(bad)
+
     def test_standalone_tests_rs_classified_as_test_file(self):
         self.assertTrue(check_project.is_standalone_test_file(Path("examples/plugins/baidupan/src/tests.rs"), Path("examples/plugins/baidupan/src/tests.rs")))
         self.assertFalse(check_project.is_standalone_test_file(Path("crates/iris/src/debug.rs"), Path("crates/iris/src/debug.rs")))

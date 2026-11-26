@@ -25,6 +25,25 @@ def _require(condition: bool, message: str):
         raise AssertionError(message)
 
 
+# Dependencies with no released fix, and the exact (code, message) warnings
+# each one may report. A new package or a new warning still fails the gate.
+KNOWN_FUTURE_INCOMPATIBILITIES = {
+    # GPUI 0.2.2 pulls in stacksafe-macro 0.1.4. Its proc-macro-error2
+    # dependency has no released fix for rust-lang/rust#127909.
+    "proc-macro-error2@2.0.1": [
+        ("E0365", "extern crate `proc_macro` is private and cannot be re-exported"),
+    ],
+    # macOS only: GPUI 0.2.2 pulls in block 0.1.6 directly and through cocoa,
+    # core-video and metal. It is the crate's last release (superseded by
+    # block2), and its `_NSConcreteStackBlock` static has an uninhabited type,
+    # rust-lang/rust#74840.
+    "block@0.1.6": [
+        ("", "static of uninhabited type"),
+    ],
+}
+FUTURE_INCOMPAT_WARNING_RE = re.compile(r"(?m)^> warning(?:\[([^]]+)\])?: ([^\r\n]+)")
+
+
 def check_future_incompatibilities(report):
     if not report.is_file():
         return
@@ -34,11 +53,7 @@ def check_future_incompatibilities(report):
     for entry in data["reports"]:
         for package, warning in entry["per_package"].items():
             warning = re.sub(r"\x1b\[[0-9;]*m", "", warning)
-            # GPUI 0.2.2 pulls in stacksafe-macro 0.1.4. Its proc-macro-error2
-            # dependency has no released fix for rust-lang/rust#127909.
-            if (package != "proc-macro-error2@2.0.1"
-                    or re.findall(r"(?m)^> warning\[([^]]+)\]: ([^\r\n]+)", warning)
-                    != [("E0365", "extern crate `proc_macro` is private and cannot be re-exported")]):
+            if FUTURE_INCOMPAT_WARNING_RE.findall(warning) != KNOWN_FUTURE_INCOMPATIBILITIES.get(package):
                 raise RuntimeError(f"Unexpected Cargo future incompatibility in {package}:\n{warning}")
 
 
