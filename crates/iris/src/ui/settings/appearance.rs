@@ -217,6 +217,7 @@ impl IrisWindow {
         );
 
         let ui_scale = s.ui_font_scale;
+        let fake_ip_doh = s.fake_ip_doh_fallback;
         let confirm_recent = self.is_confirming("clear-recent");
         let confirm_progress = self.is_confirming("clear-progress");
 
@@ -517,6 +518,24 @@ impl IrisWindow {
                     t,
                     cx.listener(|this, _, w, cx| {
                         this.toggle_always_on_top(&ToggleAlwaysOnTop, w, cx)
+                    }),
+                ),
+                t,
+            ))
+            .child(setting_row(
+                "Fake-IP 代理下使用公共 DoH",
+                "系统 DNS 返回 Fake-IP 时经阿里、DNSPod、Cloudflare 公共 DoH 解析；关闭后不外发主机名，此类请求将被拒绝",
+                toggle(
+                    "set-fake-ip-doh",
+                    fake_ip_doh,
+                    t,
+                    cx.listener(|this, _, _, cx| {
+                        this.settings.fake_ip_doh_fallback = !this.settings.fake_ip_doh_fallback;
+                        iris_core::vfs::set_fake_ip_doh_fallback(
+                            this.settings.fake_ip_doh_fallback,
+                        );
+                        this.preset_rt.record_user_edit(&this.settings);
+                        cx.notify();
                     }),
                 ),
                 t,

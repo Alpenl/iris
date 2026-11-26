@@ -9,6 +9,7 @@ Rebuild after changes to the official sources, API, SDK or Rust toolchain:
 
 ```text
 rustup target add wasm32-unknown-unknown
+rustup component add rust-src
 python -B scripts/build-official-plugins.py --output Resources/Plugins
 python -B scripts/build-official-plugins.py --check --output Resources/Plugins
 python -B scripts/build-official-plugins.py --verify-embedded
@@ -19,6 +20,11 @@ python -B scripts/test-plugin-v2-official.py
 compilation. `--verify-embedded` rebuilds into `target/` and compares distribution
 hashes with this directory. Run native host tests with the required mpv SDK.
 Do not edit the generated archives or hashes by hand.
+
+The archives here were built on Windows with the `rust-src` component installed.
+With it, rustc records standard-library panic locations against that local copy,
+remapped to `/rustup-sysroot`. Without it, they stay `/rustc/<hash>/library/...`,
+and the Wasm bytes differ. Windows CI installs it for the byte comparison.
 
 `iris --check-plugin-runtime` compiles both embedded guests, verifies an in-memory
 cache hit, instantiates them and executes a callback in the actual host process.

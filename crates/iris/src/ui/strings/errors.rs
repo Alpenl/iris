@@ -22,6 +22,7 @@ pub(in crate::ui) fn player_action_error(err: &anyhow::Error) -> &'static str {
             PlayerActionError::NoVisualMedia => "LUT 预览仅适用于已加载的视频或图片",
             PlayerActionError::InvalidSubtitlePath => "本地字幕不支持远程或内部协议路径",
             PlayerActionError::SubtitleFileNotFound => "字幕文件不存在或不可读取",
+            PlayerActionError::NonUnicodePath => "文件路径含有无法识别的字符，无法交给播放器",
         };
     }
     "当前状态无法执行此操作"

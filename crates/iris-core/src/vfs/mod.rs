@@ -13,6 +13,11 @@ use crate::media_uri::MediaUri;
 pub(crate) use http_client::fetch_range;
 pub use http_client::{HttpCancel, validate_stream_url};
 
+/// Applies `Settings::fake_ip_doh_fallback` to every host and plugin HTTP client.
+pub fn set_fake_ip_doh_fallback(enabled: bool) {
+    http_client::doh::set_fallback_enabled(enabled);
+}
+
 /// User-pinned local folder, network share, or `MediaSource` plugin folder.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PinnedBookmark {

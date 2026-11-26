@@ -238,6 +238,7 @@ fn run(initial: Vec<PathBuf>) -> ExitCode {
         let loaded_settings = Settings::load();
         let (active_settings, preset_rt, init_plugin_cmds) =
             PresetRuntime::restore_on_startup(&presets, loaded_settings);
+        iris_core::vfs::set_fake_ip_doh_fallback(active_settings.fake_ip_doh_fallback);
         cx.set_global(theme::ThemeTokens::resolve(&active_settings.theme_id, None));
 
         let use_saved_size =

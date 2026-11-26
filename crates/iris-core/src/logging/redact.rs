@@ -6,6 +6,9 @@ use url::Url;
 const REDACTED: &str = "<redacted>";
 
 const SENSITIVE_KEYS: &[&str] = &[
+    // Session cookie names of the in-repo `examples/plugins/bilibili` source. They can
+    // appear without a `Cookie:` prefix, and plugins cannot yet declare their own
+    // secret names to the host, so the host keeps them here.
     "sessdata",
     "bili_jct",
     "dedeuserid",
@@ -47,6 +50,10 @@ fn is_sensitive_key(lower: &str) -> bool {
             || SENSITIVE_KEYS.contains(&trimmed)
             || trimmed.contains("cookie")
             || trimmed.contains("token")
+            || trimmed.contains("csrf")
+            || trimmed.contains("xsrf")
+            || trimmed.contains("sessionid")
+            || trimmed.contains("sessid")
             || trimmed.contains("secret")
             || trimmed.contains("password")
             || trimmed.contains("passwd")

@@ -15,6 +15,7 @@ import tempfile
 import types
 import unittest
 from unittest.mock import patch
+import urllib.error
 import zipfile
 
 sys.dont_write_bytecode = True
@@ -91,6 +92,51 @@ class OfficialPluginVerificationTests(unittest.TestCase):
         with self.assertRaisesRegex(AssertionError, "stale"):
             self.invoke("--verify-embedded")
         self.assertEqual(self.snapshot(), before)
+
+    def test_source_stamp_covers_only_the_plugin_dependency_closure(self):
+        def lock(host_version="1.0.0", leaf_checksum="aa"):
+            return f"""version = 4
+
+[[package]]
+name = "plugin"
+version = "0.1.0"
+dependencies = ["dep 1.0.0", "leaf"]
+
+[[package]]
+name = "dep"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "11"
+
+[[package]]
+name = "dep"
+version = "2.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "22"
+
+[[package]]
+name = "leaf"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "{leaf_checksum}"
+
+[[package]]
+name = "host"
+version = "{host_version}"
+dependencies = ["dep 2.0.0 (registry+https://github.com/rust-lang/crates.io-index)"]
+"""
+
+        closure = json.loads(official_plugins.lock_closure(lock(), ["plugin"]))
+        self.assertEqual(
+            [(p["name"], p["version"]) for p in closure["package"]],
+            [("dep", "1.0.0"), ("leaf", "0.3.0"), ("plugin", "0.1.0")],
+        )
+        base = official_plugins.lock_closure(lock(), ["plugin"])
+        self.assertEqual(official_plugins.lock_closure(lock(host_version="9.0.0"), ["plugin"]), base)
+        self.assertNotEqual(official_plugins.lock_closure(lock(leaf_checksum="bb"), ["plugin"]), base)
+        self.assertEqual(official_plugins.lock_closure(lock().replace("\n", "\r\n"), ["plugin"]), base)
+        with self.assertRaisesRegex(AssertionError, "exactly one package"):
+            official_plugins.lock_closure(lock(), ["dep"])
 
     def test_index_json_uses_lf_and_check_rejects_crlf(self):
         self.invoke("--output", self.embedded)
@@ -836,6 +882,53 @@ class PluginV2CiTests(unittest.TestCase):
                 self.assertEqual(zig_exe.read_bytes(), b"MZ-valid")
                 dl_mock.assert_called_once()
 
+    def test_download_zig_retries_only_transient_network_errors(self):
+        payload = b"pinned zig archive"
+        digest = hashlib.sha256(payload).hexdigest()
+
+        def dns_failure():
+            return urllib.error.URLError("nodename nor servname provided, or not known")
+
+        def http_error(code):
+            return urllib.error.HTTPError("https://ziglang.org/download/", code, "status", None, None)
+
+        attempts_max = run_plugin_v2_ci.ZIG_DOWNLOAD_ATTEMPTS
+        cases = [
+            ("dns, then 503, then success", [dns_failure(), http_error(503), io.BytesIO(payload)], None, 3),
+            ("dns on every attempt", [dns_failure() for _ in range(attempts_max)], urllib.error.URLError, attempts_max),
+            ("404 is permanent", [http_error(404)], urllib.error.HTTPError, 1),
+            ("digest mismatch is never retried", [io.BytesIO(b"tampered")], RuntimeError, 1),
+        ]
+        for label, responses, expected_error, attempts in cases:
+            with self.subTest(label), tempfile.TemporaryDirectory() as directory:
+                archive = Path(directory) / f"zig-x86_64-macos-{run_plugin_v2_ci.ZIG_VERSION}.tar.xz"
+                with patch.object(run_plugin_v2_ci.urllib.request, "urlopen", side_effect=responses) as urlopen, \
+                     patch.object(run_plugin_v2_ci.time, "sleep") as sleep, \
+                     contextlib.redirect_stderr(io.StringIO()):
+                    if expected_error is None:
+                        run_plugin_v2_ci._download_zig(archive, digest)
+                    else:
+                        with self.assertRaises(expected_error):
+                            run_plugin_v2_ci._download_zig(archive, digest)
+                self.assertEqual(urlopen.call_count, attempts)
+                self.assertEqual(
+                    [call.args for call in sleep.call_args_list],
+                    [(run_plugin_v2_ci.ZIG_DOWNLOAD_RETRY_SECONDS * n,) for n in range(1, attempts)],
+                )
+                # No .part leftovers; the archive exists only after a verified download.
+                self.assertEqual(
+                    sorted(p.name for p in Path(directory).iterdir()),
+                    [archive.name] if expected_error is None else [],
+                )
+                if expected_error is None:
+                    self.assertEqual(archive.read_bytes(), payload)
+
+        transient = run_plugin_v2_ci._is_transient_download_error
+        self.assertTrue(transient(TimeoutError("The read operation timed out")))
+        self.assertTrue(transient(ConnectionResetError()))
+        self.assertTrue(transient(http_error(429)))
+        self.assertFalse(transient(OSError(28, "No space left on device")))
+
     def test_configure_mpv_env_leaves_posix_unset_and_defaults_only_on_windows(self):
         with tempfile.TemporaryDirectory() as directory:
             sdk = Path(directory).resolve() / "media-sdk/prefix"
@@ -899,6 +992,53 @@ class CheckProjectHelperTests(unittest.TestCase):
         sneaky_trailing = clean_src + "pub fn sneaky_after_tests() {}\n"
         with self.assertRaisesRegex(AssertionError, "after inline `mod tests`"):
             check_project.check_file_line_budget(rel, sneaky_trailing)
+
+    def test_lock_poisoning_gate_checks_production_code_only(self):
+        rel = Path("crates/iris-core/src/demo.rs")
+        clean = (
+            "fn ok(m: &Mutex<u8>) -> u8 { *m.lock().unwrap_or_else(PoisonError::into_inner) }\n"
+            "// m.lock().unwrap() in a comment is fine\n"
+            "#[cfg(test)]\n"
+            "mod tests {\n"
+            "    #[test] fn t() { let _ = M.lock().unwrap(); }\n"
+            "}\n"
+        )
+        check_project.check_lock_poisoning(rel, clean)
+        for bad in (
+            "fn f() { let _ = M.lock().unwrap(); }\n",
+            "fn f() { let _ = R.read()\n        .expect(\"poisoned\"); }\n",
+            "fn f() { *R.write().unwrap() = 1; }\n",
+        ):
+            with self.assertRaisesRegex(AssertionError, "unwraps a lock result"):
+                check_project.check_lock_poisoning(rel, bad)
+
+    def test_future_incompat_gate_allows_only_known_dependency_warnings(self):
+        block = (
+            "The package `block v0.1.6` currently triggers the following future incompatibility lints:\n"
+            "> \x1b[1m\x1b[33mwarning\x1b[0m\x1b[1m: static of uninhabited type\x1b[0m\n"
+            ">   --> block-0.1.6/src/lib.rs:64:5\n"
+            ">    = warning: this was previously accepted by the compiler but is being phased out\n"
+        )
+        proc_macro = (
+            "The package `proc-macro-error2 v2.0.1` currently triggers the following future incompatibility lints:\n"
+            "> warning[E0365]: extern crate `proc_macro` is private and cannot be re-exported\n"
+        )
+
+        def check(per_package):
+            with tempfile.TemporaryDirectory() as directory:
+                report = Path(directory) / "report.json"
+                report.write_text(json.dumps({"version": 0, "reports": [{"id": 1, "per_package": per_package}]}), encoding="utf-8")
+                check_project.check_future_incompatibilities(report)
+
+        check({"block@0.1.6": block, "proc-macro-error2@2.0.1": proc_macro})
+        for bad in (
+            {"block@0.1.7": block},
+            {"block@0.1.6": block + "> warning: another lint\n"},
+            {"block@0.1.6": proc_macro},
+            {"proc-macro-error2@2.0.1": "nothing parsed\n"},
+        ):
+            with self.assertRaisesRegex(RuntimeError, "Unexpected Cargo future incompatibility"):
+                check(bad)
 
     def test_standalone_tests_rs_classified_as_test_file(self):
         self.assertTrue(check_project.is_standalone_test_file(Path("examples/plugins/baidupan/src/tests.rs"), Path("examples/plugins/baidupan/src/tests.rs")))

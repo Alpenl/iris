@@ -428,8 +428,9 @@ fn relay_and_prepare_reject_whitespace_padded_adaptive_manifests_at_64_and_4096_
     };
 
     // 1. VirtualManifest segment with 128 leading spaces and 5000 leading newlines:
-    //    `open_stream` pre-reads 64 whitespace bytes (`undecided`), probes up to 4096 bytes,
-    //    and rejects BOTH without marking `probed`.
+    //    a short segment is rejected from the first streamed chunk; a long whitespace
+    //    prefix stays `undecided`, is probed up to 4096 bytes and rejected. Neither marks
+    //    `probed`, so repeating the short-segment request must contact upstream again.
     let (seg128_url, seg128_rx, seg128_th) = server(vec![
         range_resp(padded_128.len(), &padded_128),
         range_resp(padded_128.len(), &padded_128),
@@ -497,6 +498,7 @@ fn relay_and_prepare_reject_whitespace_padded_adaptive_manifests_at_64_and_4096_
         .collect();
     assert_eq!(seg_urls.len(), 2);
 
+    assert!(request(&seg_urls[0], "GET", "").starts_with(b"HTTP/1.1 502"));
     assert!(request(&seg_urls[0], "GET", "").starts_with(b"HTTP/1.1 502"));
     assert!(request(&seg_urls[1], "GET", "").starts_with(b"HTTP/1.1 502"));
     assert!(request(&attach_url, "GET", "").starts_with(b"HTTP/1.1 502"));

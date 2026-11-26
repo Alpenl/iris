@@ -191,7 +191,7 @@ fn spawn_dns_lookup(
                     let ips: Vec<_> = addrs.take(65).map(|addr| addr.ip()).collect();
                     if ips.len() > 64 {
                         Err("system DNS result exceeds address limit".into())
-                    } else if doh::should_bypass_fake_ip(&hostname, &ips) {
+                    } else if doh::use_fallback(&hostname, &ips) {
                         doh::resolve_a_records(&hostname, &worker.worker_cancel, || {
                             worker.current_deadline()
                         })

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Pinned CI fixture setup and real Rust/C/official/example Wasm execution."""
 import hashlib
+import http.client
 import json
 import os
 from pathlib import Path
@@ -9,6 +10,8 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import time
+import urllib.error
 import urllib.request
 import zipfile
 
@@ -107,10 +110,35 @@ def _zig_matches_verified_archive(zig: Path, archive: Path, extension: str, memb
         return False
 
 
+ZIG_DOWNLOAD_ATTEMPTS = 3
+ZIG_DOWNLOAD_RETRY_SECONDS = 10
+
+
+def _is_transient_download_error(error: BaseException) -> bool:
+    """DNS, connection, timeout and server-side failures. Never 4xx, size or digest errors."""
+    if isinstance(error, urllib.error.HTTPError):
+        return error.code in (408, 429) or error.code >= 500
+    return isinstance(error, (urllib.error.URLError, http.client.HTTPException, ConnectionError, TimeoutError))
+
+
 def _download_zig(archive: Path, digest: str):
+    url = f"https://ziglang.org/download/{ZIG_VERSION}/{archive.name}"
+    for attempt in range(1, ZIG_DOWNLOAD_ATTEMPTS + 1):
+        try:
+            _fetch_zig_archive(url, archive, digest)
+            return
+        except Exception as error:
+            if attempt == ZIG_DOWNLOAD_ATTEMPTS or not _is_transient_download_error(error):
+                raise
+            delay = ZIG_DOWNLOAD_RETRY_SECONDS * attempt
+            print(f"Zig download attempt {attempt}/{ZIG_DOWNLOAD_ATTEMPTS} failed: {error}; retrying in {delay}s",
+                  file=sys.stderr, flush=True)
+            time.sleep(delay)
+
+
+def _fetch_zig_archive(url: str, archive: Path, digest: str):
     partial = archive.with_suffix(archive.suffix + ".part")
     partial.unlink(missing_ok=True)
-    url = f"https://ziglang.org/download/{ZIG_VERSION}/{archive.name}"
     try:
         with urllib.request.urlopen(url, timeout=60) as response, partial.open("wb") as output:
             size = 0

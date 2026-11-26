@@ -372,14 +372,24 @@ fn websocket_rejects_oversized_frame_before_allocating_payload() {
         },
         &ledger,
     ));
-    // The reactor may already have rejected the header before the guest queues its read.
+    // The reactor may already have rejected the header before the guest queues its read,
+    // including in the window between `prepare` and `dispatch`, where the deferred start
+    // itself reports the closed socket.
     match executor.prepare(Task::WsRead { handle }, &BTreeMap::new(), context(&ledger)) {
-        Ok(operation) => assert!(
-            dispatch(&pool, operation)
-                .recv_timeout(Duration::from_secs(2))
-                .unwrap()
-                .is_err()
-        ),
+        Ok(operation) => {
+            let (tx, rx) = mpsc::channel();
+            let queued = operation.dispatch(
+                &pool,
+                Role::Control,
+                "socket-tests",
+                Box::new(move |r| {
+                    let _ = tx.send(r);
+                }),
+            );
+            if queued.is_ok() {
+                assert!(rx.recv_timeout(Duration::from_secs(2)).unwrap().is_err());
+            }
+        }
         Err(error) => assert!(matches!(
             error,
             ErrorCode::Cancelled | ErrorCode::QuotaExceeded

@@ -78,7 +78,7 @@ pub struct Manifest {
 
 impl Manifest {
     pub fn validate(&self) -> Result<(), &'static str> {
-        if self.protocol != crate::PROTOCOL_VERSION || self.abi != 2 {
+        if self.protocol != crate::PROTOCOL_VERSION || self.abi != super::ABI_VERSION {
             return Err("unsupported protocol or ABI");
         }
         if !crate::is_valid_id(&self.id)

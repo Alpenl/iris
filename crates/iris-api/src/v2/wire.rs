@@ -382,6 +382,9 @@ impl HostCommand {
 
     /// The host transfers only explicitly named Blob capabilities out of the
     /// returning Store; referenced files/artifacts/session handles are separate.
+    ///
+    /// The match is exhaustive on purpose: a new variant that carries a Blob
+    /// must be classified here, or the host would never detach that Blob.
     pub fn blobs(&self) -> Vec<Id> {
         use super::stream::StreamSource;
         let mut out = Vec::new();
@@ -407,7 +410,38 @@ impl HostCommand {
             Self::SetTimedOverlay { cues, .. } | Self::AppendTimedCues { cues, .. } => {
                 out.push(*cues)
             }
-            _ => {}
+            Self::TogglePlayback
+            | Self::SeekRelative { .. }
+            | Self::SeekAbsolute { .. }
+            | Self::SetSpeed { .. }
+            | Self::SetVolume { .. }
+            | Self::ToggleMute
+            | Self::OpenNext
+            | Self::OpenPrevious
+            | Self::ToggleFavorite
+            | Self::SetAbLoop { .. }
+            | Self::ClearAbLoop
+            | Self::ShowToast { .. }
+            | Self::SetSidebar { .. }
+            | Self::SetStatus { .. }
+            | Self::SetOverlay { .. }
+            | Self::SetToolbar { .. }
+            | Self::OpenModal { .. }
+            | Self::CloseModal { .. }
+            | Self::SetTheme { .. }
+            | Self::SetSources { .. }
+            | Self::RefreshSource { .. }
+            | Self::ProvideSourcePage { .. }
+            | Self::SourceError { .. }
+            | Self::AttachSubtitle { .. }
+            | Self::AttachAudioTrack { .. }
+            | Self::SetMonitorLut { .. }
+            | Self::SetTimelineMeta { .. }
+            | Self::ClearTimedOverlay { .. }
+            | Self::EditAnnotation { .. }
+            | Self::ReadAnnotation { .. }
+            | Self::RequestOrigin { .. }
+            | Self::Log { .. } => {}
         }
         out
     }

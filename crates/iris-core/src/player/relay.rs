@@ -13,7 +13,7 @@ use std::collections::BTreeMap;
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -45,6 +45,14 @@ const RELAY_WORKERS: usize = 8;
 const GLOBAL_WORKERS: usize = 32;
 const SLOT_WAIT: Duration = Duration::from_secs(1);
 static ACTIVE_WORKERS: Mutex<usize> = Mutex::new(0);
+
+/// The worker count is a plain integer, so a poisoned lock still holds a usable value.
+/// Recovering keeps `Worker::drop` from panicking while a panicking worker unwinds.
+fn active_workers() -> std::sync::MutexGuard<'static, usize> {
+    ACTIVE_WORKERS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RouteKind {
@@ -304,7 +312,7 @@ impl PlaybackRelay {
     pub(super) fn cancel(&self) {
         self.service.cancel.cancel();
         // Synchronize with the admission check before waking the listener.
-        let _workers = ACTIVE_WORKERS.lock().unwrap();
+        let _workers = active_workers();
         let _ = self.service.wake.wake();
     }
 }
@@ -321,12 +329,12 @@ impl Drop for PlaybackRelay {
                 if thread::Builder::new()
                     .name("iris-relay-reap".into())
                     .spawn(move || {
-                        if let Some(h) = bg.lock().unwrap().take() {
+                        if let Some(h) = bg.lock().unwrap_or_else(PoisonError::into_inner).take() {
                             let _ = h.join();
                         }
                     })
                     .is_err()
-                    && let Some(h) = handle.lock().unwrap().take()
+                    && let Some(h) = handle.lock().unwrap_or_else(PoisonError::into_inner).take()
                 {
                     let _ = h.join();
                 }
@@ -339,7 +347,7 @@ struct Worker(Arc<Service>);
 
 impl Drop for Worker {
     fn drop(&mut self) {
-        let mut active = ACTIVE_WORKERS.lock().unwrap();
+        let mut active = active_workers();
         self.0.workers.fetch_sub(1, Ordering::Relaxed);
         *active -= 1;
         drop(active);
@@ -349,7 +357,7 @@ impl Drop for Worker {
 
 impl Service {
     fn try_reserve_worker(self: &Arc<Self>) -> Option<Worker> {
-        let mut active = ACTIVE_WORKERS.lock().unwrap();
+        let mut active = active_workers();
         if self.cancel.is_cancelled()
             || *active >= GLOBAL_WORKERS
             || self.workers.load(Ordering::Relaxed) >= RELAY_WORKERS

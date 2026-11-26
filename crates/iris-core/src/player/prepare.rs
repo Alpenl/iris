@@ -218,6 +218,20 @@ mod tests {
 
         let mut session = Session::new().unwrap();
         let _render = session.render_handle();
+        // `sub-margin-y-offset` is new in mpv 0.42. Homebrew has no 0.42 bottle
+        // for Intel macs, so that CI runner links 0.41, which lacks the option.
+        // Skip only on MPV_ERROR_PROPERTY_NOT_FOUND (-8); other errors still fail.
+        match session.mpv.get_property_f64("sub-margin-y-offset") {
+            Ok(_) => {}
+            Err(e) if e.code == -8 => {
+                eprintln!(
+                    "skipping subtitle safe area: libmpv lacks sub-margin-y-offset (mpv < 0.42)"
+                );
+                session.shutdown();
+                return;
+            }
+            Err(e) => panic!("{e}"),
+        }
         let wait_for = |mpv: &Mpv, value| {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
             while std::time::Instant::now() < deadline {

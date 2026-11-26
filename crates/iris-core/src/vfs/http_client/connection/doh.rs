@@ -1,6 +1,12 @@
 //! Encrypted DNS-over-HTTPS (RFC 8484) fallback when a local TUN proxy hijacks
 //! port-53 DNS with IANA benchmark Fake-IPs (`198.18.0.0/15`, `2001:2::/48`).
 //!
+//! Privacy boundary: the fallback sends the hostname to the public resolvers in
+//! [`DOH_SERVERS`] and then connects to the real address, which can bypass a
+//! proxy's domain rules. It is on by default, announced once in the log, and
+//! users can turn it off (`fake_ip_doh_fallback = false`); Fake-IP answers then
+//! stay forbidden and the request fails instead of leaving the proxy.
+//!
 //! Security boundary: Fake-IP ranges remain `AddressKind::Forbidden`. We never
 //! relax `address_kind` or `RequestGrant::check_address`; instead we resolve the
 //! domain's real authoritative `A` records over verified TLS to numeric public
@@ -10,6 +16,7 @@ use std::collections::BTreeMap;
 use std::io::{BufReader, Cursor, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -111,6 +118,48 @@ fn parse_doh_framing(headers: &[httparse::Header<'_>]) -> Result<DohFraming> {
 }
 
 static DOH_CACHE: Mutex<BTreeMap<String, CachedDns>> = Mutex::new(BTreeMap::new());
+static FALLBACK_ENABLED: AtomicBool = AtomicBool::new(true);
+static FALLBACK_NOTICE: AtomicBool = AtomicBool::new(false);
+
+/// Applies the user's `fake_ip_doh_fallback` setting. Turning it off also drops
+/// cached DoH answers so no earlier public resolution is reused.
+pub fn set_fallback_enabled(enabled: bool) {
+    if FALLBACK_ENABLED.swap(enabled, Ordering::AcqRel) != enabled {
+        if !enabled {
+            DOH_CACHE.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        }
+        // A changed choice deserves a fresh notice the next time it matters.
+        FALLBACK_NOTICE.store(false, Ordering::Release);
+    }
+}
+
+pub fn fallback_enabled() -> bool {
+    FALLBACK_ENABLED.load(Ordering::Acquire)
+}
+
+/// Decides whether a system DNS answer goes through the public DoH fallback.
+/// Logs once per setting change; the hostname is never logged.
+pub(crate) fn use_fallback(host: &str, resolved: &[IpAddr]) -> bool {
+    if !should_bypass_fake_ip(host, resolved) {
+        return false;
+    }
+    let enabled = fallback_enabled();
+    if !FALLBACK_NOTICE.swap(true, Ordering::AcqRel) {
+        if enabled {
+            log::info!(
+                "system DNS returned benchmark Fake-IP addresses (local TUN proxy?); \
+                 resolving through public DoH resolvers (AliDNS, DNSPod, Cloudflare). \
+                 Set fake_ip_doh_fallback = false to keep hostnames on the system resolver"
+            );
+        } else {
+            log::warn!(
+                "system DNS returned benchmark Fake-IP addresses and the public DoH \
+                 fallback is disabled; requests to such hosts are refused"
+            );
+        }
+    }
+    enabled
+}
 
 pub(crate) fn is_benchmark_fake_ip(ip: IpAddr) -> bool {
     match ip.to_canonical() {
@@ -414,8 +463,9 @@ fn parse_dns_a_response(msg: &[u8]) -> Result<(Vec<IpAddr>, u64)> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CachedDns, DohFraming, HttpCancel, cache_insert, encode_dns_a_query, parse_dns_a_response,
-        parse_doh_framing, query_servers, resolve_a_records, should_bypass_fake_ip,
+        CachedDns, DOH_CACHE, DohFraming, HttpCancel, cache_insert, encode_dns_a_query,
+        fallback_enabled, parse_dns_a_response, parse_doh_framing, query_servers,
+        resolve_a_records, set_fallback_enabled, should_bypass_fake_ip, use_fallback,
     };
     use anyhow::anyhow;
     use std::collections::BTreeMap;
@@ -448,6 +498,35 @@ mod tests {
             "passport.bilibili.com",
             &["14.17.92.73".parse().unwrap()]
         ));
+    }
+
+    #[test]
+    fn opt_out_keeps_fake_ip_answers_off_public_resolvers() {
+        let fake: [IpAddr; 1] = ["198.18.1.82".parse().unwrap()];
+        let real: [IpAddr; 1] = ["14.17.92.73".parse().unwrap()];
+        assert!(fallback_enabled(), "the fallback defaults to on");
+        assert!(use_fallback("passport.bilibili.com", &fake));
+        assert!(!use_fallback("passport.bilibili.com", &real));
+        DOH_CACHE.lock().unwrap_or_else(|e| e.into_inner()).insert(
+            "cached.example".into(),
+            CachedDns {
+                ips: real.to_vec(),
+                expires: Instant::now() + Duration::from_secs(60),
+            },
+        );
+
+        set_fallback_enabled(false);
+        assert!(!use_fallback("passport.bilibili.com", &fake));
+        assert!(
+            !DOH_CACHE
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key("cached.example"),
+            "opting out must not keep serving earlier public answers"
+        );
+
+        set_fallback_enabled(true);
+        assert!(use_fallback("passport.bilibili.com", &fake));
     }
 
     #[test]

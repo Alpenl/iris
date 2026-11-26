@@ -11,7 +11,10 @@ impl Mpv {
                 context: "zero command receipt".into(),
             });
         }
-        let owned: Vec<CString> = args.iter().map(|arg| cstr(arg)).collect();
+        let owned = args
+            .iter()
+            .map(|arg| cstr(arg))
+            .collect::<Result<Vec<CString>>>()?;
         let mut pointers: Vec<*const c_char> = owned.iter().map(|arg| arg.as_ptr()).collect();
         pointers.push(ptr::null());
         // SAFETY: a live handle and NULL-terminated borrowed strings; libmpv

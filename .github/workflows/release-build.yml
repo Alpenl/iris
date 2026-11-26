@@ -62,11 +62,14 @@ jobs:
         if: runner.os == 'Windows'
         with:
           arch: x64
+      # rust-src: package.py rebuilds the official plugins and, on Windows, compares
+      # them byte for byte with Resources/Plugins, which was built with rust-src
+      # installed (it changes the std panic locations rustc records). See check.yml.
       - name: Install Rust toolchain and license gate
         shell: bash
         run: |
           set -euo pipefail
-          rustup toolchain install 1.100.0 --profile minimal
+          rustup toolchain install 1.100.0 --profile minimal --component rust-src
           rustup default 1.100.0
           rustup target add '${{ matrix.rust }}' wasm32-unknown-unknown
           cargo install cargo-deny --version 0.22.0 --locked
