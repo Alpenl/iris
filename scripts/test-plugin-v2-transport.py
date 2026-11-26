@@ -57,12 +57,19 @@ def main():
         'ffmpeg_sha256': sha(ffmpeg), 'ffprobe_sha256': sha(ffprobe),
         'ffmpeg_version': subprocess.check_output([str(ffmpeg), '-version'], text=True).splitlines()[0]}
     fixture['format'].pop('filename', None)
-    (directory/'fixture.json').write_text(json.dumps(fixture, indent=2)+'\n', encoding='utf-8')
+    (directory/'fixture.json').write_text(json.dumps(fixture, indent=2)+'\n', encoding='utf-8', newline='\n')
     env = dict(os.environ)
     env['IRIS_V2_TRANSPORT_FIXTURE'] = str(directory)
-    env.setdefault('MPV_LIB_DIR', str(ROOT/'target/deps/mpv'))
-    env['PATH'] = env['MPV_LIB_DIR'] + os.pathsep + env['PATH']
-    build = subprocess.run(['cargo', 'test', '--locked', '-p', 'iris-core', '--lib', '--no-run',
+    if os.name == 'nt':
+        if 'MPV_LIB_DIR' not in env or not env['MPV_LIB_DIR'].strip():
+            env['MPV_LIB_DIR'] = str(ROOT/'target/deps/mpv')
+        mpv_dir = Path(env['MPV_LIB_DIR'])
+        path_entries = [str(mpv_dir)]
+        sibling_bin = mpv_dir.parent / 'bin'
+        if mpv_dir.name.lower() == 'lib' and sibling_bin.is_dir():
+            path_entries.insert(0, str(sibling_bin))
+        env['PATH'] = os.pathsep.join([*path_entries, env.get('PATH', '')])
+    build = subprocess.run(['cargo', 'test', '--locked', '-p', 'iris-core', '--test', 'player_scoped_plugin', '--no-run',
         '--message-format=json', *(['--release'] if args.release else [])], cwd=ROOT, env=env,
         stdout=subprocess.PIPE, text=True)
     artifacts = [json.loads(line) for line in build.stdout.splitlines() if line.startswith('{')]
@@ -71,7 +78,7 @@ def main():
             if item.get('reason') == 'compiler-message':
                 print(item['message'].get('rendered', item['message']['message']), flush=True)
         raise SystemExit(build.returncode)
-    executable = Path(next(a['executable'] for a in artifacts if a.get('executable') and a.get('target', {}).get('name') == 'iris_core'))
+    executable = Path(next(a['executable'] for a in artifacts if a.get('executable') and a.get('target', {}).get('name') == 'player_scoped_plugin'))
     spec = importlib.util.spec_from_file_location('jit_benchmark', ROOT/'scripts/benchmark-plugin-v2.py')
     helper = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(helper)
@@ -118,7 +125,7 @@ def main():
             'max_transport_deadline_misses': 0, 'max_peak_rss_bytes': math.ceil(rss*1.25),
             'scope': 'single ten-minute pilot, same machine/toolchain/profile/fixture; no decoder/UI acceptance'}
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(json.dumps(result, indent=2)+'\n', encoding='utf-8')
+    args.output.write_text(json.dumps(result, indent=2)+'\n', encoding='utf-8', newline='\n')
     raise SystemExit(process.returncode if process.returncode else 0 if receipt else 1)
 
 

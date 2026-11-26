@@ -1,8 +1,8 @@
 use super::{
-    Blob, DetachedBlob, Executor, IoOutcome, Ledger, PendingOperation, ReadResult, ReadTicket,
-    Reservation, Resource, Status, TaskLease, next_id,
+    Blob, DetachedBlob, Executor, IoOutcome, Ledger, PendingOperation, ReadResult, ReadSlot,
+    ReadTicket, Reservation, Resource, Status, TaskLease, next_id,
 };
-use crate::vfs::http_client::HttpCancel;
+use crate::{plugin_v2::json_error, vfs::http_client::HttpCancel};
 use iris_api::v2::{
     CHUNK_LIMIT, Capability, ErrorCode, Generation, HostCommand, Id, MESSAGE_LIMIT, Role,
 };
@@ -11,7 +11,6 @@ use std::{
     sync::{
         Arc, Condvar, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
-        mpsc,
     },
 };
 mod windows;
@@ -20,7 +19,6 @@ pub(super) enum Message {
     Sweep,
     Closed {
         window: Id,
-        generation: Generation,
         _lease: Reservation,
     },
     Event {
@@ -70,11 +68,14 @@ struct WindowContext {
     _lease: Reservation,
 }
 pub(super) struct ReadPending {
+    // This marker shares the request's lifetime and bounded reservation. A
+    // cancelled request carries it to the actor instead of retaining history.
+    pub delivered: bool,
     pub offset: u64,
     pub len: u32,
     pub size: Option<u64>,
     pub generation: Generation,
-    pub reply: mpsc::SyncSender<Result<ReadResult, ErrorCode>>,
+    pub slot: Arc<ReadSlot>,
     pub cancel: HttpCancel,
     pub lease: Arc<ReadLease>,
 }
@@ -174,6 +175,14 @@ impl Mailbox {
     pub fn has_read(&self, id: Id) -> bool {
         self.lock().reads.contains_key(&id.0)
     }
+    pub fn deliver_read(&self, id: Id) -> bool {
+        let mut state = self.lock();
+        let Some(read) = state.reads.get_mut(&id.0) else {
+            return false;
+        };
+        read.delivered = true;
+        true
+    }
     pub fn io_context(&self, read: Option<Id>, window: Option<Id>) -> Result<IoContext, ErrorCode> {
         let state = self.lock();
         if self.cancel.load(Ordering::Acquire) {
@@ -216,7 +225,8 @@ impl Mailbox {
             &self.owner,
             &[(Resource::HostBytes, (MESSAGE_LIMIT * 32) as u64)],
         )?;
-        let value: serde_json::Value = crate::plugin_v2::json::decode(&bytes, MESSAGE_LIMIT)?;
+        let value: serde_json::Value =
+            crate::bounded_json::decode(&bytes, MESSAGE_LIMIT).map_err(json_error)?;
         let initialization = value.get("event").and_then(|v| v.as_str()) == Some("init");
         let mut state = self.lock();
         if self.cancel.load(Ordering::Acquire) {
@@ -356,7 +366,7 @@ impl Mailbox {
         cancel.cancel();
         self.executor.generation_changed(generation);
         for (_, read) in reads {
-            let _ = read.reply.try_send(Err(ErrorCode::Cancelled));
+            read.slot.deliver(Err(ErrorCode::Cancelled));
         }
         self.changed.notify_one();
         Ok(())
@@ -382,7 +392,7 @@ impl Mailbox {
             scope.cancel.cancel();
         }
         for (_, read) in reads {
-            let _ = read.reply.try_send(Err(ErrorCode::Cancelled));
+            read.slot.deliver(Err(ErrorCode::Cancelled));
         }
         self.executor.stop();
         self.changed.notify_one();
@@ -438,16 +448,17 @@ impl Mailbox {
             "generation":generation,"resource_id":resource,"offset":Id(offset),"len":len}),
         )
         .map_err(|_| ErrorCode::Internal)?;
-        let (tx, rx) = mpsc::sync_channel(1);
+        let slot = ReadSlot::new();
         let cancel = state.io_cancel.child().map_err(|_| ErrorCode::Cancelled)?;
         state.reads.insert(
             request,
             ReadPending {
+                delivered: false,
                 offset,
                 len,
                 size,
                 generation,
-                reply: tx,
+                slot: slot.clone(),
                 cancel,
                 lease,
             },
@@ -463,11 +474,7 @@ impl Mailbox {
             _memory: memory,
         });
         self.changed.notify_one();
-        Ok(ReadTicket {
-            request,
-            shared: self.clone(),
-            rx,
-        })
+        Ok(ReadTicket::new(request, self.clone(), slot))
     }
     pub fn reply(&self, request: u64, blob: Arc<Blob>, eof: bool) -> Result<usize, ErrorCode> {
         let mut state = self.lock();
@@ -494,9 +501,9 @@ impl Mailbox {
         let read = state.reads.remove(&request).ok_or(ErrorCode::StaleHandle)?;
         drop(state);
         read.cancel.cancel();
-        read.reply
-            .try_send(Ok(ReadResult { blob, eof }))
-            .map_err(|_| ErrorCode::Cancelled)?;
+        if !read.slot.deliver(Ok(ReadResult { blob, eof })) {
+            return Err(ErrorCode::Cancelled);
+        }
         Ok(count)
     }
     pub fn fail(&self, request: u64, error: ErrorCode) -> Result<(), ErrorCode> {
@@ -506,15 +513,16 @@ impl Mailbox {
             .remove(&request)
             .ok_or(ErrorCode::StaleHandle)?;
         read.cancel.cancel();
-        read.reply
-            .try_send(Err(error))
-            .map_err(|_| ErrorCode::Cancelled)
+        if !read.slot.deliver(Err(error)) {
+            return Err(ErrorCode::Cancelled);
+        }
+        Ok(())
     }
     pub fn cancel_read(&self, request: u64) {
         let read = self.lock().reads.remove(&request);
         if let Some(read) = read {
             read.cancel.cancel();
-            let _ = read.reply.try_send(Err(ErrorCode::Cancelled));
+            read.slot.deliver(Err(ErrorCode::Cancelled));
             // Cancellation delivery keeps the read reservation. A guest that
             // never drains it cannot create an unbounded notification queue.
             self.complete(Message::Cancelled {

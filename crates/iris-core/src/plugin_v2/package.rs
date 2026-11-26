@@ -71,15 +71,6 @@ impl Package {
             Some(ledger.reserve(owner, &[(super::ledger::Resource::HostBytes, bytes as u64)])?);
         Ok(self)
     }
-    pub fn read_directory(path: &Path, provenance: Provenance<'_>) -> Result<Self, ErrorCode> {
-        let root = cap_std::fs::Dir::open_ambient_dir(path, cap_std::ambient_authority())
-            .map_err(|_| ErrorCode::IoError)?;
-        let mut files = BTreeMap::new();
-        let mut names = BTreeSet::new();
-        let mut total = 0;
-        read_directory(&root, "", &mut files, &mut names, &mut total)?;
-        Self::from_files(files, provenance)
-    }
 
     pub fn from_zip(bytes: &[u8], provenance: Provenance<'_>) -> Result<Self, ErrorCode> {
         if bytes.len() > PACKAGE_LIMIT {
@@ -170,10 +161,11 @@ impl Package {
                 return Err(ErrorCode::Unsupported);
             }
         }
-        let manifest: Manifest = crate::plugin_v2::json::decode_exact(
+        let manifest: Manifest = crate::bounded_json::decode_exact(
             files.get("plugin.json").ok_or(ErrorCode::InvalidArgument)?,
             MESSAGE_LIMIT,
-        )?;
+        )
+        .map_err(super::json_error)?;
         manifest
             .validate()
             .map_err(|_| ErrorCode::InvalidArgument)?;
@@ -212,11 +204,6 @@ impl Package {
             .then(|| self.files.get("plugin.wasm").map(Vec::as_slice))
             .flatten()
     }
-    pub fn asset(&self, path: &str) -> Option<&[u8]> {
-        path.starts_with("assets/")
-            .then(|| self.files.get(path).map(Vec::as_slice))
-            .flatten()
-    }
 }
 
 fn file_limit(name: &str) -> usize {
@@ -225,59 +212,6 @@ fn file_limit(name: &str) -> usize {
         "plugin.wasm" => WASM_LIMIT,
         _ => EXPANDED_LIMIT,
     }
-}
-
-fn read_directory(
-    root: &cap_std::fs::Dir,
-    relative: &str,
-    files: &mut BTreeMap<String, Vec<u8>>,
-    names: &mut BTreeSet<String>,
-    total: &mut usize,
-) -> Result<(), ErrorCode> {
-    for entry in root
-        .read_dir(if relative.is_empty() { "." } else { relative })
-        .map_err(|_| ErrorCode::IoError)?
-    {
-        let entry = entry.map_err(|_| ErrorCode::IoError)?;
-        let component = entry
-            .file_name()
-            .into_string()
-            .map_err(|_| ErrorCode::InvalidArgument)?;
-        let name = if relative.is_empty() {
-            component
-        } else {
-            format!("{relative}/{component}")
-        };
-        validate_path(&name)?;
-        if names.len() >= ENTRY_LIMIT {
-            return Err(ErrorCode::QuotaExceeded);
-        }
-        if !names.insert(name.to_ascii_lowercase()) {
-            return Err(ErrorCode::InvalidArgument);
-        }
-        let kind = entry.file_type().map_err(|_| ErrorCode::IoError)?;
-        if kind.is_symlink() {
-            return Err(ErrorCode::Denied);
-        }
-        if kind.is_dir() {
-            read_directory(root, &name, files, names, total)?;
-        } else if kind.is_file() {
-            // Capability-relative open checks containment during resolution,
-            // including when another process races directory/link replacement.
-            let file = root.open(&name).map_err(|_| ErrorCode::Denied)?;
-            let metadata = file.metadata().map_err(|_| ErrorCode::IoError)?;
-            let limit = file_limit(&name).min(EXPANDED_LIMIT - *total);
-            if !metadata.is_file() || metadata.len() > limit as u64 {
-                return Err(ErrorCode::QuotaExceeded);
-            }
-            let bytes = read_bounded(file, limit)?;
-            *total += bytes.len();
-            files.insert(name, bytes);
-        } else {
-            return Err(ErrorCode::Unsupported);
-        }
-    }
-    Ok(())
 }
 
 pub(crate) fn read_bounded(mut reader: impl Read, limit: usize) -> Result<Vec<u8>, ErrorCode> {

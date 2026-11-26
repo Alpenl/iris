@@ -11,21 +11,15 @@ fn windows_resource_compiler() -> std::ffi::OsString {
     // Cargo discovers MSVC in a regular Windows shell. Find its standard SDK here too.
     if let Some(programs) = std::env::var_os("ProgramFiles(x86)") {
         let bin = std::path::PathBuf::from(programs).join("Windows Kits/10/bin");
-        if let Ok(entries) = std::fs::read_dir(bin) {
-            let arch = if cfg!(target_arch = "aarch64") {
-                "arm64"
-            } else {
-                "x64"
-            };
-            if let Some(rc) = entries
+        if let Ok(entries) = std::fs::read_dir(bin)
+            && let Some(rc) = entries
                 .flatten()
                 .filter(|entry| entry.file_name().to_string_lossy().starts_with("10."))
-                .map(|entry| entry.path().join(arch).join("rc.exe"))
+                .map(|entry| entry.path().join("x64").join("rc.exe"))
                 .filter(|rc| rc.is_file())
                 .max()
-            {
-                return rc.into_os_string();
-            }
+        {
+            return rc.into_os_string();
         }
     }
     "rc.exe".into()

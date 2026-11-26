@@ -161,7 +161,7 @@ fn state_limit_failures_preserve_prior_record_and_serialized_values_are_readable
         })
         .unwrap();
     assert_eq!(result["store_value"], text);
-    assert!(json::encode(&result, iris_api::v2::MESSAGE_LIMIT - 1024).is_ok());
+    assert!(crate::bounded_json::encode(&result, iris_api::v2::MESSAGE_LIMIT - 1024).is_ok());
 }
 
 #[test]

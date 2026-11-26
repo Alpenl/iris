@@ -1,8 +1,8 @@
 use super::{Build, hls_parse, stable_id};
-use crate::plugin_v2::stream::{manifest, range::decimal, remote::Fetched};
+use crate::plugin_v2::stream::{range::decimal, remote::Fetched};
 use iris_api::v2::{
     ErrorCode, Id,
-    stream::{HlsTrack, HlsVariant, ResourceExtension, ResourceKind, TrackKind, VirtualHls},
+    stream::{HlsTrack, HlsVariant, TrackKind, VirtualHls},
 };
 use std::collections::BTreeMap;
 use url::Url;
@@ -195,74 +195,11 @@ fn media(
     id_key: &str,
     build: &mut Build<'_>,
 ) -> Result<(HlsTrack, bool), ErrorCode> {
-    let text = std::str::from_utf8(&fetched.bytes)
-        .map_err(|_| ErrorCode::InvalidArgument)?
-        .trim_start_matches('\u{feff}');
-    if text
-        .lines()
-        .any(|l| l.starts_with("#EXT-X-STREAM-INF:") || l.starts_with("#EXT-X-MEDIA:"))
-    {
-        return Err(ErrorCode::Unsupported);
-    }
+    let text = std::str::from_utf8(&fetched.bytes).map_err(|_| ErrorCode::InvalidArgument)?;
     let base = Url::parse(&fetched.resource.url).map_err(|_| ErrorCode::InvalidArgument)?;
-    let fragmented = text.lines().any(|l| l.starts_with("#EXT-X-MAP:"));
-    let mut rewritten = String::new();
-    for line in text.lines() {
-        clean(line)?;
-        if line.is_empty() {
-            continue;
-        }
-        let new = if !line.starts_with('#') {
-            let (kind, ext) = match kind {
-                TrackKind::Subtitle => (ResourceKind::Subtitle, ResourceExtension::Vtt),
-                _ => (
-                    ResourceKind::Media,
-                    if fragmented {
-                        ResourceExtension::M4s
-                    } else {
-                        ResourceExtension::Ts
-                    },
-                ),
-            };
-            build.bind(&fetched.resource, &base, line, kind, ext)?
-        } else if let Some((tag, attrs)) = line
-            .split_once(':')
-            .filter(|(t, _)| matches!(*t, "#EXT-X-KEY" | "#EXT-X-MAP"))
-        {
-            let mut attrs = hls_parse::attributes(attrs)?;
-            if let Some((uri, quoted)) = attrs.get_mut("URI") {
-                if !*quoted {
-                    return Err(ErrorCode::InvalidArgument);
-                }
-                let (kind, ext) = if tag == "#EXT-X-KEY" {
-                    (ResourceKind::Key, ResourceExtension::Key)
-                } else {
-                    (ResourceKind::Init, ResourceExtension::Mp4)
-                };
-                *uri = build.bind(&fetched.resource, &base, uri, kind, ext)?;
-            }
-            format!(
-                "{tag}:{}",
-                attrs
-                    .into_iter()
-                    .map(|(k, (v, q))| if q {
-                        format!("{k}=\"{v}\"")
-                    } else {
-                        format!("{k}={v}")
-                    })
-                    .collect::<Vec<_>>()
-                    .join(",")
-            )
-        } else {
-            line.to_owned()
-        };
-        if rewritten.len() + new.len() + 1 > manifest::INPUT_LIMIT {
-            return Err(ErrorCode::QuotaExceeded);
-        }
-        rewritten.push_str(&new);
-        rewritten.push('\n');
-    }
-    let (mut track, live) = hls_parse::parse(&rewritten, &build.resources)?;
+    let (mut track, live) = hls_parse::parse_media(text, kind, |uri, res_kind, ext| {
+        build.bind(&fetched.resource, &base, uri, res_kind, ext)
+    })?;
     track.id = stable_id("track", id_key);
     track.kind = kind;
     track.default = false;

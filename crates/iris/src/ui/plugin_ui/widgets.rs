@@ -23,6 +23,7 @@ type ValCallback<T> = Rc<dyn Fn(&mut IrisWindow, T, &mut Window, &mut Context<Ir
 #[derive(Clone)]
 pub(super) enum WidgetSurface<'a> {
     Sidebar {
+        section_ix: usize,
         window: &'a Window,
     },
     Modal {
@@ -30,6 +31,28 @@ pub(super) enum WidgetSurface<'a> {
         on_submit: FormEnterCallback,
         window: &'a Window,
     },
+}
+
+fn widget_id_scope(pid: &str, surface: &WidgetSurface<'_>, base_id: usize) -> String {
+    match surface {
+        WidgetSurface::Sidebar { section_ix, .. } => {
+            format!("sb:{}:{pid}:{section_ix}:{base_id}", pid.len())
+        }
+        WidgetSurface::Modal { modal_id, .. } => {
+            format!(
+                "md:{}:{pid}:{}:{modal_id}:{base_id}",
+                pid.len(),
+                modal_id.len()
+            )
+        }
+    }
+}
+
+fn widget_element_id(kind: &str, scope: &str, sub: Option<&str>) -> SharedString {
+    match sub {
+        Some(part) => SharedString::from(format!("{kind}:{scope}:{part}")),
+        None => SharedString::from(format!("{kind}:{scope}")),
+    }
 }
 
 fn is_qr_dark_module(ch: char) -> bool {
@@ -110,7 +133,7 @@ fn dispatch_widget_value(
     let (pid, id, action_id, modal_key) = target;
     let explicit_act = action_id.filter(|a| !a.is_empty());
     if let Some(mk) = modal_key {
-        this.plugin_view.modal.submitting = None;
+        this.plugin_view.modal.clear_feedback();
         this.set_form_value(mk, next_val.clone());
         if let Some(act) = explicit_act {
             this.invoke_plugin_widget_action(pid, act, Some(next_val), w, cx);
@@ -236,7 +259,7 @@ fn qr_canvas_metrics(dim: usize, max_logical: f32, scale_factor: f32) -> (f32, f
 }
 
 fn render_pixel_grid_widget(
-    base_id: usize,
+    scope: &str,
     max_logical_side: f32,
     scale_factor: f32,
     (label, rows, copy_text, caption): (String, Vec<String>, Option<String>, Option<String>),
@@ -246,12 +269,16 @@ fn render_pixel_grid_widget(
     let parsed = QrMatrix::from_lines(&rows);
     let copy_row = copy_text.filter(|s| !s.trim().is_empty()).map(|data| {
         let copy_payload = data.clone();
-        let btn = chip_button(("pl-grid-copy", base_id), "复制内容", false, t).on_click(
-            cx.listener(move |this, _, _, cx| {
-                cx.write_to_clipboard(ClipboardItem::new_string(copy_payload.clone()));
-                this.show_toast("内容已复制到剪贴板", cx);
-            }),
-        );
+        let btn = chip_button(
+            widget_element_id("pl-grid-copy", scope, None),
+            "复制内容",
+            false,
+            t,
+        )
+        .on_click(cx.listener(move |this, _, _, cx| {
+            cx.write_to_clipboard(ClipboardItem::new_string(copy_payload.clone()));
+            this.show_toast("内容已复制到剪贴板", cx);
+        }));
         let url_txt = trunc_txt(data, t.text_xs, t.text_dim)
             .flex_1()
             .min_w(px(0.))
@@ -342,6 +369,7 @@ pub(super) fn render_plugin_widget(
     let is_modal = matches!(surface, WidgetSurface::Modal { .. });
     let rest_bg = if is_modal { t.window_bg } else { t.panel };
     let pid_owned = pid.to_string();
+    let scope = widget_id_scope(pid, &surface, base_id);
     let modal_key = |id: &str| match &surface {
         WidgetSurface::Modal { modal_id, .. } => Some(format!("modal:{pid}:{modal_id}:{id}")),
         WidgetSurface::Sidebar { .. } => None,
@@ -422,8 +450,8 @@ pub(super) fn render_plugin_widget(
             });
             let dec_cb = step_cb.clone();
             let controls = stepper_box(
-                ("pl-sldr-dec", base_id),
-                ("pl-sldr-inc", base_id),
+                widget_element_id("pl-sldr-dec", &scope, None),
+                widget_element_id("pl-sldr-inc", &scope, None),
                 readout,
                 rest_bg,
                 t,
@@ -449,7 +477,7 @@ pub(super) fn render_plugin_widget(
             icon: icon_name,
             accent,
         } => icon_pill_button(
-            ("pl-btn", base_id),
+            widget_element_id("pl-btn", &scope, None),
             label,
             icon_name.as_deref().and_then(Icon::from_name),
             accent,
@@ -462,29 +490,20 @@ pub(super) fn render_plugin_widget(
         }))
         .into_any_element(),
 
-        Widget::ButtonGroup { buttons } => {
-            div()
-                .flex()
-                .flex_wrap()
-                .gap(px(4.))
-                .children(buttons.into_iter().enumerate().map(|(bi, btn)| {
-                    let (pid_b, act) = (pid_owned.clone(), btn.action_id);
-                    let g = btn.icon.as_deref().and_then(Icon::from_name);
-                    icon_pill_button(
-                        ("pl-gbtn", bi),
-                        btn.label,
-                        g,
-                        btn.accent,
-                        t.control_h_sm,
-                        rest_bg,
-                        t,
-                    )
+        Widget::ButtonGroup { buttons } => div()
+            .flex()
+            .flex_wrap()
+            .gap(px(4.))
+            .children(buttons.into_iter().enumerate().map(|(bi, btn)| {
+                let (pid_b, act) = (pid_owned.clone(), btn.action_id);
+                let g = btn.icon.as_deref().and_then(Icon::from_name);
+                let bid = widget_element_id("pl-gbtn", &scope, Some(&bi.to_string()));
+                icon_pill_button(bid, btn.label, g, btn.accent, t.control_h_sm, rest_bg, t)
                     .on_click(cx.listener(move |this, _, w, cx| {
                         this.invoke_plugin_action(&pid_b, &act, w, cx)
                     }))
-                }))
-                .into_any_element()
-        }
+            }))
+            .into_any_element(),
 
         Widget::Input {
             id,
@@ -509,7 +528,7 @@ pub(super) fn render_plugin_widget(
                         .child(win.render_text_field(spec, Some(window), cx))
                         .into_any_element()
                 }
-                WidgetSurface::Sidebar { window } => {
+                WidgetSurface::Sidebar { window, .. } => {
                     let field_key = format!("sb:{pid_owned}:{id}");
                     let seed_sub = value.clone();
                     let target_act = action_id.filter(|a| !a.is_empty()).unwrap_or(id);
@@ -536,9 +555,14 @@ pub(super) fn render_plugin_widget(
                         secret,
                         Some(submit_cb),
                     );
-                    let btn = chip_button(("pl-inp-sub", base_id), "提交", false, t)
-                        .h(px(f32::from(t.control_h_md).max(30.)))
-                        .on_click(cx.listener(move |this, _, w, cx| btn_cb(this, w, cx)));
+                    let btn = chip_button(
+                        widget_element_id("pl-inp-sub", &scope, None),
+                        "提交",
+                        false,
+                        t,
+                    )
+                    .h(px(f32::from(t.control_h_md).max(30.)))
+                    .on_click(cx.listener(move |this, _, w, cx| btn_cb(this, w, cx)));
                     let field = div().flex_1().min_w(px(0.)).child(win.render_text_field(
                         spec,
                         Some(window),
@@ -577,7 +601,7 @@ pub(super) fn render_plugin_widget(
                 .flex_1()
                 .min_w(px(0.));
             row_box(
-                SharedString::from(format!("pl-tgl:{base_id}:{id}")),
+                widget_element_id("pl-tgl", &scope, Some(&id)),
                 rest_bg,
                 border,
                 t,
@@ -616,7 +640,8 @@ pub(super) fn render_plugin_widget(
             });
             let chips = options.into_iter().enumerate().map(|(oi, opt)| {
                 let (cb, val) = (on_sel.clone(), opt.value);
-                chip_button(("pl-sel", oi), opt.label, val == cur_sel, t)
+                let sid = widget_element_id("pl-sel", &scope, Some(&oi.to_string()));
+                chip_button(sid, opt.label, val == cur_sel, t)
                     .h(if is_modal {
                         t.control_h_md
                     } else {
@@ -658,7 +683,7 @@ pub(super) fn render_plugin_widget(
             } else {
                 (rest_bg, t.line)
             };
-            let rid = SharedString::from(format!("pl-li:{base_id}:{id}"));
+            let rid = widget_element_id("pl-li", &scope, Some(&id));
             row_box(rid, bg, border, t)
                 .px(px(8.))
                 .py(px(6.))
@@ -679,7 +704,9 @@ pub(super) fn render_plugin_widget(
             caption,
         } => {
             let window = match &surface {
-                WidgetSurface::Sidebar { window } | WidgetSurface::Modal { window, .. } => *window,
+                WidgetSurface::Sidebar { window, .. } | WidgetSurface::Modal { window, .. } => {
+                    *window
+                }
             };
             let max_logical_side = if is_modal {
                 (f32::from(window.viewport_size().width) - 108.0).clamp(160.0, 260.0)
@@ -687,7 +714,7 @@ pub(super) fn render_plugin_widget(
                 (win.settings.directory_width - 64.0).clamp(140.0, 256.0)
             };
             render_pixel_grid_widget(
-                base_id,
+                &scope,
                 max_logical_side,
                 window.scale_factor(),
                 (label, rows, copy_text, caption),
@@ -708,7 +735,7 @@ pub(super) fn render_plugin_widget(
                 .filter(|s| !s.is_empty())
                 .unwrap_or("复制链接")
                 .to_string();
-            let btn_id = ("pl-lnk-copy", base_id);
+            let btn_id = widget_element_id("pl-lnk-copy", &scope, None);
             let copy_btn = icon_pill_button(
                 btn_id,
                 btn_lbl,
@@ -739,7 +766,7 @@ pub(super) fn render_plugin_widget(
             .into_any_element(),
     };
     div()
-        .id(("plugin-widget", base_id))
+        .id(widget_element_id("plugin-widget", &scope, None))
         .child(content)
         .into_any_element()
 }
@@ -748,7 +775,32 @@ pub(super) fn render_plugin_widget(
 mod tests {
     use super::{
         QR_QUIET_MODULES, QrMatrix, finite_value, qr_canvas_metrics, sanitize_range, step_clamped,
+        widget_element_id,
     };
+
+    #[test]
+    fn widget_element_ids_stay_unique_across_plugins_sections_and_controls() {
+        let s1 = format!("sb:{}:{}:{}:{}", "iris.guides".len(), "iris.guides", 0, 0);
+        let s2 = format!("sb:{}:{}:{}:{}", "iris.webdav".len(), "iris.webdav", 0, 0);
+        let s3 = format!("sb:{}:{}:{}:{}", "iris.guides".len(), "iris.guides", 1, 0);
+        let s4 = format!("sb:{}:{}:{}:{}", "iris.guides".len(), "iris.guides", 0, 1);
+        assert_ne!(
+            widget_element_id("pl-btn", &s1, None),
+            widget_element_id("pl-btn", &s2, None)
+        );
+        assert_ne!(
+            widget_element_id("pl-btn", &s1, None),
+            widget_element_id("pl-btn", &s3, None)
+        );
+        assert_ne!(
+            widget_element_id("pl-gbtn", &s1, Some("0")),
+            widget_element_id("pl-gbtn", &s4, Some("0"))
+        );
+        assert_ne!(
+            widget_element_id("pl-sel", &s1, Some("0")),
+            widget_element_id("pl-sel", &s4, Some("0"))
+        );
+    }
 
     #[test]
     fn slider_extreme_ranges_and_invalid_drafts_stay_finite() {

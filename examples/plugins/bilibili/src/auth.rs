@@ -107,7 +107,8 @@ impl WbiKeys {
     }
 
     pub fn is_fresh(&self, now_secs: u64) -> bool {
-        !self.img_key.is_empty()
+        now_secs > 0
+            && !self.img_key.is_empty()
             && !self.sub_key.is_empty()
             && now_secs.saturating_sub(self.updated_secs) < 3600 * 6
     }
@@ -191,24 +192,26 @@ impl StoredSession {
         let mut buvid3 = existing_buvid3.to_owned();
 
         if trimmed.contains('=') {
-            for pair in trimmed.split(';') {
+            for pair in trimmed.split([';', '\n', '\r']) {
                 let Some((k, v)) = pair.trim().split_once('=') else {
                     continue;
                 };
-                let (k, v) = (k.trim(), v.trim());
+                let k = k.trim();
+                let v = Self::sanitize_header(v.trim());
                 if k.eq_ignore_ascii_case("SESSDATA") {
-                    sessdata = v.to_owned();
+                    sessdata = v;
                 } else if k.eq_ignore_ascii_case("bili_jct") {
-                    bili_jct = v.to_owned();
+                    bili_jct = v;
                 } else if k.eq_ignore_ascii_case("DedeUserID") {
-                    dede_user_id = v.to_owned();
+                    dede_user_id = v;
                 } else if k.eq_ignore_ascii_case("buvid3") && !v.is_empty() {
-                    buvid3 = v.to_owned();
+                    buvid3 = v;
                 }
             }
         } else {
-            sessdata = trimmed.to_owned();
+            sessdata = Self::sanitize_header(trimmed);
         }
+        let buvid3 = Self::sanitize_header(&buvid3);
         if sessdata.is_empty() || sessdata.len() > 1024 {
             return Err("未识别到有效的 SESSDATA 字段");
         }
@@ -320,6 +323,9 @@ pub fn parse_qr_poll(
                     }
                 }
             }
+            sessdata = StoredSession::sanitize_header(&sessdata);
+            bili_jct = StoredSession::sanitize_header(&bili_jct);
+            dede_user_id = StoredSession::sanitize_header(&dede_user_id);
             if sessdata.is_empty() {
                 return Err("登录响应未包含 SESSDATA 凭据".into());
             }
@@ -327,7 +333,7 @@ pub fn parse_qr_poll(
                 sessdata,
                 bili_jct,
                 dede_user_id,
-                buvid3: existing_buvid3.to_owned(),
+                buvid3: StoredSession::sanitize_header(existing_buvid3),
                 uname: None,
                 vip_label: None,
             }))

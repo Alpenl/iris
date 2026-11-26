@@ -96,7 +96,6 @@ pub struct Attachment {
 pub enum ResourceKind {
     Manifest,
     Init,
-    Index,
     Media,
     Subtitle,
     Key,

@@ -65,22 +65,24 @@ impl IrisWindow {
                 .plugins
                 .client()
                 .confirm_origin(origin.id, false, false);
-            if self.plugin_view.consent_busy == Some(origin.id) {
-                self.plugin_view.consent_busy = None;
-            }
+            self.plugin_view.consent_busy.remove(&origin.id);
         } else if let Some(review) = self.plugin_view.review.take() {
             let _ = self.plugins.client().dismiss_review(review.id);
             self.plugin_view.review_created = None;
-            if self.plugin_view.consent_busy == Some(review.id) {
-                self.plugin_view.consent_busy = None;
-            }
+            self.plugin_view.consent_busy.remove(&review.id);
         }
-        self.focus.focus(window);
+        self.restore_modal_focus_if_unblocked();
+        self.sync_view_timer(cx);
+        if self.plugin_view.modal.focus_pending {
+            self.sync_plugin_modal_focus(window);
+        } else {
+            self.focus.focus(window);
+        }
         cx.notify();
     }
     pub(in crate::ui) fn approve_host_consent(&mut self, cx: &mut Context<Self>) {
         let (target_id, result) = if let Some(origin) = &self.plugin_view.origin {
-            if self.plugin_view.consent_busy == Some(origin.id) {
+            if self.plugin_view.consent_busy.contains(&origin.id) {
                 return;
             }
             (
@@ -92,7 +94,7 @@ impl IrisWindow {
                 ),
             )
         } else if let Some(review) = &self.plugin_view.review {
-            if self.plugin_view.consent_busy == Some(review.id) {
+            if self.plugin_view.consent_busy.contains(&review.id) {
                 return;
             }
             (
@@ -107,7 +109,9 @@ impl IrisWindow {
             return;
         };
         match result {
-            Ok(()) => self.plugin_view.consent_busy = Some(target_id),
+            Ok(()) => {
+                self.plugin_view.consent_busy.insert(target_id);
+            }
             Err(error) => {
                 log::warn!("host consent submit failed: {error:?}");
                 self.show_error_toast(
@@ -155,7 +159,7 @@ impl IrisWindow {
                     "允许向此 HTTP 服务发送凭据（传输未加密）",
                     t,
                     cx.listener(move |this, _, _, cx| {
-                        if this.plugin_view.consent_busy != Some(origin_id) {
+                        if !this.plugin_view.consent_busy.contains(&origin_id) {
                             this.plugin_view.insecure_auth = !this.plugin_view.insecure_auth;
                             cx.notify();
                         }
@@ -201,7 +205,7 @@ impl IrisWindow {
                         "信任此更新继续使用原插件状态、凭据与已确认服务",
                         t,
                         cx.listener(move |this, _, _, cx| {
-                            if this.plugin_view.consent_busy != Some(review_id) {
+                            if !this.plugin_view.consent_busy.contains(&review_id) {
                                 this.plugin_view.keep_identity = !this.plugin_view.keep_identity;
                                 cx.notify();
                             }
@@ -226,7 +230,7 @@ impl IrisWindow {
                         "信任此插件包并恢复此前保留的登录信息与设置",
                         t,
                         cx.listener(move |this, _, _, cx| {
-                            if this.plugin_view.consent_busy != Some(review_id) {
+                            if !this.plugin_view.consent_busy.contains(&review_id) {
                                 this.plugin_view.keep_identity = !this.plugin_view.keep_identity;
                                 cx.notify();
                             }
@@ -240,7 +244,7 @@ impl IrisWindow {
             .as_ref()
             .map(|o| o.id)
             .or_else(|| self.plugin_view.review.as_ref().map(|r| r.id));
-        let busy = active_id.is_some() && self.plugin_view.consent_busy == active_id;
+        let busy = active_id.is_some_and(|id| self.plugin_view.consent_busy.contains(&id));
         let cancel: ModalCallback =
             Rc::new(|this, window, cx| this.cancel_host_consent(window, cx));
         let submit: ModalCallback = Rc::new(|this, _, cx| this.approve_host_consent(cx));

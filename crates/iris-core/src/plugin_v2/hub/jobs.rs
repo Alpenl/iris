@@ -31,7 +31,7 @@ pub(super) enum Work {
         id: Id,
         result: Result<iris_api::v2::task_result::OriginResult, ErrorCode>,
     },
-    Scanned(Result<Vec<super::super::installation::InstallationEntry>, ErrorCode>),
+    Scanned(Result<super::super::official::BootstrapScan, ErrorCode>),
     Loaded {
         plugin: String,
         ticket: Id,
@@ -357,13 +357,10 @@ impl Worker {
             }
         }
     }
-    fn scanned(
-        &mut self,
-        result: Result<Vec<super::super::installation::InstallationEntry>, ErrorCode>,
-    ) {
+    fn scanned(&mut self, result: Result<super::super::official::BootstrapScan, ErrorCode>) {
         self.scanning = false;
-        let entries = match result {
-            Ok(entries) => entries,
+        let scan = match result {
+            Ok(scan) => scan,
             Err(error) => {
                 for window in self.windows.keys() {
                     self.error(*window, None, None, error, None);
@@ -371,6 +368,7 @@ impl Worker {
                 return;
             }
         };
+        let entries = scan.entries;
         let seen: BTreeSet<_> = entries.iter().map(|e| e.plugin_id.clone()).collect();
         let removed_ids: Vec<_> = self
             .plugins
@@ -394,7 +392,8 @@ impl Worker {
             }
             let enabled = !self.config.disabled.contains(&entry.plugin_id);
             if let Some(plugin) = self.plugins.get_mut(&entry.plugin_id) {
-                if plugin.record != entry.record {
+                plugin.enabled = enabled;
+                if plugin.record != entry.record || !enabled {
                     plugin.stop();
                     plugin.record = entry.record;
                 }
@@ -424,7 +423,75 @@ impl Worker {
                 );
             }
         }
+        for upgrade in scan.pending_reviews {
+            let active = self.reviews.values().any(|pending| {
+                pending
+                    .review
+                    .as_ref()
+                    .is_some_and(|r| r.manifest().id == upgrade.plugin_id)
+            });
+            if !active {
+                self.official_reviews
+                    .insert(upgrade.plugin_id, upgrade.review);
+            }
+        }
+        self.surface_official_reviews();
         self.dirty = true;
+    }
+    pub fn surface_official_reviews(&mut self) {
+        let Some(&window) = self.windows.keys().next() else {
+            return;
+        };
+        let keys: Vec<String> = self.official_reviews.keys().cloned().collect();
+        for plugin_id in keys {
+            if self.review_slots.len() >= 2 {
+                break;
+            }
+            let Some(mut review) = self.official_reviews.remove(&plugin_id) else {
+                continue;
+            };
+            let Ok(id) = super::super::instance::next_id().map(Id) else {
+                self.official_reviews.insert(plugin_id, review);
+                break;
+            };
+            let summary = self
+                .shared
+                .ledger
+                .reserve("host-coordinator", &[(Resource::HostBytes, 2 << 20)])
+                .map(|lease| {
+                    Arc::new(ReviewSummary {
+                        id,
+                        manifest: review.manifest().clone(),
+                        digest: review.digest(),
+                        previous: review.previous().cloned(),
+                        archived: review.archived().cloned(),
+                        _lease: lease,
+                    })
+                });
+            let pushed = summary.and_then(|summary| {
+                self.windows
+                    .get(&window)
+                    .ok_or(ErrorCode::Cancelled)?
+                    .inbox
+                    .push(Notice::Review(summary))
+            });
+            if pushed.is_ok() {
+                review.refresh_expiry();
+                self.reviews.insert(
+                    id,
+                    PendingReview {
+                        window,
+                        cancel: Arc::new(AtomicBool::new(false)),
+                        expires: Instant::now() + Duration::from_secs(300),
+                        review: Some(review),
+                    },
+                );
+                self.review_slots.insert(id);
+            } else {
+                self.official_reviews.insert(plugin_id, review);
+                break;
+            }
+        }
     }
     fn loaded(&mut self, id: &str, ticket: Id, result: Result<Control, ErrorCode>) {
         let Some(state) = self.plugins.get_mut(id) else {

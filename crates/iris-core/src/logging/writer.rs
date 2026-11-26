@@ -22,16 +22,8 @@ pub(super) struct RotatingFile {
 }
 
 impl RotatingFile {
-    pub(super) fn open(
-        path: PathBuf,
-        max_bytes: u64,
-        max_backups: usize,
-        rotate_existing_on_open: bool,
-    ) -> io::Result<Self> {
+    pub(super) fn open(path: PathBuf, max_bytes: u64, max_backups: usize) -> io::Result<Self> {
         crate::fs_util::create_parent(&path)?;
-        if rotate_existing_on_open && fs::metadata(&path).is_ok_and(|meta| meta.len() > 0) {
-            rotate_backups(&path, max_backups);
-        }
         let existing_len = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
         if existing_len >= max_bytes {
             rotate_backups(&path, max_backups);

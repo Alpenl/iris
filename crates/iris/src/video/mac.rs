@@ -11,6 +11,7 @@ use std::sync::mpsc::{self, SyncSender};
 use std::sync::{Arc, LazyLock, Mutex, Once};
 use std::thread::JoinHandle;
 
+use super::VideoReset;
 use anyhow::{Context as _, Result, anyhow};
 use cocoa::base::{NO, YES, id, nil};
 use cocoa::foundation::NSRect;
@@ -422,7 +423,7 @@ impl VideoSurface {
     pub(crate) fn attach(
         window: &gpui::Window,
         mpv: RenderHandle,
-    ) -> Result<(Self, UnboundedReceiver<()>)> {
+    ) -> Result<(Self, UnboundedReceiver<VideoReset>)> {
         let gpui_view: id = match HasWindowHandle::window_handle(window)
             .map_err(|e| anyhow!("{e:?}"))?
             .as_raw()
@@ -516,10 +517,10 @@ impl VideoSurface {
             let worker = match worker {
                 Ok(worker) => worker,
                 Err(error) => {
-                    let previous = CGLGetCurrentContext();
-                    CGLSetCurrentContext(gl);
-                    drop(render);
-                    CGLSetCurrentContext(previous);
+                    {
+                        let _current = CurrentContext::lock(gl);
+                        drop(render);
+                    }
                     let _: () = msg_send![layer, release];
                     let _: () = msg_send![layer, release];
                     return Err(error.into());
@@ -657,7 +658,9 @@ impl VideoSurface {
     }
 
     #[cfg(any(debug_assertions, feature = "devtools"))]
-    pub(crate) fn debug_force_device_reset(&self) {}
+    pub(crate) fn debug_force_device_reset(&self) -> bool {
+        false
+    }
 
     /// Stops mpv callbacks, joins the video thread, and detaches its view.
     fn shutdown(&mut self) {

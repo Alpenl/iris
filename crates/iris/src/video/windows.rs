@@ -2,10 +2,11 @@
 //! Only the render worker touches its immediate context and mpv render API.
 
 use std::cell::Cell;
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Mutex, PoisonError, mpsc};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use super::VideoReset;
 use anyhow::{Context, Result, anyhow};
 use futures::channel::mpsc::{UnboundedReceiver, unbounded};
 use iris_core::logging::{self, EventLevel};
@@ -35,6 +36,7 @@ use windows::Win32::{
 use windows::core::Interface;
 
 const MONITOR_POLL_INTERVAL: Duration = Duration::from_millis(500);
+const VID_CAPTURE_TIMEOUT: Duration = Duration::from_millis(150);
 const MAX_TEXTURE_DIM: f64 = 16_384.;
 
 #[derive(Clone, Copy, PartialEq)]
@@ -59,7 +61,7 @@ impl VideoSurface {
     pub(crate) fn attach(
         window: &gpui::Window,
         mpv: RenderHandle,
-    ) -> Result<(Self, UnboundedReceiver<()>)> {
+    ) -> Result<(Self, UnboundedReceiver<VideoReset>)> {
         let hwnd = match HasWindowHandle::window_handle(window)
             .map_err(|e| anyhow!("{e:?}"))?
             .as_raw()
@@ -123,14 +125,15 @@ impl VideoSurface {
                             let layout = {
                                 #[cfg(any(debug_assertions, feature = "devtools"))]
                                 {
-                                    let mut g = shared.lock().unwrap();
+                                    let mut g =
+                                        shared.lock().unwrap_or_else(PoisonError::into_inner);
                                     let s = *g;
                                     g.force_reset = false;
                                     s
                                 }
                                 #[cfg(not(any(debug_assertions, feature = "devtools")))]
                                 {
-                                    *shared.lock().unwrap()
+                                    *shared.lock().unwrap_or_else(PoisonError::into_inner)
                                 }
                             };
                             if layout.stopped {
@@ -205,18 +208,23 @@ impl VideoSurface {
                                     };
                                     current_monitor = monitor_of(raw_hwnd);
                                     update_display_profile(current_monitor, &render_mpv);
-                                    if let Some(track) = saved_vid
-                                        && let Err(e) = render_mpv.restore_vid(track)
-                                    {
-                                        log::warn!("queuing video track recovery: {e}");
-                                    }
+                                    let restored_vid = match saved_vid {
+                                        Some(track) => match render_mpv.restore_vid(track) {
+                                            Ok(restored) => restored,
+                                            Err(e) => {
+                                                log::warn!("queuing video track recovery: {e}");
+                                                false
+                                            }
+                                        },
+                                        None => false,
+                                    };
                                     logging::event_kv(
                                         EventLevel::Info,
                                         "video",
                                         "surface_rebuilt",
                                         &[("backend", "d3d11")],
                                     );
-                                    let _ = reset_tx.unbounded_send(());
+                                    let _ = reset_tx.unbounded_send(VideoReset { restored_vid });
                                     renderer = rebuilt;
                                     retry_frame = false;
                                     logged_frame_error = false;
@@ -276,13 +284,17 @@ impl VideoSurface {
     }
 
     #[cfg(any(debug_assertions, feature = "devtools"))]
-    pub(crate) fn debug_force_device_reset(&self) {
-        self.layout.lock().unwrap().force_reset = true;
+    pub(crate) fn debug_force_device_reset(&self) -> bool {
+        self.layout
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .force_reset = true;
         self.request_redraw();
+        true
     }
 
     pub(crate) fn set_frame(&self, x: f64, y: f64, w: f64, h: f64) {
-        let mut layout = self.layout.lock().unwrap();
+        let mut layout = self.layout.lock().unwrap_or_else(PoisonError::into_inner);
         let rect = [x, y, w, h];
         if layout.rect == rect {
             return;
@@ -302,7 +314,7 @@ impl VideoSurface {
         if poll_monitor {
             self.last_monitor_check = Instant::now();
         }
-        let mut layout = self.layout.lock().unwrap();
+        let mut layout = self.layout.lock().unwrap_or_else(PoisonError::into_inner);
         if scale_changed {
             layout.scale = scale;
         }
@@ -313,7 +325,10 @@ impl VideoSurface {
 
     fn shutdown(&mut self) {
         if let Some(worker) = self.worker.take() {
-            self.layout.lock().unwrap().stopped = true;
+            self.layout
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .stopped = true;
             self.request_redraw();
             if worker.join().is_err() {
                 log::error!("video worker panicked");
@@ -336,14 +351,20 @@ fn capture_active_vid(
     rx: &mpsc::Receiver<()>,
 ) -> Option<ActiveVideoTrack> {
     let reply = match mpv.request_active_vid(wake.clone()) {
-        Ok(reply) => reply,
+        Ok(Some(reply)) => reply,
+        Ok(None) => return None,
         Err(e) => {
             log::warn!("queuing video track query: {e}");
             return None;
         }
     };
+    let deadline = Instant::now() + VID_CAPTURE_TIMEOUT;
     loop {
-        if layout.lock().unwrap().stopped {
+        if layout
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .stopped
+        {
             return None;
         }
         match reply.try_recv() {
@@ -351,12 +372,18 @@ fn capture_active_vid(
             Err(mpsc::TryRecvError::Disconnected) => return None,
             Err(mpsc::TryRecvError::Empty) => {}
         }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            log::warn!("timed out waiting for active video track before surface rebuild");
+            return None;
+        }
         // The core may need this context before it can answer the query.
         if let Err(e) = skip_render_update(render) {
             log::warn!("servicing lost video device: {e}");
         }
-        if rx.recv().is_err() {
-            return None;
+        match rx.recv_timeout(remaining) {
+            Ok(()) | Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => return None,
         }
     }
 }
@@ -382,7 +409,11 @@ fn rebuild_renderer(
     loop {
         let deadline = Instant::now() + delay;
         loop {
-            if layout.lock().unwrap().stopped {
+            if layout
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .stopped
+            {
                 return None;
             }
             match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
@@ -392,7 +423,11 @@ fn rebuild_renderer(
                 Ok(()) => {}
             }
         }
-        if layout.lock().unwrap().stopped {
+        if layout
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .stopped
+        {
             return None;
         }
         match unsafe { Renderer::new(hwnd, mpv.clone(), wake.clone()) } {

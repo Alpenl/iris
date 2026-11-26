@@ -2,9 +2,9 @@ name: Release recipe policy
 on:
   workflow_dispatch:
   pull_request:
-    paths: ['scripts/release/**', 'scripts/build-official-plugins.py', 'scripts/test_package.py', 'scripts/check-project.py', 'scripts/check-windows-installer.py', '.github/workflows/release-*.yml', '.github/workflows/media-sdk.yml', 'Resources/**', 'LICENSE-*', 'Cargo.toml', 'Cargo.lock', 'crates/**/Cargo.toml', 'deny.toml']
+    paths: ['scripts/release/**', 'scripts/build-official-plugins.py', 'scripts/run-plugin-v2-ci.py', 'scripts/test_package.py', 'scripts/check-project.py', 'scripts/check-windows-installer.py', '.github/workflows/release-*.yml', '.github/workflows/media-sdk.yml', 'Resources/**', 'LICENSE-*', 'Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', 'crates/**/Cargo.toml', 'examples/**/Cargo.toml', 'deny.toml']
   push:
-    paths: ['scripts/release/**', 'scripts/build-official-plugins.py', 'scripts/test_package.py', 'scripts/check-project.py', 'scripts/check-windows-installer.py', '.github/workflows/release-*.yml', '.github/workflows/media-sdk.yml', 'Resources/**', 'LICENSE-*', 'Cargo.toml', 'Cargo.lock', 'crates/**/Cargo.toml', 'deny.toml']
+    paths: ['scripts/release/**', 'scripts/build-official-plugins.py', 'scripts/run-plugin-v2-ci.py', 'scripts/test_package.py', 'scripts/check-project.py', 'scripts/check-windows-installer.py', '.github/workflows/release-*.yml', '.github/workflows/media-sdk.yml', 'Resources/**', 'LICENSE-*', 'Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', 'crates/**/Cargo.toml', 'examples/**/Cargo.toml', 'deny.toml']
 permissions:
   contents: read
 jobs:

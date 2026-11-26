@@ -136,8 +136,11 @@ impl IrisWindow {
             }
             "sim_device_reset" => {
                 if let Some(v) = self.active().video.borrow().as_ref() {
-                    v.debug_force_device_reset();
-                    eprintln!("[iris/control] sim_device_reset ok");
+                    if v.debug_force_device_reset() {
+                        eprintln!("[iris/control] sim_device_reset ok");
+                    } else {
+                        eprintln!("[iris/control] sim_device_reset unsupported");
+                    }
                 }
             }
             "quit" => cx.quit(),

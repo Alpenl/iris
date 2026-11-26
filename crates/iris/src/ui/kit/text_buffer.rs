@@ -385,6 +385,20 @@ impl TextInputBuffers {
         }
     }
 
+    pub(in crate::ui) fn modal_has_input_key(pid: &str, modal: &PluginModal, key: &str) -> bool {
+        let Some(rest) = key.strip_prefix("modal:") else {
+            return false;
+        };
+        let prefix = format!("{pid}:{}:", modal.id);
+        let Some(input_id) = rest.strip_prefix(&prefix) else {
+            return false;
+        };
+        modal
+            .widgets
+            .iter()
+            .any(|w| matches!(w, Widget::Input { id, .. } if id == input_id))
+    }
+
     pub(in crate::ui) fn sync_plugin_modal(
         &mut self,
         active: Option<(&str, &PluginModal)>,
@@ -402,6 +416,7 @@ impl TextInputBuffers {
             self.active_modal_tag = Some((pid.to_string(), modal.id.clone()));
         }
         let mut first_input = None;
+        let mut active_input_still_live = false;
         for w in &modal.widgets {
             let field_key = |id: &str| format!("modal:{pid}:{}:{id}", modal.id);
             match w {
@@ -409,6 +424,9 @@ impl TextInputBuffers {
                     id, value, secret, ..
                 } => {
                     let key = field_key(id);
+                    if self.active_form_key.as_deref() == Some(key.as_str()) {
+                        active_input_still_live = true;
+                    }
                     first_input.get_or_insert_with(|| key.clone());
                     let state = self
                         .form_fields
@@ -438,7 +456,7 @@ impl TextInputBuffers {
                 _ => {}
             }
         }
-        if !same {
+        if !same || !active_input_still_live {
             self.active_form_key = first_input;
             return self.active_form_key.is_some();
         }
@@ -620,5 +638,71 @@ mod tests {
         buffers.clear_modal_fields();
         buffers.sync_plugin_modal(Some(("plugin", &modal)));
         assert_eq!(buffers.form_fields[&key].clipboard_text(true), Some("seed"));
+    }
+
+    #[test]
+    fn in_place_modal_refresh_reassigns_or_clears_removed_input_focus() {
+        use super::{PluginModal, TextInputBuffers, Widget};
+
+        let make_modal = |widgets: Vec<Widget>| PluginModal {
+            id: "wizard".into(),
+            title: "登录向导".into(),
+            subtitle: None,
+            widgets,
+            submit_label: None,
+            cancel_label: None,
+            timer: None,
+        };
+        let input = |id: &str| Widget::Input {
+            id: id.into(),
+            label: None,
+            value: String::new(),
+            placeholder: String::new(),
+            secret: false,
+            action_id: None,
+        };
+
+        let mut buffers = TextInputBuffers::default();
+        let step1 = make_modal(vec![input("phone")]);
+        assert!(buffers.sync_plugin_modal(Some(("demo", &step1))));
+        assert_eq!(
+            buffers.active_form_key.as_deref(),
+            Some("modal:demo:wizard:phone")
+        );
+        assert!(TextInputBuffers::modal_has_input_key(
+            "demo",
+            &step1,
+            "modal:demo:wizard:phone",
+        ));
+
+        // Replacing the input ID within the same modal.id switches focus to the new live input.
+        let step2 = make_modal(vec![input("otp")]);
+        assert!(!TextInputBuffers::modal_has_input_key(
+            "demo",
+            &step2,
+            "modal:demo:wizard:phone",
+        ));
+        assert!(buffers.sync_plugin_modal(Some(("demo", &step2))));
+        assert_eq!(
+            buffers.active_form_key.as_deref(),
+            Some("modal:demo:wizard:otp")
+        );
+
+        // Removing all inputs within the same modal.id clears active_form_key so Esc/Enter work.
+        let step3 = make_modal(vec![Widget::Label {
+            text: "正在等待扫码确认…".into(),
+            muted: false,
+            mono: false,
+        }]);
+        assert!(!buffers.sync_plugin_modal(Some(("demo", &step3))));
+        assert_eq!(buffers.active_form_key, None);
+        assert!(!buffers.is_focused_given(false, false, true));
+
+        // Transitioning back to an input re-focuses it cleanly.
+        assert!(buffers.sync_plugin_modal(Some(("demo", &step1))));
+        assert_eq!(
+            buffers.active_form_key.as_deref(),
+            Some("modal:demo:wizard:phone")
+        );
     }
 }

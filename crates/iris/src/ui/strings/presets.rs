@@ -2,7 +2,7 @@
 
 use iris_core::preset::{PresetManager, SidebarMode, WorkspacePreset};
 
-pub(in crate::ui) const DEFAULT_PRESET_NAME: &str = "默认工作区";
+const DEFAULT_PRESET_NAME: &str = "默认工作区";
 pub(in crate::ui) const DEFAULT_CUSTOM_PRESET_NAME: &str = "自定义工作区";
 
 pub(in crate::ui) fn sidebar_mode_label(mode: SidebarMode) -> &'static str {

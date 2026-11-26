@@ -1,14 +1,12 @@
 # 媒体增强实现约束
 
-本页记录 v2 开发入口的已实现部分，不代表正式插件发现已切到协议 2。
+本页记录 `0.0.2`（`protocol: 2 / ABI: 2`）媒体增强子系统的实现约束与边界（原零调用方的 `export_files` / `external_tool` 导出模块已于 `0.0.2` 移除）。
 
-## 字节产物与导出
+## 私有字节产物
 
 `ArtifactBegin { format }` 返回 `artifact_writer`，随后 `ArtifactWrite { handle, blob, finish }` 每次最多写 1 MiB。同一 writer 只允许一个在途写入；排队失败、取消、关闭与未交付结果均回收 writer。完成后产生只读 artifact；每次读取仍受实例、安装身份和代次检查。产物格式为固定枚举，不接受扩展名、路径或滤镜字符串。
 
-创建/读取产物需 `media_enhance`、`external_tool`、`export_files` 之一；StreamStore 不开放这些操作。`ExportArtifact { artifact, export }` 必须另有 `export_files` 与宿主保存对话框签发的单次 ExportGrant。它只能保存格式匹配的产物，不覆盖现存文件，不为生成它的插件授予目标目录访问权。
-
-宿主保留独立 `ExportAudit`：原子链接成功后为 `Committed`，Guest 取消/完成事件丢失不会把成功保存改成取消，也不删除已保存文件。UI 接入必须消费这个记录；仅凭 Guest 终态不能判断磁盘提交是否成功。产物、暂存副本、清理任务与 audit 分别持有资源租约。
+创建/读取私有产物需 `media_enhance` 权限；StreamStore 不开放这些操作。私有产物目录在首次写入时惰性创建，卸载、关闭或取消时由后台回收并归还磁盘/句柄配额，不触碰用户媒体文件或任意目录。
 
 ## 批注与选择范围
 
@@ -22,7 +20,7 @@ OverlayBank 按媒体/seek 代次、窗口 revision 验证整批提交；窗口�
 
 所有轨道共享每安装身份 10,000 cue / 4 MiB 原始数据上限，宿主结构另计 HostBytes；每身份最多 8 轨道、全局 64。替换轨道先验证再原子替换租约，不能靠开新轨道绕过总额。每帧每身份最多 256 活跃 cue、全局 512，超额显示项计入 `omitted`；已接纳的时间窗口仍完整保留。UI 应展示拥挤提示并允许调整密度。
 
-宿主时钟插值，不逐帧调用 Guest。暂停/缓冲冻结；无活动 cue 不启用动画，仅在下一条开始时唤醒。OverlayFrame 持有布局预算，UI 保留其文本或布局时须同时保留 frame。GPUI 绘制接入与 60/120Hz 实测尚未完成。
+宿主时钟插值，不逐帧调用 Guest。暂停/缓冲冻结；无活动 cue 不启用动画，仅在下一条开始时唤醒。OverlayFrame 持有布局预算，UI 保留其文本或布局时须同时保留 frame。GPUI 绘制已接入主视口叠层（含文本字形缓存租约与矢量节点渲染），60/120Hz 实测尚未完成。
 
 ## 原生 A-B 与 LUT 预览
 
@@ -38,4 +36,4 @@ Windows x64 的实际 libmpv 测试覆盖三次连续 A-B 循环、清除及 see
 
 SourceRequests 已校验请求身份、代次、翻页游标、重复条目与浏览取消；缩略图请求被取出执行后仍可随视图取消。控制命令入 UI 队列前验证数值、声明式组件、URL、资源计数，避免畸形数据进入布局。
 
-剩余接入包括：产品 v2 管理器与授权 UI、增强附件的独立权限中继、批注编辑界面、选择/导出事件回执、时序叠层绘制、工作台贡献和官方包迁移。对应 issue #8 保持开放；正式协议仍为 1。
+上述媒体增强路径已随 `protocol: 2` 接入主程序 UI（含官方 `iris.guides` / `iris.webdav` 与示例插件），实际已验证与待验证平台/性能项见 [PLUGIN_V2_IMPLEMENTATION.md](PLUGIN_V2_IMPLEMENTATION.md) 与 [总 issue #2](https://github.com/Alpenl/iris/issues/2)。

@@ -28,15 +28,6 @@ impl DirtySlots {
             sources: true,
         }
     }
-    pub const fn is_empty(self) -> bool {
-        !(self.sidebar
-            || self.status
-            || self.toolbar
-            || self.overlay
-            || self.theme
-            || self.modal
-            || self.sources)
-    }
     pub fn merge(&mut self, o: Self) {
         self.sidebar |= o.sidebar;
         self.status |= o.status;

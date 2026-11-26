@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use gpui::{RenderImage, ScrollHandle, SharedString, UniformListScrollHandle};
-use iris_api::{SourceEntry, StreamVariant};
+use iris_api::StreamVariant;
 use iris_core::catalog::{CatalogItem, LocalDirectory, MediaFilter};
 use iris_core::preset::{PresetCaptureScope, SidebarMode};
 
@@ -86,7 +86,6 @@ pub(super) struct PluginSourceView {
     pub(super) folder_id: Option<String>,
     pub(super) parent_id: Option<String>,
     pub(super) title: String,
-    pub(super) entries: Vec<SourceEntry>,
     pub(super) next_page: Option<String>,
     pub(super) authenticated: bool,
     pub(super) auth_hint: Option<String>,
@@ -123,6 +122,13 @@ pub(super) struct ActiveStreamMeta {
     pub(super) entry_id: Option<String>,
     pub(super) variants: Vec<StreamVariant>,
     pub(super) active_variant: Option<String>,
+}
+
+impl ActiveStreamMeta {
+    pub(super) fn matches_source(&self, pid: Option<&str>, sid: Option<&str>) -> bool {
+        pid.is_none_or(|p| self.plugin_id.as_deref() == Some(p))
+            && sid.is_none_or(|s| self.source_id.as_deref() == Some(s))
+    }
 }
 
 pub(super) struct PendingBrowse {
@@ -162,8 +168,6 @@ pub(super) enum StreamReply {
 /// Dropping the window or superseding a load must wake its blocking network read.
 pub(super) struct RemoteLoad {
     pub(super) cancel: iris_core::vfs::HttpCancel,
-    pub(super) plugin_id: Option<String>,
-    pub(super) source_id: Option<String>,
     pub(super) _task: gpui::Task<()>,
 }
 
@@ -289,11 +293,28 @@ impl CatalogState {
     pub(super) fn has_media_load_for(&self, pid: Option<&str>, sid: Option<&str>) -> bool {
         self.pending_resolve.as_ref().is_some_and(|r| {
             pid.is_none_or(|p| p == r.plugin_id) && sid.is_none_or(|s| s == r.source_id)
-        }) || self.remote_load.as_ref().is_some_and(|load| {
-            load.plugin_id.is_some()
-                && pid.is_none_or(|p| load.plugin_id.as_deref() == Some(p))
-                && sid.is_none_or(|s| load.source_id.as_deref() == Some(s))
         })
+    }
+
+    pub(super) fn clear_stream_meta_for(
+        &mut self,
+        overlays: &mut OverlayState,
+        pid: Option<&str>,
+        sid: Option<&str>,
+    ) -> bool {
+        if self
+            .active_stream_meta
+            .as_ref()
+            .is_some_and(|meta| meta.matches_source(pid, sid))
+        {
+            self.active_stream_meta = None;
+            if overlays.popover == Some(PopoverKind::Variants) {
+                overlays.popover = None;
+                overlays.popover_index = None;
+            }
+            return true;
+        }
+        false
     }
 }
 
@@ -457,6 +478,7 @@ impl OverlayState {
         self.context_menu = None;
         self.palette_open = false;
         self.dialog = None;
+        self.dialog_error = None;
         self.popover_index = None;
         if self.popover == Some(kind) {
             self.popover = None;
@@ -469,12 +491,27 @@ impl OverlayState {
 
     pub(super) fn open_context_menu(&mut self, menu: ContextMenu) {
         self.popover = None;
+        self.popover_index = None;
         self.palette_open = false;
+        self.settings_open = false;
+        self.dialog = None;
+        self.dialog_error = None;
+        self.recording_shortcut = None;
         self.context_menu = Some(menu);
     }
 
     pub(super) fn open_dialog(&mut self, dialog: BuiltinDialog) {
         self.close_all();
+        self.dialog_error = None;
+        self.dialog = Some(dialog);
+    }
+
+    pub(super) fn open_dialog_over_settings(&mut self, dialog: BuiltinDialog) {
+        self.popover = None;
+        self.popover_index = None;
+        self.context_menu = None;
+        self.palette_open = false;
+        self.recording_shortcut = None;
         self.dialog_error = None;
         self.dialog = Some(dialog);
     }
@@ -496,8 +533,6 @@ impl OverlayState {
             self.dialog_error = None;
             buffers.active_form_key = None;
             EscapeStep::CloseBuiltinDialog
-        } else if self.context_menu.take().is_some() {
-            EscapeStep::CloseContextMenu
         } else if self.palette_open {
             self.palette_open = false;
             buffers.palette_input.clear();
@@ -505,6 +540,8 @@ impl OverlayState {
         } else if self.settings_open {
             self.settings_open = false;
             EscapeStep::CloseSettings
+        } else if self.context_menu.take().is_some() {
+            EscapeStep::CloseContextMenu
         } else if self.popover.take().is_some() {
             EscapeStep::ClosePopover
         } else if self.info_open {
@@ -730,8 +767,6 @@ mod remote_lifecycle_tests {
             pending_resolve: Some(resolve("resolve-1")),
             remote_load: Some(RemoteLoad {
                 cancel: cancel.clone(),
-                plugin_id: Some("plugin".into()),
-                source_id: Some("source".into()),
                 _task: gpui::Task::ready(()),
             }),
             ..Default::default()
@@ -786,7 +821,6 @@ mod remote_lifecycle_tests {
                 folder_id: None,
                 parent_id: None,
                 title: String::new(),
-                entries: Vec::new(),
                 next_page: None,
                 authenticated: true,
                 auth_hint: None,
@@ -813,16 +847,17 @@ mod remote_lifecycle_tests {
     fn replacing_remote_load_cancels_reader_and_serializes_preparation() {
         let cancel = iris_core::vfs::HttpCancel::default();
         let mut catalog = CatalogState {
+            pending_resolve: Some(resolve("resolve-1")),
             remote_load: Some(RemoteLoad {
                 cancel: cancel.clone(),
-                plugin_id: Some("plugin".into()),
-                source_id: Some("source".into()),
                 _task: gpui::Task::ready(()),
             }),
             ..Default::default()
         };
         let active = catalog.remote_work_slot.try_lock().unwrap();
         assert!(catalog.has_media_load_for(Some("plugin"), Some("source")));
+        catalog.pending_resolve = None;
+        assert!(!catalog.has_media_load_for(Some("plugin"), Some("source")));
         catalog.remote_load = None;
         assert!(cancel.is_cancelled());
         assert!(catalog.remote_work_slot.try_lock().is_none());

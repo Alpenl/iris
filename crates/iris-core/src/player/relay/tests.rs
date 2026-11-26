@@ -1,11 +1,21 @@
-use super::*;
+use std::collections::BTreeMap;
+use std::io::{self, Read, Write};
+use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
+
+use url::Url;
+
+use super::playlist::{is_hls, rewrite_playlist};
+use super::transfer::valid_range;
+use super::{CLIENT_TIMEOUT, MAX_REQUEST, PlaybackRelay, RELAY_WORKERS, RouteKind, Routes};
 use crate::library::Kind;
+use crate::loopback_http::read_request;
 use crate::media_uri::MediaUri;
 use crate::player::{RemoteMediaRequest, RemoteSubtitle, Session};
 use crate::settings::Settings;
-use std::net::TcpListener;
-use std::sync::Mutex;
-use std::sync::atomic::AtomicBool;
 
 #[test]
 fn playlist_routes_bind_urls_extensions_and_playback_keys() {
@@ -160,6 +170,78 @@ fn silent_mp3() -> Vec<u8> {
     let mut frame = [0; 417];
     frame[..4].copy_from_slice(&[0xff, 0xfb, 0x90, 0x64]);
     frame.repeat(80)
+}
+
+#[test]
+fn release_scoped_preserves_direct_http_transport_and_pending_subtitles() {
+    let origin = Fixture::new(|_| {
+        (
+            "200 OK",
+            "Content-Type: audio/mpeg\r\n".into(),
+            silent_mp3(),
+        )
+    });
+    let mut session = Session::new().unwrap();
+    session.mpv.set_property_string("ao", "null").unwrap();
+    session.mpv.set_property_string("pause", "yes").unwrap();
+    let playback_url = format!("http://{}/audio.mp3", origin.address);
+    let uri = MediaUri::HttpUrl(playback_url.clone());
+    session
+        .open_remote(
+            RemoteMediaRequest {
+                uri: uri.clone(),
+                playback_url: playback_url.clone(),
+                title: "Scoped cleanup fixture".into(),
+                headers: BTreeMap::from([("X-Media-Key".into(), "fixture".into())]),
+                kind: Kind::Audio,
+                is_live: false,
+                photo: None,
+                subtitles: vec![RemoteSubtitle::InlineText(
+                    "WEBVTT\n\n00:00.000 --> 00:01.000\nKeep me\n".into(),
+                )],
+            },
+            &Settings::default(),
+            0.,
+        )
+        .unwrap();
+    let crate::player::MediaSourceState::DirectRemote { relay, .. } = &session.source else {
+        panic!("remote load did not install its transport");
+    };
+    let local = Url::parse(&relay.url(&Url::parse(&playback_url).unwrap()).unwrap()).unwrap();
+    let read_media = || -> io::Result<Vec<u8>> {
+        let address = local.socket_addrs(|| None).unwrap()[0];
+        let mut client = TcpStream::connect_timeout(&address, Duration::from_secs(2))?;
+        client.set_read_timeout(Some(Duration::from_secs(2)))?;
+        write!(
+            client,
+            "GET {} HTTP/1.1\r\nHost: {address}\r\n\r\n",
+            local.path()
+        )?;
+        let mut reply = Vec::new();
+        client.read_to_end(&mut reply)?;
+        Ok(reply)
+    };
+    assert!(read_media().unwrap().ends_with(&silent_mp3()));
+    for _ in 0..2 {
+        // A new media attempt releases plugin resources before preparation succeeds.
+        session.release_scoped();
+        let reply = read_media().expect("plugin cleanup must preserve the direct HTTP relay");
+        assert!(reply.starts_with(b"HTTP/1.1 200"));
+        assert!(reply.ends_with(&silent_mp3()));
+        assert_eq!(session.current_media_uri(), Some(uri.clone()));
+        let crate::player::MediaSourceState::DirectRemote {
+            last_remote,
+            pending_subs,
+            ..
+        } = &session.source
+        else {
+            panic!("plugin cleanup discarded direct remote state");
+        };
+        assert_eq!(last_remote.playback_url, playback_url);
+        assert_eq!(pending_subs.len(), 1);
+    }
+    session.shutdown();
+    assert!(origin.seen.lock().unwrap().iter().all(|(_, auth)| *auth));
 }
 
 #[test]
@@ -499,4 +581,204 @@ fn playlist_probe_falls_back_when_range_rejected_and_subtitle_keeps_explicit_aut
     sub_upstream.join().unwrap();
     assert!(sub_reply.ends_with("\r\n\r\nhi"));
     drop(origin);
+}
+
+#[test]
+fn relay_rejects_request_bodies_and_returns_accurate_client_status_codes() {
+    let origin = Fixture::new(|_| {
+        (
+            "200 OK",
+            "Content-Type: application/octet-stream\r\n".into(),
+            b"payload".to_vec(),
+        )
+    });
+    let url = Url::parse(&format!("http://{}/video.mp4", origin.address)).unwrap();
+    let relay = PlaybackRelay::start(url.clone(), BTreeMap::new()).unwrap();
+    let local = Url::parse(&relay.url(&url).unwrap()).unwrap();
+    let authority = relay.service.routes.authority;
+
+    let send = |raw: String| -> String {
+        let mut client = TcpStream::connect(authority).unwrap();
+        client.set_read_timeout(Some(CLIENT_TIMEOUT)).unwrap();
+        client.write_all(raw.as_bytes()).unwrap();
+        let mut reply = String::new();
+        client.read_to_string(&mut reply).unwrap();
+        reply
+    };
+
+    let path = local.path();
+    let cases = [
+        (
+            format!(
+                "GET {path} HTTP/1.1\r\nHost: {authority}\r\nTransfer-Encoding: chunked\r\n\r\n"
+            ),
+            "HTTP/1.1 400 Bad Request\r\n",
+        ),
+        (
+            format!("GET {path} HTTP/1.1\r\nHost: {authority}\r\nContent-Length: 4\r\n\r\n"),
+            "HTTP/1.1 413 Payload Too Large\r\n",
+        ),
+        (
+            format!(
+                "GET {path} HTTP/1.1\r\nHost: {authority}\r\nOrigin: https://evil.test\r\n\r\n"
+            ),
+            "HTTP/1.1 403 Forbidden\r\n",
+        ),
+        (
+            format!("GET {path} HTTP/1.1\r\nHost: {authority}\r\nSec-Fetch-Mode: cors\r\n\r\n"),
+            "HTTP/1.1 403 Forbidden\r\n",
+        ),
+        (
+            format!("GET {path} HTTP/1.1\r\nHost: evil.invalid:80\r\n\r\n"),
+            "HTTP/1.1 403 Forbidden\r\n",
+        ),
+        (
+            format!("GET /m/1/invalid.mp4 HTTP/1.1\r\nHost: {authority}\r\n\r\n"),
+            "HTTP/1.1 403 Forbidden\r\n",
+        ),
+        (
+            format!("POST {path} HTTP/1.1\r\nHost: {authority}\r\n\r\n"),
+            "HTTP/1.1 405 Method Not Allowed\r\n",
+        ),
+        (
+            format!("GET {path} HTTP/1.1\r\nHost: {authority}\r\nRange: bytes=20-10\r\n\r\n"),
+            "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */*\r\n",
+        ),
+        (
+            format!("GET {path} HTTP/1.1\r\nHost: {authority}\r\nRange: bytes=0-1,2-3\r\n\r\n"),
+            "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */*\r\n",
+        ),
+    ];
+    for (req, expected_prefix) in cases {
+        let reply = send(req);
+        assert!(
+            reply.starts_with(expected_prefix),
+            "expected {expected_prefix:?}, got {reply:?}"
+        );
+    }
+    assert!(
+        origin.seen.lock().unwrap().is_empty(),
+        "rejected client requests must not contact upstream origin"
+    );
+
+    let ok = send(format!(
+        "GET {path} HTTP/1.1\r\nHost: {authority}\r\nContent-Length: 0\r\n\r\n"
+    ));
+    assert!(ok.starts_with("HTTP/1.1 200 OK\r\n"), "{ok:?}");
+    assert!(ok.ends_with("\r\n\r\npayload"));
+}
+
+#[test]
+fn media_route_rejects_whitespace_prefixed_adaptive_manifests_while_key_route_allows_raw_keys() {
+    let origin = Fixture::new(|path| match path {
+        "/smuggle-128.ts" => (
+            "200 OK",
+            "Content-Type: video/mp2t\r\n".into(),
+            format!("{}#EXTM3U\n#EXT-X-VERSION:3\n", " ".repeat(128)).into_bytes(),
+        ),
+        "/smuggle-4080.mpd" => (
+            "200 OK",
+            "Content-Type: video/mp4\r\n".into(),
+            format!(
+                "{}<MPD xmlns=\"urn:mpeg:dash:schema:mpd:2011\"/>",
+                " ".repeat(4080)
+            )
+            .into_bytes(),
+        ),
+        "/undecided-5000.bin" => (
+            "200 OK",
+            "Content-Type: application/octet-stream\r\n".into(),
+            " ".repeat(5000).into_bytes(),
+        ),
+        "/short-ws.bin" => (
+            "200 OK",
+            "Content-Type: application/octet-stream\r\n".into(),
+            b"   \n".to_vec(),
+        ),
+        "/aes.bin" => (
+            "200 OK",
+            "Content-Type: application/octet-stream\r\n".into(),
+            b"#EXTM3U\n12345678".to_vec(),
+        ),
+        "/session.bin" => (
+            "200 OK",
+            "Content-Type: application/octet-stream\r\n".into(),
+            b"<MPD>0123456789!".to_vec(),
+        ),
+        _ => ("404 Not Found", String::new(), Vec::new()),
+    });
+    let base = Url::parse(&format!("http://{}/master.m3u8", origin.address)).unwrap();
+    let relay = PlaybackRelay::start(base.clone(), BTreeMap::new()).unwrap();
+    let authority = relay.service.routes.authority;
+
+    let fetch = |local_url: &str| -> Vec<u8> {
+        let parsed = Url::parse(local_url).unwrap();
+        let mut client = TcpStream::connect(authority).unwrap();
+        client.set_read_timeout(Some(CLIENT_TIMEOUT)).unwrap();
+        write!(
+            client,
+            "GET {} HTTP/1.1\r\nHost: {authority}\r\n\r\n",
+            parsed.path()
+        )
+        .unwrap();
+        let mut reply = Vec::new();
+        client.read_to_end(&mut reply).unwrap();
+        reply
+    };
+
+    for blocked in [
+        "/smuggle-128.ts",
+        "/smuggle-4080.mpd",
+        "/undecided-5000.bin",
+    ] {
+        let upstream = Url::parse(&format!("http://{}{blocked}", origin.address)).unwrap();
+        let sealed = relay.url(&upstream).unwrap();
+        let reply = fetch(&sealed);
+        assert!(
+            reply.starts_with(b"HTTP/1.1 502"),
+            "expected 502 for {blocked}, got {:?}",
+            String::from_utf8_lossy(&reply)
+        );
+    }
+
+    let short_ws = Url::parse(&format!("http://{}/short-ws.bin", origin.address)).unwrap();
+    let short_reply = fetch(&relay.url(&short_ws).unwrap());
+    assert!(short_reply.starts_with(b"HTTP/1.1 200 OK\r\n"));
+    assert!(short_reply.ends_with(b"\r\n\r\n   \n"));
+
+    let playlist = concat!(
+        "#EXTM3U\n",
+        "#EXT-X-SESSION-KEY:METHOD=AES-128,URI=\"/session.bin\"\n",
+        "#EXT-X-KEY:METHOD=AES-128,URI=\"/aes.bin\"\n",
+        "#EXTINF:2,\n",
+        "/short-ws.bin\n",
+    );
+    let rewritten = rewrite_playlist(playlist, &base, &relay.service.routes).unwrap();
+    let mut key_urls = Vec::new();
+    for line in rewritten.lines() {
+        if let Some((_, tail)) = line.split_once("URI=\"") {
+            let uri = tail.split_once('"').unwrap().0;
+            let parsed = Url::parse(uri).unwrap();
+            assert!(
+                parsed.path().starts_with("/k/"),
+                "unexpected key path: {uri}"
+            );
+            assert!(
+                parsed.path().ends_with(".key"),
+                "unexpected key suffix: {uri}"
+            );
+            let (_, kind) = relay.service.routes.open(parsed.path()).unwrap();
+            assert!(kind == RouteKind::Key);
+            key_urls.push(uri.to_owned());
+        }
+    }
+    assert_eq!(key_urls.len(), 2);
+
+    let session_key_reply = fetch(&key_urls[0]);
+    assert!(session_key_reply.starts_with(b"HTTP/1.1 200 OK\r\n"));
+    assert!(session_key_reply.ends_with(b"\r\n\r\n<MPD>0123456789!"));
+
+    let aes_key_reply = fetch(&key_urls[1]);
+    assert!(aes_key_reply.starts_with(b"HTTP/1.1 200 OK\r\n"));
+    assert!(aes_key_reply.ends_with(b"\r\n\r\n#EXTM3U\n12345678"));
 }

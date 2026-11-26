@@ -247,3 +247,44 @@ fn uninstall_removes_user_and_damaged_records_while_protecting_bundled_plugins()
 
     std::fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn overwrite_and_upgrade_report_all_superseded_ids_and_prune_old_object() {
+    let root =
+        std::env::temp_dir().join(format!("iris-v2-supersede-{}", random_identity().unwrap()));
+    let mut installer = Installer::new(root.clone(), Ledger::default());
+    let v1_bytes = archive(r#", "description":"v1""#);
+    let v1 = installer.install(&v1_bytes, approval(&v1_bytes)).unwrap();
+    let v1_obj = root.join("objects").join(&v1.object);
+    assert!(v1_obj.exists());
+
+    // Overwrite active plugin with keep_identity=false (no archived):
+    // must report v1.installation_id as superseded AND delete obsolete v1 object.
+    let v2_bytes = archive(r#", "description":"v2""#);
+    let (v2, superseded) = installer
+        .install_reviewed(&v2_bytes, approval(&v2_bytes), false, None, None)
+        .unwrap();
+    assert_ne!(v2.installation_id, v1.installation_id);
+    assert_eq!(superseded, vec![v1.installation_id.clone()]);
+    assert!(!v1_obj.exists(), "superseded object must be removed");
+    let v2_obj = root.join("objects").join(&v2.object);
+    assert!(v2_obj.exists());
+
+    // Upgrade with keep_identity=true and new content digest:
+    // preserves installation_id, no superseded id, deletes obsolete v2 object.
+    let v3_bytes = archive(r#", "description":"v3""#);
+    let mut keep_approval = approval(&v3_bytes);
+    keep_approval.previous = Some((v2.installation_id.clone(), v2.digest));
+    let (v3, superseded) = installer
+        .install_reviewed(&v3_bytes, keep_approval, false, None, None)
+        .unwrap();
+    assert_eq!(v3.installation_id, v2.installation_id);
+    assert!(superseded.is_empty());
+    assert!(
+        !v2_obj.exists(),
+        "previous object must be pruned on upgrade"
+    );
+    assert!(root.join("objects").join(&v3.object).exists());
+
+    std::fs::remove_dir_all(root).unwrap();
+}

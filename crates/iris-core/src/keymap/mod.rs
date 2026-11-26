@@ -90,7 +90,14 @@ fn safe_while_typing(chord: &CanonicalChord, is_macos: bool) -> bool {
 
 /// Resolves a GPUI predicate while preserving text entry, navigation, and editing chords.
 pub fn effective_gpui_context(declared_ctx: &str, keystroke: &str) -> Option<&'static str> {
-    let is_macos = cfg!(target_os = "macos");
+    effective_gpui_context_for_os(declared_ctx, keystroke, cfg!(target_os = "macos"))
+}
+
+fn effective_gpui_context_for_os(
+    declared_ctx: &str,
+    keystroke: &str,
+    is_macos: bool,
+) -> Option<&'static str> {
     let chord = canonicalize_for_host(keystroke, is_macos)?;
     match declared_ctx.trim() {
         "Workspace" => {
@@ -398,14 +405,24 @@ impl Keymap {
             overrides: BTreeMap::new(),
             backing_path: Some(path.to_path_buf()),
         };
-        if let Ok(raw) = std::fs::read_to_string(path)
+        if let Ok(raw) = fs_util::retry_sharing_violation(|| std::fs::read_to_string(path))
             && let Ok(parsed) = serde_json::from_str::<PersistedKeymap>(&raw)
         {
             km.scheme = parsed.scheme;
             for (k, v) in parsed.overrides {
-                let (k, v) = (k.trim().to_string(), v.trim().to_string());
-                if !k.is_empty() && !v.chars().any(char::is_control) {
-                    km.overrides.insert(k, v);
+                let k = k.trim();
+                if k.is_empty() || k.chars().any(char::is_control) {
+                    continue;
+                }
+                let v = v.trim();
+                if v.is_empty() {
+                    if find_action(k).is_some() {
+                        km.overrides.insert(k.to_string(), String::new());
+                    }
+                } else if let Some(spec) = canonical_binding(v)
+                    && reserved_shortcut(&spec).is_none()
+                {
+                    km.overrides.insert(k.to_string(), spec);
                 }
             }
         }
@@ -572,7 +589,13 @@ impl Keymap {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{
+        ACTIONS, ConflictTarget, Keymap, KeymapScheme, RESERVED_SHORTCUTS, canonical_binding,
+        canonicalize_for_host, effective_gpui_context, effective_gpui_context_for_os, find_action,
+        format_keystroke_display, normalize_gpui_keystroke, reserved_for_os, safe_while_typing,
+    };
+    use crate::test_util::TestDir;
+    use std::collections::BTreeMap;
 
     #[test]
     fn builtin_schemes_have_zero_conflicts_and_lock_text_input_firewall() {
@@ -591,18 +614,20 @@ mod tests {
                         km.find_conflict_for_os(entry.context, &key, entry.id, is_macos),
                         None
                     );
-                    if !safe_while_typing(
-                        &canonicalize_for_host(&key, cfg!(target_os = "macos")).unwrap(),
-                        cfg!(target_os = "macos"),
-                    ) {
-                        for &ctx in entry.gpui_contexts(&key) {
+                    if !safe_while_typing(&canonicalize_for_host(&key, is_macos).unwrap(), is_macos)
+                    {
+                        for &ctx in entry.gpui_contexts_for_os(&key, is_macos) {
                             assert_ne!(ctx, "Workspace", "bare Workspace leak on {key}");
                         }
                         assert_ne!(
-                            effective_gpui_context(entry.context, &key),
+                            effective_gpui_context_for_os(entry.context, &key, is_macos),
                             Some("Workspace")
                         );
                     }
+                    assert_eq!(
+                        entry.gpui_contexts(&key),
+                        entry.gpui_contexts_for_os(&key, cfg!(target_os = "macos"))
+                    );
                 }
             }
         }
@@ -718,9 +743,7 @@ mod tests {
             Some("space".into())
         );
 
-        let dir = std::env::temp_dir().join(format!("iris-keymap-split-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = TestDir::new("keymap-split");
         let file = dir.join("keymap.json");
 
         let mut km = Keymap::load_from(&file);
@@ -744,6 +767,40 @@ mod tests {
             vec![("iris.guides", "thirds", "shift-g")]
         );
 
-        let _ = std::fs::remove_dir_all(&dir);
+        // R1-L09: `load_from` normalizes via `canonical_binding` and drops malformed/reserved entries.
+        std::fs::write(
+            &file,
+            r#"{
+                "scheme": "iris_default",
+                "overrides": {
+                    "zoom_in": "control--",
+                    "photo_next": "ArrowRight",
+                    "toggle_info": "escape",
+                    "preset:bad": "ctrl--a",
+                    "preset:empty": "",
+                    "toggle_favorite": ""
+                }
+            }"#,
+        )
+        .unwrap();
+        let sanitized = Keymap::load_from(&file);
+        assert_eq!(
+            sanitized.overrides.get("zoom_in").map(String::as_str),
+            Some("ctrl--")
+        );
+        assert_eq!(
+            sanitized.overrides.get("photo_next").map(String::as_str),
+            Some("right")
+        );
+        assert!(!sanitized.overrides.contains_key("toggle_info"));
+        assert!(!sanitized.overrides.contains_key("preset:bad"));
+        assert!(!sanitized.overrides.contains_key("preset:empty"));
+        assert_eq!(
+            sanitized
+                .overrides
+                .get("toggle_favorite")
+                .map(String::as_str),
+            Some("")
+        );
     }
 }

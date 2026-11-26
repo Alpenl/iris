@@ -17,13 +17,19 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+struct BindingState {
+    instance: Option<Id>,
+    global_generation: Option<Generation>,
+    windows: BTreeMap<Id, (Generation, HttpCancel)>,
+}
+
 struct Inner {
     store: Arc<Storage>,
     network: NetworkGrant,
     capabilities: BTreeSet<Capability>,
     activity: Activity,
     cancel: HttpCancel,
-    binding: Mutex<(Option<Id>, Option<Generation>)>,
+    binding: Mutex<BindingState>,
 }
 #[derive(Clone)]
 pub struct StorageExecutor(Arc<Inner>);
@@ -42,7 +48,11 @@ impl StorageExecutor {
             capabilities,
             activity: Activity::default(),
             cancel: HttpCancel::default(),
-            binding: Mutex::new((None, None)),
+            binding: Mutex::new(BindingState {
+                instance: None,
+                global_generation: None,
+                windows: BTreeMap::new(),
+            }),
         })))
     }
     fn credential_key(&self, bucket: &CredentialBucket, key: &str) -> Result<String, ErrorCode> {
@@ -83,7 +93,9 @@ impl StorageExecutor {
                     .try_get_secret(&store.scope(), &key)
                     .map_err(|e| vault_error_code(&e))?;
                 // Revocation while waiting on the OS vault must not deliver data.
-                self.credential_key(&bucket, "check")?;
+                if let CredentialBucket::Origin { origin_grant } = &bucket {
+                    self.0.network.confirmed_origin(*origin_grant)?;
+                }
                 check(&context.cancel)?;
                 if value.as_ref().is_some_and(|v| v.len() > 2048) {
                     return Err(ErrorCode::QuotaExceeded);
@@ -154,14 +166,34 @@ impl Executor for StorageExecutor {
             .link(&context.cancel)
             .map_err(|_| ErrorCode::Cancelled)?;
         let mut binding = self.0.binding.lock().unwrap_or_else(|e| e.into_inner());
-        if binding.0.is_some_and(|id| id != context.instance_id) {
+        if binding.instance.is_some_and(|id| id != context.instance_id) {
             return Err(ErrorCode::Denied);
         }
-        if binding.1.is_some_and(|g| g != context.generation) {
-            return Err(ErrorCode::StaleHandle);
+        binding.instance = Some(context.instance_id);
+        match context.window {
+            None => {
+                if binding
+                    .global_generation
+                    .is_some_and(|g| g != context.generation)
+                {
+                    return Err(ErrorCode::StaleHandle);
+                }
+                binding.global_generation = Some(context.generation);
+            }
+            Some(win) => {
+                let entry = binding
+                    .windows
+                    .entry(win)
+                    .or_insert_with(|| (context.generation, HttpCancel::default()));
+                if entry.0 != context.generation {
+                    return Err(ErrorCode::StaleHandle);
+                }
+                entry
+                    .1
+                    .link(&context.cancel)
+                    .map_err(|_| ErrorCode::Cancelled)?;
+            }
         }
-        binding.0 = Some(context.instance_id);
-        binding.1 = Some(context.generation);
         drop(binding);
         let ticket = self.0.store.serial.enter()?;
         let lease = self
@@ -183,9 +215,40 @@ impl Executor for StorageExecutor {
     }
     fn stop(&self) {
         self.0.cancel.cancel();
+        let windows = std::mem::take(
+            &mut self
+                .0
+                .binding
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .windows,
+        );
+        for (_, (_, cancel)) in windows {
+            cancel.cancel();
+        }
     }
     fn generation_changed(&self, generation: Generation) {
-        self.0.binding.lock().unwrap_or_else(|e| e.into_inner()).1 = Some(generation);
+        self.0
+            .binding
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .global_generation = Some(generation);
+    }
+    fn window_changed(&self, window: Id, generation: Option<Generation>) {
+        let cancel = {
+            let mut binding = self.0.binding.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(generation) = generation {
+                binding
+                    .windows
+                    .insert(window, (generation, HttpCancel::default()))
+                    .map(|(_, c)| c)
+            } else {
+                binding.windows.remove(&window).map(|(_, c)| c)
+            }
+        };
+        if let Some(cancel) = cancel {
+            cancel.cancel();
+        }
     }
     fn is_quiescent(&self) -> bool {
         self.0.activity.is_idle()

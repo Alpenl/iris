@@ -64,6 +64,7 @@ impl Cookies for CookieJar {
         let mut jar = self.jar.lock().unwrap_or_else(|e| e.into_inner());
         let mut next = jar.clone();
         next.retain(|_, cookie| cookie.expires.is_none_or(|time| time > SystemTime::now()));
+        let mut total_bytes: usize = next.iter().map(|(k, c)| cost(k, c)).sum();
         for (_, field) in headers
             .iter()
             .filter(|(name, _)| name.eq_ignore_ascii_case("set-cookie"))
@@ -76,30 +77,19 @@ impl Cookies for CookieJar {
             };
             let key = (origin.clone(), name, path);
             if cookie.expires.is_some_and(|time| time <= SystemTime::now()) {
-                next.remove(&key);
+                if let Some(removed) = next.remove(&key) {
+                    total_bytes -= cost(&key, &removed);
+                }
             } else {
                 let old = next.get(&key).map_or(0, |old| cost(&key, old));
-                let current: usize = next.iter().map(|(k, c)| cost(k, c)).sum();
-                if (!next.contains_key(&key) && next.len() >= 128)
-                    || current - old + cost(&key, &cookie) > 65536
-                {
+                let added = cost(&key, &cookie);
+                let updated = total_bytes - old + added;
+                if (!next.contains_key(&key) && next.len() >= 128) || updated > 65536 {
                     return Err(ErrorCode::QuotaExceeded);
                 }
+                total_bytes = updated;
                 next.insert(key, cookie);
             }
-        }
-        let bytes: usize = next
-            .iter()
-            .map(|((origin, name, path), cookie)| {
-                origin.host.len()
-                    + origin.scheme.len()
-                    + name.len()
-                    + path.len()
-                    + cookie.value.len()
-            })
-            .sum();
-        if next.len() > 128 || bytes > 65536 {
-            return Err(ErrorCode::QuotaExceeded);
         }
         *jar = next;
         Ok(())

@@ -64,9 +64,26 @@ use crate::platform::{self, MediaKey, MediaKeyBridge, PinchMonitor, SleepPrevent
 use crate::theme::{FONT_UI, ThemeTokens};
 use crate::video::VideoSurface;
 
+pub(super) fn should_recover_after_gpu_reset(
+    reset_gen: u64,
+    current_gen: u64,
+    kind: Option<Kind>,
+    loaded: bool,
+    restored_vid: bool,
+) -> bool {
+    if reset_gen != current_gen {
+        return false;
+    }
+    match kind {
+        Some(Kind::Photo) => true,
+        Some(Kind::Video) if restored_vid && loaded => false,
+        _ => true,
+    }
+}
+
 pub(crate) struct IrisWindow {
     focus: FocusHandle,
-    viewports: Vec<Viewport>,
+    viewport: Viewport,
     catalog: CatalogState,
     queue: PlayQueue,
     overlays: OverlayState,
@@ -116,12 +133,13 @@ impl IrisWindow {
         };
         if let Some(mut reset_rx) = video_reset_rx {
             cx.spawn(async move |this, cx| {
-                while reset_rx.next().await.is_some() {
-                    let is_photo = this
-                        .update(cx, |this, _| {
-                            this.active().session.kind() == Some(Kind::Photo)
-                        })
-                        .unwrap_or(false);
+                while let Some(reset) = reset_rx.next().await {
+                    let Ok((is_photo, load_gen)) = this.update(cx, |this, _| {
+                        let vp = this.active();
+                        (vp.session.kind() == Some(Kind::Photo), vp.load_generation)
+                    }) else {
+                        break;
+                    };
                     if !is_photo {
                         cx.background_executor()
                             .timer(Duration::from_millis(120))
@@ -129,10 +147,17 @@ impl IrisWindow {
                     }
                     if this
                         .update(cx, |this, cx| {
-                            let (zoom, pan) = {
-                                let vp = this.active();
-                                (vp.image.zoom, vp.image.pan)
-                            };
+                            let vp = this.active();
+                            if !should_recover_after_gpu_reset(
+                                load_gen,
+                                vp.load_generation,
+                                vp.session.kind(),
+                                vp.session.state().loaded,
+                                reset.restored_vid,
+                            ) {
+                                return;
+                            }
+                            let (zoom, pan) = (vp.image.zoom, vp.image.pan);
                             let settings = this.settings.clone();
                             this.active_mut()
                                 .session
@@ -291,7 +316,7 @@ impl IrisWindow {
 
         let mut this = Self {
             focus,
-            viewports: vec![Viewport::new(session, video, now)],
+            viewport: Viewport::new(session, video, now),
             catalog,
             queue: PlayQueue::new(),
             overlays: OverlayState::default(),
@@ -338,17 +363,18 @@ impl IrisWindow {
             this.command(Command::SetSpeed(v), cx);
         }
         this.open_paths(initial, cx);
+        this.sync_view_timer(cx);
         this
     }
 
     #[inline]
     fn active(&self) -> &Viewport {
-        &self.viewports[0]
+        &self.viewport
     }
 
     #[inline]
     fn active_mut(&mut self) -> &mut Viewport {
-        &mut self.viewports[0]
+        &mut self.viewport
     }
 
     pub(super) fn is_confirming(&self, key: &str) -> bool {
@@ -440,6 +466,7 @@ impl Render for IrisWindow {
         self.prepare_timed_overlay_frame(window, cx);
         self.sync_fullscreen(window, cx);
         self.sync_plugin_modal_focus(window);
+        self.sync_view_timer(cx);
         if !self.text_inputs.form_focus.is_focused(window) {
             self.text_inputs.active_form_key = None;
         }
@@ -457,13 +484,19 @@ impl Render for IrisWindow {
             .as_deref()
             .is_some_and(|key| {
                 if key.starts_with("modal:") {
-                    modal_visible
+                    !self.has_host_consent()
+                        && self.plugins.active_modal().is_some_and(|(pid, modal)| {
+                            kit::text_buffer::TextInputBuffers::modal_has_input_key(pid, modal, key)
+                        })
                 } else if key.starts_with("sb:") {
                     sidebar_forms_visible && !modal_visible && !self.overlays.has_menu_or_modal()
                 } else {
                     self.overlays.dialog.is_some() && !modal_visible
                 }
             });
+        if !form_visible {
+            self.text_inputs.active_form_key = None;
+        }
         let recorder_focused = self.text_inputs.recorder_focus.is_focused(window);
         let recording = self.overlays.is_recording(recorder_focused);
         if !recording {

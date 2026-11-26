@@ -61,7 +61,10 @@ impl IrisWindow {
                 .gap(px(2.))
                 .child(
                     icon_button("sb-search", Icon::Search, self.text_inputs.search_open, t)
-                        .tooltip(tip("搜索目录", self.key_hint("toggle_search")))
+                        .tooltip(tip(
+                            super::strings::actions::action_title("toggle_search"),
+                            self.key_hint("toggle_search"),
+                        ))
                         .on_click(cx.listener(|this, _, w, cx| {
                             this.toggle_search(&super::actions::ToggleSearch, w, cx);
                         })),
@@ -78,14 +81,20 @@ impl IrisWindow {
                 )
                 .child(
                     icon_button("sb-refresh", Icon::Refresh, false, t)
-                        .tooltip(tip("刷新目录", self.key_hint("refresh_directory")))
+                        .tooltip(tip(
+                            super::strings::actions::action_title("refresh_directory"),
+                            self.key_hint("refresh_directory"),
+                        ))
                         .on_click(cx.listener(|this, _, w, cx| {
                             this.refresh_directory(&super::actions::RefreshDirectory, w, cx);
                         })),
                 )
                 .child(
                     icon_button("sb-open", Icon::FolderOpen, false, t)
-                        .tooltip(tip("打开本地文件…", self.key_hint("open_file")))
+                        .tooltip(tip(
+                            super::strings::actions::action_title("open_file"),
+                            self.key_hint("open_file"),
+                        ))
                         .on_click(cx.listener(|this, _, w, cx| this.open_file(&OpenFile, w, cx))),
                 ),
             SidebarMode::Sources => div().flex().items_center().gap(px(2.)).child(
@@ -219,6 +228,7 @@ impl IrisWindow {
                     )
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.catalog.sidebar_mode = m;
+                        this.sync_view_timer(cx);
                         cx.notify();
                     }))
                 })),

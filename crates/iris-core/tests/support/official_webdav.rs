@@ -1,11 +1,8 @@
 use super::*;
 use iris_api::v2::Id;
-use iris_core::{
-    plugin_v2::{
-        hub::{Client, Notice},
-        requests::BrowseTarget,
-    },
-    vfs::fetch_head_bytes,
+use iris_core::plugin_v2::{
+    hub::{Client, Notice},
+    requests::BrowseTarget,
 };
 use std::{
     io::{Read, Write},
@@ -129,7 +126,7 @@ fn check_errors(notices: &[Notice]) {
 fn target() -> BrowseTarget {
     BrowseTarget {
         source: "fixture-nas".into(),
-        folder: Some("/".into()),
+        folder: None,
         query: None,
         filters: BTreeMap::new(),
     }
@@ -152,17 +149,44 @@ fn await_page(client: &Client, request: Id) -> iris_api::v2::source::SourcePage 
     });
     result.unwrap()
 }
+fn fetch_loopback_body(url: &str, max_bytes: usize) -> Vec<u8> {
+    let parsed = url::Url::parse(url).unwrap();
+    let authority = format!(
+        "{}:{}",
+        parsed.host_str().unwrap(),
+        parsed.port_or_known_default().unwrap()
+    );
+    let mut socket = TcpStream::connect(&authority).unwrap();
+    socket
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    write!(
+        socket,
+        "GET {} HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n\r\n",
+        parsed.path()
+    )
+    .unwrap();
+    let mut raw = Vec::new();
+    socket
+        .take((max_bytes + 8192) as u64)
+        .read_to_end(&mut raw)
+        .unwrap();
+    assert!(raw.starts_with(b"HTTP/1.1 200 "));
+    let split = raw.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+    raw[split..].iter().copied().take(max_bytes).collect()
+}
+
 #[test]
 #[ignore = "build official packages with scripts/test-plugin-v2-official.py"]
 fn official_webdav_wasm_requires_host_consent_and_preserves_sources_across_windows() {
     let server = Server::new();
     let fixture = Fixture::load("IRIS_V2_WEBDAV_PACKAGE");
     let (one, _) = fixture
-        .hub
+        .hub()
         .open_window(Generation::default(), None)
         .unwrap();
     let (two, _) = fixture
-        .hub
+        .hub()
         .open_window(Generation::default(), None)
         .unwrap();
     wait(|| {
@@ -226,9 +250,17 @@ fn official_webdav_wasm_requires_host_consent_and_preserves_sources_across_windo
     one.confirm_origin(review.id, true, true).unwrap();
     drop(review);
     let page = await_page(&one, request);
+    assert_eq!(
+        page.folder_id, None,
+        "the sidebar requests the implicit root"
+    );
     assert_eq!(page.entries[0].id, "/movie.mp4");
-    let (_, request) = two.browse("iris.webdav", target()).unwrap();
-    assert_eq!(await_page(&two, request).entries[0].id, "/movie.mp4");
+    let mut explicit_root = target();
+    explicit_root.folder = Some("/".into());
+    let (_, request) = two.browse("iris.webdav", explicit_root).unwrap();
+    let page = await_page(&two, request);
+    assert_eq!(page.folder_id.as_deref(), Some("/"));
+    assert_eq!(page.entries[0].id, "/movie.mp4");
     let request = one
         .resolve(
             "iris.webdav",
@@ -259,7 +291,7 @@ fn official_webdav_wasm_requires_host_consent_and_preserves_sources_across_windo
     });
     let playback = playback.take().unwrap();
     assert!(playback.url.starts_with("http://127.0.0.1:"));
-    let bytes = fetch_head_bytes(&playback.url, &BTreeMap::new(), 4096).unwrap();
+    let bytes = fetch_loopback_body(&playback.url, 4096);
     assert_eq!(bytes, b"fixture-video-content");
     assert_eq!(playback.attachments.len(), 1);
     drop(playback);
@@ -268,7 +300,7 @@ fn official_webdav_wasm_requires_host_consent_and_preserves_sources_across_windo
     drop((one, two));
     wait(|| fixture.resources.ledger.used(None, Resource::ControlStore) == 0);
     let (three, _) = fixture
-        .hub
+        .hub()
         .open_window(Generation::default(), None)
         .unwrap();
     wait(|| {
@@ -282,13 +314,6 @@ fn official_webdav_wasm_requires_host_consent_and_preserves_sources_across_windo
     });
     let (_, request) = three.browse("iris.webdav", target()).unwrap();
     assert_eq!(await_page(&three, request).entries[0].id, "/movie.mp4");
-    let Fixture {
-        root,
-        resources,
-        hub,
-    } = fixture;
-    drop((three, hub));
-    wait(|| resources.ledger.used(None, Resource::HostBytes) == 0);
-    assert!(root.starts_with(std::env::temp_dir()));
-    std::fs::remove_dir_all(root).unwrap();
+    drop(three);
+    fixture.shutdown();
 }

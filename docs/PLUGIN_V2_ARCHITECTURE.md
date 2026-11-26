@@ -16,7 +16,6 @@
 |---|---|
 | 第三方/官方 Guest、包内容、网络响应、清单、媒体字节 | 均验证；官方身份不绕过能力与配额检查。 |
 | 宿主、Wasmtime、解复用/解码库 | 可信实现边界；仍需版本审查、故障测试和边界 fuzz。 |
-| 用户显式绑定的原生工具与批准的辅助程序 | 可信本地程序。语义适配器约束插件请求；不宣称进程自动获得 OS 沙箱。 |
 | 用户授权记录 | 仅由宿主可信交互生成、扩展或撤销；插件声明和表单默认值不等于授权。 |
 
 所有敏感操作同时检查插件身份、实例角色、已授予能力、作用域、代次和配额。没有 `read_state` 不发送完整播放快照；其他能力所需的最小媒体 ID、时间窗口、标记或文件内容也须逐项授权，不能把 `read_state` 当成唯一隐私开关。
@@ -76,7 +75,7 @@ flowchart LR
 - 每插件一个 `ControlStore`；RandomAccess/VirtualManifest 每播放会话一个 `StreamStore`，同一 Module 独立实例化，不共享 Guest 内存。DirectHttp 不为每块数据创建 Guest 调用。
 - 一个安装身份的 ControlStore 同时服务多个窗口：宿主用 `Window { window, generation, body }` 包裹窗口事件和异步完成，回复继承当前窗口。每插件最多四个活跃窗口上下文，宿主分配 ID 且不复用；Init/安装状态为全局，StreamStore 事件保持会话专属。窗口之间仍共享同一 Guest 内存，不是不同插件的安全边界。
 - 每个窗口有独立取消域和宿主服务句柄。控制事件的外层 `Window.generation` 绑定媒体/context 生命周期；普通拖动或 mpv 原生 A-B 循环只推进 StreamSession 的读取代次和 TimedOverlay 的内层 seek 代次，不撤销同窗口的目录、配置保存或登录任务。切集、关闭、停用才撤销对应控制窗口上下文。切换回调时隔离 Blob 句柄表，禁止在另一个窗口回调中读取或关闭原窗口的句柄。后台结果须经过各自作用域的代次检查才能应用。关闭后的服务仍保留其资源账本直到 I/O 退出；每插件最多八个活跃或等待回收的窗口执行器，超过返回背压。
-- 单 Store 任一时刻仅执行一个 Guest 调用。网络、工具、全量文件哈希在两种实例中都必须返回后再等待完成事件；中继的等待不能占着 Store 或 UI 线程。
+- 单 Store 任一时刻仅执行一个 Guest 调用。网络与全量文件哈希在对应实例中都必须返回后再等待完成事件；中继的等待不能占着 Store 或 UI 线程。
 - 播放/控制分离队列与执行容量，限制单插件连续占用；同时等待视频、音频、清单、Range 的请求以 ID 区分。排队、执行、I/O、结果缓冲均有独立账本。
 - 设置内存/表/实例限制、Epoch 和调用预算后才允许实例化及执行 start/init。未启用实例不执行 Guest 代码。
 - Epoch 定时器只在 Guest 可能执行时需要活跃；建议 10ms 粒度，普通调用初始硬截止 2s、初始化 5s，均为墙钟保护值，非精确 CPU 计量或正常延迟目标。宿主短计算另有输入规模限制，长任务使用独立超时与取消。
@@ -87,8 +86,8 @@ flowchart LR
 公共身份键为 `(installation_id, plugin_epoch, instance_id)`；敏感请求另绑定 `session_id / media_generation / seek_generation` 及网络授权版本。宿主分配 ID，Guest 不得指定别人的命名空间。
 
 - 媒体切换递增 media_generation；拖动递增 seek_generation 并取消被替代的流请求。晚到结果只回收资源，不应用于新媒体。
-- `StreamInit` 传递只读初始上下文与必要能力引用；`StreamContextUpdate { version, ... }` 支持签名 URL、密钥轮换和鉴权刷新，拒绝回退版本。已在途请求保持绑定其版本；涉及撤权则立即取消，不能等版本自然过期。
-- StreamStore 仅导入所需网络、密码学、时钟、随机数和流响应接口；不导入 UI、工具、导出、任意凭据枚举或本地文件能力。
+- `StreamInit { session, generation, context_blob }` 传递只读初始上下文与必要能力引用；控制面 `UpdateStreamContext { session, expected_version, context }` 与流侧 `StreamContextChanged { session, generation, context_blob }` 支持签名 URL、密钥轮换和鉴权刷新，拒绝回退版本。已在途请求保持绑定其版本；涉及撤权则立即取消，不能等版本自然过期。
+- StreamStore 仅导入所需网络、密码学、时钟、随机数和流响应接口；不导入 UI、任意凭据枚举或本地文件能力。
 - 控制实例普通 Trap 进入 `ControlError`，取消其任务；现有流仅在授权和上下文仍有效时可继续。更新依赖失败需显式返回错误。权限违规/ABI 损坏可隔离整个插件，用户停用/卸载则必须终止全部子资源。
 - 播放准备请求的取消范围在准备完成时结束；准入后的中继继续绑定安装身份、窗口和媒体生命周期。拖动推进 seek 并取消旧读取，不直接关闭整个中继；切集、窗口关闭和停用撤销整路播放。控制实例失败后不接收新的播放准入，普通超时不自动撤销已获准的独立流。
 - SDK 内部凭据副本仅在必要上下文中出现；日志、错误文本、调试快照和进度事件不得包含密钥、Cookie 或签名 URL 查询串。
@@ -100,8 +99,8 @@ flowchart LR
 会话：`Opening → Ready → Closing → Closed`，失败也经 Closing 回收。状态转换必须幂等：
 
 1. 标记 Closing/Stopping，撤销新请求能力，递增代次并关闭入队入口。
-2. 取消会话/实例的子 HttpCancel、任务、工具与待交付响应，触发 Guest 中断。
-3. 后台等待执行中的调用退出、I/O 结束、工具终止；UI 只观察状态，不 join 等待。
+2. 取消会话/实例的子 HttpCancel、异步任务与待交付响应，触发 Guest 中断。
+3. 后台等待执行中的调用退出与 I/O 结束；UI 只观察状态，不 join 等待。
 4. 由持有实例的执行侧释放 Store、缓冲、句柄、私有临时文件和授权引用；清理失败记录可重试任务。
 
 `HttpCancel` 只能负责接入它的宿主操作；DNS、进程、文件作业和回调队列也必须定义独立取消与清理路径。不能跨线程销毁正在调用的 Store，也不承诺释放后进程 RSS 瞬间归零。
@@ -150,7 +149,7 @@ op_id、handle、request_id 使用 1..=i64::MAX，宿主绑定身份和代次，
 
 accepted op 最终产生一个终态事件：完成、失败或取消；成功的 HTTP 头事件可创建后续读取用 stream_handle。实例退出时未交付的终态事件转为宿主账本终态并释放，不要求再次唤醒已销毁 Guest。中间进度可合并，终态通知必须预留队列容量。
 
-`HttpStart`、`HttpRead`、`HttpWrite`、Socket/WS、工具和文件哈希均使用 submit/完成事件。`HttpRead` 返回 `{blob, eof}`，零字节仅与 eof=true 同时出现；没有数据时保持异步等待，不以空包忙轮询。HTTP 状态码属于正常响应，不能与传输错误混淆。
+`HttpStart`、`HttpRead`、`HttpWrite`、Socket/WS、私有产物和文件哈希均使用 submit/完成事件。`HttpRead` 返回 `{blob, eof}`，零字节仅与 eof=true 同时出现；没有数据时保持异步等待，不以空包忙轮询。HTTP 状态码属于正常响应，不能与传输错误混淆。
 
 同一 HTTP 响应流至多一个在途读任务；同一请求体的写入按提交顺序完成。TCP/WS 各方向分别保持顺序，可并行一个读和一个写，不以并发调用打乱协议字节；超额请求返回 BAD_STATE/BACKPRESSURE。关闭句柄取消其未完成操作，实际退出前仍占配额。
 
@@ -175,7 +174,7 @@ accepted op 最终产生一个终态事件：完成、失败或取消；成功�
 
 0 不统一表示 EOF：它在 status 接口表示成功，在 blob_read 表示 EOF，在 stream_reply 中须结合 EOF 标记；异步待完成由正 op_id 表达，不占用负错误码。
 
-宿主以 `StreamRead { request_id, session_id, media_generation, seek_generation, context_version, resource_id, offset, len }` 投递读取；len 为 1..=1 MiB。Guest 可先启动 I/O，在后续事件中 reply/fail，不保留同步 `iris_on_stream_read` 或直接返回原始清单的入口。
+宿主以 `StreamRead { request_id, generation: { media, seek, context }, resource_id, offset, len }` 投递读取（会话身份已由 `StreamStore` 的 `StreamInit.session` 专属绑定）；len 为 1..=1 MiB。Guest 可先启动 I/O，在后续事件中 reply/fail，不保留同步 `iris_on_stream_read` 或直接返回原始清单的入口。
 
 每个 request_id 至多完成一次。reply 字节不得超过 len；短读可不带 EOF，宿主推进 offset；零字节必须 EOF。已知 size 时不能提前报告 EOF，offset==size 才允许空 EOF，offset>size 报 RANGE_INVALID。宿主按 HTTP Range 语义生成 200/206/416、Content-Range/Length 和 HEAD；未知长度禁止伪造总长，suffix Range 仅在能确定长度时支持。
 
@@ -190,23 +189,23 @@ accepted op 最终产生一个终态事件：完成、失败或取消；成功�
 | 项目 | 首版契约 |
 |---|---|
 | `net_http` / `net_ws` | 分别允许 HTTP(S) 与 WS(S)；不互相隐含。 |
-| `net_tcp` | 原始 TCP/TLS，单独确认目标 host:port；不因 net_public 获得任意 TCP/端口。 |
+| `net_tcp` | 原始 TCP/TLS，使用静态声明 `tcp_targets` 或经宿主确认的 `PrivateOriginGrant`（`http`/`https` scheme 分别对应明文 TCP 与 TLS，绑定确认端口与解析地址集合）；不因 net_public 获得任意 TCP/端口。 |
 | `net_hosts` | 公网域名匹配范围，声明 scheme 与端口集合。裸域精确匹配；`*.example.com` 仅匹配点分隔的子域，不匹配裸域或 `evil-example.com`。IDNA、大小写与尾点先规范化。 |
 | `net_public` | 对获准 HTTP/WS 协议和端口允许公网目标；默认端口为 80/443，其他端口须额外声明确认。对安装/启用界面明确展示，不从命中 URL 自动升级。 |
 | `PrivateOriginGrant` | 宿主确认的 scheme、host、port、解析后的私有 IP 集合及授权版本；不允许 CIDR 扫描或继承其他连接的授权。 |
-| 宿主回环能力 | 播放中继、工具任务代理、OAuth 回调使用各自窄能力，不成为插件通用 localhost 许可。 |
+| 宿主回环能力 | 播放中继与 OAuth 回调使用各自窄能力，不成为插件通用 localhost 许可。 |
 
 自建服务的表单提交后由宿主显示真实规范化 Origin 与目的地并确认；UI 默认值、隐藏字段、插件回调或服务器重定向不能创建授权。地址集合变化、TLS 身份变化或新增 Origin 需要重新校验/授权；不能永久锁定旧 IP 后静默改连新地址。
 
 自建服务使用公网地址时，宿主可生成同等精度的用户确认公网 Origin 授权，不要求插件升级为 net_public；它仍受协议/端口和跨 Origin 凭据规则约束。公网授权不会随 DNS 变化转为私网授权。
 
-实现接口：`RequestOrigin { request_id, origin }` 需要 ui_modal 与 net_http，只请求宿主审核；Host 的 `OriginGranted` 返回单次审核结果。`OriginLookup` 是控制面异步任务，只返回当前安装身份已确认的 Origin 句柄，不在 StreamStore 中开放。审核最多两份（含尚未退出作业）、有效期 5 分钟，绑定窗口、媒体代次及授权版本；窗口关闭、换代或停用后拒绝批准。规范 Origin、解析 IP、旧固定地址及明文凭据选项由宿主独立展示，Guest 表单值不能代替确认。
+实现接口：`RequestOrigin { request_id, origin }` 需要 ui_modal 与 net_http、net_ws 或 net_tcp 之一，只请求宿主审核；Host 的 `OriginGranted` 返回单次审核结果。`OriginLookup` 是控制面异步任务（同样需 net_http、net_ws 或 net_tcp 之一），只返回当前安装身份已确认的 Origin 句柄，不在 StreamStore 中开放。审核最多两份（含尚未退出作业）、有效期 5 分钟，绑定窗口、媒体代次及授权版本；窗口关闭、换代或停用后拒绝批准。规范 Origin、解析 IP、旧固定地址及明文凭据选项由宿主独立展示，Guest 表单值不能代替确认。
 
 宿主专属授权文件按安装身份保存最多 16 个 Origin；锁内比对审核时的旧条目并原子写入，损坏记录不能当作空记录覆盖。重新确认撤销同一 Origin 的旧句柄；启动时恢复已确认的固定地址，不自动跟随 DNS 改变。批准提交与取消竞争时可能已经持久化，界面需反映实际记录，不能把“取消等待”承诺为撤销既有批准。
 
 ### 5.2 全部出口统一执行
 
-以下出口必须传递安装身份、实例/会话、授权版本及请求作用域：RawHttp、WS/TCP、DirectHttp 主备 URL、各音轨/字幕、缩略图、远程照片探测、清单与子资源、鉴权刷新及工具适配器的宿主请求。
+以下出口必须传递安装身份、实例/会话、授权版本及请求作用域：RawHttp、WS/TCP、DirectHttp 主备 URL、各音轨/字幕、缩略图、远程照片探测、清单与子资源及鉴权刷新。
 
 1. 规范化并校验初始 URL、scheme、端口、域名；拒绝 userinfo、非法头和未授权协议。
 2. 每次重定向重新校验，不接受 HTTPS 降级、超次数或循环；默认最多 10 跳。
@@ -241,24 +240,19 @@ accepted op 最终产生一个终态事件：完成、失败或取消；成功�
 |---|---|
 | `DirectHttp` | 主 URL、fallback_urls、audio_tracks、subtitles 各自绑定授权/凭据。宿主拉流，无逐块 Guest 转换；刷新可触发控制请求。备用源必须确认相同媒体与字节表示，不能把不一致 Range 拼接成一个文件。 |
 | `RandomAccess` | 提供 resource_id 与可选 size，按第 4 节异步 StreamRead 返回明文字节。插件负责把明文 offset 映射到加密块、认证块或分卷位置，不能假设密文 Range 等于明文 Range。 |
-| `VirtualManifest` | 提交结构化 VirtualHls/VirtualDash 或受限 HLS 文本，由宿主生成/重写清单；子资源走已授权宿主直取或 StreamStore 转换。未经校验的清单不交给解复用器。 |
+| `VirtualManifest` | 提交结构化 `VirtualHls`，由宿主生成/重写清单；子资源走已授权宿主直取或 StreamStore 转换。未经校验的清单不交给解复用器。（零调用方的 `VirtualDash` 与受限 HLS 文本通道已于 `0.0.2` 移除。） |
 
 首版 DirectHttp 的备用表示采用可验证的 `ByteIdentity`：明确明文 size、64 KiB 至 1 MiB 的二次幂 chunk_bytes，以及连续 SHA-256 摘要 Blob（最多 1 MiB）。跨备用源交付前验证完整分块，不以不同 CDN 的 ETag 相等作为内容证明；不提供该证明时不接受备用 URL 列表。单个原始 URL 的 Range 响应仍校验总长、偏移、编码及已有强 ETag，不能静默拼接发生变化的表示。摘要表预算不足的超大媒体暂不支持该备用策略，后续扩展须独立定义契约。
 
 ### 6.1 清单模型与支持子集
 
-资源模型使用不含路径语义的逻辑 resource_id，类型区分 manifest/init/index/media/subtitle/key；实际远端 URL 只能存在于授权的宿主资源绑定或插件上下文，不能原样输出到清单。
+资源模型使用不含路径语义的逻辑 resource_id，类型区分 manifest/init/media/subtitle/key；实际远端 URL 只能存在于授权的宿主资源绑定或插件上下文，不能原样输出到清单。
 
 - 轨道：稳定 ID、种类、编解码信息、时间基准、语言、分组/可选变体及初始化资源。
-- 时间线：起点、时长、时间戳偏移、period/discontinuity、sequence、有限直播滑动窗口；支持 byte range 和索引资源。
-- 首批必需样例：HLS 点播/主清单/独立音轨/fMP4 初始化/byte range/普通直播更新；DASH 点播的独立音视频、初始化、SegmentBase 索引范围及可展开的 SegmentList/SegmentTemplate 时间线。
-- DASH 多 period/动态清单、低延迟 HLS、内容 steering、外部 XML 引用和其他扩展，通过能力发现单独列出；未实现或缺少必要语义返回 UNSUPPORTED。不能把上述首版子集描述为全部 HLS/DASH 支持。
-
-受限 HLS 文本只接受文档化标签和逻辑相对资源引用；以语法解析后重新序列化，拒绝外部 scheme、authority、路径穿越、编码/分隔符歧义和未知标签，不做字符串替换式“清洗”。不直接接受 Guest 原始 MPD XML。两种输入通过相同资源验证，不宣称表达能力完全等价。
-
-首版受限 HLS 文本入口限定媒体清单：EXTM3U、VERSION（1..7）、TARGETDURATION、MEDIA-SEQUENCE、DISCONTINUITY-SEQUENCE、PLAYLIST-TYPE、EXTINF（毫秒精度）、BYTERANGE、MAP、KEY（NONE/AES-128 identity）、DISCONTINUITY、ENDLIST、INDEPENDENT-SEGMENTS；主清单通过 VirtualHls 提交。逻辑 ID 为至多 128 字节 ASCII 字母数字及 `_-.`，拒绝 `..` 和宿主保留前缀。其他标签或语义明确返回 UNSUPPORTED。宿主稳定的直播清单 URL 指向新快照，未变化资源保持原令牌；重新绑定和移出窗口的资源令牌撤销。整个更新先准备、再比较版本提交，失败保留旧快照。
-
-远端 DirectHttp 若返回 HLS/DASH，也必须经过相应受控解析；默认保持引用访问关闭，只有已重写且受支持的清单才按格式打开。未知容器引用、扩展或异常输入失败关闭，禁止回退原文绕过检查。
+- 时间线：起点、时长、时间戳偏移、discontinuity、sequence、有限直播滑动窗口；支持 byte range。
+- 支持的 `VirtualHls` 与远端 HLS 转换子集：HLS 点播/主清单/独立音轨/fMP4 初始化/byte range/普通直播更新（支持 EXTM3U、VERSION 1..7、TARGETDURATION、MEDIA-SEQUENCE、DISCONTINUITY-SEQUENCE、PLAYLIST-TYPE、EXTINF、BYTERANGE、MAP、KEY NONE/AES-128 identity、DISCONTINUITY、ENDLIST、INDEPENDENT-SEGMENTS）。
+- 低延迟 HLS、内容 steering 与其他未列出的扩展按能力发现处理，未实现或缺少必要语义时明确返回 UNSUPPORTED。逻辑 ID 为至多 128 字节 ASCII 字母数字及 `_-.`，拒绝 `..` 和宿主保留前缀。宿主稳定的直播清单 URL 指向新快照，未变化资源保持原令牌；重新绑定和移出窗口的资源令牌撤销。整个更新先准备、再比较版本提交，失败保留旧快照。
+- 远端 DirectHttp 若返回 HLS，必须经过宿主受控解析与重写；默认保持引用访问关闭，只有已重写且受支持的清单才按格式打开。未知容器引用、扩展或异常输入失败关闭，禁止回退原文绕过检查。
 
 ### 6.2 会话资源与播放器约束
 
@@ -273,11 +267,11 @@ accepted op 最终产生一个终态事件：完成、失败或取消；成功�
 
 StreamStore 的上下文刷新在同一原始传输能力和 Origin 授权集合内轮换密钥、URL 和字节；不能通过刷新扩大或隐式替换该集合，改变集合需重新进行流准入。刷新事件入队与版本提升原子提交，在途读取携带原上下文版本；完成、失败及单次取消均取消该读取派生的后台任务。取消通知和未退出任务继续占读取配额，Guest 在取消通知中清理其业务状态。
 
-## 7. 密码学、文件与外部工具
+## 7. 密码学与私有文件产物
 
 ### 7.1 有界纯计算及文件指纹
 
-`host_crypto` 的 spec 为带算法/操作标签的 JSON：key/nonce/iv/aad 使用本实例 Blob 句柄，操作明确区分 hash、hmac、encrypt、decrypt。输入最多 1 MiB，检查输出容量；仅允许完全相同的输入输出缓冲原地操作或完全不重叠，禁止部分重叠。
+`host_crypto` 的 spec（`iris_api::v2::crypto::CryptoSpec`）为带算法/操作标签的 JSON：key/nonce/iv/aad 使用本实例 Blob 句柄，操作明确区分 hash、hmac、encrypt、decrypt。输入最多 1 MiB，检查输出容量；仅允许完全相同的输入输出缓冲原地操作或完全不重叠，禁止部分重叠。该宿主导入与 `CryptoSpec` 作为正式 ABI v2 契约持续保留，供任意语言 Wasm Guest（如 C/Zig 或直接调用导入的 Rust 插件）使用，即使 `iris-plugin-sdk` 未额外封装高层 Rust 密码学辅助层。
 
 - 哈希：MD5、SHA-1、SHA-256、BLAKE3；HMAC-SHA256。MD5/SHA-1 只用于协议兼容指纹，不作为包真实性证明。
 - AES-128/256 CTR：16 字节初始计数块，按大端递增，禁止计数回绕；任意字节偏移的块定位由 SDK 明确定义和验证。
@@ -286,34 +280,13 @@ StreamStore 的上下文刷新在同一原始传输能力和 Origin 授权集合
 - `host_random` 与时钟可用于签名/认证协议；纯计算不授予文件、网络或凭据库访问。
 - `HashCurrentMedia` 需 read_state 和有效媒体绑定，作为异步文件作业执行，支持取消、进度合并、文件变化检测；只读当前获准媒体，返回摘要，不返回路径以外文件内容。FullMd5/FullSha256 与版本化稀疏模式各有测试向量；不得声称通用稀疏哈希自动兼容任意字幕服务算法。
 
-### 7.2 本地输入、临时产物与导出
+### 7.2 私有临时产物（`FileExecutor`）
 
-本地文件内容使用宿主颁发的 `MediaInputGrant`，由用户选择媒体/动作产生并绑定插件、媒体代次和任务；external_tool/read_state 本身不授予任意文件读取。插件仅持有不透明句柄，不能提交任意宿主路径。
+> 零调用方的 BYOB 外部原生工具适配器（`external_tool`、`tools/`、`process_tree/`）与用户目录导出（`export_files`、`ExportGrant`、`MediaInputGrant`）已于 `0.0.2` 移除。宿主当前仅保留受配额约束的私有临时产物读写与当前媒体哈希。
 
-临时产物位于插件私有受配额目录，以句柄传递；导出需 export_files 与保存框/显式默认目录产生的 `ExportGrant`。默认只创建新文件，不覆盖源文件或既有文件。允许的导出格式按动作列明，如 EDL/XMP/CSV/字幕/文本/支持的媒体容器；可执行后缀黑名单不是唯一防线。
-
-检查规范路径、目录归属、文件身份及符号链接/hardlink/reparse 关系，防止路径比较、竞态或大小写差异绕过。临时写入、校验、原子提交均由宿主/可信适配器负责；输出失败或取消后回收未提交文件。卸载等待资源静止后清理私有缓存，不误删用户已导出的成果。
-
-### 7.3 受限工具操作
-
-`QueryTools` 返回可用固定任务与模型句柄；`InvokeTool { task: ToolTask }` 通过 host_submit 发起。每个 task 有独立 schema，不包含 argv、extra_args、滤镜/脚本原文、可执行文件路径、插件目录或配置路径。`RequestMediaInput { request_id, action: slice/extract_audio }` 触发宿主当前文件确认，返回 `MediaInputGranted { request_id, media, grant? }`；拒绝、非本地媒体或忙碌返回空授权。授权单次消费、5 分钟有效，不可跨媒体或操作复用。
-
-| 首批动作 | 输入、结果与语义 |
-|---|---|
-| Ffmpeg::LosslessSlice | 授权媒体、起止时间及允许的容器枚举；流拷贝并返回请求/实际切点。无法满足帧精确要求时明确拒绝或另选已授权操作。 |
-| Ffmpeg::ExtractAudio | 授权媒体与音轨 ID、受限采样配置；输出私有临时音频句柄。 |
-| Whisper::Transcribe | 授权临时音频、已绑定模型、语言等枚举；返回有界字幕产物，适配器记录支持的具体实现/版本。 |
-| YtDlp::ResolveMetadata | 用户或已授权插件提交的 HTTP(S) 网页 URL；只返回有界元数据，限制选集展开和输出大小，不请求下载媒体或后处理。 |
-
-宿主绑定可信工具及具体兼容版本，首次使用明确确认操作、输入与输出范围；查询只返回可用性/版本摘要。文件内容或版本改变后重新验证。动作可扩展，但须增加宿主适配器、schema、能力校验和验收；完全信任任意本地命令模式 B 不在 v2。
-
-产品设置由原生文件选择器指定工具/模型，后台计算主文件与受限辅助文件摘要，确认前不执行候选程序。用户确认后才运行版本检查并原子保存绑定；whisper.cpp 无版本查询接口，其版本与发布来源由用户确认，摘要只固定文件身份，不证明作者真实性。重启后台重新校验，校验失败不启用绑定；替换/移除立即取消该绑定的在途任务。工具设置为全窗口共享，最多四种工具和一个 Whisper 模型，配置文件限 512 KiB。文件输入和导出仍各自需要独立授权。
-
-适配器按各工具语法生成参数数组，禁止 Shell；控制 cwd、环境、配置搜索、插件加载、模型/辅助程序来源。yt-dlp 的 ignore-config/no-exec/no-plugin-dirs 等仅作为对应版本适配规则；JavaScript 运行时和远程组件须显式列入可信辅助程序策略，不能假定禁用所有辅助程序仍保留所有网站解析能力。
-
-元数据解析使用任务专属受控代理，代理检查实际连接、重定向和凭据范围。代理是可信工具的配置约束，不是 OS 防火墙；若工具/辅助程序无法证明正常请求均遵循适配规则，该版本拒绝启用。工具返回的 URL/Headers/清单必须再次执行第 5、6 节授权。
-
-JobObject/进程组管理子进程生命周期，进度/stdout/stderr 有总量限制；取消先请求退出，再按宿主截止终止进程树并异步等待。它们不提供文件/网络沙箱。若未来需要限制原生程序本身的 OS 权限，另立实现与验收，不混入当前保证。
+- 临时产物位于插件私有受配额目录（惰性创建），以不透明句柄传递，插件不能提交任意宿主路径。
+- `ArtifactBegin { format }` 创建写入句柄，`ArtifactWrite { handle, blob, finish }` 每次最多写 1 MiB，`ArtifactRead { handle, offset, len }` 每次最多读 1 MiB；产物句柄绑定安装身份、控制实例和媒体代次。
+- 检查规范路径、目录归属、文件身份及符号链接/hardlink/reparse 关系，防止路径比较、竞态或大小写差异绕过；取消、过期与卸载由后台异步回收临时目录与配额。
 
 ## 8. 媒体增强、叠层与工作台
 
@@ -346,8 +319,6 @@ JobObject/进程组管理子进程生命周期，进度/stdout/stderr 有总量�
 | media_enhance | 授权字幕、音轨、LUT、时间轴数据 | 限格式/大小/代次；不隐含网络、本地文件读取或通用播放控制。 |
 | ui_overlay | 静态叠层与时间窗口 | 可收到必要媒体时钟/代次，不因此收到文件路径/完整快照。 |
 | annotations | 指定媒体/选择集合的标记读写 | 仅应用数据库，不修改源文件。 |
-| export_files | 支持格式的产物导出 | ExportGrant；不隐含任意目录写入。 |
-| external_tool | 已实现的语义动作 | 可信工具绑定 + 对应输入/输出能力；不隐含任意命令执行或本地媒体内容读取。 |
 | secrets | 本安装身份的系统凭据 | 分桶、脱敏、受限迁移；按使用场景授予 StreamStore 必要副本而非整个 vault。 |
 | ui_sidebar / ui_modal / ui_toolbar / ui_status / ui_theme / notifications | 声明式 UI | 保留元素/字节配额及逃生护栏；表单不自行授予新权限。 |
 
@@ -358,22 +329,22 @@ JobObject/进程组管理子进程生命周期，进度/stdout/stderr 有总量�
 | 资源 | 每插件/实例上限 | 全局上限或补充规则 |
 |---|---|---|
 | Wasm 内存 | ControlStore 128 MiB；StreamStore 64 MiB；显式批准大缓冲可至单 Store 256 MiB；插件合计 512 MiB | 活跃/关闭中 Store 合计 1 GiB；单内存、有限 table，table 元素最多 16,384/Store。 |
-| 实例 | 1 控制 + 2 播放实例 | 播放实例最多 8；实例内存先预留，不能只套单 memory_size 限制。 |
-| 播放会话/中继 | 每插件 2 会话、8 个中继请求 | 全局 8 会话、32 个请求；DirectHttp 同样占会话额度，UI 不同步等待请求线程退出。 |
+| 实例 | 1 控制 + 2 播放实例 | 控制实例全局最多 64，播放实例最多 8；实例内存先预留，不能只套单 memory_size 限制。 |
+| 播放会话/中继 | 每插件 4 会话、8 个中继请求 | 全局 12 会话、32 个请求；DirectHttp 同样占会话额度，UI 不同步等待请求线程退出。 |
 | Module 编译/缓存 | Wasm 输入 <=16 MiB；只保留实际需要的 Module 引用 | 编译并发 2、排队 4；缓存账本预算 256 MiB，含活动项，无空间拒绝新编译；编译器临时分配另测，不把预算当进程 RSS 硬上限。 |
-| 宿主缓冲/消息/解析/叠层 | 合计 128 MiB | 合计 512 MiB；网络、工具输出、清单、字形/布局等均记账，共享项计入全局。 |
+| 宿主缓冲/消息/解析/叠层 | 合计 128 MiB | 合计 512 MiB；网络、清单、字形/布局等均记账，共享项计入全局。 |
 | 在途宿主任务 | 32（含排队和完成待交付） | 128；终态事件预留容量，控制/播放分别限流。 |
 | I/O 调度 | 控制每插件最多 2 个阻塞作业、排队 32；播放最多 4 个、排队 16 | 控制 4 工作线程/96 排队，播放独立 8 线程/32 排队；按插件轮转。TCP/WS 等待及 OAuth 回调采用独立有界事件循环，不占阻塞作业槽。 |
 | 安装私有状态/凭据 | 共用提交顺序队列，含执行中最多 8 项；每项宿主预留 2 MiB | 等待仅在控制 I/O 池，30 秒排队截止，取消约 20ms 检查；计入普通任务/内存总额，丢弃排队项会让出序位。多窗口写入按接受顺序提交。 |
-| 网络 | HTTP 8、WS 4、TCP/TLS 4 | HTTP 64、WS 16、TCP/TLS 16；播放预留至少 8 个 HTTP 槽。 |
-| DNS / OAuth | 系统 DNS 作业 2；OAuth 事务 1 | DNS 最多 8（每结果最多 64 地址，OS 调用未退出继续计账）；OAuth 最多 4，头 8 KiB/32 字段，最多 32 次无效回调，单客户端 2s 截止。 |
-| 流读取 | 每 StreamStore 4 个在途 read | 每插件 8；每块 <=1 MiB；不得占着 Store 等读。 |
+| 网络 | HTTP 合计 12（控制面至多 8）、WS 4、TCP/TLS 4 | HTTP 合计 68（控制面至多 56，为播放预留 12 个 HTTP 槽）、WS 16、TCP/TLS 16。 |
+| DNS / OAuth | 系统 DNS 作业 6；OAuth 事务 1 | DNS 最多 16（每结果最多 64 地址，OS 调用未退出继续计账）；OAuth 最多 4，头 8 KiB/32 字段，最多 32 次无效回调，单客户端 2s 截止。 |
+| 流读取 | 每 StreamStore 4 个在途 read | 每插件 8、全局 32；每块 <=1 MiB；不得占着 Store 等读。 |
 | 句柄 | 128，含 Blob、流、临时产物等 | 1,024；跨实例转交同样计账。 |
-| 工具/文件哈希 | 工具并发 1；文件哈希并发 1 | 工具 2、哈希 2；工具 stdout 8 MiB、stderr 1 MiB，超限终止/报错。 |
-| 临时文件 | 1 GiB | 4 GiB；取消、过期、卸载异步回收，用户导出不作为可删缓存。 |
+| 文件哈希 | 文件哈希并发 1 | 全局哈希并发 2；只读当前获准媒体，支持取消与文件变更检测。 |
+| 临时文件 | 1 GiB | 4 GiB；惰性创建私有产物目录，取消、过期、卸载异步回收。 |
 | HTTP/清单 | 响应头 64 KiB；输入清单 4 MiB、重写后 16 MiB | 每会话 10,000 个驻留资源、嵌套深度 8；直播滚动回收失效资源，旧 token 拒绝访问。 |
-| 会话资源登记 | 每插件 20,000 项 | 全局 80,000；包含关闭中旧快照，单会话和宿主字节预算同时生效。内部路由登记不占 Guest 的 128 个裸句柄额度。 |
-| 叠层驻留 | 10,000 cue 且规范化 UTF-8 数据 <=4 MiB，单 cue 文本 <=1 KiB | 宿主布局/字形内存另受总账本约束；窗口外拒绝，已确认窗口内数据不得静默丢失。 |
+| 会话资源登记 | 每插件 45,000 项 | 全局 180,000；包含关闭中旧快照，单会话和宿主字节预算同时生效。内部路由登记不占 Guest 的 128 个裸句柄额度。 |
+| 叠层驻留 | 10,000 cue 且规范化 UTF-8 数据 <=4 MiB，单 cue 文本 <=1 KiB | 全局 40,000 cue / 16 MiB，宿主布局/字形内存另受总账本约束；窗口外拒绝，已确认窗口内数据不得静默丢失。 |
 | 绘制/声明式 UI | 每次 UI 256 元素/64 KiB；旧 OverlayNode 64 节点/512 展开元素；TimedOverlay 每帧 256 cue | 旧绘制元素每帧合计 2,048，TimedOverlay 合计 512 cue；可见超额确定性降级并报告，驻留数据仍按窗口保存。 |
 | 附件 | 字幕 10 MiB、LUT 4 MiB | 验证格式/维度/有限数值；压缩展开、图片解码和时间轴数组仍受总内存账本。 |
 
@@ -388,9 +359,9 @@ JobObject/进程组管理子进程生命周期，进度/stdout/stderr 有总量�
 3. **官方包与交付演练**：构建 iris.guides/iris.webdav，准备 Rust Wasm 示例及打包流程；验证连接配置、凭据、稳定 source/media ID、收藏/续播、禁用状态和多实例行为。备份并测试失败回退；旧凭据在迁移成功前不删除。
 4. **一个切换变更**：同步提升 PROTOCOL_VERSION 到 2、更新所有示例/清单门禁/SDK fixtures、启用随包发现与发布打包、更新当前架构/开发文档，并删除 BuiltinPlugin、旧 process/Python 路径及已替代的内置实现。Windows 进程监管中被工具桥复用的通用部分应迁移保留，不能按旧目录整段误删。
 
-官方包在构建前生成到 `Resources/Plugins/`，归档与摘要索引一起嵌入宿主；源码戳和归档/规范内容双摘要可由构建脚本复核。启动扫描在后台先完成官方安装与迁移，再开放 ControlStore。迁移按安装身份记录完成日志，备份采用私有权限与内容寻址（每安装最多 8 份、每份不超过 16 MiB）；保留原 v1 文件和旧凭据，不修改收藏、续播、书签或通用设置。损坏记录不降级为空配置，只阻止对应安装加载；修正后可重试。已经存在的 v2 状态不由旧数据覆盖。
+官方包在构建前生成到 `Resources/Plugins/`，归档与摘要索引一起嵌入宿主；源码戳和归档/规范内容双摘要可由构建脚本复核。启动扫描在后台先完成官方安装与迁移，再开放 ControlStore。迁移按安装身份记录完成日志，备份采用私有权限与内容寻址（每安装最多 8 份、每份不超过 16 MiB）；保留原 v1 文件和旧凭据，通用设置保持不变，仅在超长 WebDAV 连接 ID 被规范化时同步重写对应引用（见下段）。损坏记录不降级为空配置，只阻止对应安装加载；修正后可重试。已经存在的 v2 状态不由旧数据覆盖。
 
-WebDAV 仅定向读取 `builtin.iris.webdav/secret.<connection_id>`，复制到该官方安装的 Plugin 凭据桶；若旧 URL 含账号密码，校验后将凭据转入系统存储并去除新配置中的 URL userinfo。连接 ID 保持不变。旧 `allow_insecure_auth` 不迁移为网络授权，第一次使用仍须宿主 Origin/IP 与 HTTP 凭据确认。配置编辑先保存新的随机凭据键，再原子切换服务器列表引用；结果不确定时重读，旧凭据保留至明确成功回执。旧 A-B 插件的时间标记仅驻留内存，没有可迁移的持久记录；新的原生标注独立落库。
+WebDAV 优先读取旧连接上的 `builtin.iris.webdav/<credential_key>`（缺省回退至 `builtin.iris.webdav/secret.<connection_id>`），复制到该官方安装的 `plugin-v2.<installation_id>` 凭据桶；若旧 URL 含账号密码，校验后将凭据转入系统存储并去除新配置中的 URL userinfo。长度不超过 48 字节的连接 ID 保持不变；超过 48 字节的旧连接 ID 确定性哈希映射为 `v1-<sha256_前16字节hex>` 以满足 64 字节 `is_valid_id` 约束，并同步重写 `locations.json`、`records.tsv`、`uri_records.tsv`、`recent.tsv`、`recent_uris.tsv` 与 `annotations.json` 中指向该旧连接 ID 的引用。旧 `allow_insecure_auth` 不迁移为网络授权，第一次使用仍须宿主 Origin/IP 与 HTTP 凭据确认。配置编辑先保存新的随机凭据键，再原子切换服务器列表引用；结果不确定时重读，旧凭据保留至明确成功回执。旧 A-B 插件的时间标记仅驻留内存，没有可迁移的持久记录；新的原生标注独立落库。
 
 切换必须通过第 12 节；未就绪就推迟切换，不以删门禁过关。版本发布与协议切换分开管理，当前仅准许 0.0.x 的版本规则保持，0.1.0 发布需相应授权并同步版本门禁。
 
@@ -398,7 +369,7 @@ WebDAV 仅定向读取 `builtin.iris.webdav/secret.<connection_id>`，复制到�
 
 | 阶段 | 交付方向 | 完成条件 |
 |---|---|---|
-| Stage 1：0.0.x → 0.1.0（规划） | v2 运行时/SDK、网络与三模流、标记/A-B、窗口叠层、语义工具、官方自举 | 契约与安全验收、迁移/打包验收完成；实际版本发布另行授权。 |
+| Stage 1：0.0.x → 0.1.0（规划） | v2 运行时/SDK、网络与三模流、标记/A-B、窗口叠层、私有产物与官方自举 | 契约与安全验收、迁移/打包验收完成；实际版本发布另行授权。 |
 | Stage 2：0.1.x → 0.3.x | 外部 OpenList/S3/Emby/Jellyfin/SMB；字幕/弹幕/审片工具；远程缓存、缩略图、双语字幕 | 用真实连接器验证接口；缓存密钥/稀疏块/回收独立设计与测试。 |
 | Stage 3：0.3.x → 0.6.x | HDR/EDR、ICC/LUT、原生照片层、瓦片与 RAW | 逐平台验证色彩/交换链、画质、内存与翻页性能，不承诺任意素材固定耗时。 |
 | Stage 4：0.6.x → 1.0 | 双视口/独立监看、GPUI 基线升级、Linux/Windows ARM64、签名插件索引 | 单独评估平台、依赖和分发兼容性，不把尚未存在/验证的上游能力写成现状。 |
@@ -414,14 +385,14 @@ WebDAV 仅定向读取 `builtin.iris.webdav/secret.<connection_id>`，复制到�
 | A01 包/身份 | ZIP 穿越、链接、炸弹、重复路径、同 ID 冲突、用户目录冒充 iris.*、升级增权 | 安装失败且旧版本/凭据不受影响；增权不静默生效；畸形包不执行 Guest。 |
 | A02 ABI | Rust 及至少一个 C/Zig Guest 的相同 JSON/返回值向量；越界/溢出/别名/错误长度/Trap/memory.grow | 编解码一致；恶意 Guest 不引起宿主越界或 panic；不跨调用保留切片；无错误释放。 |
 | A03 调度 | 控制目录 I/O 延迟 5s，同时流侧有四个可完成的音视频/Range 请求；再注入控制死循环 | 流请求在控制等待结束前独立完成；播放执行容量不被控制占满；超时只按定义的故障范围传播。 |
-| A04 生命周期 | 播放中 seek/切集/停用/卸载；取消与完成竞争；模拟长 DNS/Socket/工具退出 | UI 不阻塞等待；代次旧结果无效；终态唯一；资源静止后账本归零，无后台孤儿任务。 |
+| A04 生命周期 | 播放中 seek/切集/停用/卸载；取消与完成竞争；模拟长 DNS/Socket/文件作业退出 | UI 不阻塞等待；代次旧结果无效；终态唯一；资源静止后账本归零，无后台孤儿任务。 |
 | A05 网络 | 初始/重定向/DNS 混合私有地址、IPv4-mapped IPv6、域名后缀混淆、端口变化、撤权 | 所有直接及代发出口一致拒绝；实际连接地址与校验一致；公网请求不能借 NAS 授权。 |
 | A06 凭据/登录 | 跨 CDN、字幕/缩略图异源、重定向 Set-Cookie、多 Origin、错误/重放 OAuth state | 不错发凭据；重复头保留；回调事务仅消费一次；日志不含密钥/令牌。 |
 | A07 三模/范围 | DirectHttp 音画分离及备用源；加密块非对齐 read_at；短读/EOF/HEAD/206/416/溢出 | 字节与参考一致，音画同步；备用表示不一致拒绝；不伪造长度或提前 EOF。 |
-| A08 清单 | HLS/DASH 首版 profile；init/index/字幕/key 引用；file://、外部 URL、编码穿越、跨会话 token、未知标签 | 所有引用限定到本会话授权资源；未知必要语义明确 UNSUPPORTED；绝不回退原文；合法 token 支持重复 Range。 |
+| A08 清单 | `VirtualHls` 与远端 HLS 重写；init/字幕/key 引用；file://、外部 URL、编码穿越、跨会话 token、未知标签 | 所有引用限定到本会话授权资源；未知必要语义明确 UNSUPPORTED；绝不回退原文；合法 token 支持重复 Range。 |
 | A09 流刷新 | 长直播清单滚动、URL/密钥轮换、控制错误、更新回退、撤销旧能力 | 版本单调、请求绑定正确；有效上下文可继续，无法刷新时报错；撤权立即阻止新读。 |
-| A10 配额 | 填满缓冲/句柄/队列、持续 Append、连续创建关闭实例、工具大输出、编译大包 | 到界背压，无额外无界分配；终态可交付；取消中资源仍计账，释放后额度恢复。 |
-| A11 工具/文件 | 把 CLI 开关、配置路径、滤镜、脚本作为字段；不支持工具版本；链接/同源输出路径；子进程及环境继承 | schema 拒绝扩大操作；不覆盖源文件；未知版本失败关闭；进程树可取消；只报告可信工具模型内的保证。 |
+| A10 配额 | 填满缓冲/句柄/队列、持续 Append、连续创建关闭实例、产物写满配额、编译大包 | 到界背压，无额外无界分配；终态可交付；取消中资源仍计账，释放后额度恢复。 |
+| A11 私有产物/文件哈希 | 产物格式校验、路径/链接隔离、单在途写入、过期代次读拒与当前媒体哈希取消 | 拒绝越界路径或非法格式；未完成/过期产物回收配额；取消与文件变更不返回伪成功。 |
 | A12 叠层/增强 | 整片 >10,000 cue、直播未来数据、拖动重载、暂停/空轨道、旧字幕晚到 | 驻留量有界且分页完整；窗口外明确报错；旧结果拒绝；无其他事件时叠层不持续重绘。 |
 | A13 密码学/标记 | 标准向量、CTR 边界、CBC 长度、AEAD 错 tag、哈希取消/文件变化、标记重启持久化 | 摘要/明文正确；错误认证不泄露明文；文件变化不返回伪成功；标记仅修改 Store。 |
 | A14 迁移/门禁 | 干净新装和 v1 旧资料；WebDAV 多实例/凭据/收藏/禁用/续播；官方包缺失和失败回退 | 每准备提交通过旧门禁；最终切换同时更新协议与门禁；来源/功能对等，失败不破坏旧资料。 |
@@ -441,8 +412,8 @@ A15 的播放基准须记录素材哈希、编解码/码率、CPU/GPU/系统、�
 | [V2-01 · #3](https://github.com/Alpenl/iris/issues/3) | 包加载、内存 JIT、ABI 与跨语言 SDK | 无；先建立 A01/A02 夹具 |
 | [V2-02 · #4](https://github.com/Alpenl/iris/issues/4) | 双实例异步调度、取消、资源总账本 | V2-01 |
 | [V2-03 · #5](https://github.com/Alpenl/iris/issues/5) | 全链路网络/凭据授权与登录 | V2-01、V2-02 |
-| [V2-04 · #6](https://github.com/Alpenl/iris/issues/6) | 三模流、受控 HLS/DASH 与上下文刷新 | V2-01、V2-02、V2-03 |
-| [V2-05 · #7](https://github.com/Alpenl/iris/issues/7) | 语义工具适配器、输入/导出能力 | V2-01、V2-02、V2-03 |
+| [V2-04 · #6](https://github.com/Alpenl/iris/issues/6) | 三模流、受控 `VirtualHls`/远端 HLS 重写与上下文刷新（DASH 已于 `0.0.2` 移除） | V2-01、V2-02、V2-03 |
+| [V2-05 · #7](https://github.com/Alpenl/iris/issues/7) | 私有文件产物与当前媒体哈希（原 BYOB 外部工具/导出已于 `0.0.2` 移除） | V2-01、V2-02、V2-03 |
 | [V2-06 · #8](https://github.com/Alpenl/iris/issues/8) | 媒体增强、窗口叠层、标记与原生 A-B | 可先做内核标记/A-B；插件接口依赖 V2-01/02/03 |
 | [V2-07 · #9](https://github.com/Alpenl/iris/issues/9) | 官方自举、原子切换、发布与验收 | V2-01 至 V2-06 |
 
@@ -451,5 +422,4 @@ A15 的播放基准须记录素材哈希、编解码/码率、CPU/GPU/系统、�
 - Wasmtime 的 [Epoch 与阻塞宿主调用](https://docs.wasmtime.dev/api/wasmtime/struct.Config.html#method.epoch_interruption)、[Memory 借用安全](https://docs.wasmtime.dev/api/wasmtime/struct.Memory.html)、[资源限制范围](https://docs.rs/wasmtime/latest/wasmtime/trait.ResourceLimiter.html) 分别约束第 3、4、9 节；落地需固定依赖版本，不能把 latest 文档当锁定版本。
 - [Module 反序列化安全要求](https://docs.wasmtime.dev/api/wasmtime/struct.Module.html#method.deserialize) 是取消磁盘机器码缓存的依据。
 - [mpv 引用访问选项](https://mpv.io/manual/stable/#options-access-references)、[硬解条件](https://mpv.io/manual/stable/#options-hwdec) 不构成完整沙箱或任意格式硬解保证。
-- [HLS RFC 8216](https://www.rfc-editor.org/rfc/rfc8216)、[DASH-IF 时间模型](https://dashif.org/Guidelines-TimingModel/) 用于限定支持 profile 和清单夹具。
-- [yt-dlp 选项与加载机制](https://github.com/yt-dlp/yt-dlp#general-options)、[FFmpeg 流拷贝/定位语义](https://ffmpeg.org/ffmpeg.html#Main-options) 用于工具版本适配与切点验收。
+- [HLS RFC 8216](https://www.rfc-editor.org/rfc/rfc8216) 用于限定受控 HLS 重写与 `VirtualHls` 夹具。

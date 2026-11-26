@@ -52,12 +52,9 @@ impl IrisWindow {
                 self.overlays.open_dialog(dialog);
             }
             BuiltinDialog::ConfirmUninstallPlugin { .. } => {
-                self.overlays.popover = None;
-                self.overlays.context_menu = None;
-                self.overlays.palette_open = false;
+                self.overlays.open_dialog_over_settings(dialog);
                 self.text_inputs.active_form_key = None;
                 self.focus.focus(window);
-                self.overlays.dialog = Some(dialog);
             }
         }
         cx.notify();
@@ -162,25 +159,13 @@ impl IrisWindow {
             cx.notify();
         });
 
-        let (title, submit_label, body, on_submit) = match dialog {
+        let submit_cb: ModalCallback = Rc::new(|this, w, cx| {
+            this.submit_builtin_dialog(w, cx);
+        });
+
+        let (title, submit_label, body) = match dialog {
             BuiltinDialog::OpenUrl => {
-                let submit: ModalCallback = Rc::new(|this, w, cx| {
-                    let url = this.form_value("url").trim().to_string();
-                    if url.is_empty() {
-                        this.overlays.dialog_error = Some("请输入网络流或媒体地址".into());
-                        cx.notify();
-                        return;
-                    }
-                    let resolver = this.form_value("url-resolver").to_owned();
-                    if !this.open_user_url(&url, &resolver, cx) {
-                        return;
-                    }
-                    this.overlays.dialog = None;
-                    this.overlays.dialog_error = None;
-                    this.text_inputs.active_form_key = None;
-                    this.focus.focus(w);
-                });
-                let enter_cb: FormEnterCallback = submit.clone();
+                let enter_cb: FormEnterCallback = submit_cb.clone();
                 let inp = self.render_text_field(
                     TextFieldSpec {
                         id: "dlg-open-url".into(),
@@ -215,19 +200,10 @@ impl IrisWindow {
                     super::strings::chrome::OPEN_STREAM_DIALOG_TITLE,
                     "打开播放",
                     content,
-                    submit,
                 )
             }
             BuiltinDialog::SavePreset { scope } => {
-                let submit: ModalCallback = Rc::new(move |this, w, cx| {
-                    let name = this.form_value("preset_name").to_string();
-                    let desc = this.form_value("preset_desc").to_string();
-                    this.overlays.dialog = None;
-                    this.text_inputs.active_form_key = None;
-                    this.focus.focus(w);
-                    this.save_current_as_preset(name, desc, scope, w, cx);
-                });
-                let enter_cb: FormEnterCallback = submit.clone();
+                let enter_cb: FormEnterCallback = submit_cb.clone();
                 let name_inp = self.render_text_field(
                     TextFieldSpec {
                         id: "dlg-preset-name".into(),
@@ -345,22 +321,15 @@ impl IrisWindow {
                             )),
                     )
                     .into_any_element();
-                ("保存当前状态为工作区预设", "保存预设", content, submit)
+                ("保存当前状态为工作区预设", "保存预设", content)
             }
             BuiltinDialog::ConfirmUninstallPlugin {
                 plugin_id,
                 plugin_name,
                 keep_data,
             } => {
-                let target_id = plugin_id.clone();
                 let pid_toggle = plugin_id.clone();
                 let name_toggle = plugin_name.clone();
-                let submit: ModalCallback = Rc::new(move |this, w, cx| {
-                    this.overlays.dialog = None;
-                    this.text_inputs.active_form_key = None;
-                    this.focus.focus(w);
-                    this.uninstall_plugin(&target_id, keep_data, cx);
-                });
                 let desc = if keep_data {
                     "将立即停止并移除该插件包；登录凭据与偏好设置将保留在本地，重新安装插件包时可由你选择是否恢复。"
                 } else {
@@ -404,7 +373,7 @@ impl IrisWindow {
                             .child(desc),
                     )
                     .into_any_element();
-                ("删除插件", "确认删除", content, submit)
+                ("删除插件", "确认删除", content)
             }
         };
 
@@ -418,7 +387,7 @@ impl IrisWindow {
                 submit_label,
                 body,
                 cancel_cb,
-                on_submit,
+                submit_cb,
             )
             .with_error(self.overlays.dialog_error.clone()),
             t,

@@ -4,10 +4,10 @@ mod executor;
 mod serial;
 use super::{
     installation::valid_identity,
+    json_error,
     ledger::{Ledger, Resource},
 };
-use crate::plugin_v2::json;
-use crate::{fs_util, vault::CredentialVault, vfs::HttpCancel};
+use crate::{bounded_json, fs_util, vault::CredentialVault, vfs::HttpCancel};
 pub use executor::StorageExecutor;
 use iris_api::v2::{ErrorCode, Id};
 use serde::{Deserialize, Serialize};
@@ -79,7 +79,7 @@ impl Storage {
         file.take(STATE_BYTES as u64 + 1)
             .read_to_end(&mut bytes)
             .map_err(|_| ErrorCode::IoError)?;
-        let record: Record = json::decode(&bytes, STATE_BYTES)?;
+        let record: Record = bounded_json::decode(&bytes, STATE_BYTES).map_err(json_error)?;
         if record.schema != 1
             || record.installation != self.owner
             || record.entries.len() > STATE_KEYS
@@ -146,7 +146,7 @@ impl Storage {
             .0
             .checked_add(1)
             .ok_or(ErrorCode::QuotaExceeded)?);
-        let bytes = json::encode(&record, STATE_BYTES)?;
+        let bytes = bounded_json::encode(&record, STATE_BYTES).map_err(json_error)?;
         check(cancel)?;
         fs_util::atomic_write_private(&self.path, bytes).map_err(|_| ErrorCode::IoError)?;
         // A cancel racing the atomic commit cannot undo a committed write.
@@ -162,7 +162,7 @@ fn validate_entry(key: &str, value: Option<&str>, max: usize) -> Result<(), Erro
         return Err(ErrorCode::QuotaExceeded);
     }
     if let Some(value) = value {
-        json::encode(&value, iris_api::v2::MESSAGE_LIMIT - 4096)?;
+        bounded_json::encode(&value, iris_api::v2::MESSAGE_LIMIT - 4096).map_err(json_error)?;
     }
     Ok(())
 }

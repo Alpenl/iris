@@ -20,7 +20,7 @@ struct Cleanup {
     root: Arc<TempRoot>,
     name: String,
     _leases: Vec<Reservation>,
-    _activity: ActivityLease,
+    _activities: Vec<ActivityLease>,
 }
 fn cleanup_queue() -> Result<&'static mpsc::Sender<Cleanup>, ErrorCode> {
     static QUEUE: OnceLock<Result<mpsc::Sender<Cleanup>, ()>> = OnceLock::new();
@@ -60,6 +60,7 @@ fn cleanup_queue() -> Result<&'static mpsc::Sender<Cleanup>, ErrorCode> {
 pub struct TempRoot {
     dir: Option<Dir>,
     pub(crate) path: PathBuf,
+    parent_path: PathBuf,
     owner: String,
     ledger: Ledger,
     parent: Dir,
@@ -73,7 +74,7 @@ impl TempRoot {
         let parent_path = canonical_host_dir(parent)?;
         let parent = Dir::open_ambient_dir(&parent_path, cap_std::ambient_authority())
             .map_err(|_| ErrorCode::IoError)?;
-        let name = super::random_name()?;
+        let name = crate::plugin_v2::installation::random_identity()?;
         let mut builder = cap_std::fs::DirBuilder::new();
         #[cfg(unix)]
         {
@@ -89,6 +90,7 @@ impl TempRoot {
         Ok(Arc::new(Self {
             dir: Some(dir),
             path: parent_path.join(&name),
+            parent_path,
             owner,
             ledger,
             parent,
@@ -131,7 +133,11 @@ impl TempRoot {
             &self.owner,
             &[(Resource::Handle, 1), (Resource::HostBytes, 4096)],
         )?;
-        let name = format!("{}.{}", super::random_name()?, format);
+        let name = format!(
+            "{}.{}",
+            crate::plugin_v2::installation::random_identity()?,
+            format
+        );
         let mut options = OpenOptions::new();
         options.write(true).read(true).create_new(true);
         #[cfg(unix)]
@@ -151,7 +157,7 @@ impl TempRoot {
             format: format.into(),
             bytes: 0,
             lease: Some(lease),
-            activity: Some(self.activity.start()),
+            activities: vec![self.activity.start()],
         })
     }
 }
@@ -159,6 +165,7 @@ impl Drop for TempRoot {
     fn drop(&mut self) {
         drop(self.dir.take());
         let _ = self.parent.remove_dir(&self.name);
+        let _ = std::fs::remove_dir(&self.parent_path);
     }
 }
 pub struct ArtifactWriter {
@@ -168,9 +175,13 @@ pub struct ArtifactWriter {
     format: String,
     bytes: u64,
     lease: Option<Reservation>,
-    activity: Option<ActivityLease>,
+    activities: Vec<ActivityLease>,
 }
 impl ArtifactWriter {
+    pub(crate) fn with_activity(mut self, lease: ActivityLease) -> Self {
+        self.activities.push(lease);
+        self
+    }
     pub fn write(&mut self, bytes: &[u8], cancel: &HttpCancel) -> Result<(), ErrorCode> {
         if cancel.is_cancelled() {
             return Err(ErrorCode::Cancelled);
@@ -205,7 +216,7 @@ impl ArtifactWriter {
             name: self.name.clone(),
             format: self.format.clone(),
             lease: self.lease.take(),
-            activity: self.activity.take(),
+            activities: std::mem::take(&mut self.activities),
         }))
     }
 }
@@ -216,7 +227,7 @@ impl Drop for ArtifactWriter {
             &self.root,
             &self.name,
             self.lease.take(),
-            self.activity.take(),
+            std::mem::take(&mut self.activities),
         );
     }
 }
@@ -227,7 +238,7 @@ pub struct Artifact {
     name: String,
     pub format: String,
     lease: Option<Reservation>,
-    activity: Option<ActivityLease>,
+    activities: Vec<ActivityLease>,
 }
 impl Artifact {
     pub fn size(&self) -> u64 {
@@ -258,7 +269,7 @@ impl Drop for Artifact {
             &self.root,
             &self.name,
             self.lease.take(),
-            self.activity.take(),
+            std::mem::take(&mut self.activities),
         );
     }
 }
@@ -266,14 +277,14 @@ fn queue(
     root: &Arc<TempRoot>,
     name: &str,
     lease: Option<Reservation>,
-    activity: Option<ActivityLease>,
+    activities: Vec<ActivityLease>,
 ) {
-    if let (Some(lease), Some(activity)) = (lease, activity) {
+    if let Some(lease) = lease {
         let job = Cleanup {
             root: root.clone(),
             name: name.into(),
             _leases: vec![lease],
-            _activity: activity,
+            _activities: activities,
         };
         enqueue(job);
     }

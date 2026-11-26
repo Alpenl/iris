@@ -1,4 +1,4 @@
-//! Reversible personal-baseline runtime (`PresetRuntime`, `PresetRevert`) for sparse presets.
+//! Reversible personal-baseline runtime (`PresetRuntime`) for sparse presets.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -13,7 +13,7 @@ use super::{
 
 /// In-memory revert state tracking fields owned by the active preset.
 #[derive(Clone, Debug, Default, PartialEq)]
-pub struct PresetRevert {
+struct PresetRevert {
     initial_mask: u32,
     active_mask: u32,
     applied: Settings,
@@ -24,7 +24,7 @@ pub struct PresetRevert {
     on_exit_commands: Vec<(String, String)>,
 }
 
-/// Holds the user's clean daily `baseline` (`settings.conf`) and active [`PresetRevert`].
+/// Holds the user's clean daily `baseline` (`settings.conf`) and active revert state.
 #[derive(Clone, Debug)]
 pub struct PresetRuntime {
     baseline: Settings,
@@ -189,12 +189,6 @@ impl PresetRuntime {
 
     pub fn baseline(&self) -> &Settings {
         &self.baseline
-    }
-    pub fn revert_state(&self) -> &PresetRevert {
-        &self.revert
-    }
-    pub fn set_settings_path(&mut self, path: Option<PathBuf>) {
-        self.settings_path = path;
     }
 
     fn persist_baseline(&mut self) {
@@ -378,12 +372,19 @@ impl PresetRuntime {
         // A click is explicit even if a stale local settings snapshot already
         // happens to contain that value. It also releases a preset's ownership.
         self.revert.plugin_overrides.remove(id);
-        set_plugin_disabled(&mut self.observed_plugins, id, enabled);
         set_plugin_disabled(&mut active_settings.disabled_plugins, id, !enabled);
-        self.record_user_edit(active_settings);
+        self.record_user_edit_with_forced(active_settings, Some(id));
     }
 
     pub fn record_user_edit(&mut self, active_settings: &Settings) {
+        self.record_user_edit_with_forced(active_settings, None);
+    }
+
+    fn record_user_edit_with_forced(
+        &mut self,
+        active_settings: &Settings,
+        forced_plugin: Option<&str>,
+    ) {
         let mut next = active_settings.clone();
         next.active_preset.clone_from(&self.baseline.active_preset);
         let mut keep_mask = 0u32;
@@ -406,12 +407,13 @@ impl PresetRuntime {
             .chain(&self.observed_plugins)
             .chain(self.revert.plugin_overrides.keys())
             .cloned()
+            .chain(forced_plugin.map(str::to_owned))
             .collect();
         next.disabled_plugins
             .clone_from(&self.baseline.disabled_plugins);
         for id in all_ids {
             let dis = active_settings.disabled_plugins.contains(&id);
-            if dis == self.observed_plugins.contains(&id) {
+            if forced_plugin != Some(id.as_str()) && dis == self.observed_plugins.contains(&id) {
                 continue;
             }
             match self.revert.plugin_overrides.get(&id).copied() {

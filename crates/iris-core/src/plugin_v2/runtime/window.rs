@@ -1,24 +1,17 @@
-use super::{Control, Setup, WindowState};
+use super::{Control, WindowState};
 use crate::{
-    plugin_v2::{
-        actor::Executor, auth::BrowserOpen, installation::Installed, network::NetworkGrant,
-        services::HostServices, storage::Storage,
-    },
+    plugin_v2::{actor::Executor, auth::BrowserOpen, json_error},
     vfs::HttpCancel,
 };
 use iris_api::v2::{ErrorCode, Generation, HostEvent, Id, source::PlaybackSnapshot};
 use std::sync::Arc;
 
-/// The coordinator moves this plan to its bounded filesystem worker lane.
+/// Lightweight window-open plan; actual artifact directories are created lazily.
 pub struct WindowPreparation {
     control: Id,
     window: Id,
     generation: Generation,
     event: Vec<u8>,
-    setup: Setup,
-    installed: Installed,
-    network: NetworkGrant,
-    storage: Arc<Storage>,
     browser: BrowserOpen,
 }
 pub struct PreparedWindow {
@@ -26,24 +19,16 @@ pub struct PreparedWindow {
     window: Id,
     generation: Generation,
     event: Vec<u8>,
-    services: HostServices,
+    browser: BrowserOpen,
 }
 impl WindowPreparation {
     pub fn prepare(self) -> Result<PreparedWindow, ErrorCode> {
-        let services = Control::make_services(
-            &self.setup,
-            &self.installed,
-            &self.network,
-            &self.storage,
-            Some(self.window),
-            self.browser,
-        )?;
         Ok(PreparedWindow {
             control: self.control,
             window: self.window,
             generation: self.generation,
             event: self.event,
-            services,
+            browser: self.browser,
         })
     }
 }
@@ -67,19 +52,16 @@ impl Control {
                 .grants
                 .contains(&iris_api::v2::Capability::ReadState)
         });
-        let event = crate::plugin_v2::json::encode(
+        let event = crate::bounded_json::encode(
             &HostEvent::<serde_json::Value>::WindowOpened { snapshot },
             iris_api::v2::MESSAGE_LIMIT - 512,
-        )?;
+        )
+        .map_err(json_error)?;
         Ok(WindowPreparation {
             control: self.control_id,
             window,
             generation,
             event,
-            setup: self.setup.clone(),
-            installed: self.installed.clone(),
-            network: self.network.clone(),
-            storage: self.storage.clone(),
             browser,
         })
     }
@@ -93,7 +75,7 @@ impl Control {
             window,
             generation,
             event,
-            services,
+            browser,
             ..
         } = prepared;
         if self.windows.contains_key(&window) {
@@ -102,23 +84,18 @@ impl Control {
         if self.windows.len() >= 4 {
             return Err(ErrorCode::Backpressure);
         }
-        self.services
-            .register(window, generation, Arc::new(services.clone()))?;
-        if let Some(actor) = &self.actor {
-            if let Err(error) = actor.open_window(window, generation) {
-                self.services.window_changed(window, None);
-                return Err(error);
-            }
-            if let Err(error) = actor.send_window(window, generation, event) {
-                let _ = actor.close_window(window);
-                return Err(error);
-            }
+        let files = self.services.open_window(window, generation, browser)?;
+        if let Some(actor) = &self.actor
+            && let Err(error) = actor.open_window_with_event(window, generation, event)
+        {
+            self.services.window_changed(window, None);
+            return Err(error);
         }
         self.windows.insert(
             window,
             WindowState {
                 generation,
-                services,
+                files,
                 media: HttpCancel::default(),
                 attachments: Arc::new(super::super::enhancement::AttachmentRegistry::default()),
             },

@@ -184,7 +184,6 @@ impl IrisWindow {
                                         this.overlays.recording_shortcut = None;
                                         this.overlays.shortcut_conflict = None;
                                         this.keymap.reset_all();
-                                        this.keymap.save();
                                         rebind_keys(cx, &this.keymap);
                                         this.focus.focus(w);
                                         this.show_toast("已将全部快捷键恢复为当前方案默认值", cx);
@@ -235,6 +234,17 @@ impl IrisWindow {
                         "切换到预设 · {}",
                         super::super::strings::presets::preset_name_by_id(&self.presets, pid)
                     )
+                } else if let Some(rest) = rec.strip_prefix("plugin:") {
+                    self.plugins
+                        .commands()
+                        .into_iter()
+                        .find(|(pid, _, spec)| {
+                            rest.strip_prefix(*pid)
+                                .and_then(|tail| tail.strip_prefix(':'))
+                                == Some(spec.id.as_str())
+                        })
+                        .map(|(_, pname, spec)| format!("{pname} · {}", spec.title))
+                        .unwrap_or_else(|| rec.clone())
                 } else {
                     rec.clone()
                 };
@@ -440,7 +450,6 @@ impl IrisWindow {
                                         this.focus.focus(w);
                                     }
                                     this.keymap.reset_binding(&id_reset);
-                                    this.keymap.save();
                                     rebind_keys(cx, &this.keymap);
                                     cx.notify();
                                 },

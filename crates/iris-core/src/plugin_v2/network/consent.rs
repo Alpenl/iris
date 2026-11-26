@@ -4,16 +4,17 @@ use super::{
     AddressKind, NetworkGrant, Origin, TransportKind, address_kind, grant::validate_pins,
     normalize_url,
 };
-use crate::plugin_v2::json;
+use crate::bounded_json;
 use crate::{
     fs_util,
     plugin_v2::{
         installation::valid_identity,
+        json_error,
         ledger::{Ledger, Reservation, Resource},
     },
     vfs::HttpCancel,
 };
-use iris_api::v2::{ErrorCode, Id, task_result::OriginResult};
+use iris_api::v2::{Capability, ErrorCode, Id, task_result::OriginResult};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -100,12 +101,12 @@ impl OriginStore {
         file.take(MAX_RECORD as u64 + 1)
             .read_to_end(&mut bytes)
             .map_err(|_| ErrorCode::IoError)?;
-        let record: Record = json::decode(&bytes, MAX_RECORD)?;
+        let record: Record = bounded_json::decode(&bytes, MAX_RECORD).map_err(json_error)?;
         if record.schema != 1 || record.installation != self.owner || record.entries.len() > 16 {
             return Err(ErrorCode::InvalidArgument);
         }
         for (key, entry) in &record.entries {
-            let (origin, pins, _) = validate_pins(&entry.origin, TransportKind::Http, &entry.ips)?;
+            let (origin, pins) = validate_pins(&entry.origin, TransportKind::Http, &entry.ips)?;
             if origin.display() != *key
                 || entry.origin != *key
                 || pins.len() != entry.ips.len()
@@ -136,7 +137,8 @@ impl OriginStore {
         let record = self.read()?;
         for entry in record.entries.values() {
             self.check(grant, cancel)?;
-            let id = grant.confirm_origin(&entry.origin, TransportKind::Http, &entry.ips)?;
+            let kind = consent_transport(grant, &entry.origin)?;
+            let id = grant.confirm_origin(&entry.origin, kind, &entry.ips)?;
             if entry.insecure_auth {
                 grant.confirm_insecure_auth(id)?;
             }
@@ -154,15 +156,17 @@ impl OriginStore {
         let memory = self
             .ledger
             .reserve(&self.owner, &[(Resource::HostBytes, 2 << 20)])?;
-        let origin = parse_consent_origin(raw)?;
+        let (origin, _) = parse_consent_origin_url(raw)?;
+        let origin_display = origin.display();
+        consent_transport(grant, &origin_display)?;
         let ips = resolve(&origin, &self.owner, &self.ledger, cancel)?;
-        validate_pins(&origin.display(), TransportKind::Http, &ips)?;
-        let previous = self.read()?.entries.remove(&origin.display());
+        validate_pins(&origin_display, TransportKind::Http, &ips)?;
+        let previous = self.read()?.entries.remove(&origin_display);
         self.check(grant, cancel)?;
         Ok(OriginReview {
             owner: self.owner.clone(),
             version: grant.version(),
-            origin: origin.display(),
+            origin: origin_display,
             ips,
             previous,
             expires: Instant::now() + Duration::from_secs(300),
@@ -189,6 +193,7 @@ impl OriginStore {
         if insecure_auth && !review.plaintext() {
             return Err(ErrorCode::InvalidArgument);
         }
+        let kind = consent_transport(grant, &review.origin)?;
         let _lock = fs_util::lock_file_with_timeout(
             &self.path.with_extension("lock"),
             Duration::from_millis(250),
@@ -215,17 +220,17 @@ impl OriginStore {
                 insecure_auth,
             },
         );
-        let bytes = json::encode(&record, MAX_RECORD)?;
+        let bytes = bounded_json::encode(&record, MAX_RECORD).map_err(json_error)?;
         self.check(grant, cancel)?;
         fs_util::atomic_write_private(&self.path, &bytes).map_err(|_| ErrorCode::IoError)?;
         // Persistence can win a race with cancellation. A later reload observes
         // exactly this explicit approval; it never fabricates an empty record.
         self.check(grant, cancel)?;
-        let id = grant.confirm_origin(&review.origin, TransportKind::Http, &review.ips)?;
+        let id = grant.confirm_origin(&review.origin, kind, &review.ips)?;
         if insecure_auth {
             grant.confirm_insecure_auth(id)?;
         }
-        grant.lookup_origin(&review.origin, TransportKind::Http)
+        grant.lookup_origin(&review.origin, kind)
     }
     pub fn revoke(
         &self,
@@ -234,7 +239,7 @@ impl OriginStore {
         cancel: &HttpCancel,
     ) -> Result<(), ErrorCode> {
         self.check(grant, cancel)?;
-        let origin = parse_consent_origin(origin)?.display();
+        let origin = parse_consent_origin_url(origin)?.0.display();
         let _lock = fs_util::lock_file_with_timeout(
             &self.path.with_extension("lock"),
             Duration::from_millis(250),
@@ -243,18 +248,39 @@ impl OriginStore {
         let mut record = self.read()?;
         record.entries.remove(&origin);
         self.check(grant, cancel)?;
-        fs_util::atomic_write_private(&self.path, &json::encode(&record, MAX_RECORD)?)
-            .map_err(|_| ErrorCode::IoError)?;
-        if let Ok(found) = grant.lookup_origin(&origin, TransportKind::Http) {
+        let encoded = bounded_json::encode(&record, MAX_RECORD).map_err(json_error)?;
+        fs_util::atomic_write_private(&self.path, &encoded).map_err(|_| ErrorCode::IoError)?;
+        if let Ok(kind) = consent_transport(grant, &origin)
+            && let Ok(found) = grant.lookup_origin(&origin, kind)
+        {
             grant.revoke_origin(found.origin_grant)?;
         }
         Ok(())
     }
 }
-fn parse_consent_origin(raw: &str) -> Result<Origin, ErrorCode> {
-    let url = normalize_url(raw, TransportKind::Http)
-        .or_else(|_| normalize_url(raw, TransportKind::WebSocket))?;
-    Ok(Origin::of(&url)?.http_equivalent())
+pub fn parse_consent_origin_url(raw: &str) -> Result<(Origin, TransportKind), ErrorCode> {
+    for kind in [
+        TransportKind::Http,
+        TransportKind::WebSocket,
+        TransportKind::Tcp { tls: false },
+        TransportKind::Tcp { tls: true },
+    ] {
+        if let Ok(url) = normalize_url(raw, kind) {
+            return Ok((Origin::of(&url)?.http_equivalent(), kind));
+        }
+    }
+    Err(ErrorCode::Denied)
+}
+fn consent_transport(grant: &NetworkGrant, origin: &str) -> Result<TransportKind, ErrorCode> {
+    if grant.has_capability(Capability::NetHttp) || grant.has_capability(Capability::NetWs) {
+        Ok(TransportKind::Http)
+    } else if grant.has_capability(Capability::NetTcp) {
+        Ok(TransportKind::Tcp {
+            tls: origin.starts_with("https:"),
+        })
+    } else {
+        Err(ErrorCode::Denied)
+    }
 }
 fn resolve(
     origin: &Origin,
@@ -288,10 +314,11 @@ fn resolve(
                         .collect();
                     let snapshot: Vec<_> = ips.iter().copied().collect();
                     if crate::vfs::http_client::doh::should_bypass_fake_ip(&host, &snapshot) {
+                        let doh_deadline = Instant::now() + Duration::from_secs(8);
                         let real = crate::vfs::http_client::doh::resolve_a_records(
                             &host,
                             &job_cancel,
-                            Instant::now() + Duration::from_secs(8),
+                            || doh_deadline,
                         )
                         .map_err(|_| ErrorCode::IoError)?;
                         ips = real.into_iter().map(|ip| ip.to_canonical()).collect();

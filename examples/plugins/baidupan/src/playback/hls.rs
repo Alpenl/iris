@@ -314,7 +314,8 @@ pub fn build_hls_resolved_media(
     if encoded.len() > CHUNK_LIMIT {
         return Err("转码清单体积超过 1 MiB 上限，请切换为「原画直链」播放".into());
     }
-    let doc_blob = make_blob(&encoded).map_err(|e| format!("提交清单缓冲失败：{e:?}"))?;
+    let doc_blob = make_blob(&encoded)
+        .map_err(|e| format!("提交清单缓冲失败：{}", iris_plugin_sdk::error_message(e)))?;
     let mut variants = vec![StreamVariant {
         id: "orig.0".into(),
         label: "原画直链".into(),

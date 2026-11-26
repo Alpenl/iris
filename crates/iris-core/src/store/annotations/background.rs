@@ -136,38 +136,24 @@ impl AnnotationSnapshot {
 }
 
 impl AnnotationStore {
-    pub fn accept(&mut self, snapshot: AnnotationSnapshot) -> Result<(), AnnotationError> {
+    pub fn accept(&mut self, snapshot: AnnotationSnapshot) {
         if snapshot.revision <= self.revision {
-            return Ok(());
+            return;
         }
-        if self.dirty() {
-            let mut merged = (*snapshot.records).clone();
-            for (uri, edits) in &self.edits {
-                let value = merged.entry(uri.clone()).or_default();
-                for edit in edits.values() {
-                    value.edit(edit)?;
-                }
-                if value.empty() {
-                    merged.remove(uri);
-                }
-            }
-            validate(&merged)?;
-            self.records = Arc::new(merged);
-        } else {
-            self.records = snapshot.records;
-        }
+        self.records = snapshot.records;
         self.revision = snapshot.revision;
         self.lease = Some(snapshot.lease);
-        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{AnnotationEdit, AnnotationError, AnnotationStore, AnnotationTarget, MediaUri};
     use crate::store::ColorLabel;
     use crate::test_util::TestDir;
+    use std::any::Any;
     use std::cell::Cell;
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     #[test]
@@ -212,8 +198,8 @@ mod tests {
             )
             .unwrap();
         let mut store = AnnotationStore::default();
-        store.accept(second).unwrap();
-        store.accept(first).unwrap();
+        store.accept(second);
+        store.accept(first);
         assert_eq!(store.get(&uris[0]).unwrap().rating, 4);
         assert_eq!(store.get(&uris[0]).unwrap().color, Some(ColorLabel::Green));
         let previous = std::fs::read(dir.path().join("annotations.json")).unwrap();

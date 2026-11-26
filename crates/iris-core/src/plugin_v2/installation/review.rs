@@ -25,6 +25,7 @@ pub struct Review {
     previous: Option<Installed>,
     archived: Option<ArchivedIdentity>,
     bytes: Vec<u8>,
+    bundled: bool,
     _module: Option<Arc<CompiledModule>>,
     expires: Instant,
     _lease: Reservation,
@@ -40,12 +41,37 @@ impl Review {
         if cancel.load(Ordering::Acquire) {
             return Err(ErrorCode::Cancelled);
         }
+        let bytes = Installer::read_candidate(path)?;
+        Self::from_bytes(bytes, installer, resources, cancel, false)
+    }
+    pub(crate) fn from_bundled(
+        bytes: Vec<u8>,
+        installer: &Installer,
+        resources: &Resources,
+        cancel: &AtomicBool,
+    ) -> Result<Self, ErrorCode> {
+        Self::from_bytes(bytes, installer, resources, cancel, true)
+    }
+    fn from_bytes(
+        bytes: Vec<u8>,
+        installer: &Installer,
+        resources: &Resources,
+        cancel: &AtomicBool,
+        bundled: bool,
+    ) -> Result<Self, ErrorCode> {
+        if cancel.load(Ordering::Acquire) {
+            return Err(ErrorCode::Cancelled);
+        }
         let owner = format!("package-review-{}", next_id()?);
         let mut lease = resources
             .ledger
             .reserve(&owner, &[(Resource::HostBytes, 128 << 20)])?;
-        let bytes = Installer::read_candidate(path)?;
-        let package = Package::from_zip(&bytes, Provenance::User)?;
+        let provenance = if bundled {
+            Provenance::Bundled(installer.bundled_pins())
+        } else {
+            Provenance::User
+        };
+        let package = Package::from_zip(&bytes, provenance)?;
         let module = package
             .wasm()
             .map(|wasm| resources.engine.compile(wasm, cancel))
@@ -65,6 +91,7 @@ impl Review {
             previous,
             archived,
             bytes,
+            bundled,
             _module: module,
             expires: Instant::now() + Duration::from_secs(300),
             _lease: lease,
@@ -82,24 +109,21 @@ impl Review {
     pub fn archived(&self) -> Option<&ArchivedIdentity> {
         self.archived.as_ref()
     }
+    pub(crate) fn is_bundled(&self) -> bool {
+        self.bundled
+    }
+    pub(crate) fn refresh_expiry(&mut self) {
+        self.expires = Instant::now() + Duration::from_secs(300);
+    }
     /// Keep identity only after the UI explicitly offers that choice alongside
     /// both content digests and the requested grants. Reinstall gets a new scope
     /// unless the user explicitly approves restoring an archived identity.
-    pub fn approve(
-        self,
-        installer: &mut Installer,
-        grants: BTreeSet<Capability>,
-        keep_identity: bool,
-    ) -> Result<Installed, ErrorCode> {
-        self.approve_with_cleanup(installer, grants, keep_identity)
-            .map(|(installed, _)| installed)
-    }
     pub(crate) fn approve_with_cleanup(
         self,
         installer: &mut Installer,
         grants: BTreeSet<Capability>,
         keep_identity: bool,
-    ) -> Result<(Installed, Option<String>), ErrorCode> {
+    ) -> Result<(Installed, Vec<String>), ErrorCode> {
         if Instant::now() >= self.expires {
             return Err(ErrorCode::StaleHandle);
         }
@@ -114,7 +138,7 @@ impl Review {
         } else {
             None
         };
-        installer.install_from(
+        installer.install_reviewed(
             &self.bytes,
             Approval {
                 digest: self.digest,
@@ -122,7 +146,7 @@ impl Review {
                 network: self.manifest.network,
                 previous,
             },
-            Provenance::User,
+            self.bundled,
             Some(&self.previous),
             Some(&self.archived),
         )

@@ -5,9 +5,137 @@ use gpui::{
     Context, InteractiveElement, IntoElement, ParentElement, SharedString,
     StatefulInteractiveElement, Styled, div, px,
 };
+use iris_api::v2::{Capability, source::PlaylistEntry};
 use iris_core::media_uri::MediaUri;
 
+pub(in crate::ui) fn resolve_playlist_current(
+    playlist: &[PlaylistEntry],
+    playback_source_id: Option<&str>,
+    playback_entry_id: Option<&str>,
+    requested: Option<(&str, &str)>,
+) -> Option<(String, String)> {
+    if playlist.is_empty() {
+        return None;
+    }
+    if let (Some(sid), Some(eid)) = (playback_source_id, playback_entry_id)
+        && playlist
+            .iter()
+            .any(|p| p.source_id == sid && p.entry_id == eid)
+    {
+        return Some((sid.to_owned(), eid.to_owned()));
+    }
+    if let Some(eid) = playback_entry_id {
+        if let Some((req_sid, _)) = requested
+            && playlist
+                .iter()
+                .any(|p| p.source_id == req_sid && p.entry_id == eid)
+        {
+            return Some((req_sid.to_owned(), eid.to_owned()));
+        }
+        if let Some(hit) = playlist.iter().find(|p| p.entry_id == eid) {
+            return Some((hit.source_id.clone(), hit.entry_id.clone()));
+        }
+    }
+    if let Some((req_sid, req_eid)) = requested {
+        if playlist
+            .iter()
+            .any(|p| p.source_id == req_sid && p.entry_id == req_eid)
+        {
+            return Some((req_sid.to_owned(), req_eid.to_owned()));
+        }
+        if let Some(hit) = playlist.iter().find(|p| p.entry_id == req_eid) {
+            return Some((hit.source_id.clone(), hit.entry_id.clone()));
+        }
+    }
+    playlist
+        .first()
+        .map(|first| (first.source_id.clone(), first.entry_id.clone()))
+}
+
+pub(in crate::ui) fn find_plugin_playlist_index(
+    playlist: &[PlaylistEntry],
+    playlist_plugin_id: &str,
+    stream_plugin_id: Option<&str>,
+    playlist_current: Option<&(String, String)>,
+    current_uri: Option<&MediaUri>,
+) -> Option<usize> {
+    if playlist.len() <= 1 {
+        return None;
+    }
+    match current_uri {
+        Some(MediaUri::Local(_)) => return None,
+        Some(MediaUri::Plugin { plugin_id, .. }) if plugin_id != playlist_plugin_id => {
+            return None;
+        }
+        Some(MediaUri::HttpUrl(_)) | None if stream_plugin_id != Some(playlist_plugin_id) => {
+            return None;
+        }
+        _ => {}
+    }
+    if let Some((sid, eid)) = playlist_current
+        && let Some(ix) = playlist
+            .iter()
+            .position(|p| p.source_id == *sid && p.entry_id == *eid)
+    {
+        return Some(ix);
+    }
+    if let Some(MediaUri::Plugin {
+        plugin_id,
+        source_id,
+        entry_id,
+    }) = current_uri
+        && plugin_id == playlist_plugin_id
+    {
+        return playlist
+            .iter()
+            .position(|p| p.source_id == *source_id && p.entry_id == *entry_id);
+    }
+    None
+}
+
+pub(in crate::ui) fn remote_search_query(supports_search: bool, raw: &str) -> Option<String> {
+    supports_search
+        .then(|| raw.trim())
+        .filter(|q| !q.is_empty())
+        .map(str::to_owned)
+}
+
 impl IrisWindow {
+    pub(in crate::ui) fn can_step_plugin_playlist(
+        &self,
+        current: Option<&MediaUri>,
+        delta: isize,
+    ) -> bool {
+        let Some(binding) = &self.plugin_view.playlist_binding else {
+            return false;
+        };
+        if !binding.is_live() {
+            return false;
+        }
+        let pid = &binding.installed.plugin_id;
+        if self
+            .precheck_plugin_capability(pid, Capability::MediaSource)
+            .is_err()
+        {
+            return false;
+        }
+        let Some(index) = find_plugin_playlist_index(
+            &self.plugin_view.playlist,
+            pid,
+            self.plugin_view.stream_plugin.as_deref(),
+            self.plugin_view.playlist_current.as_ref(),
+            current,
+        ) else {
+            return false;
+        };
+        let len = self.plugin_view.playlist.len() as isize;
+        let target = &self.plugin_view.playlist[(index as isize + delta).rem_euclid(len) as usize];
+        iris_api::is_valid_id(&target.source_id)
+            && !target.entry_id.is_empty()
+            && target.entry_id.len() <= 4096
+            && !target.entry_id.chars().any(char::is_control)
+    }
+
     pub(in crate::ui) fn step_plugin_playlist(
         &mut self,
         current: Option<&MediaUri>,
@@ -18,26 +146,17 @@ impl IrisWindow {
         let Some(binding) = &self.plugin_view.playlist_binding else {
             return false;
         };
-        if !binding.is_live() || self.plugin_view.playlist.is_empty() {
+        if !binding.is_live() {
             return false;
         }
-        let Some(MediaUri::Plugin {
-            plugin_id,
-            source_id,
-            entry_id,
-        }) = current
-        else {
-            return false;
-        };
-        if binding.installed.plugin_id != *plugin_id {
-            return false;
-        }
-        let Some(index) = self
-            .plugin_view
-            .playlist
-            .iter()
-            .position(|p| p.source_id == *source_id && p.entry_id == *entry_id)
-        else {
+        let plugin = binding.installed.plugin_id.clone();
+        let Some(index) = find_plugin_playlist_index(
+            &self.plugin_view.playlist,
+            &plugin,
+            self.plugin_view.stream_plugin.as_deref(),
+            self.plugin_view.playlist_current.as_ref(),
+            current,
+        ) else {
             return false;
         };
         let next = index as isize + delta;
@@ -47,7 +166,6 @@ impl IrisWindow {
             return true;
         }
         let item = self.plugin_view.playlist[next.rem_euclid(len) as usize].clone();
-        let plugin = plugin_id.clone();
         self.resolve_plugin_entry(
             &plugin,
             &item.source_id,
@@ -103,11 +221,20 @@ impl IrisWindow {
                                     else {
                                         return;
                                     };
-                                    let (pid, sid, folder) = (
+                                    let (pid, sid, folder, supports_search) = (
                                         view.plugin_id.clone(),
                                         view.source_id.clone(),
                                         view.folder_id.clone(),
+                                        view.supports_search,
                                     );
+                                    if let Some(f) = this
+                                        .plugin_view
+                                        .source_filters
+                                        .iter_mut()
+                                        .find(|f| f.id == filter_id)
+                                    {
+                                        f.selected = val.clone();
+                                    }
                                     if let Some(value) = &val {
                                         this.plugin_view
                                             .filter_values
@@ -115,10 +242,10 @@ impl IrisWindow {
                                     } else {
                                         this.plugin_view.filter_values.remove(&filter_id);
                                     }
-                                    let query =
-                                        (!this.text_inputs.search_input.is_empty()).then(|| {
-                                            this.text_inputs.search_input.text().trim().to_owned()
-                                        });
+                                    let query = remote_search_query(
+                                        supports_search && this.text_inputs.search_open,
+                                        this.text_inputs.search_input.text(),
+                                    );
                                     this.browse_plugin_source(&pid, &sid, folder, None, query, cx);
                                 },
                             ))
@@ -159,6 +286,7 @@ impl IrisWindow {
                     chip_button(("url-resolver-choice", i), label, active, t).on_click(cx.listener(
                         move |this, _, _, cx| {
                             this.set_form_value("url-resolver", &id);
+                            this.overlays.dialog_error = None;
                             cx.notify();
                         },
                     ))
@@ -205,7 +333,15 @@ impl IrisWindow {
                 fail(self, "解析地址不能内嵌账号密码，请通过插件登录", cx);
                 return false;
             }
+            if let Err(error) =
+                self.precheck_plugin_capability(&plugin, iris_api::v2::Capability::UrlResolver)
+            {
+                let msg = super::notices::describe_error_code(error);
+                fail(self, &format!("解析请求未能提交 · {msg}"), cx);
+                return false;
+            }
             self.cancel_media_loads();
+            self.save_progress_sync();
             if !self.advance_plugin_media(cx) {
                 return false;
             }

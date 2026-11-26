@@ -1,28 +1,81 @@
 //! Media enhancement helpers: CID lookup, danmaku windowing, WBI-signed `/x/player/wbi/v2`,
 //! and sequential BCC -> WebVTT subtitle artifact staging.
 
-use super::*;
-use iris_plugin_sdk::api::v2::{
-    enhance::{EnhancementResource, SubtitleFormat},
-    task::ArtifactFormat,
-    task_result::{ArtifactResult, ArtifactWriterResult},
+use crate::{
+    BilibiliPlugin, HttpFlow, PendingSubtitleArtifact, WindowState,
+    danmaku::{self, SubtitleTrackMeta},
+    playback::VideoMeta,
+    wbi,
 };
+use iris_plugin_sdk::{
+    api::v2::{
+        HostCommand, Id, LogLevel,
+        enhance::{EnhancementResource, SubtitleFormat},
+        task::{ArtifactFormat, Task},
+        task_result::{ArtifactResult, ArtifactWriterResult},
+    },
+    client::{Host, completed},
+    serde_json::{self, Value},
+};
+
+use std::collections::VecDeque;
+
+const MAX_CID_CACHE: usize = 256;
+
+pub(crate) type CidInfo = (String, u64, u64);
+
+#[derive(Default)]
+pub(crate) struct CidCache {
+    pub(crate) entries: VecDeque<(String, CidInfo)>,
+}
+
+impl CidCache {
+    pub(crate) fn insert(&mut self, key: String, val: CidInfo) {
+        if key.is_empty() {
+            return;
+        }
+        self.entries.retain(|(k, _)| k != &key);
+        while self.entries.len() >= MAX_CID_CACHE {
+            self.entries.pop_front();
+        }
+        self.entries.push_back((key, val));
+    }
+
+    pub(crate) fn get(&self, key: &str) -> Option<&CidInfo> {
+        self.entries
+            .iter()
+            .rev()
+            .find_map(|(k, v)| (k == key).then_some(v))
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.entries.clear();
+    }
+}
 
 impl BilibiliPlugin {
     pub(super) fn lookup_playing_cid(&self, uri: &str) -> Option<(String, u64, u64)> {
-        if let Some(found) = self.cid_lookup.get(uri) {
-            return Some(found.clone());
+        if let Some((source_id, entry_id)) = wbi::parse_plugin_uri(uri) {
+            let scoped = format!("{source_id}/{}", entry_id.trim_start_matches('/'));
+            if let Some(found) = self.cid_lookup.get(&scoped) {
+                return Some(found.clone());
+            }
+            if let Some(found) = self.cid_lookup.get(&entry_id) {
+                return Some(found.clone());
+            }
+            if let Some(rest) = entry_id.strip_prefix("ugc:") {
+                let (vid, cid_s) = rest.split_once(':')?;
+                let cid = cid_s.parse::<u64>().ok()?;
+                if let Some(aid_s) = vid.strip_prefix("av")
+                    && let Ok(aid) = aid_s.parse::<u64>()
+                {
+                    return Some((String::new(), aid, cid));
+                }
+                return Some((vid.to_owned(), 0, cid));
+            }
+            return None;
         }
-        let tail = uri.rsplit('/').next()?;
-        if let Some(found) = self.cid_lookup.get(tail) {
-            return Some(found.clone());
-        }
-        if let Some(rest) = tail.strip_prefix("ugc:") {
-            let (bvid, cid_s) = rest.split_once(':')?;
-            let cid = cid_s.parse::<u64>().ok()?;
-            return Some((bvid.to_owned(), 0, cid));
-        }
-        None
+        self.cid_lookup.get(uri).cloned()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -35,7 +88,7 @@ impl BilibiliPlugin {
         cid: u64,
         host: &mut impl Host,
         now_secs: u64,
-    ) {
+    ) -> Vec<HostCommand> {
         let _ = self.start_http(
             state,
             "GET",
@@ -47,25 +100,11 @@ impl BilibiliPlugin {
         );
         if self.wbi.mixin().is_none() {
             state.needs_wbi_player_v2 = true;
-            if !state
-                .http_jobs
-                .values()
-                .any(|j| matches!(j.flow, HttpFlow::Nav { .. }))
-            {
-                let _ = self.start_http(
-                    state,
-                    "GET",
-                    "https://api.bilibili.com/x/web-interface/nav".into(),
-                    true,
-                    None,
-                    HttpFlow::Nav { open_modal: false },
-                    host,
-                );
-            }
-        } else {
-            state.needs_wbi_player_v2 = false;
+            let _ = self.ensure_nav_in_flight(state, host);
+            return Vec::new();
         }
-        self.request_player_v2(state, media, bvid, aid, cid, false, host, now_secs);
+        state.needs_wbi_player_v2 = false;
+        self.request_player_v2(state, media, bvid, aid, cid, false, host, now_secs)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -79,15 +118,22 @@ impl BilibiliPlugin {
         retried_wbi: bool,
         host: &mut impl Host,
         now_secs: u64,
-    ) {
+    ) -> Vec<HostCommand> {
         let mut params = vec![("cid", cid.to_string())];
         if !bvid.is_empty() {
             params.push(("bvid", bvid.to_owned()));
         } else if aid > 0 {
             params.push(("aid", aid.to_string()));
         }
-        let q = if let Some(mixin) = self.wbi.mixin() {
-            wbi::sign_wbi_query(&params, &mixin, now_secs)
+        let used_mixin = self.wbi.mixin();
+        let q = if let Some(mixin) = used_mixin.as_deref() {
+            if now_secs == 0 {
+                return vec![HostCommand::Log {
+                    level: LogLevel::Warn,
+                    message: "bilibili: system wall clock unavailable (now_ms == 0); skipping WBI-signed player/v2 request".into(),
+                }];
+            }
+            wbi::sign_wbi_query(&params, mixin, now_secs)
         } else {
             wbi::unsigned_query(&params)
         };
@@ -101,9 +147,11 @@ impl BilibiliPlugin {
                 media,
                 cid,
                 retried_wbi,
+                used_mixin,
             },
             host,
         );
+        Vec::new()
     }
 
     pub(super) fn push_danmaku_window(
@@ -265,20 +313,11 @@ impl BilibiliPlugin {
             if key.is_empty() {
                 continue;
             }
-            while self.cid_lookup.len() >= 128 {
-                let Some(first) = self.cid_lookup.keys().next().cloned() else {
-                    break;
-                };
-                self.cid_lookup.remove(&first);
-            }
             self.cid_lookup.insert(key.to_owned(), val.clone());
             if !meta.source_id.is_empty() {
-                let full_uri = format!(
-                    "iris-plugin://community.bilibili/{}/{}",
-                    meta.source_id,
-                    key.trim_start_matches('/')
-                );
-                self.cid_lookup.insert(full_uri, val.clone());
+                let clean = key.trim_start_matches('/');
+                self.cid_lookup
+                    .insert(format!("{}/{clean}", meta.source_id), val.clone());
             }
         }
     }

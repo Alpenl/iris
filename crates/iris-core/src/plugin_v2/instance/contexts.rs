@@ -44,7 +44,9 @@ impl Instance {
             }
         }
         self.current_context = (window, generation);
-        self.store.data_mut().services.on_window(window);
+        if let Some(services) = &mut self.store.data_mut().services {
+            services.on_window(window);
+        }
     }
     pub(crate) fn retain_contexts(
         &mut self,

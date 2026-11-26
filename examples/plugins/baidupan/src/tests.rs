@@ -10,6 +10,16 @@ use iris_plugin_sdk::api::{
 use serde_json::json;
 use std::collections::VecDeque;
 
+mod account_lifecycle;
+mod paging;
+mod regressions;
+
+impl super::VideoCache {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
 #[derive(Default)]
 struct MockHost {
     next: u64,
@@ -159,7 +169,7 @@ fn build_synthetic_qr_png(modules: usize, scale: usize) -> (Vec<u8>, Vec<String>
         out.extend_from_slice(&(data.len() as u32).to_be_bytes());
         out.extend_from_slice(kind);
         out.extend_from_slice(data);
-        out.extend_from_slice(&0u32.to_be_bytes());
+        out.extend_from_slice(&qr_png::crc32_chunk(kind, data).to_be_bytes());
     };
     let mut ihdr = Vec::new();
     ihdr.extend_from_slice(&(w as u32).to_be_bytes());

@@ -1,5 +1,8 @@
 //! Explicit command receipts for resources that must outlive native work.
-use super::*;
+use std::ffi::{CString, c_char};
+use std::ptr;
+
+use super::{Error, Mpv, Result, check, cstr, sys};
 impl Mpv {
     pub fn command_with_reply(&self, id: u64, args: &[&str]) -> Result<()> {
         if id == 0 {

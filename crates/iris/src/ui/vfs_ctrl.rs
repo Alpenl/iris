@@ -1,27 +1,24 @@
-//! Unified virtual media source controller: local folders, `MediaSource` plugins
-//! (including built-in `iris.webdav`), bookmarks, direct HTTP(S) streams, async
-//! remote photo header probing, cross-origin subtitle prefetching, and `step`.
+//! Unified virtual media source controller: local folders, `MediaSource` plugins,
+//! bookmarks, direct HTTP(S) streams, async remote photo header probing, and `step`.
 
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::Duration;
 
 use gpui::{Context, Window};
+use iris_api::SourceManageAction;
 use iris_api::v2::{HostEvent, Id};
-use iris_api::{SourceManageAction, SubtitleAttachment};
 use iris_core::catalog::{CatalogItem, CatalogItemKind};
 use iris_core::library::{self, Kind};
 use iris_core::media_uri::MediaUri;
 use iris_core::photo;
-use iris_core::player::{RemoteMediaRequest, RemoteSubtitle};
+use iris_core::player::RemoteMediaRequest;
 use iris_core::plugin_v2::requests::BrowseTarget;
 use iris_core::preset::SidebarMode;
 use iris_core::vfs::{self, PinnedBookmark};
 
 use super::IrisWindow;
-use super::state::{
-    ActiveSource, ActiveStreamMeta, PendingBrowse, PendingResolve, PluginSourceView, RemoteLoad,
-};
+use super::state::{ActiveSource, PendingBrowse, PendingResolve, PluginSourceView, RemoteLoad};
 
 const SOURCE_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -38,7 +35,9 @@ impl IrisWindow {
                 .cancel_request(&request.plugin_id, Id(id));
         }
         let was_resolving = pending.is_some();
-        if self.catalog.remote_load.take().is_some() || was_resolving {
+        let was_remote = self.catalog.remote_load.take().is_some();
+        let was_local = self.active_mut().pending_path.take().is_some();
+        if was_remote || was_resolving || was_local {
             let vp = self.active_mut();
             vp.load_generation += 1;
             vp.loading_visible = false;
@@ -74,7 +73,7 @@ impl IrisWindow {
                 if let Ok(id) = id.parse() {
                     let _ = this.plugins.client().cancel_request(&pid, Id(id));
                 }
-                this.handle_source_error(&pid, &id, "数据源请求超时".into(), cx);
+                let _ = this.handle_source_error(&pid, &id, "数据源请求超时".into(), cx);
             });
         })
     }
@@ -131,6 +130,7 @@ impl IrisWindow {
         self.close_plugin_browse();
         self.catalog.active_source = ActiveSource::Local;
         self.catalog.sidebar_mode = SidebarMode::Files;
+        self.sync_view_timer(cx);
         self.rebuild_directory_rows();
         self.ensure_filmstrip_thumbnails(cx);
         cx.notify();
@@ -149,11 +149,10 @@ impl IrisWindow {
             return;
         }
         let folder = view.folder_id.clone();
-        let query = view
-            .supports_search
-            .then(|| self.text_inputs.search_input.text().trim())
-            .filter(|query| !query.is_empty())
-            .map(str::to_owned);
+        let query = super::plugin_runtime::remote_search_query(
+            view.supports_search && self.text_inputs.search_open,
+            self.text_inputs.search_input.text(),
+        );
         self.browse_plugin_source(plugin_id, source_id, folder, None, query, cx);
     }
 
@@ -208,6 +207,7 @@ impl IrisWindow {
             MediaUri::Local(path) => {
                 self.catalog.active_source = ActiveSource::Local;
                 self.catalog.sidebar_mode = SidebarMode::Files;
+                self.sync_view_timer(cx);
                 self.open_path(path, cx);
             }
             MediaUri::Plugin {
@@ -216,6 +216,7 @@ impl IrisWindow {
                 entry_id,
             } => {
                 self.catalog.sidebar_mode = SidebarMode::Files;
+                self.sync_view_timer(cx);
                 let fid = bm
                     .folder_id
                     .clone()
@@ -307,15 +308,22 @@ impl IrisWindow {
             s.supports_search,
             s.auth_command_id.clone(),
         );
-        let append = page.is_some()
-            && matches!(&self.catalog.active_source,
-            ActiveSource::Plugin(ps) if ps.plugin_id == pid && ps.source_id == source_id && ps.folder_id == folder_id);
-        let filters = if matches!(&self.catalog.active_source, ActiveSource::Plugin(ps) if ps.plugin_id == pid && ps.source_id == source_id && ps.folder_id == folder_id)
-        {
-            self.plugin_view.filter_values.clone()
+        let same_location = matches!(
+            &self.catalog.active_source,
+            ActiveSource::Plugin(ps)
+                if ps.plugin_id == pid && ps.source_id == source_id && ps.folder_id == folder_id
+        );
+        let append = page.is_some() && same_location;
+        let (preserved_filters, filters) = if same_location {
+            (
+                self.plugin_view.source_filters.clone(),
+                self.plugin_view.filter_values.clone(),
+            )
         } else {
-            BTreeMap::new()
+            (Vec::new(), BTreeMap::new())
         };
+        let query =
+            query.and_then(|q| super::plugin_runtime::remote_search_query(supports_search, &q));
         let issued = if append {
             self.plugin_view
                 .view
@@ -329,6 +337,7 @@ impl IrisWindow {
                 })
         } else {
             self.close_plugin_browse();
+            self.plugin_view.source_filters = preserved_filters;
             self.plugin_view.filter_values = filters.clone();
             self.plugins
                 .client()
@@ -350,6 +359,7 @@ impl IrisWindow {
             Ok(id) => id,
             Err(error) => {
                 log::warn!("browse request rejected for {pid}: {error:?}");
+                self.rebuild_directory_rows();
                 self.show_error_toast(
                     format!(
                         "目录请求未能提交 · {}",
@@ -366,6 +376,7 @@ impl IrisWindow {
             ps.error = None;
         } else {
             self.catalog.sidebar_mode = SidebarMode::Files;
+            self.sync_view_timer(cx);
             self.catalog.active_source = ActiveSource::Plugin(Box::new(PluginSourceView {
                 plugin_id: pid.clone(),
                 plugin_name: pname,
@@ -376,7 +387,6 @@ impl IrisWindow {
                 folder_id: folder_id.clone(),
                 parent_id: None,
                 title: sname,
-                entries: Vec::new(),
                 next_page: None,
                 authenticated: true,
                 auth_hint: None,
@@ -398,7 +408,7 @@ impl IrisWindow {
         cx: &mut Context<Self>,
     ) {
         if action == SourceManageAction::Remove {
-            self.cancel_plugin_requests(Some(plugin_id), Some(source_id));
+            self.cleanup_plugin_playback(Some(plugin_id), Some(source_id));
             if matches!(
                 &self.catalog.active_source,
                 ActiveSource::Plugin(ps) if ps.plugin_id == plugin_id && ps.source_id == source_id
@@ -427,7 +437,31 @@ impl IrisWindow {
         variant: Option<String>,
         cx: &mut Context<Self>,
     ) {
+        let valid_args = iris_api::is_valid_id(source_id)
+            && !entry_id.is_empty()
+            && entry_id.len() <= 4096
+            && !entry_id.chars().any(char::is_control)
+            && variant.as_deref().is_none_or(|v| {
+                !v.is_empty() && v.len() <= 256 && !v.chars().any(char::is_control)
+            });
+        let precheck = if !valid_args {
+            Err(iris_api::v2::ErrorCode::InvalidArgument)
+        } else {
+            self.precheck_plugin_capability(plugin_id, iris_api::v2::Capability::MediaSource)
+        };
+        if let Err(error) = precheck {
+            log::warn!("resolve precheck rejected for {plugin_id}: {error:?}");
+            self.show_error_toast(
+                format!(
+                    "解析请求未能提交 · {}",
+                    super::plugin_runtime::describe_error_code(error)
+                ),
+                cx,
+            );
+            return;
+        }
         self.cancel_media_loads();
+        self.save_progress_sync();
         if !self.advance_plugin_media(cx) {
             return;
         }
@@ -488,7 +522,7 @@ impl IrisWindow {
             return;
         }
         if !trimmed.contains("://") {
-            self.open_path(Path::new(raw_url), cx);
+            self.open_path(Path::new(trimmed), cx);
             return;
         }
         let Ok(parsed) = vfs::validate_stream_url(trimmed) else {
@@ -521,43 +555,20 @@ impl IrisWindow {
                 photo: None,
                 subtitles: Vec::new(),
             },
-            None,
-            Vec::new(),
-            false,
-            false,
             cx,
         );
     }
 
-    fn open_remote_media(
-        &mut self,
-        mut req: RemoteMediaRequest,
-        meta: Option<ActiveStreamMeta>,
-        attachments: Vec<SubtitleAttachment>,
-        resolving: bool,
-        private_identity: bool,
-        cx: &mut Context<Self>,
-    ) {
-        let Ok(stream_url) = vfs::validate_stream_url(&req.playback_url) else {
-            self.show_toast("远程流地址不合法（仅允许 HTTP/HTTPS）", cx);
-            if resolving {
-                self.active_mut().pending_subtitles.clear();
-            }
-            return;
-        };
+    fn open_remote_media(&mut self, mut req: RemoteMediaRequest, cx: &mut Context<Self>) {
         self.cancel_media_loads();
+        self.save_progress_sync();
         if !self.advance_plugin_media(cx) {
             return;
         }
-        self.save_progress_sync();
         self.overlays.close_menus();
         let generation = {
             let vp = self.active_mut();
-            let previous = vp.load_generation;
             vp.load_generation += 1;
-            if resolving {
-                vp.pending_subtitles.advance(previous, vp.load_generation);
-            }
             vp.pending_path = None;
             vp.loading_visible = true;
             vp.load_generation
@@ -565,7 +576,7 @@ impl IrisWindow {
         cx.notify();
 
         let cancel = vfs::HttpCancel::default();
-        let task = if req.kind != Kind::Photo && attachments.is_empty() {
+        let task = if req.kind != Kind::Photo {
             gpui::Task::ready(Some(req))
         } else {
             let worker_cancel = cancel.clone();
@@ -575,38 +586,16 @@ impl IrisWindow {
                 if worker_cancel.is_cancelled() {
                     return None;
                 }
-                if req.kind == Kind::Photo {
-                    req.photo = Some(photo::probe_remote(
-                        &req.playback_url,
-                        &req.headers,
-                        Some(&req.title),
-                        &worker_cancel,
-                    ));
-                }
-                for att in attachments {
-                    if worker_cancel.is_cancelled() {
-                        return None;
-                    }
-                    let Ok(sub_url) = vfs::validate_stream_url(&att.url) else {
-                        continue;
-                    };
-                    match RemoteSubtitle::prefetch_for_media(
-                        &stream_url,
-                        &sub_url,
-                        &req.headers,
-                        &att.headers,
-                        &worker_cancel,
-                    ) {
-                        Ok(subtitle) => req.subtitles.push(subtitle),
-                        Err(e) => log::warn!("prefetching remote subtitle failed: {e}"),
-                    }
-                }
+                req.photo = Some(photo::probe_remote(
+                    &req.playback_url,
+                    &req.headers,
+                    Some(&req.title),
+                    &worker_cancel,
+                ));
                 (!worker_cancel.is_cancelled()).then_some(req)
             })
         };
 
-        let plugin_id = meta.as_ref().and_then(|m| m.plugin_id.clone());
-        let source_id = meta.as_ref().and_then(|m| m.source_id.clone());
         let completion = cx.spawn(async move |this, cx| {
             let Some(req) = task.await else { return };
             let _ = this.update(cx, |this, cx| {
@@ -614,11 +603,9 @@ impl IrisWindow {
                     return;
                 }
                 this.catalog.remote_load = None;
-                this.active_mut().loading_visible = false;
-                let resume = !private_identity
-                    && this.settings.resume_playback
-                    && !req.is_live
-                    && req.kind == Kind::Video;
+                this.active_mut().commit_media_open_generation();
+                let resume =
+                    this.settings.resume_playback && !req.is_live && req.kind == Kind::Video;
                 let resume = if resume {
                     this.store.resume(&req.uri)
                 } else {
@@ -631,10 +618,6 @@ impl IrisWindow {
                     .open_remote(req, &settings, resume)
                 {
                     Ok(()) => {
-                        this.active_mut()
-                            .session
-                            .set_private_identity(private_identity);
-                        this.catalog.active_stream_meta = meta.filter(|m| !m.variants.is_empty());
                         this.finish_media_open(cx);
                     }
                     Err(e) => {
@@ -650,8 +633,6 @@ impl IrisWindow {
         });
         self.catalog.remote_load = Some(RemoteLoad {
             cancel,
-            plugin_id,
-            source_id,
             _task: completion,
         });
     }

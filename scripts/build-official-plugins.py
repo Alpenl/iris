@@ -1,14 +1,206 @@
 #!/usr/bin/env python3
 """Build public-SDK official Wasm plugins into deterministic .irisplugin archives."""
 import argparse
+import functools
 import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
+import sys
 import zipfile
 
+sys.dont_write_bytecode = True
+if not __debug__:
+    raise RuntimeError("Optimization (-O / PYTHONOPTIMIZE) disables official plugin verification gates")
+
 ROOT = Path(__file__).resolve().parents[1]
+
+DEFAULT_NETWORK = {
+    "net_public": False,
+    "net_hosts": [],
+    "public_ports": [],
+    "tcp_targets": [],
+}
+
+# Reviewed capability/network baseline for bundled official plugins (R1-M07).
+# Expanding permissions or static network rules requires updating this baseline
+# and verifying the host upgrade review path in crates/iris-core/src/plugin_v2/official.rs.
+FROZEN_OFFICIAL_CAPABILITIES = {
+    "iris.guides": (
+        frozenset({"ui_overlay", "ui_status", "ui_sidebar", "notifications"}),
+        DEFAULT_NETWORK,
+    ),
+    "iris.webdav": (
+        frozenset({"media_source", "net_http", "secrets", "ui_modal", "notifications"}),
+        DEFAULT_NETWORK,
+    ),
+}
+
+_WINDOWS_USERS_RE = re.compile(rb"(?i)[a-z]:[\\/]+users[\\/]+")
+
+
+def _require(condition: bool, message: str):
+    if not condition:
+        raise AssertionError(message)
+
+
+def _is_windows_host() -> bool:
+    return os.name == "nt"
+
+
+def cargo_target_dir(env: dict[str, str] | None = None) -> Path:
+    source = os.environ if env is None else env
+    raw = source.get("CARGO_TARGET_DIR", "").strip()
+    if not raw:
+        return ROOT / "target"
+    path = Path(raw)
+    return path if path.is_absolute() else (ROOT / path)
+
+
+def _user_home(source: dict[str, str]) -> Path | None:
+    keys = ("USERPROFILE", "HOME") if _is_windows_host() else ("HOME", "USERPROFILE")
+    for key in keys:
+        raw = source.get(key, "").strip()
+        if raw:
+            return Path(raw).resolve()
+    try:
+        return Path.home().resolve()
+    except RuntimeError:
+        return None
+
+
+def _cargo_home(env: dict[str, str] | None = None) -> Path | None:
+    source = os.environ if env is None else env
+    raw = source.get("CARGO_HOME", "").strip()
+    if raw:
+        return Path(raw).resolve()
+    home = _user_home(source)
+    return (home / ".cargo").resolve() if home is not None else None
+
+
+def _rustup_home(env: dict[str, str] | None = None) -> Path | None:
+    source = os.environ if env is None else env
+    raw = source.get("RUSTUP_HOME", "").strip()
+    if raw:
+        return Path(raw).resolve()
+    home = _user_home(source)
+    return (home / ".rustup").resolve() if home is not None else None
+
+
+@functools.lru_cache(maxsize=8)
+def _cached_rustc_sysroot(rustup_home: str, toolchain: str, path_env: str) -> Path | None:
+    query_env = os.environ.copy()
+    if rustup_home:
+        query_env["RUSTUP_HOME"] = rustup_home
+    if toolchain:
+        query_env["RUSTUP_TOOLCHAIN"] = toolchain
+    if path_env:
+        query_env["PATH"] = path_env
+    try:
+        out = subprocess.check_output(
+            ["rustc", "--print", "sysroot"], cwd=ROOT, env=query_env, text=True, timeout=15
+        ).strip()
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return Path(out).resolve() if out else None
+
+
+def _rustc_sysroot(env: dict[str, str] | None = None) -> Path | None:
+    source = os.environ if env is None else env
+    return _cached_rustc_sysroot(
+        source.get("RUSTUP_HOME", ""),
+        source.get("RUSTUP_TOOLCHAIN", ""),
+        source.get("PATH", ""),
+    )
+
+
+def build_remap_rustflags(env: dict[str, str] | None = None) -> str:
+    """Build \\x1f-separated rustc --remap-path-prefix flags (later entries take precedence in rustc)."""
+    mappings: list[tuple[Path, str]] = [(ROOT, "/iris")]
+    cargo_home = _cargo_home(env)
+    if cargo_home is not None:
+        mappings.append((cargo_home, "/cargo"))
+    rustup_home = _rustup_home(env)
+    if rustup_home is not None:
+        mappings.append((rustup_home, "/rustup"))
+    sysroot = _rustc_sysroot(env)
+    if sysroot is not None:
+        mappings.append((sysroot, "/rustup-sysroot"))
+    flags: list[str] = []
+    seen: set[str] = set()
+    for prefix, replacement in mappings:
+        for form in (str(prefix), prefix.as_posix()):
+            flag = f"--remap-path-prefix={form}={replacement}"
+            if flag not in seen:
+                seen.add(flag)
+                flags.append(flag)
+    return "\x1f".join(flags)
+
+
+def verify_wasm_no_host_paths(
+    wasm_bytes: bytes,
+    env: dict[str, str] | None = None,
+    extra_prefixes: tuple[Path, ...] = (),
+):
+    if _WINDOWS_USERS_RE.search(wasm_bytes):
+        raise RuntimeError("plugin.wasm leaked a Windows Users directory path")
+    for marker in (b"/Users/", b"/home/"):
+        if marker in wasm_bytes:
+            raise RuntimeError(f"plugin.wasm leaked host path prefix {marker.decode('ascii')!r}")
+    candidates: list[Path] = [ROOT]
+    for home_dir in (_cargo_home(env), _rustup_home(env), _rustc_sysroot(env)):
+        if home_dir is not None:
+            candidates.append(home_dir)
+    candidates.extend(extra_prefixes)
+    lowered = wasm_bytes.lower() if _is_windows_host() else None
+    for candidate in candidates:
+        for form in {str(candidate), candidate.as_posix()}:
+            if len(form) < 4:
+                continue
+            needle = form.encode("utf-8")
+            if needle in wasm_bytes or (lowered is not None and needle.lower() in lowered):
+                raise RuntimeError(f"plugin.wasm leaked host directory prefix: {form}")
+
+
+def _canonical_manifest_bytes(manifest: dict) -> bytes:
+    return (
+        json.dumps(manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
+    ).encode("utf-8")
+
+
+def _normalize_network(raw) -> dict:
+    _require(isinstance(raw, dict), f"network declaration must be an object, got {type(raw).__name__}")
+    unknown = set(raw) - set(DEFAULT_NETWORK)
+    _require(not unknown, f"unknown network declaration fields: {sorted(unknown)}")
+    return {
+        "net_public": bool(raw.get("net_public", False)),
+        "net_hosts": list(raw.get("net_hosts", [])),
+        "public_ports": list(raw.get("public_ports", [])),
+        "tcp_targets": list(raw.get("tcp_targets", [])),
+    }
+
+
+def validate_official_manifest(manifest: dict):
+    plugin_id = manifest.get("id")
+    _require(plugin_id in FROZEN_OFFICIAL_CAPABILITIES, f"Unexpected official plugin id: {plugin_id!r}")
+    allowed_permissions, allowed_network = FROZEN_OFFICIAL_CAPABILITIES[plugin_id]
+    permissions = manifest.get("permissions", [])
+    _require(
+        isinstance(permissions, list) and all(isinstance(p, str) for p in permissions),
+        f"{plugin_id}: permissions must be a list of strings",
+    )
+    extra_permissions = sorted(set(permissions) - allowed_permissions)
+    _require(
+        not extra_permissions,
+        f"{plugin_id}: official plugin expanded permissions beyond reviewed baseline: {extra_permissions}",
+    )
+    network = _normalize_network(manifest.get("network", {}))
+    _require(
+        network == allowed_network,
+        f"{plugin_id}: official plugin changed network declaration beyond reviewed baseline: {network!r}",
+    )
 
 
 def source_hash() -> str:
@@ -29,39 +221,74 @@ def source_hash() -> str:
 
 
 def check(output: Path):
-    index = json.loads((output / "index.json").read_text(encoding="utf-8"))
-    assert index["schema"] == 1 and index["source_sha256"] == source_hash(), "Official Wasm source stamp is stale; rebuild the packages"
-    assert {p["id"] for p in index["packages"]} == {"iris.guides", "iris.webdav"}
-    assert len(index["packages"]) == 2
+    raw_index = (output / "index.json").read_bytes()
+    _require(b"\r" not in raw_index, "Official plugin index.json must use LF line endings only")
+    index = json.loads(raw_index.decode("utf-8"))
+    _require(
+        index["schema"] == 1 and index["source_sha256"] == source_hash(),
+        "Official Wasm source stamp is stale; rebuild the packages",
+    )
+    _require({p["id"] for p in index["packages"]} == {"iris.guides", "iris.webdav"}, "Unexpected official package set")
+    _require(len(index["packages"]) == 2, "Expected exactly two official packages")
     for item in index["packages"]:
-        assert item["file"] == item["id"] + ".irisplugin"
+        _require(item["file"] == item["id"] + ".irisplugin", f"Unexpected package filename: {item['file']!r}")
         archive = output / item["file"]
-        assert hashlib.sha256(archive.read_bytes()).hexdigest() == item["sha256"]
+        _require(hashlib.sha256(archive.read_bytes()).hexdigest() == item["sha256"], f"Archive sha256 mismatch: {archive}")
         digest = hashlib.sha256()
         with zipfile.ZipFile(archive) as package_file:
-            assert sorted(package_file.namelist()) == ["plugin.json", "plugin.wasm"]
+            _require(sorted(package_file.namelist()) == ["plugin.json", "plugin.wasm"], f"Unexpected entries in {archive}")
             for name in sorted(package_file.namelist()):
                 encoded, data = name.encode("ascii"), package_file.read(name)
                 digest.update(len(encoded).to_bytes(8, "little") + encoded)
                 digest.update(len(data).to_bytes(8, "little") + data)
-            manifest = json.loads(package_file.read("plugin.json"))
-            assert manifest["id"] == item["id"] and manifest["version"] == item["version"]
-            assert manifest["protocol"] == manifest["abi"] == 2
-        assert digest.hexdigest() == item["content_sha256"]
+            wasm_bytes = package_file.read("plugin.wasm")
+            _require(wasm_bytes.startswith(b"\x00asm\x01\x00\x00\x00"), f"Invalid Wasm header in {archive}")
+            verify_wasm_no_host_paths(wasm_bytes)
+            manifest = json.loads(package_file.read("plugin.json").decode("utf-8"))
+            _require(manifest["id"] == item["id"] and manifest["version"] == item["version"], f"Manifest identity mismatch in {archive}")
+            _require(manifest["protocol"] == manifest["abi"] == 2, f"Unsupported protocol/abi in {archive}")
+            validate_official_manifest(manifest)
+        _require(digest.hexdigest() == item["content_sha256"], f"Archive content_sha256 mismatch: {archive}")
     return index
 
 
-def package(crate: Path, output: Path) -> dict:
+def verify_embedded(fresh_index: dict, crates: list[Path], embedded_dir: Path):
+    embedded = check(embedded_dir)
+    _require(fresh_index["schema"] == embedded["schema"], "Official plugin index schema mismatch")
+    _require(
+        fresh_index["source_sha256"] == embedded["source_sha256"],
+        "Official Wasm source stamp differs from embedded distribution",
+    )
+    fresh_meta = [(p["id"], p["version"], p["file"]) for p in fresh_index["packages"]]
+    embedded_meta = [(p["id"], p["version"], p["file"]) for p in embedded["packages"]]
+    _require(fresh_meta == embedded_meta, "Official plugin package metadata differs from embedded distribution")
+    for crate in crates:
+        source_manifest = json.loads((crate / "plugin.json").read_text(encoding="utf-8"))
+        expected_manifest_bytes = _canonical_manifest_bytes(source_manifest)
+        embedded_archive = embedded_dir / f"{source_manifest['id']}.irisplugin"
+        with zipfile.ZipFile(embedded_archive) as package_file:
+            _require(
+                package_file.read("plugin.json") == expected_manifest_bytes,
+                f"Embedded plugin.json differs from source manifest for {source_manifest['id']}",
+            )
+    if _is_windows_host():
+        _require(fresh_index == embedded, "Fresh Wasm build differs from embedded distribution")
+    return embedded
+
+
+def package(crate: Path, output: Path, target_dir: Path | None = None, env: dict[str, str] | None = None) -> dict:
     manifest = json.loads((crate / "plugin.json").read_text(encoding="utf-8"))
-    assert manifest["protocol"] == manifest["abi"] == 2
-    assert manifest["id"].startswith("iris.") and manifest["entry"] == "plugin.wasm"
-    wasm = ROOT / "target/wasm32-unknown-unknown/release" / (crate.name.replace("-", "_") + ".wasm")
+    _require(manifest["protocol"] == manifest["abi"] == 2, f"{crate}: protocol/abi must be 2")
+    _require(manifest["id"].startswith("iris.") and manifest["entry"] == "plugin.wasm", f"{crate}: invalid official entry")
+    validate_official_manifest(manifest)
+    resolved_target = cargo_target_dir(env) if target_dir is None else target_dir
+    wasm = resolved_target / "wasm32-unknown-unknown/release" / (crate.name.replace("-", "_") + ".wasm")
     data = wasm.read_bytes()
-    assert data.startswith(b"\x00asm\x01\x00\x00\x00")
+    _require(data.startswith(b"\x00asm\x01\x00\x00\x00"), f"{wasm}: invalid Wasm magic")
+    verify_wasm_no_host_paths(data, env=env)
     output.mkdir(parents=True, exist_ok=True)
     target = output / (manifest["id"] + ".irisplugin")
-    parts = {"plugin.json": (json.dumps(manifest, ensure_ascii=False, sort_keys=True,
-                                     separators=(",", ":")) + "\n").encode("utf-8"), "plugin.wasm": data}
+    parts = {"plugin.json": _canonical_manifest_bytes(manifest), "plugin.wasm": data}
     with zipfile.ZipFile(target, "w", compression=zipfile.ZIP_STORED) as archive:
         for name, content in sorted(parts.items()):
             entry = zipfile.ZipInfo(name, (1980, 1, 1, 0, 0, 0))
@@ -89,23 +316,27 @@ def main():
     if args.check:
         print(json.dumps(check(args.output), indent=2))
         return
+    if args.verify_embedded and args.output.resolve() == (ROOT / "Resources/Plugins").resolve():
+        parser.error("--verify-embedded requires an output directory separate from Resources/Plugins")
     crates = sorted(p.parent for p in (ROOT / "crates").glob("iris-plugin-*/plugin.json"))
     if not crates:
         raise SystemExit("No official plugin sources found")
+    target_dir = cargo_target_dir()
+    build_env = os.environ.copy()
     if not args.no_build:
-        env = os.environ.copy()
-        env["CARGO_TARGET_DIR"] = str(ROOT / "target")
-        env["CARGO_PROFILE_RELEASE_DEBUG"] = "0"
-        env["CARGO_PROFILE_RELEASE_STRIP"] = "debuginfo"
-        env["CARGO_ENCODED_RUSTFLAGS"] = f"--remap-path-prefix={ROOT}=/iris"
+        build_env["CARGO_TARGET_DIR"] = str(target_dir)
+        build_env.pop("RUSTFLAGS", None)
+        build_env["CARGO_PROFILE_RELEASE_DEBUG"] = "0"
+        build_env["CARGO_PROFILE_RELEASE_STRIP"] = "symbols"
+        build_env["CARGO_ENCODED_RUSTFLAGS"] = build_remap_rustflags(build_env)
         subprocess.run(["cargo", "build", "--locked", "--release", "--target", "wasm32-unknown-unknown",
-                        *[part for crate in crates for part in ("-p", crate.name)]], cwd=ROOT, env=env, check=True)
-    index = {"schema": 1, "source_sha256": source_hash(), "packages": [package(crate, args.output) for crate in crates]}
-    (args.output / "index.json").write_text(json.dumps(index, indent=2) + "\n", encoding="utf-8")
+                        *[part for crate in crates for part in ("-p", crate.name)]], cwd=ROOT, env=build_env, check=True)
+    index = {"schema": 1, "source_sha256": source_hash(), "packages": [package(crate, args.output, target_dir, build_env) for crate in crates]}
+    with (args.output / "index.json").open("w", encoding="utf-8", newline="\n") as fh:
+        fh.write(json.dumps(index, indent=2) + "\n")
     print(json.dumps(index, indent=2))
     if args.verify_embedded:
-        embedded = check(ROOT / "Resources/Plugins")
-        assert index == embedded, "Fresh Wasm build differs from embedded distribution"
+        verify_embedded(index, crates, ROOT / "Resources/Plugins")
 
 
 if __name__ == "__main__":

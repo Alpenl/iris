@@ -1,14 +1,39 @@
 use iris_core::player::AspectMode;
 use iris_core::preset::{
-    DEFAULT_WINDOW_SIZE, PresetCaptureScope, PresetLayout, PresetManager, PresetRuntime,
-    SidebarMode,
+    DEFAULT_WINDOW_SIZE, PluginPatch, PresetCaptureScope, PresetLayout, PresetManager,
+    PresetRuntime, SidebarMode, WorkspacePreset,
 };
 use iris_core::settings::{Settings, Side};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+struct TempDir(PathBuf);
+
+impl TempDir {
+    fn new(label: &str) -> Self {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        let path =
+            std::env::temp_dir().join(format!("iris-preset-{label}-{}-{id}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).unwrap();
+        Self(path)
+    }
+
+    fn join(&self, name: impl AsRef<Path>) -> PathBuf {
+        self.0.join(name)
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
 
 #[test]
 fn another_windows_layout_save_preserves_explicit_plugin_toggles() {
-    let dir = std::env::temp_dir().join(format!("iris-preset-multi-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = TempDir::new("multi");
     let file = dir.join("settings.conf");
     Settings::default().save_to(&file).unwrap();
     let manager = PresetManager::load_from(&dir.join("presets.json"));
@@ -40,15 +65,11 @@ fn another_windows_layout_save_preserves_explicit_plugin_toggles() {
             .disabled_plugins
             .contains(&"test.tool".into())
     );
-    std::fs::remove_file(file).unwrap();
-    std::fs::remove_dir(dir).unwrap();
 }
 
 #[test]
 fn sparse_revert_user_edit_promotion_crash_restart_and_custom_crud() {
-    let dir = std::env::temp_dir().join(format!("iris-preset-1b-test-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = TempDir::new("1b-test");
     let settings_file = dir.join("settings.conf");
     let presets_file = dir.join("presets.json");
 
@@ -56,12 +77,13 @@ fn sparse_revert_user_edit_promotion_crash_restart_and_custom_crud() {
     assert_eq!(mgr.list().len(), 5);
     assert!(!mgr.delete_custom("cinema"));
 
-    // Built-in presets never touch external plugin enable/disable lists.
+    // Built-in presets never hardcode external/official plugin enable lists or commands.
     for b in mgr.list() {
-        if let Some(pl) = &b.plugins {
-            assert!(pl.enable_plugins.is_empty());
-            assert!(pl.disable_plugins.is_empty());
-        }
+        assert!(
+            b.plugins.is_none(),
+            "builtin preset {} must not couple to plugins",
+            b.id
+        );
     }
 
     // User's personal habit: 10s seek_step, 1.0x sub_scale, and disabled "ext.noise".
@@ -115,26 +137,40 @@ fn sparse_revert_user_edit_promotion_crash_restart_and_custom_crud() {
     );
     assert_eq!(active.sub_scale, 1.0);
 
-    // 2. Switch to `review` -> verify entry/exit commands for `iris.guides`.
-    let tr_rev = rt.switch_preset(
+    // 2. Switch to a custom preset with entry/exit plugin commands and verify transition hooks.
+    let hook_id = mgr.save_custom(WorkspacePreset {
+        id: "with-hooks".into(),
+        name: "Hooks".into(),
+        description: String::new(),
+        builtin: false,
+        layout: None,
+        playback: None,
+        plugins: Some(PluginPatch {
+            plugin_commands: vec![("demo.overlay".into(), "on".into())],
+            on_exit_commands: vec![("demo.overlay".into(), "off".into())],
+            ..Default::default()
+        }),
+    });
+    let tr_hooks = rt.switch_preset(
         &mgr,
-        "review",
+        &hook_id,
         &mut active,
         PresetLayout {
             sidebar_mode: tr_pip.sidebar_mode.unwrap_or(layout.sidebar_mode),
             window_size: tr_pip.window_size,
         },
     );
-    assert_eq!(tr_rev.window_size, layout.window_size);
+    assert_eq!(tr_hooks.window_size, layout.window_size);
     assert_eq!(
-        tr_rev.plugin_commands,
-        vec![("iris.guides".into(), "thirds".into())]
+        tr_hooks.plugin_commands,
+        vec![("demo.overlay".into(), "on".into())]
     );
     let tr_back_study = rt.switch_preset(&mgr, "study", &mut active, layout);
     assert_eq!(
         tr_back_study.on_exit_commands,
-        vec![("iris.guides".into(), "off".into())]
+        vec![("demo.overlay".into(), "off".into())]
     );
+    assert!(mgr.delete_custom(&hook_id));
     assert_eq!(active.seek_step, 3.0);
     assert_eq!(active.sub_scale, 1.25);
 
@@ -236,13 +272,11 @@ fn sparse_revert_user_edit_promotion_crash_restart_and_custom_crud() {
     assert_eq!(mgr.next_id("pip"), "custom-1");
     assert_eq!(mgr.next_id("custom-1"), "default");
     assert!(mgr.delete_custom("custom-1"));
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn startup_pip_restores_default_window_without_a_saved_size() {
-    let dir = std::env::temp_dir().join(format!("iris-preset-startup-{}", std::process::id()));
+    let dir = TempDir::new("startup");
     let mgr = PresetManager::load_from(&dir.join("presets.json"));
     let settings = Settings {
         active_preset: "pip".into(),
@@ -257,9 +291,7 @@ fn startup_pip_restores_default_window_without_a_saved_size() {
 
 #[test]
 fn updating_active_or_inactive_preset_keeps_revert_and_plugin_scopes_isolated() {
-    let dir = std::env::temp_dir().join(format!("iris-preset-update-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = TempDir::new("update");
     let settings_file = dir.join("settings.conf");
     let presets_file = dir.join("presets.json");
 
@@ -281,7 +313,7 @@ fn updating_active_or_inactive_preset_keeps_revert_and_plugin_scopes_isolated() 
     };
 
     // Save two custom presets: `p1` (forces `ext.alpha` disabled) and `p2` (clean plugin patch).
-    let p1 = PresetManager::capture_from_current(
+    let mut p1 = PresetManager::capture_from_current(
         "p1",
         "预设一",
         "",
@@ -293,7 +325,6 @@ fn updating_active_or_inactive_preset_keeps_revert_and_plugin_scopes_isolated() 
         1.0,
         AspectMode::Original,
     );
-    let mut p1 = p1;
     p1.plugins.as_mut().unwrap().disable_plugins = vec!["ext.alpha".into()];
     mgr.save_custom(p1);
     mgr.save_custom(PresetManager::capture_from_current(
@@ -366,6 +397,46 @@ fn updating_active_or_inactive_preset_keeps_revert_and_plugin_scopes_isolated() 
     rt.switch_preset(&mgr, "default", &mut active, layout);
     assert_eq!(active.seek_step, 10.0);
     assert_eq!(active.disabled_plugins, vec!["ext.alpha"]);
+}
 
-    let _ = std::fs::remove_dir_all(&dir);
+#[test]
+fn presets_json_sanitizes_control_and_comma_characters_in_plugin_and_dock_fields() {
+    let dir = TempDir::new("sanitize");
+    let presets_file = dir.join("presets.json");
+    std::fs::write(
+        &presets_file,
+        r#"[{
+            "id": "clean-test",
+            "name": "My\nPreset\r\t",
+            "description": "desc\u0000ok",
+            "layout": {
+                "hidden_dock_buttons": ["loop", "bad,btn", "ctrl\nbtn", "  "]
+            },
+            "plugins": {
+                "enable_plugins": ["good.a", "bad,b", "bad\nc"],
+                "disable_plugins": ["good.d", "x\ry"],
+                "plugin_commands": [["good.a", "run"], ["bad,p", "cmd"], ["good.a", "bad\ncmd"]],
+                "on_exit_commands": [["good.a", "stop"], ["", "stop"]]
+            }
+        }]"#,
+    )
+    .unwrap();
+    let mgr = PresetManager::load_from(&presets_file);
+    let preset = mgr.get("clean-test").unwrap();
+    assert_eq!(preset.name, "MyPreset");
+    assert_eq!(preset.description, "descok");
+    assert_eq!(
+        preset
+            .layout
+            .as_ref()
+            .unwrap()
+            .hidden_dock_buttons
+            .as_deref(),
+        Some(&["loop".to_string()][..])
+    );
+    let pl = preset.plugins.as_ref().unwrap();
+    assert_eq!(pl.enable_plugins, vec!["good.a"]);
+    assert_eq!(pl.disable_plugins, vec!["good.d"]);
+    assert_eq!(pl.plugin_commands, vec![("good.a".into(), "run".into())]);
+    assert_eq!(pl.on_exit_commands, vec![("good.a".into(), "stop".into())]);
 }

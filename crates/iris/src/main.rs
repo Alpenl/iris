@@ -335,63 +335,70 @@ fn run(initial: Vec<PathBuf>) -> ExitCode {
 }
 
 fn app_menus() -> Vec<Menu> {
+    use ui::strings::{actions::action_title, chrome};
     vec![
         Menu {
             name: "Iris".into(),
             items: vec![
-                MenuItem::action("设置…", ui::OpenSettings),
-                MenuItem::action("切换工作区预设", ui::CyclePreset),
-                MenuItem::action("恢复默认外观", ui::ResetAppearance),
+                MenuItem::action(action_title("open_settings"), ui::OpenSettings),
+                MenuItem::action(action_title("cycle_preset"), ui::CyclePreset),
+                MenuItem::action(chrome::RESET_APPEARANCE_LABEL, ui::ResetAppearance),
                 MenuItem::separator(),
-                MenuItem::action("退出 Iris", ui::Quit),
+                MenuItem::action(action_title("quit"), ui::Quit),
             ],
         },
         Menu {
             name: "文件".into(),
             items: vec![
-                MenuItem::action("打开本地文件…", ui::OpenFile),
-                MenuItem::action(ui::strings::chrome::OPEN_STREAM_LABEL, ui::OpenStreamUrl),
+                MenuItem::action(action_title("open_file"), ui::OpenFile),
+                MenuItem::action(chrome::OPEN_STREAM_LABEL, ui::OpenStreamUrl),
                 MenuItem::separator(),
-                MenuItem::action("搜索目录", ui::ToggleSearch),
-                MenuItem::action("刷新目录", ui::RefreshDirectory),
+                MenuItem::action(action_title("toggle_search"), ui::ToggleSearch),
+                MenuItem::action(action_title("refresh_directory"), ui::RefreshDirectory),
                 MenuItem::separator(),
-                MenuItem::action("截图保存", ui::TakeScreenshot),
+                MenuItem::action(action_title("take_screenshot"), ui::TakeScreenshot),
             ],
         },
         Menu {
             name: "播放".into(),
             items: vec![
-                MenuItem::action("播放 / 暂停", ui::TogglePause),
-                MenuItem::action("静音", ui::ToggleMute),
-                MenuItem::action("单曲循环", ui::ToggleLoop),
+                MenuItem::action(action_title("toggle_pause"), ui::TogglePause),
+                MenuItem::action(action_title("toggle_mute"), ui::ToggleMute),
+                MenuItem::action(action_title("toggle_loop"), ui::ToggleLoop),
                 MenuItem::separator(),
-                MenuItem::action("上一章节", ui::PrevChapter),
-                MenuItem::action("下一章节", ui::NextChapter),
+                MenuItem::action(action_title("prev_chapter"), ui::PrevChapter),
+                MenuItem::action(action_title("next_chapter"), ui::NextChapter),
                 MenuItem::separator(),
-                MenuItem::action("上一个", ui::OpenPreviousMedia),
-                MenuItem::action("下一个", ui::OpenNextMedia),
+                MenuItem::action(action_title("open_prev"), ui::OpenPreviousMedia),
+                MenuItem::action(action_title("open_next"), ui::OpenNextMedia),
             ],
         },
         Menu {
             name: "视图".into(),
             items: vec![
-                MenuItem::action("命令面板…", ui::OpenCommandPalette),
-                MenuItem::action("切换工作区预设", ui::CyclePreset),
-                MenuItem::action("恢复默认外观", ui::ResetAppearance),
+                MenuItem::action(action_title("open_palette"), ui::OpenCommandPalette),
+                MenuItem::action(action_title("cycle_preset"), ui::CyclePreset),
+                MenuItem::action(chrome::RESET_APPEARANCE_LABEL, ui::ResetAppearance),
                 MenuItem::separator(),
-                MenuItem::action("展开 / 收起侧栏", ui::ToggleDirectory),
-                MenuItem::action(ui::strings::chrome::MEDIA_INFO_LABEL, ui::ToggleInfo),
-                MenuItem::action("窗口置顶", ui::ToggleAlwaysOnTop),
-                MenuItem::action("切换画面比例", ui::CycleAspect),
+                MenuItem::action(action_title("toggle_directory"), ui::ToggleDirectory),
+                MenuItem::action(chrome::MEDIA_INFO_LABEL, ui::ToggleInfo),
+                MenuItem::action(action_title("toggle_always_on_top"), ui::ToggleAlwaysOnTop),
+                MenuItem::action(action_title("cycle_aspect"), ui::CycleAspect),
                 MenuItem::separator(),
-                MenuItem::action("全屏", ui::ToggleFullscreen),
+                MenuItem::action(action_title("toggle_fullscreen"), ui::ToggleFullscreen),
             ],
         },
     ]
 }
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::ffi::OsString;
+    use std::path::PathBuf;
+
+    use gpui::MenuItem;
+    use iris_core::media_uri::MediaUri;
+
+    use super::{Invocation, app_menus, parse_args, ui};
 
     #[test]
     fn cli_validates_all_options_and_preserves_literal_paths() {
@@ -418,5 +425,32 @@ mod tests {
             panic!("empty CLI arg must not fail");
         };
         assert!(empty_skipped.is_empty());
+    }
+
+    #[test]
+    fn app_menus_match_canonical_action_titles() {
+        let labels: Vec<String> = app_menus()
+            .into_iter()
+            .flat_map(|menu| menu.items)
+            .filter_map(|item| match item {
+                MenuItem::Action { name, .. } => Some(name.to_string()),
+                _ => None,
+            })
+            .collect();
+        for expected in [
+            ui::strings::actions::action_title("open_file"),
+            ui::strings::actions::action_title("open_settings"),
+            ui::strings::actions::action_title("cycle_preset"),
+            ui::strings::actions::action_title("toggle_loop"),
+            ui::strings::actions::action_title("toggle_fullscreen"),
+            ui::strings::chrome::OPEN_STREAM_LABEL,
+            ui::strings::chrome::MEDIA_INFO_LABEL,
+            ui::strings::chrome::RESET_APPEARANCE_LABEL,
+        ] {
+            assert!(
+                labels.iter().any(|l| l == expected),
+                "missing canonical menu label {expected:?}"
+            );
+        }
     }
 }

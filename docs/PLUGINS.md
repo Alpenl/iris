@@ -14,8 +14,8 @@
 | `example.watch-stats` | 窗口计时、状态栏和右键重置；不持久化 |
 | `example.virtual-audio` | 独立 StreamStore 的 RandomAccess PCM 示例，无外网请求 |
 | `example.cinema-ui` | 纯声明式主题，无 Wasm 实例 |
-| `example.bilibili` | 视频源、弹幕、清晰度与 `PixelGrid` + `ViewTimer` 扫码登录示例 |
-| `example.baidupan` | 网盘目录与结构化 `VirtualHls` 播放源示例 |
+| `community.bilibili` | 视频源、弹幕、清晰度与 `PixelGrid` + `ViewTimer` 扫码登录示例 |
+| `community.baidupan` | 网盘目录与结构化 `VirtualHls` 播放源示例 |
 
 官方包来自 `crates/iris-plugin-guides`、`crates/iris-plugin-webdav`，在构建前生成到 `Resources/Plugins/` 并嵌入宿主。宿主使用编译时摘要验证身份；第三方包不能自称 `iris.*`。官方包遵守同样的能力与资源检查。
 
@@ -26,7 +26,7 @@
 ```text
 rustup target add wasm32-unknown-unknown
 python -B scripts/build-example-plugins.py
-python -B scripts/test-plugin-v2-examples.py
+python -B scripts/test-plugin-v2-examples.py --release   # 默认即为 --release
 ```
 
 输出为 `target/plugin-v2/examples/*.irisplugin`。源代码见 [examples/plugins](../examples/plugins/README.md)。Rust Guest 使用 `iris-plugin-sdk` 的 `export_plugin!`、`guest` 与 `client`，目标为 `wasm32-unknown-unknown`，无 WASI。C 的最小 ABI 夹具见 `crates/iris-plugin-sdk/tests/fixtures/contract.c`。官方 WebDAV 展示完整异步任务、Origin 确认、凭据、状态保存和目录分页。
@@ -37,7 +37,7 @@ python -B scripts/test-plugin-v2-examples.py
 {
   "id": "example.timer",
   "name": "窗口计时",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "protocol": 2,
   "abi": 2,
   "entry": "plugin.wasm",
@@ -50,9 +50,9 @@ python -B scripts/test-plugin-v2-examples.py
 
 ## 3. 运行时、ABI 与异步生命周期
 
-每个安装身份共享一个 ControlStore；宿主按窗口封装事件，最多四个活跃窗口。窗口共享同一插件内存，不是不同插件之间的隔离边界。每路需要 Guest 读取的播放会话有独立 StreamStore，共享已编译 Module；目录或工具等待不占播放 Store。
+每个安装身份共享一个 ControlStore；宿主按窗口封装事件，最多四个活跃窗口。窗口共享同一插件内存，不是不同插件之间的隔离边界。每路需要 Guest 读取的播放会话有独立 StreamStore，共享已编译 Module；目录或配置等待不占播放 Store。
 
-控制面采用有界、严格 JSON；宿主导入 `host_submit` 立即返回请求 ID，后台完成以事件交付。回调不能阻塞等待网络、工具或用户。64 位 ID/长度以十进制字符串编码，`u64(ptr,len)` 为高 32 位指针、低 32 位长度。消息上限 64 KiB、单次 Blob 1 MiB，错误表及导出签名见 [ABI 规范](PLUGIN_V2_ARCHITECTURE.md#4-abi-v2控制编码字节与所有权)。
+控制面采用有界、严格 JSON；宿主导入 `host_submit` 立即返回请求 ID，后台完成以事件交付。回调不能阻塞等待网络或用户。64 位 ID/长度以十进制字符串编码，`u64(ptr,len)` 为高 32 位指针、低 32 位长度。消息上限 64 KiB、单次 Blob 1 MiB，错误表及导出签名见 [ABI 规范](PLUGIN_V2_ARCHITECTURE.md#4-abi-v2控制编码字节与所有权)。
 
 Guest 输出和 Blob 需遵循转移/关闭约定；任何跨 Guest 调用保存 `Memory` 借用的实现都不符合契约。`memory.grow` 后必须重新取得范围。短读、EOF、取消各有明确返回值，不能把空缓冲当作未完成轮询。SDK 负责基础编解码与内存交接，但业务请求和资源仍须正确结束。
 

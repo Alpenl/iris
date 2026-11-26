@@ -126,7 +126,8 @@ fn default_stroke() -> f32 {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{OverlayNode, TextAlign};
+    use crate::workbench::Color;
 
     #[test]
     fn overlay_nodes_deserialize_defaults_and_colors() {
@@ -150,5 +151,8 @@ mod tests {
 
         let bad_color = r##"{"kind":"grid","cols":3,"rows":3,"color":"#12345"}"##;
         assert!(serde_json::from_str::<OverlayNode>(bad_color).is_err());
+
+        let unknown_field = r#"{"kind":"grid","cols":3,"rows":3,"unexpected":true}"#;
+        assert!(serde_json::from_str::<OverlayNode>(unknown_field).is_err());
     }
 }

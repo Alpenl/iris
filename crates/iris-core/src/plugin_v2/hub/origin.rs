@@ -5,9 +5,9 @@ use super::{
 };
 use crate::{
     plugin_v2::network::{
-        NetworkGrant, Origin, TransportKind,
+        NetworkGrant,
         consent::{OriginReview, OriginStore, SavedOrigin},
-        normalize_url,
+        parse_consent_origin_url,
     },
     vfs::HttpCancel,
 };
@@ -66,7 +66,8 @@ impl Worker {
         {
             return Err(ErrorCode::StaleHandle);
         }
-        let origin = Origin::of(&normalize_url(raw, TransportKind::Http)?)?.display();
+        let (origin, _) = parse_consent_origin_url(raw)?;
+        let origin = origin.display();
         let control = self.plugins[&binding.installed.plugin_id]
             .control
             .as_ref()

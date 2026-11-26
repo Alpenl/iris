@@ -3,14 +3,14 @@
 use std::any::Any;
 use std::collections::BTreeMap;
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 
 use crate::bounded_json::{self, BoundedJsonError};
-use crate::{fs_util, media_uri::MediaUri};
+use crate::media_uri::MediaUri;
 
 const BYTE_LIMIT: usize = 16 << 20;
 const MEDIA_LIMIT: usize = 4096;
@@ -65,7 +65,19 @@ mod decimal_u64 {
     use serde::{Deserializer, Serializer, de};
 
     pub fn serialize<S: Serializer>(value: &u64, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(&value.to_string())
+        let mut buf = [0u8; 20];
+        let mut n = *value;
+        let mut pos = buf.len();
+        loop {
+            pos -= 1;
+            buf[pos] = b'0' + (n % 10) as u8;
+            n /= 10;
+            if n == 0 {
+                break;
+            }
+        }
+        let text = std::str::from_utf8(&buf[pos..]).expect("ASCII decimal digits");
+        serializer.serialize_str(text)
     }
 
     pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<u64, D::Error> {
@@ -208,22 +220,6 @@ impl Annotations {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-enum Field {
-    Rating,
-    Color,
-    Marker(String),
-}
-
-fn field(edit: &AnnotationEdit) -> Field {
-    match edit {
-        AnnotationEdit::Rating { .. } => Field::Rating,
-        AnnotationEdit::Color { .. } => Field::Color,
-        AnnotationEdit::UpsertMarker { marker } => Field::Marker(marker.id.clone()),
-        AnnotationEdit::RemoveMarker { id } => Field::Marker(id.clone()),
-    }
-}
-
 mod background;
 pub use background::{AnnotationSnapshot, AnnotationTarget};
 
@@ -234,15 +230,12 @@ pub(super) struct AnnotationStore {
     records: Arc<Records>,
     revision: u64,
     lease: Option<Arc<dyn Any + Send + Sync>>,
-    edits: BTreeMap<String, BTreeMap<Field, AnnotationEdit>>,
-    directory: Option<PathBuf>,
 }
 
 impl std::fmt::Debug for AnnotationStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AnnotationStore")
             .field("records", &self.records.len())
-            .field("pending", &self.edits.len())
             .finish()
     }
 }
@@ -255,97 +248,16 @@ impl AnnotationStore {
         });
         Self {
             records: Arc::new(records),
-            directory: Some(directory.into()),
             ..Default::default()
         }
     }
     pub fn get(&self, uri: &MediaUri) -> Option<&Annotations> {
         self.records.get(&uri.to_uri_string())
     }
-    pub fn dirty(&self) -> bool {
-        !self.edits.is_empty()
-    }
-    pub fn edit(
-        &mut self,
-        uris: &[MediaUri],
-        edit: &AnnotationEdit,
-    ) -> Result<(), AnnotationError> {
-        if uris.is_empty() || uris.len() > 1000 {
-            return Err(AnnotationError::InvalidArgument);
-        }
-        validate_edit(edit)?;
-        let mut next = (*self.records).clone();
-        for uri in uris {
-            if !uri.may_share_identity() {
-                return Err(AnnotationError::Denied);
-            }
-            let key = uri.to_uri_string();
-            if key.len() > 8192 {
-                return Err(AnnotationError::QuotaExceeded);
-            }
-            next.entry(key.clone()).or_default().edit(edit)?;
-            if next[&key].empty() {
-                next.remove(&key);
-            }
-        }
-        validate(&next)?;
-        let mut pending = self.edits.clone();
-        for uri in uris {
-            pending
-                .entry(uri.to_uri_string())
-                .or_default()
-                .insert(field(edit), edit.clone());
-        }
-        if pending.len() > MEDIA_LIMIT
-            || pending.values().map(BTreeMap::len).sum::<usize>() > MARKER_LIMIT + 2 * MEDIA_LIMIT
-        {
-            return Err(AnnotationError::QuotaExceeded);
-        }
-        self.records = Arc::new(next);
-        self.edits = pending;
-        Ok(())
-    }
-    pub fn save(&mut self) -> Result<(), AnnotationError> {
-        if !self.dirty() {
-            return Ok(());
-        }
-        let directory = self
-            .directory
-            .clone()
-            .or_else(fs_util::data_dir)
-            .ok_or(AnnotationError::Io)?;
-        std::fs::create_dir_all(&directory).map_err(|_| AnnotationError::Io)?;
-        let _lock = fs_util::lock_file(&directory.join("annotations.lock")).map_err(|e| {
-            if e.kind() == std::io::ErrorKind::WouldBlock {
-                AnnotationError::Backpressure
-            } else {
-                AnnotationError::Io
-            }
-        })?;
-        let path = directory.join("annotations.json");
-        let mut latest = read(&path)?;
-        for (uri, edits) in &self.edits {
-            let value = latest.entry(uri.clone()).or_default();
-            for edit in edits.values() {
-                value.edit(edit)?;
-            }
-            if value.empty() {
-                latest.remove(uri);
-            }
-        }
-        validate(&latest)?;
-        let revision = next_revision()?;
-        let bytes = bounded_json::encode(&latest, BYTE_LIMIT)?;
-        fs_util::atomic_write_private(&path, &bytes).map_err(|_| AnnotationError::Io)?;
-        self.revision = revision;
-        self.records = Arc::new(latest);
-        self.edits.clear();
-        Ok(())
-    }
 }
 
 pub(super) fn read(path: &Path) -> Result<Records, AnnotationError> {
-    let file = match std::fs::File::open(path) {
+    let file = match crate::fs_util::retry_sharing_violation(|| std::fs::File::open(path)) {
         Ok(file) => file,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
         Err(_) => return Err(AnnotationError::Io),
@@ -354,7 +266,9 @@ pub(super) fn read(path: &Path) -> Result<Records, AnnotationError> {
     file.take(BYTE_LIMIT as u64 + 1)
         .read_to_end(&mut bytes)
         .map_err(|_| AnnotationError::Io)?;
-    let value: Records = bounded_json::decode_exact(&bytes, BYTE_LIMIT)?;
+    // All annotation structs derive `#[serde(deny_unknown_fields)]` and hold no floats,
+    // so 2-pass `bounded_json::decode` enforces size, depth, duplicate keys, and exact schema.
+    let value: Records = bounded_json::decode(&bytes, BYTE_LIMIT)?;
     validate(&value)?;
     Ok(value)
 }
@@ -382,70 +296,126 @@ pub(super) fn validate(records: &Records) -> Result<(), AnnotationError> {
             })?;
         }
     }
-    bounded_json::encode(records, BYTE_LIMIT)
-        .map(|_| ())
-        .map_err(Into::into)
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{
+        AnnotationEdit, AnnotationError, AnnotationStore, AnnotationTarget, ColorLabel, TimeMarker,
+        read,
+    };
+    use crate::fs_util;
+    use crate::media_uri::MediaUri;
     use crate::test_util::TestDir;
+    use std::any::Any;
+    use std::sync::Arc;
+
+    fn noop_reserve(_: &str, _: u64) -> Result<Arc<dyn Any + Send + Sync>, AnnotationError> {
+        Ok(Arc::new(()))
+    }
 
     #[test]
-    fn annotations_merge_fields_across_instances_and_never_write_media() {
+    fn annotations_merge_via_transact_reject_corrupt_and_never_write_media() {
         let dir = TestDir::new("annotations");
         let source = dir.path().join("video.mp4");
         std::fs::write(&source, b"source bytes").unwrap();
-        let uri = MediaUri::Local(source.clone());
+        let uri = MediaUri::from(source.clone());
         let uris = [uri.clone()];
-        let mut a = AnnotationStore::load(dir.path());
-        let mut b = AnnotationStore::load(dir.path());
-        a.edit(&uris, &AnnotationEdit::Rating { rating: 4 })
+        let target = AnnotationTarget::new(dir.path().to_path_buf());
+
+        let snap1 = target
+            .transact(
+                Some((&uris, &AnnotationEdit::Rating { rating: 4 })),
+                "a",
+                noop_reserve,
+                || Ok(()),
+            )
             .unwrap();
-        a.save().unwrap();
-        b.edit(
-            &uris,
-            &AnnotationEdit::UpsertMarker {
-                marker: TimeMarker {
-                    id: "note".into(),
-                    position_ms: 1250,
-                    label: "Review".into(),
-                    color: Some(ColorLabel::Blue),
-                },
-            },
-        )
-        .unwrap();
-        b.save().unwrap();
-        a.edit(
-            &uris,
-            &AnnotationEdit::Color {
-                color: Some(ColorLabel::Green),
-            },
-        )
-        .unwrap();
-        a.save().unwrap();
-        let value = AnnotationStore::load(dir.path());
-        let value = value.get(&uri).unwrap();
+        let snap2 = target
+            .transact(
+                Some((
+                    &uris,
+                    &AnnotationEdit::UpsertMarker {
+                        marker: TimeMarker {
+                            id: "note".into(),
+                            position_ms: 1250,
+                            label: "Review".into(),
+                            color: Some(ColorLabel::Blue),
+                        },
+                    },
+                )),
+                "b",
+                noop_reserve,
+                || Ok(()),
+            )
+            .unwrap();
+        let snap3 = target
+            .transact(
+                Some((
+                    &uris,
+                    &AnnotationEdit::Color {
+                        color: Some(ColorLabel::Green),
+                    },
+                )),
+                "a",
+                noop_reserve,
+                || Ok(()),
+            )
+            .unwrap();
+
+        let mut store = AnnotationStore::load(dir.path());
+        store.accept(snap3);
+        store.accept(snap1);
+        store.accept(snap2);
+        let value = store.get(&uri).unwrap();
         assert_eq!(value.rating, 4);
         assert_eq!(value.color, Some(ColorLabel::Green));
         assert_eq!(value.markers["note"].position_ms, 1250);
         assert_eq!(std::fs::read(&source).unwrap(), b"source bytes");
+
+        // File lock contention fails with Backpressure.
         let lock = fs_util::lock_file(&dir.path().join("annotations.lock")).unwrap();
-        a.edit(&uris, &AnnotationEdit::Rating { rating: 5 })
-            .unwrap();
-        assert_eq!(a.save(), Err(AnnotationError::Backpressure));
-        assert!(a.dirty());
+        assert!(matches!(
+            target.transact(
+                Some((&uris, &AnnotationEdit::Rating { rating: 5 })),
+                "a",
+                noop_reserve,
+                || Ok(()),
+            ),
+            Err(AnnotationError::Backpressure)
+        ));
         drop(lock);
-        a.save().unwrap();
-        assert!(!a.dirty());
-        std::fs::write(dir.path().join("annotations.json"), b"broken").unwrap();
-        a.edit(&uris, &AnnotationEdit::Rating { rating: 1 })
-            .unwrap();
-        assert!(a.save().is_err());
-        assert_eq!(
-            std::fs::read(dir.path().join("annotations.json")).unwrap(),
-            b"broken"
+
+        // Corrupt JSON is rejected without replacing on-disk contents.
+        let json_path = dir.path().join("annotations.json");
+        std::fs::write(&json_path, b"broken").unwrap();
+        assert!(
+            target
+                .transact(
+                    Some((&uris, &AnnotationEdit::Rating { rating: 1 })),
+                    "a",
+                    noop_reserve,
+                    || Ok(()),
+                )
+                .is_err()
         );
+        assert_eq!(std::fs::read(&json_path).unwrap(), b"broken");
+
+        // Unknown fields and duplicate keys remain rejected under 2-pass `bounded_json::decode`.
+        let key = uri.to_uri_string();
+        std::fs::write(
+            &json_path,
+            serde_json::json!({ &key: { "rating": 3, "color": null, "unknown": 1 } }).to_string(),
+        )
+        .unwrap();
+        assert_eq!(read(&json_path), Err(AnnotationError::InvalidArgument));
+
+        std::fs::write(
+            &json_path,
+            format!(r#"{{"{key}":{{"rating":1,"rating":2,"color":null}}}}"#),
+        )
+        .unwrap();
+        assert_eq!(read(&json_path), Err(AnnotationError::InvalidArgument));
     }
 }

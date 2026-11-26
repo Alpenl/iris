@@ -1,5 +1,5 @@
 //! Sparse `1B+` workspace presets (`LayoutPatch`, `PlaybackPatch`, `PluginPatch`)
-//! and reversible personal-baseline runtime (`PresetRuntime`, `PresetRevert`).
+//! and reversible personal-baseline runtime (`PresetRuntime`).
 
 mod runtime;
 
@@ -14,7 +14,7 @@ use crate::settings::{
     Settings, Side,
 };
 
-pub use runtime::{PresetRevert, PresetRuntime};
+pub use runtime::PresetRuntime;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PresetCaptureScope {
@@ -190,10 +190,39 @@ fn clamp_opt(v: Option<f64>, min: f64, max: f64) -> Option<f64> {
     v.filter(|x| x.is_finite()).map(|x| x.clamp(min, max))
 }
 
+fn sanitize_control_text(raw: &str) -> String {
+    raw.chars()
+        .filter(|c| !c.is_control())
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
+fn sanitize_id_item(raw: &str) -> Option<String> {
+    if raw.contains(',') || raw.chars().any(char::is_control) {
+        return None;
+    }
+    let clean = raw.trim();
+    (!clean.is_empty()).then(|| clean.to_string())
+}
+
+fn sanitize_id_list(list: &mut Vec<String>) {
+    *list = list.iter().filter_map(|id| sanitize_id_item(id)).collect();
+}
+
+fn sanitize_command_pairs(pairs: &mut Vec<(String, String)>) {
+    *pairs = pairs
+        .iter()
+        .filter_map(|(plugin_id, cmd_id)| {
+            Some((sanitize_id_item(plugin_id)?, sanitize_id_item(cmd_id)?))
+        })
+        .collect();
+}
+
 fn sanitize_preset(preset: &mut WorkspacePreset) {
     preset.builtin = false;
-    preset.name = preset.name.trim().to_string();
-    preset.description = preset.description.trim().to_string();
+    preset.name = sanitize_control_text(&preset.name);
+    preset.description = sanitize_control_text(&preset.description);
     if let Some(l) = &mut preset.layout {
         l.directory_width = l.directory_width.map(|w| {
             if w.is_finite() {
@@ -206,14 +235,23 @@ fn sanitize_preset(preset: &mut WorkspacePreset) {
             (w.is_finite() && h.is_finite()).then_some((w.clamp(480., 7680.), h.clamp(300., 4320.)))
         });
         l.theme_id = l.theme_id.as_ref().and_then(|t| {
-            let clean: String = t.chars().filter(|c| !c.is_control()).collect();
-            (!clean.trim().is_empty()).then(|| clean.trim().to_string())
+            let clean = sanitize_control_text(t);
+            (!clean.is_empty()).then_some(clean)
         });
+        if let Some(buttons) = &mut l.hidden_dock_buttons {
+            sanitize_id_list(buttons);
+        }
     }
     if let Some(pb) = &mut preset.playback {
         pb.speed = clamp_opt(pb.speed, MIN_SPEED, MAX_SPEED);
         pb.seek_step = clamp_opt(pb.seek_step, 1.0, 60.0);
         pb.sub_scale = clamp_opt(pb.sub_scale, 0.5, 2.5);
+    }
+    if let Some(pl) = &mut preset.plugins {
+        sanitize_id_list(&mut pl.enable_plugins);
+        sanitize_id_list(&mut pl.disable_plugins);
+        sanitize_command_pairs(&mut pl.plugin_commands);
+        sanitize_command_pairs(&mut pl.on_exit_commands);
     }
 }
 
@@ -254,8 +292,7 @@ impl PresetManager {
                 Some(PlaybackPatch { on_eof: Some(OnEof::Next), ..Default::default() }), None),
             ("review",
                 Some(LayoutPatch { theme_id: Some("studio".into()), directory_side: Some(Side::Right), directory_width: Some(360.0), directory_open: Some(true), photo_filmstrip: Some(true), ..Default::default() }),
-                Some(PlaybackPatch { on_eof: Some(OnEof::Pause), ..Default::default() }),
-                Some(PluginPatch { plugin_commands: vec![("iris.guides".into(), "thirds".into())], on_exit_commands: vec![("iris.guides".into(), "off".into())], ..Default::default() })),
+                Some(PlaybackPatch { on_eof: Some(OnEof::Pause), ..Default::default() }), None),
             ("study",
                 Some(LayoutPatch { directory_side: Some(Side::Left), directory_open: Some(true), sidebar_mode: Some(SidebarMode::Plugins), ..Default::default() }),
                 Some(PlaybackPatch { seek_step: Some(3.0), sub_scale: Some(1.25), ..Default::default() }), None),

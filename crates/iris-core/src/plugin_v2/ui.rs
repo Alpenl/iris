@@ -57,6 +57,7 @@ type UiOverrides = (Option<UiThemeSpec>, Option<ChromeLayoutSpec>);
 pub struct PluginManager {
     client: Client,
     catalog: Arc<Catalog>,
+    catalog_synced: bool,
     ready: BTreeSet<String>,
     slots: BTreeMap<String, slots::Slots>,
     modal_order: u64,
@@ -69,6 +70,7 @@ impl PluginManager {
         Self {
             client,
             catalog,
+            catalog_synced: false,
             ready: BTreeSet::new(),
             slots: BTreeMap::new(),
             modal_order: 0,
@@ -112,7 +114,13 @@ impl PluginManager {
             report.dirty.merge(DirtySlots::all());
         }
         let catalog = self.client.catalog();
-        if catalog.revision != self.catalog.revision || self.slots.is_empty() {
+        let needs_initial_seed = !self.catalog_synced
+            && catalog
+                .plugins
+                .iter()
+                .any(|p| p.status == PluginStatus::Ready);
+        self.catalog_synced = true;
+        if catalog.revision != self.catalog.revision || needs_initial_seed {
             let mut removed = Vec::new();
             for (id, slots) in &self.slots {
                 let current = catalog.plugins.iter().find(|p| p.id == *id);
@@ -230,14 +238,15 @@ impl PluginManager {
     }
     pub fn reload_with_snapshot(
         &self,
-        _disabled: &[String],
+        disabled: &[String],
         snapshot: PlaybackSnapshot,
     ) -> PollReport {
+        let disabled: BTreeSet<String> = disabled.iter().cloned().collect();
         Self::sent(
             None,
             self.client
                 .update_snapshot(snapshot)
-                .and_then(|_| self.client.reload()),
+                .and_then(|_| self.client.reload_with_disabled(disabled)),
         )
     }
     pub fn shutdown(&self) {
@@ -390,9 +399,6 @@ impl PluginManager {
             self.overrides.borrow_mut().take();
         }
         Ok(())
-    }
-    pub fn selected_theme(&self) -> Option<&str> {
-        self.selected_theme.as_deref()
     }
     pub fn active_ui_overrides(&self) -> UiOverrides {
         if self

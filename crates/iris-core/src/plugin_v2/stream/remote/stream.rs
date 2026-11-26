@@ -14,7 +14,10 @@ use crate::{
 };
 use iris_api::v2::ErrorCode;
 use serde_json::json;
-use std::time::{Duration, Instant};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 const STREAM_CHUNK: usize = 64 << 10;
 const STREAM_RESERVATION: u64 = 256 << 10;
@@ -29,7 +32,7 @@ impl StreamSlice for EmptySlice {
 }
 
 struct RemoteStream {
-    target: RemoteTarget,
+    target: Arc<RemoteTarget>,
     response: Option<Response>,
     offset: u64,
     remaining: Option<u64>,
@@ -63,38 +66,15 @@ impl RemoteStream {
         let attempt = self.consecutive_resumes;
         let known_total = self.total.or(self.target.expected);
         let host = logging::url_host(&self.target.resource.url);
-        let mut send_if_range = true;
-        let resp = loop {
-            let deadline = Instant::now() + STREAM_IDLE_TIMEOUT;
-            let resp = self.target.open_range(
-                "GET",
-                Some((self.offset, Some(end))),
-                send_if_range,
-                STREAM_RESERVATION,
-                &self.cancel,
-                deadline,
-            )?;
-            let RawState::Response(raw) = &resp.state else {
-                return Err(ErrorCode::Internal);
-            };
-            if send_if_range {
-                if raw.status == 412 {
-                    send_if_range = false;
-                    continue;
-                }
-                if raw.status == 200 {
-                    let size = unique(&raw.headers, "content-length")?
-                        .map(super::super::range::decimal)
-                        .transpose()?;
-                    if known_total.is_some() && size == known_total {
-                        send_if_range = false;
-                        continue;
-                    }
-                    return Err(ErrorCode::StaleHandle);
-                }
-            }
-            break resp;
-        };
+        let (resp, retried) = self.target.open_range_with_fallback(
+            Some((self.offset, Some(end))),
+            known_total,
+            true,
+            true,
+            STREAM_RESERVATION,
+            &self.cancel,
+            || Instant::now() + STREAM_IDLE_TIMEOUT,
+        )?;
         let RawState::Response(raw) = &resp.state else {
             return Err(ErrorCode::Internal);
         };
@@ -134,6 +114,11 @@ impl RemoteStream {
                 .is_some_and(|n| n != count)
         {
             return Err(ErrorCode::RangeInvalid);
+        }
+        if self.offset > 0 && !retried {
+            self.target.remember(&raw.headers, new_total, true)?;
+        } else {
+            self.target.remember_stream(&raw.headers, new_total, true)?;
         }
         logging::event(
             logging::EventLevel::Info,
@@ -228,17 +213,11 @@ impl RemoteReader {
         len: Option<u64>,
         cancel: &HttpCancel,
     ) -> Result<OpenedStream, ErrorCode> {
-        self.grant.check_live()?;
+        self.target.grant.check_live()?;
         if cancel.is_cancelled() {
             return Err(ErrorCode::Cancelled);
         }
-        let known = self.expected.or_else(|| {
-            self.metadata
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .as_ref()
-                .and_then(|m| m.size)
-        });
+        let known = self.target.known_size();
         if known.is_some_and(|size| offset > size) {
             return Err(ErrorCode::RangeInvalid);
         }
@@ -274,41 +253,15 @@ impl RemoteReader {
             None => None,
         };
 
-        let mut send_if_range = offset > 0;
-        let mut response = loop {
-            let deadline = Instant::now() + STREAM_IDLE_TIMEOUT;
-            let resp = self.open_range(
-                "GET",
-                range,
-                send_if_range,
-                STREAM_RESERVATION,
-                cancel,
-                deadline,
-            )?;
-            let RawState::Response(raw) = &resp.state else {
-                return Err(ErrorCode::Internal);
-            };
-            // Multi-edge CDNs often serve an immutable object with per-edge ETags.
-            // If If-Range fell back to 200 OK with the exact same byte length (or
-            // returned 412) on a seek, retry once without If-Range.
-            if offset > 0 && send_if_range {
-                if raw.status == 412 {
-                    send_if_range = false;
-                    continue;
-                }
-                if raw.status == 200 {
-                    let size = unique(&raw.headers, "content-length")?
-                        .map(super::super::range::decimal)
-                        .transpose()?;
-                    if known.is_some() && size == known {
-                        send_if_range = false;
-                        continue;
-                    }
-                    return Err(ErrorCode::StaleHandle);
-                }
-            }
-            break resp;
-        };
+        let (mut response, retried) = self.target.open_range_with_fallback(
+            range,
+            known,
+            offset > 0,
+            offset > 0,
+            STREAM_RESERVATION,
+            cancel,
+            || Instant::now() + STREAM_IDLE_TIMEOUT,
+        )?;
 
         let RawState::Response(raw) = &response.state else {
             return Err(ErrorCode::Internal);
@@ -319,7 +272,12 @@ impl RemoteReader {
                 .and_then(|v| v.strip_prefix("bytes */"))
                 .ok_or(ErrorCode::RangeInvalid)?;
             let total = super::super::range::decimal(total)?;
-            self.remember_stream(&raw.headers, Some(total), offset == 0)?;
+            if offset > 0 && !retried {
+                self.target.remember(&raw.headers, Some(total), false)?;
+            } else {
+                self.target
+                    .remember_stream(&raw.headers, Some(total), offset == 0 || retried)?;
+            }
             if offset != total {
                 return Err(ErrorCode::RangeInvalid);
             }
@@ -369,7 +327,7 @@ impl RemoteReader {
                 "stream",
                 "upstream_open_failed",
                 json!({
-                    "host": logging::url_host(&self.resource.url),
+                    "host": logging::url_host(&self.target.resource.url),
                     "offset": offset,
                     "status": raw.status,
                     "error": format!("{code:?}"),
@@ -377,7 +335,11 @@ impl RemoteReader {
             );
             return Err(code);
         };
-        self.remember_stream(&raw.headers, total, offset == 0)?;
+        if offset > 0 && !retried {
+            self.target.remember(&raw.headers, total, true)?;
+        } else {
+            self.target.remember_stream(&raw.headers, total, true)?;
+        }
 
         // Pre-read the first chunk before committing loopback HTTP headers so
         // immediate upstream failures still yield a clean HTTP error status.
@@ -411,7 +373,7 @@ impl RemoteReader {
             Box::new(EmptySlice)
         } else {
             Box::new(RemoteStream {
-                target: self.target(),
+                target: Arc::clone(&self.target),
                 response: Some(response),
                 offset: end,
                 remaining: left,
@@ -429,13 +391,62 @@ impl RemoteReader {
             rest,
         })
     }
+}
 
-    fn remember_stream(
+impl RemoteTarget {
+    /// Opens a GET range request, retrying once without `If-Range` if a
+    /// multi-edge CDN rejects the pinned edge ETag with `412` or `200` (with
+    /// matching byte length).
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn open_range_with_fallback(
+        &self,
+        range: Option<(u64, Option<u64>)>,
+        known_total: Option<u64>,
+        allow_if_range: bool,
+        retry_on_200: bool,
+        host_bytes: u64,
+        cancel: &HttpCancel,
+        deadline: impl Fn() -> Instant,
+    ) -> Result<(Response, bool), ErrorCode> {
+        let mut send_if_range = range.is_some() && allow_if_range && self.has_etag();
+        let mut retried = false;
+        loop {
+            let resp =
+                self.open_range("GET", range, send_if_range, host_bytes, cancel, deadline())?;
+            let RawState::Response(raw) = &resp.state else {
+                return Err(ErrorCode::Internal);
+            };
+            if send_if_range {
+                if raw.status == 412 {
+                    send_if_range = false;
+                    retried = true;
+                    continue;
+                }
+                if raw.status == 200 && retry_on_200 {
+                    let size = unique(&raw.headers, "content-length")?
+                        .map(super::super::range::decimal)
+                        .transpose()?;
+                    if known_total.is_some() && size == known_total {
+                        send_if_range = false;
+                        retried = true;
+                        continue;
+                    }
+                    return Err(ErrorCode::StaleHandle);
+                }
+            }
+            return Ok((resp, retried));
+        }
+    }
+
+    pub(super) fn remember_stream(
         &self,
         headers: &[(String, String)],
         size: Option<u64>,
         reset_etag: bool,
     ) -> Result<(), ErrorCode> {
+        if self.verified {
+            return self.remember(headers, size, false);
+        }
         let etag = unique(headers, "etag")?
             .filter(|s| s.len() >= 2 && s.starts_with('"') && s.ends_with('"') && s.len() <= 1024)
             .map(str::to_owned);

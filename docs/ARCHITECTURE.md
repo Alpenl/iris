@@ -16,8 +16,8 @@ crates/
 
 1. `iris-core` 不依赖 GPUI、`iris-plugin-sdk` 或原生窗口/图像库；
 2. `iris-api` 常规依赖仅限 `serde`（不依赖 GPUI 或 `iris-mpv`）；
-3. `crates/iris/src/` 除 `video/` 外递归禁止出现 `iris_mpv` 或原始 mpv 调用；
-4. `crates/iris-core/src/` 全量非测试文件禁止 `use super::*;`，且 17 个核心域模块禁止反向依赖 `plugin_v2` 或 `iris_api`；
+3. `crates/iris/src/` 除 `video/` 外递归禁止出现 `iris_mpv` 或原始 mpv 调用，且 `crates/iris/src/` 与 `crates/iris-core/src/` 全量非测试代码禁止 `use super::*;`；
+4. `crates/iris-core/src/` 中 17 个核心域模块（含其单元测试）禁止反向依赖 `plugin_v2` 或 `iris_api`；
 5. `devtools` 控制管道门禁未被默认特性或普通发布版绕过；
 6. 全仓 `.rs` 模块行数预算（超过 650 行生产代码提示，生产代码上限 850 行、总行数上限 1,000 行），以及图标、官方嵌入插件摘要与示例插件清单一致性。
 
@@ -32,14 +32,14 @@ crates/
   - `media_uri.rs`：三元正交寻址 `MediaUri`（`Local` | `HttpUrl` | `Plugin`，经 `MediaUri::parse_persisted` 无损升级历史 `webdav://` URI）。
   - `catalog.rs`：跨本地、插件源与收藏统一的 `CatalogItem` 排序/过滤纯函数，以及与当前浏览文件夹彻底解耦的独立播放队列 `PlayQueue`。
   - `store.rs`：以稳定媒体身份保存收藏、续播和最近记录。写入时取得文件锁，重读磁盘、合并修改字段并原子替换。写入失败保留待保存变更，旧记录在迁移成功后退役。
-  - `vault.rs`：系统安全凭据库 `CredentialVault`（macOS Keychain / Windows Credential Manager，单条上限 2048B，失败显式报错）。按 `builtin.<id>` 与 `ext.<id>` 隔离。`credential_index.json` 只保存作用域与键名，测试可用 `in_memory()`。
+  - `vault.rs`：系统安全凭据库 `CredentialVault`（macOS Keychain / Windows Credential Manager，单条上限 2048B，失败显式报错）。v2 插件按安装身份 `plugin-v2.<installation_id>` 隔离（兼容读取迁移期 `builtin.<id>` 与 `ext.<id>`），Windows 下采用 `app.iris.vault.v2:` 小写十六进制编码目标名以消除大小写不敏感碰撞并保护作用域/键名边界。`credential_index.json` 只保存作用域与键名，测试可用 `in_memory()`。
   - `preset.rs` + `preset/runtime.rs`：`1B+` 稀疏工作区预设（`Option<T>` 补丁 + 显式插件启停差量与退出指令），`settings.conf` 始终只存纯净个人基线，运行期通过内存 `PresetRevert` 自动回正（全局字号 `ui_font_scale` 属个人偏好不进预设）。
 - `crates/iris-core/src/plugin_v2/`：有界 Wasmtime 运行时、安装/能力授权、网络、三模流（`DirectHttp` / `RandomAccess` / `VirtualHls`）、轻量文件产物与哈希（`FileExecutor`）、媒体增强与共享 Hub；`iris-plugin-sdk` 和两个官方插件 crate 是同一套公开 Guest 入口。
 - `crates/iris-core/src/photo/{mod,containers,heif,exif,icc}.rs`：魔数优先单遍照片头解析（JPEG/PNG/WebP/HEIF/TIFF 尺寸、方向、EXIF 摘要与内嵌 ICC 原色匹配）。
 - `crates/iris-core/src/{keymap/,vfs/,logging/,input,geometry,library,settings,fs_util}.rs`：三方案键位目录与结构化 `ConflictTarget`、常驻位置书签与有界 HTTP 客户端、单一集中脱敏日志与结构化事件流（`iris.log` + `events.jsonl`）、指针手势策略、几何变换与慢速共享盘优化扫描。
 - `crates/iris/src/theme.rs` + `ui/`：GPUI `Global` `ThemeTokens` 引擎（方向 C 默认 + 扁平 `text_xs/sm/md/lg` / `control_h_sm/md` / `danger` / `ui_font_scale` `0.85..=1.35` 字号缩放与防裁切下限 + 插件圆角/栏高安全 clamp 与最低对比度兜底）；`#root` 采用统一 5 层 Z-Order 渲染栈与唯一 `Esc` 逐层退出管线：
   - `ui/kit/{mod,text_buffer,text_field,form,list_row,modal}.rs`：共用 Direction C 基础控件库——全仓唯一单行 IME 输入框 `TextInputHub` + `render_text_field`、4 变体×3 尺寸 `button` / `icon_button_disabled`、`select_row`、`panel_header` / `surface_card` / `section_label`、`tab_strip` 与居中 `modal_shell`（支持内联错误区与提交禁用）。
-  - `ui/strings/{mod,actions,presets,errors,chrome}.rs`：按领域归集的中文 UI 文案与统一术语表，剥离 `iris-core` 与 `iris-api` 中的全部硬编码中文 UI 文本。
+  - `ui/strings/{mod,actions,presets,errors,chrome}.rs`：按领域归集的共享枚举、菜单、错误、预设与通用操作中文文案表，彻底剥离 `iris-core` 与 `iris-api` 中的硬编码中文 UI 文本（其余视图局部文案保留在各 UI 模块内）。
   - `ui/{mod,events,vfs_ctrl,plugin_ctrl,preset_ctrl,chrome,actions*,viewport*,titlebar,info,palette,context_menu,dialogs,debug_cmd}.rs`：核心窗口装配、`hide_titlebar` 三重安全护栏、3 秒两步内联危险操作确认、异步远程源拉取与命令面板。
   - `ui/{sidebar,controls,popover,plugin_ui,settings}/`：四模式统一侧栏（零硬编码插件特判，统一读取 `SourceDescriptor.badge` / `icon`）、响应式底栏与 60fps 时间轴、锚定浮层、插件声明式控件（含正交 `Widget::PixelGrid` + `ViewTimer`）/非破坏性校验弹窗/视口叠层，以及 7 标签设置中心。
 - `crates/iris/src/instance.rs`：Windows 单实例，见第 8 节。macOS 由系统把打开请求发给已运行进程，经 GPUI `on_open_urls` 进来，只接受 `file://`。
@@ -161,7 +161,7 @@ DirectHttp、RandomAccess、VirtualManifest 共用受控播放准入。远端及
 - 外部文件路径和网络地址以数据参数传给 mpv。插件只能发送预定义的 `HostCommand`，由宿主校验权限。`RenderHandle` 限制 UI 能调用的渲染接口。
 - **插件边界**：包、Guest 输出和网络输入均校验；凭据按安装身份分桶，网络和文件能力逐请求检查，取消中资源持续计账，插件日志经宿主限流与统一脱敏。
 - 任意 mpv 控制仅用于 debug／显式 `devtools` 构建，同用户访问，普通 release 不监听；不得把性能测试二进制当发行包。
-- 媒体和所在目录只读；设置、日志、收藏进度（`records.tsv`）、最近打开（`recent.tsv`）与外部插件（`plugins/`）全部保存在系统应用数据目录，不往媒体目录写隐藏文件或缓存（缩略图底条仅驻留内存）。
+- 媒体和所在目录只读；设置、日志、收藏进度（`records.tsv`）、最近打开（`recent.tsv`）与外部插件（`plugins-v2/`）全部保存在系统应用数据目录，不往媒体目录写隐藏文件或缓存（缩略图底条仅驻留内存）。
 - Windows 用 `Local\Iris.Player.Batch.<用户 SID>` 互斥量识别当前登录会话的播放器。后启动的进程通过同用户双向管道 `\\.\pipe\iris-open-batch-v2-<会话号>-<用户 SID>` 发送绝对路径并授予前台窗口权限。消息使用有界 UTF-16LE 路径批次，两端核对会话号，主窗口接收后确认。连接、读写或确认超时后，后启动的进程以失败状态退出。`IRIS_SETTINGS` 实例独立运行。
 - 命令行参数、Finder 的本地文件 URL、文件选择器和视口拖放都把一次选择交给 `open_paths`。单个媒体沿用同目录浏览。多个媒体按选择顺序排队，所选目录在队列中展开一层，同一文件保留首次出现的位置。混选的外挂字幕等待本次媒体加载后依次挂载，单独选中的字幕挂载到正在播放或正在打开的音视频。切换媒体会使上一批待挂载字幕失效。
 

@@ -5,13 +5,15 @@
 mod playlist;
 mod transfer;
 
-use transfer::{copy_stream, ensure_identity, valid_range};
+use transfer::{
+    RelayError, copy_stream, ensure_identity, reject_busy, valid_range, write_error_response,
+};
 
 use std::collections::BTreeMap;
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -24,7 +26,8 @@ use ring::rand::{SecureRandom, SystemRandom};
 use url::Url;
 
 use crate::loopback_http::{
-    ClientHub, is_adaptive_manifest, is_adaptive_prefix_undecided, read_request,
+    ClientHub, HttpMethod, HttpRequestError, is_adaptive_manifest, is_adaptive_prefix_undecided,
+    parse_http_request, read_request,
 };
 use crate::vfs::http_client::{
     HttpCancel, NetworkScope, Request, open_stream, validate_stream_url,
@@ -36,16 +39,17 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_URL: usize = 2800;
 const MAX_REQUEST: usize = 24 * 1024;
 const MAX_PLAYLIST: usize = 4 * 1024 * 1024;
+const MAX_ADAPTIVE_SNIFF: usize = 4096;
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(10);
 const RELAY_WORKERS: usize = 8;
 const GLOBAL_WORKERS: usize = 32;
 const SLOT_WAIT: Duration = Duration::from_secs(1);
 static ACTIVE_WORKERS: Mutex<usize> = Mutex::new(0);
-static WORKER_AVAILABLE: Condvar = Condvar::new();
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RouteKind {
     Media,
+    Key,
     Playlist,
     Subtitle,
 }
@@ -54,6 +58,7 @@ impl RouteKind {
     fn tag(self) -> &'static str {
         match self {
             Self::Media => "m",
+            Self::Key => "k",
             Self::Playlist => "p",
             Self::Subtitle => "s",
         }
@@ -85,10 +90,11 @@ impl Routes {
     fn seal(&self, url: &Url, kind: RouteKind, fallback_ext: &str) -> Result<String> {
         ensure!(url.as_str().len() <= MAX_URL, "media URL exceeds limit");
         // FFmpeg checks the suffix of HLS segments. Expose only known format hints.
-        let ext = if kind == RouteKind::Playlist {
-            "m3u8"
-        } else {
-            url.path_segments()
+        let ext = match kind {
+            RouteKind::Playlist => "m3u8",
+            RouteKind::Key => "key",
+            RouteKind::Media | RouteKind::Subtitle => url
+                .path_segments()
                 .and_then(|mut parts| parts.next_back())
                 .and_then(|name| name.rsplit_once('.'))
                 .and_then(|(_, suffix)| {
@@ -100,7 +106,7 @@ impl Routes {
                     .into_iter()
                     .find(|ext| ext.eq_ignore_ascii_case(suffix))
                 })
-                .unwrap_or(fallback_ext)
+                .unwrap_or(fallback_ext),
         };
         let sequence = self
             .nonce
@@ -131,6 +137,7 @@ impl Routes {
             .context("invalid playback route")?;
         let kind = match tag {
             "m" => RouteKind::Media,
+            "k" => RouteKind::Key,
             "p" => RouteKind::Playlist,
             "s" => RouteKind::Subtitle,
             _ => bail!("invalid playback route kind"),
@@ -203,7 +210,7 @@ impl PlaybackRelay {
                                 workers.push(handle);
                             }
                         } else if Instant::now() >= deadline {
-                            reject_busy(socket);
+                            reject_busy(socket, MAX_REQUEST);
                         } else {
                             waiting = Some((socket, deadline));
                         }
@@ -298,7 +305,6 @@ impl PlaybackRelay {
         self.service.cancel.cancel();
         // Synchronize with the admission check before waking the listener.
         let _workers = ACTIVE_WORKERS.lock().unwrap();
-        WORKER_AVAILABLE.notify_all();
         let _ = self.service.wake.wake();
     }
 }
@@ -336,19 +342,9 @@ impl Drop for Worker {
         let mut active = ACTIVE_WORKERS.lock().unwrap();
         self.0.workers.fetch_sub(1, Ordering::Relaxed);
         *active -= 1;
-        WORKER_AVAILABLE.notify_all();
+        drop(active);
         let _ = self.0.wake.wake();
     }
-}
-
-fn reject_busy(mut socket: TcpStream) {
-    // Drain the ordinary small request before replying so closing the
-    // socket does not discard the response as an unread-data reset.
-    let _ = read_request(&mut socket, Duration::from_millis(100), MAX_REQUEST);
-    let _ = socket.set_write_timeout(Some(Duration::from_millis(100)));
-    let _ = socket.write_all(
-        b"HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
-    );
 }
 
 impl Service {
@@ -370,51 +366,65 @@ impl Service {
         worker: Worker,
         mut socket: TcpStream,
     ) -> Option<thread::JoinHandle<()>> {
-        thread::Builder::new().name("iris-media-request".into()).spawn(move || {
-            let service = &worker.0;
-            let Ok(_registration) = service.cancel.register(&socket) else { return };
-            let mut committed = false;
-            if service.serve(&mut socket, &mut committed).is_err() && !committed {
-                let _ = socket.write_all(b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
-            }
-        }).ok()
+        thread::Builder::new()
+            .name("iris-media-request".into())
+            .spawn(move || {
+                let service = &worker.0;
+                let Ok(_registration) = service.cancel.register(&socket) else {
+                    return;
+                };
+                let mut committed = false;
+                if let Err(err) = service.serve(&mut socket, &mut committed)
+                    && !committed
+                {
+                    write_error_response(&mut socket, err);
+                }
+            })
+            .ok()
     }
 
-    fn serve(&self, socket: &mut TcpStream, committed: &mut bool) -> Result<()> {
-        socket.set_write_timeout(Some(CLIENT_TIMEOUT))?;
-        let raw = read_request(socket, CLIENT_TIMEOUT, MAX_REQUEST)?;
-        let mut slots = [httparse::EMPTY_HEADER; 64];
-        let mut request = httparse::Request::new(&mut slots);
-        ensure!(
-            request.parse(&raw)?.is_complete(),
-            "incomplete relay request"
-        );
-        let method = request.method.context("missing request method")?;
-        ensure!(matches!(method, "GET" | "HEAD"), "unsupported relay method");
+    fn serve(
+        &self,
+        socket: &mut TcpStream,
+        committed: &mut bool,
+    ) -> std::result::Result<(), RelayError> {
+        socket
+            .set_write_timeout(Some(CLIENT_TIMEOUT))
+            .map_err(|_| RelayError::BadGateway)?;
+        let raw =
+            read_request(socket, CLIENT_TIMEOUT, MAX_REQUEST).map_err(|err| match err.kind() {
+                io::ErrorKind::TimedOut => RelayError::Timeout,
+                io::ErrorKind::InvalidData => RelayError::Request(HttpRequestError::BadRequest),
+                _ => RelayError::BadGateway,
+            })?;
         let host = self.routes.authority.to_string();
-        let mut host_seen = false;
-        let mut range = None;
-        for h in request.headers {
-            if h.name.eq_ignore_ascii_case("host") {
-                ensure!(
-                    !host_seen && h.value == host.as_bytes(),
-                    "invalid relay authority"
-                );
-                host_seen = true;
-            } else if h.name.eq_ignore_ascii_case("origin")
-                || h.name.to_ascii_lowercase().starts_with("sec-fetch-")
-            {
-                bail!("browser access to playback relay denied");
-            } else if h.name.eq_ignore_ascii_case("range") {
-                let value = std::str::from_utf8(h.value)?;
-                ensure!(range.is_none() && valid_range(value), "invalid relay range");
-                range = Some(value);
-            }
+        let parsed = parse_http_request(&raw, &host).map_err(RelayError::Request)?;
+        if let Some(value) = parsed.range
+            && !valid_range(value)
+        {
+            return Err(RelayError::Request(HttpRequestError::RangeNotSatisfiable));
         }
-        ensure!(host_seen, "missing relay authority");
+        let method = match parsed.method {
+            HttpMethod::Get => "GET",
+            HttpMethod::Head => "HEAD",
+        };
         let (url, kind) = self
             .routes
-            .open(request.path.context("missing playback route")?)?;
+            .open(parsed.path)
+            .map_err(|_| RelayError::Request(HttpRequestError::Forbidden))?;
+        self.serve_route(socket, method, parsed.range, url, kind, committed)
+            .map_err(|_| RelayError::BadGateway)
+    }
+
+    fn serve_route(
+        &self,
+        socket: &mut TcpStream,
+        method: &str,
+        range: Option<&str>,
+        url: Url,
+        kind: RouteKind,
+        committed: &mut bool,
+    ) -> Result<()> {
         let req_cancel = self.cancel.child()?;
         let mut client_watch = self.hub.watch(socket, req_cancel.clone())?;
         if kind == RouteKind::Subtitle {
@@ -490,24 +500,27 @@ impl Service {
         }
 
         let mut sniffed = Vec::new();
-        let mut deferred_err = None;
-        if !playlist && method == "GET" && range.is_none_or(|r| r.starts_with("bytes=0-")) {
-            let mut buf = [0u8; 64];
+        if kind == RouteKind::Media
+            && method == "GET"
+            && range.is_none_or(|r| r.starts_with("bytes=0-"))
+        {
+            let mut buf = [0u8; MAX_ADAPTIVE_SNIFF];
             let mut used = 0;
+            let mut eof = false;
             while used < buf.len() && is_adaptive_prefix_undecided(&buf[..used]) {
                 match response.body().read(&mut buf[used..]) {
-                    Ok(0) => break,
-                    Ok(n) => used += n,
-                    Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                    Err(e) if used == 0 => return Err(e.into()),
-                    Err(e) => {
-                        deferred_err = Some(e);
+                    Ok(0) => {
+                        eof = true;
                         break;
                     }
+                    Ok(n) => used += n,
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(e) => return Err(e.into()),
                 }
             }
             ensure!(
-                !is_adaptive_manifest(&buf[..used]),
+                !is_adaptive_manifest(&buf[..used])
+                    && (eof || !is_adaptive_prefix_undecided(&buf[..used])),
                 "unexpected adaptive manifest on media route"
             );
             sniffed.extend_from_slice(&buf[..used]);
@@ -531,18 +544,6 @@ impl Service {
             socket.write_all(b"Transfer-Encoding: chunked\r\n")?;
         }
         socket.write_all(b"\r\n")?;
-        if let Some(err) = deferred_err {
-            if !sniffed.is_empty() {
-                if chunked {
-                    write!(socket, "{:x}\r\n", sniffed.len())?;
-                    socket.write_all(&sniffed)?;
-                    socket.write_all(b"\r\n")?;
-                } else {
-                    socket.write_all(&sniffed)?;
-                }
-            }
-            return Err(err.into());
-        }
         if method == "GET" {
             // Switch to nonblocking writes with NO SO_SNDTIMEO before streaming
             // body bytes so long pauses or full demuxer caches never time out or

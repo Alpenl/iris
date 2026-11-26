@@ -7,6 +7,7 @@ mod grant;
 pub(crate) mod raw;
 mod socket;
 pub use crate::vfs::http_client::{AddressKind, address_kind};
+pub use consent::parse_consent_origin_url;
 pub use executor::NetworkExecutor;
 pub use grant::{NetworkGrant, Origin, RequestGrant, TransportKind, normalize_url};
 

@@ -43,21 +43,21 @@ impl RenderHandle {
     }
 
     /// Requests the selected concrete video track before freeing a lost device.
-    /// The client event loop delivers the result and signals `wake`. Keep
-    /// servicing render updates while waiting for it.
+    /// Returns `Ok(None)` when no playlist entry is active. Otherwise, the client
+    /// event loop delivers the result and signals `wake`; keep servicing render
+    /// updates while waiting for it.
     #[cfg(target_os = "windows")]
     pub fn request_active_vid(
         &self,
         wake: SyncSender<()>,
-    ) -> Result<Receiver<Option<ActiveVideoTrack>>> {
-        let (tx, rx) = mpsc::channel();
+    ) -> Result<Option<Receiver<Option<ActiveVideoTrack>>>> {
         let mut recovery = self
             .0
             .video_recovery
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let Some(entry) = recovery.entry else {
-            return Ok(rx);
+            return Ok(None);
         };
         if recovery.pending.is_some() {
             return Err(Error {
@@ -65,13 +65,14 @@ impl RenderHandle {
                 context: "video track query already pending".into(),
             });
         }
+        let query_id = recovery.allocate_query_id()?;
         with_cstr("vid", |name| {
             // SAFETY: The live handle queues a copy of the property name.
             check(
                 unsafe {
                     sys::mpv_get_property_async(
                         self.0.raw(),
-                        VideoRecovery::QUERY_VID,
+                        query_id,
                         name,
                         sys::MPV_FORMAT_STRING,
                     )
@@ -79,14 +80,21 @@ impl RenderHandle {
                 || "get_property_async vid".into(),
             )
         })?;
-        recovery.pending = Some(VideoTrackRequest { entry, tx, wake });
-        Ok(rx)
+        let (tx, rx) = mpsc::channel();
+        recovery.pending = Some(VideoTrackRequest {
+            query_id,
+            entry,
+            tx,
+            wake,
+        });
+        Ok(Some(rx))
     }
 
     /// Queues video reattachment after recreating the render context, provided
     /// the corresponding file is still active in the client event stream.
+    /// Returns `Ok(true)` iff the file is still active and `vid` was queued.
     #[cfg(target_os = "windows")]
-    pub fn restore_vid(&self, track: ActiveVideoTrack) -> Result<()> {
+    pub fn restore_vid(&self, track: ActiveVideoTrack) -> Result<bool> {
         let recovery = self
             .0
             .video_recovery
@@ -95,8 +103,10 @@ impl RenderHandle {
         if recovery.entry == Some(track.entry) {
             self.0
                 .set_property_string_async("vid", &track.id.to_string())?;
+            Ok(true)
+        } else {
+            Ok(false)
         }
-        Ok(())
     }
 }
 
@@ -108,6 +118,7 @@ pub struct ActiveVideoTrack {
 
 #[cfg(target_os = "windows")]
 struct VideoTrackRequest {
+    query_id: u64,
     entry: i64,
     tx: Sender<Option<ActiveVideoTrack>>,
     wake: SyncSender<()>,
@@ -117,12 +128,20 @@ struct VideoTrackRequest {
 #[derive(Default)]
 pub(crate) struct VideoRecovery {
     entry: Option<i64>,
+    next_query_id: u64,
     pending: Option<VideoTrackRequest>,
 }
 
 #[cfg(target_os = "windows")]
 impl VideoRecovery {
-    pub(crate) const QUERY_VID: u64 = 1;
+    fn allocate_query_id(&mut self) -> Result<u64> {
+        let id = self.next_query_id.checked_add(1).ok_or_else(|| Error {
+            code: sys::MPV_ERROR_INVALID_PARAMETER,
+            context: "exhausted video recovery query IDs".into(),
+        })?;
+        self.next_query_id = id;
+        Ok(id)
+    }
 
     pub(crate) fn on_event(&mut self, event: &Event) {
         match *event {
@@ -134,7 +153,7 @@ impl VideoRecovery {
             }
             Event::QueueOverflow | Event::Shutdown => {
                 self.entry = None;
-                self.reply(None);
+                self.cancel_pending();
             }
             _ => (),
         }
@@ -144,8 +163,25 @@ impl VideoRecovery {
         self.entry = entry;
     }
 
-    pub(crate) fn reply(&mut self, vid: Option<i64>) {
-        if let Some(VideoTrackRequest { entry, tx, wake }) = self.pending.take() {
+    fn cancel_pending(&mut self) {
+        if let Some(VideoTrackRequest { tx, wake, .. }) = self.pending.take() {
+            let _ = tx.send(None);
+            let _ = wake.try_send(());
+        }
+    }
+
+    pub(crate) fn reply(&mut self, query_id: u64, vid: Option<i64>) {
+        if self
+            .pending
+            .as_ref()
+            .is_none_or(|pending| pending.query_id != query_id)
+        {
+            return;
+        }
+        if let Some(VideoTrackRequest {
+            entry, tx, wake, ..
+        }) = self.pending.take()
+        {
             let track = vid
                 .filter(|_| self.entry == Some(entry))
                 .map(|id| ActiveVideoTrack { entry, id });
@@ -153,35 +189,6 @@ impl VideoRecovery {
             let _ = wake.try_send(());
         }
     }
-}
-
-#[cfg(all(test, target_os = "windows"))]
-#[test]
-fn recovery_discards_track_from_replaced_file() {
-    let (wake, woke) = mpsc::sync_channel(1);
-    let (tx, rx) = mpsc::channel();
-    let mut recovery = VideoRecovery {
-        entry: Some(7),
-        pending: Some(VideoTrackRequest { entry: 7, tx, wake }),
-    };
-    recovery.on_event(&Event::StartFile(8));
-    recovery.reply(Some(3));
-    woke.try_recv().expect("video worker notified");
-    assert!(rx.try_recv().expect("query completed").is_none());
-
-    let (wake2, woke2) = mpsc::sync_channel(1);
-    let (tx2, rx2) = mpsc::channel();
-    let mut overflow = VideoRecovery {
-        entry: Some(8),
-        pending: Some(VideoTrackRequest {
-            entry: 8,
-            tx: tx2,
-            wake: wake2,
-        }),
-    };
-    overflow.on_event(&Event::QueueOverflow);
-    woke2.try_recv().expect("overflow unblocks video worker");
-    assert!(rx2.try_recv().expect("overflow completes query").is_none());
 }
 
 type UpdateFn = Box<dyn Fn() + Send + Sync>;
@@ -274,12 +281,12 @@ impl RenderContext {
                 data: &mut advanced as *mut _ as *mut c_void,
             },
             sys::mpv_render_param {
-                type_: 0,
+                type_: sys::MPV_RENDER_PARAM_INVALID,
                 data: ptr::null_mut(),
             },
         ];
         let mut ctx = ptr::null_mut();
-        // SAFETY: `mpv.0` holds a live `mpv_handle`, `params` is zero-terminated,
+        // SAFETY: `mpv.0` holds a live `mpv_handle`, `params` is `MPV_RENDER_PARAM_INVALID`-terminated,
         // and the caller guarantees `device` is a valid multi-thread-safe ID3D11Device.
         check(
             unsafe { sys::mpv_render_context_create(&mut ctx, mpv.0.raw(), params.as_mut_ptr()) },
@@ -314,11 +321,11 @@ impl RenderContext {
                 data: &mut block as *mut _ as *mut c_void,
             },
             sys::mpv_render_param {
-                type_: 0,
+                type_: sys::MPV_RENDER_PARAM_INVALID,
                 data: ptr::null_mut(),
             },
         ];
-        // SAFETY: `self.ctx` is valid, `params` is zero-terminated, and the caller
+        // SAFETY: `self.ctx` is valid, `params` is `MPV_RENDER_PARAM_INVALID`-terminated, and the caller
         // guarantees `texture` is a valid D3D11 render target for the duration of the call.
         check(
             unsafe { sys::mpv_render_context_render(self.ctx, params.as_mut_ptr()) },
@@ -457,5 +464,116 @@ impl Drop for RenderContext {
         if let Some(callback) = self.update.take() {
             unsafe { drop(Box::from_raw(callback.as_ptr())) };
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(target_os = "windows")]
+    use std::sync::{Arc, mpsc};
+
+    #[cfg(target_os = "windows")]
+    use crate::{Event, Mpv, RenderHandle};
+
+    #[cfg(target_os = "windows")]
+    use super::{ActiveVideoTrack, VideoRecovery, VideoTrackRequest};
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn recovery_discards_track_from_replaced_file_and_stale_query_ids() {
+        let (wake, woke) = mpsc::sync_channel(1);
+        let (tx, rx) = mpsc::channel();
+        let mut recovery = VideoRecovery {
+            entry: Some(7),
+            next_query_id: 1,
+            pending: Some(VideoTrackRequest {
+                query_id: 1,
+                entry: 7,
+                tx,
+                wake,
+            }),
+        };
+        recovery.on_event(&Event::StartFile(8));
+        recovery.reply(1, Some(3));
+        woke.try_recv().expect("video worker notified");
+        assert!(rx.try_recv().expect("query completed").is_none());
+
+        let (wake2, woke2) = mpsc::sync_channel(1);
+        let (tx2, rx2) = mpsc::channel();
+        let mut overflow = VideoRecovery {
+            entry: Some(8),
+            next_query_id: 1,
+            pending: Some(VideoTrackRequest {
+                query_id: 1,
+                entry: 8,
+                tx: tx2,
+                wake: wake2,
+            }),
+        };
+        overflow.on_event(&Event::QueueOverflow);
+        woke2.try_recv().expect("overflow unblocks video worker");
+        assert!(rx2.try_recv().expect("overflow completes query").is_none());
+
+        overflow.set_entry(Some(9));
+        let q2 = overflow.allocate_query_id().unwrap();
+        assert_eq!(q2, 2);
+        let (wake3, woke3) = mpsc::sync_channel(1);
+        let (tx3, rx3) = mpsc::channel();
+        overflow.pending = Some(VideoTrackRequest {
+            query_id: q2,
+            entry: 9,
+            tx: tx3,
+            wake: wake3,
+        });
+        overflow.reply(1, Some(4));
+        assert!(woke3.try_recv().is_err());
+        assert!(rx3.try_recv().is_err());
+
+        overflow.reply(2, Some(5));
+        woke3.try_recv().expect("matching query wakes worker");
+        let resolved = rx3
+            .try_recv()
+            .expect("matching query completes")
+            .expect("active entry matches");
+        assert_eq!((resolved.entry, resolved.id), (9, 5));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn request_active_vid_and_restore_vid_report_active_entry_match() {
+        let mut mpv = Mpv::create().unwrap();
+        mpv.set_option("vo", "null").unwrap();
+        mpv.set_option("ao", "null").unwrap();
+        mpv.set_option("idle", "yes").unwrap();
+        mpv.set_option("config", "no").unwrap();
+        mpv.initialize().unwrap();
+        let mpv = Arc::new(mpv);
+        let handle = RenderHandle::new(Arc::clone(&mpv));
+        let (wake, woke) = mpsc::sync_channel(1);
+        assert!(handle.request_active_vid(wake).unwrap().is_none());
+        assert!(woke.try_recv().is_err());
+
+        assert!(
+            !handle
+                .restore_vid(ActiveVideoTrack { entry: 7, id: 1 })
+                .unwrap()
+        );
+        mpv.reseed_video_recovery(Some(7));
+        assert!(
+            !handle
+                .restore_vid(ActiveVideoTrack { entry: 8, id: 1 })
+                .unwrap()
+        );
+        assert!(
+            handle
+                .restore_vid(ActiveVideoTrack { entry: 7, id: 2 })
+                .unwrap()
+        );
+        mpv.reseed_video_recovery(None);
+        assert!(
+            !handle
+                .restore_vid(ActiveVideoTrack { entry: 7, id: 2 })
+                .unwrap()
+        );
     }
 }

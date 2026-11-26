@@ -84,7 +84,9 @@ impl Socket {
         }
         let poll = Poll::new().map_err(|_| ErrorCode::IoError)?;
         let wake = Arc::new(Waker::new(poll.registry(), Token(1)).map_err(|_| ErrorCode::IoError)?);
-        let cancel_wake = duplex::cancellation_wake(&cancel, wake.clone())?;
+        let cancel_wake = cancel
+            .register_shared_wake(wake.clone())
+            .map_err(|_| ErrorCode::Cancelled)?;
         let inner = Arc::new(Inner {
             queue: Mutex::new(Queue {
                 requests: VecDeque::new(),

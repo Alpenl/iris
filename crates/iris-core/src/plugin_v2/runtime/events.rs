@@ -48,7 +48,10 @@ pub(super) fn filter(
             Some(Capability::Annotations)
         }
         HostEvent::OriginGranted { .. } => {
-            if !grants.contains(&Capability::NetHttp) {
+            if !grants.contains(&Capability::NetHttp)
+                && !grants.contains(&Capability::NetWs)
+                && !grants.contains(&Capability::NetTcp)
+            {
                 return Err(ErrorCode::Denied);
             }
             Some(Capability::UiModal)

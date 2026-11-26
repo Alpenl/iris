@@ -1,11 +1,25 @@
 """Install a Windows distribution on a clean runner and verify its shell registrations."""
 
 import argparse
+from importlib.util import module_from_spec, spec_from_file_location
+import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import time
-import winreg
+
+try:
+    import winreg
+except ImportError:
+    winreg = None
+
+sys.dont_write_bytecode = True
+os.environ.setdefault("NoDefaultCurrentDirectoryInExePath", "1")
+
+_pkg_spec = spec_from_file_location("iris_release_package", Path(__file__).resolve().parent / "release/package.py")
+_pkg_mod = module_from_spec(_pkg_spec)
+_pkg_spec.loader.exec_module(_pkg_mod)
 
 
 REGISTRATION = r"Software\RegisteredApplications"
@@ -42,8 +56,12 @@ def residue():
     return keys
 
 
+def find_signtool():
+    return _pkg_mod._windows_signtool()
+
+
 def verify_signed(exe):
-    subprocess.run(["signtool", "verify", "/pa", "/all", str(exe)], check=True, timeout=45)
+    subprocess.run([str(find_signtool()), "verify", "/pa", "/all", str(exe)], check=True, timeout=45)
 
 
 def run_setup(exe, *args):
@@ -51,17 +69,18 @@ def run_setup(exe, *args):
                    check=True, timeout=180)
 
 
-def check(installer, signed):
+def check(installer, signed, wait_timeout=30.0):
     if not installer.is_file():
         raise FileNotFoundError(installer)
     if signed:
         verify_signed(installer)
-    with tempfile.TemporaryDirectory(prefix="iris-installer-") as tmp:
+    with tempfile.TemporaryDirectory(prefix="iris-installer-", ignore_cleanup_errors=True) as tmp:
         dest = Path(tmp) / "Iris"
         exe = dest / "iris.exe"
         command = rf"{CLASSES}\{PROGID}\shell\open\command"
         if residue():
             raise RuntimeError("An Iris installation already exists. Use a clean runner.")
+        primary_error = None
         try:
             run_setup(installer, f"/DIR={dest}", "/NOICONS")
             if not exe.is_file() or not (dest / "unins000.exe").is_file() or not key_exists(UNINSTALL):
@@ -79,16 +98,30 @@ def check(installer, signed):
                     raise RuntimeError(f"Missing application capability for {extension}")
                 if value(key, PROGID) != ("", winreg.REG_SZ):
                     raise RuntimeError(f"Missing Open With registration in {key}")
+        except BaseException as exc:
+            primary_error = exc
+            raise
         finally:
-            uninstaller = dest / "unins000.exe"
-            if uninstaller.is_file():
-                run_setup(uninstaller)
-            deadline = time.monotonic() + 30
-            # Inno delegates to a temporary child. Wait for the complete install tree and registrations.
-            while dest.exists() or residue():
-                if time.monotonic() >= deadline:
-                    raise RuntimeError(f"Uninstall left installation files or registry entries: {dest}, {residue()}")
-                time.sleep(0.1)
+            uninstall_error = None
+            try:
+                uninstaller = dest / "unins000.exe"
+                if uninstaller.is_file():
+                    run_setup(uninstaller)
+            except BaseException as exc:
+                uninstall_error = exc
+            finally:
+                deadline = time.monotonic() + wait_timeout
+                # Inno delegates to a temporary child. Wait for the complete install tree and registrations.
+                while dest.exists() or residue():
+                    if time.monotonic() >= deadline:
+                        if primary_error is None and uninstall_error is None:
+                            raise RuntimeError(
+                                f"Uninstall left installation files or registry entries: {dest}, {residue()}"
+                            )
+                        break
+                    time.sleep(0.1)
+            if primary_error is None and uninstall_error is not None:
+                raise uninstall_error
 
 
 if __name__ == "__main__":

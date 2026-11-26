@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// T is the versioned completed-task result. Hosts serialize only results defined
-/// by the submitted operation; guests may use task_result::TaskResult.
+/// by the submitted operation; guests deserialize typed structs from `task_result`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case", deny_unknown_fields)]
 pub enum HostEvent<T> {
@@ -331,7 +331,10 @@ impl HostCommand {
     pub fn authorized(&self, grants: &BTreeSet<Capability>) -> bool {
         match self {
             Self::RequestOrigin { .. } => {
-                grants.contains(&Capability::UiModal) && grants.contains(&Capability::NetHttp)
+                grants.contains(&Capability::UiModal)
+                    && (grants.contains(&Capability::NetHttp)
+                        || grants.contains(&Capability::NetWs)
+                        || grants.contains(&Capability::NetTcp))
             }
             Self::ResolveStream { .. }
             | Self::SourceError { .. }
@@ -340,13 +343,6 @@ impl HostCommand {
                 grants.contains(&Capability::MediaSource)
                     || grants.contains(&Capability::UrlResolver)
             }
-            _ => self
-                .required_capability()
-                .is_none_or(|cap| grants.contains(&cap)),
-        }
-    }
-    pub fn required_capability(&self) -> Option<Capability> {
-        Some(match self {
             Self::TogglePlayback
             | Self::SeekRelative { .. }
             | Self::SeekAbsolute { .. }
@@ -357,33 +353,31 @@ impl HostCommand {
             | Self::OpenPrevious
             | Self::ToggleFavorite
             | Self::SetAbLoop { .. }
-            | Self::ClearAbLoop => Capability::ControlPlayback,
-            Self::ShowToast { .. } => Capability::Notifications,
-            Self::SetSidebar { .. } => Capability::UiSidebar,
-            Self::SetStatus { .. } => Capability::UiStatus,
+            | Self::ClearAbLoop => grants.contains(&Capability::ControlPlayback),
+            Self::ShowToast { .. } => grants.contains(&Capability::Notifications),
+            Self::SetSidebar { .. } => grants.contains(&Capability::UiSidebar),
+            Self::SetStatus { .. } => grants.contains(&Capability::UiStatus),
             Self::SetOverlay { .. }
             | Self::SetTimedOverlay { .. }
             | Self::AppendTimedCues { .. }
-            | Self::ClearTimedOverlay { .. } => Capability::UiOverlay,
-            Self::SetToolbar { .. } => Capability::UiToolbar,
-            Self::OpenModal { .. } | Self::CloseModal { .. } | Self::RequestOrigin { .. } => {
-                Capability::UiModal
+            | Self::ClearTimedOverlay { .. } => grants.contains(&Capability::UiOverlay),
+            Self::SetToolbar { .. } => grants.contains(&Capability::UiToolbar),
+            Self::OpenModal { .. } | Self::CloseModal { .. } => {
+                grants.contains(&Capability::UiModal)
             }
-            Self::SetTheme { .. } => Capability::UiTheme,
+            Self::SetTheme { .. } => grants.contains(&Capability::UiTheme),
             Self::SetSources { .. }
             | Self::RefreshSource { .. }
-            | Self::ProvideSourcePage { .. }
-            | Self::ResolveStream { .. }
-            | Self::SourceError { .. }
-            | Self::UpdateStreamContext { .. }
-            | Self::UpdateManifest { .. } => Capability::MediaSource,
+            | Self::ProvideSourcePage { .. } => grants.contains(&Capability::MediaSource),
             Self::AttachSubtitle { .. }
             | Self::AttachAudioTrack { .. }
             | Self::SetMonitorLut { .. }
-            | Self::SetTimelineMeta { .. } => Capability::MediaEnhance,
-            Self::EditAnnotation { .. } | Self::ReadAnnotation { .. } => Capability::Annotations,
-            Self::Log { .. } => return None,
-        })
+            | Self::SetTimelineMeta { .. } => grants.contains(&Capability::MediaEnhance),
+            Self::EditAnnotation { .. } | Self::ReadAnnotation { .. } => {
+                grants.contains(&Capability::Annotations)
+            }
+            Self::Log { .. } => true,
+        }
     }
 
     /// The host transfers only explicitly named Blob capabilities out of the
@@ -416,5 +410,42 @@ impl HostCommand {
             _ => {}
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::HostCommand;
+    use crate::v2::{Capability, Id, stream::ManifestFormat};
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn host_command_authorization_handles_ws_origin_and_url_resolver() {
+        let req_origin = HostCommand::RequestOrigin {
+            request_id: Id(1),
+            origin: "wss://stream.example".into(),
+        };
+        assert!(!req_origin.authorized(&BTreeSet::from([Capability::UiModal])));
+        assert!(!req_origin.authorized(&BTreeSet::from([Capability::NetWs])));
+        assert!(!req_origin.authorized(&BTreeSet::from([Capability::NetTcp])));
+        assert!(req_origin.authorized(&BTreeSet::from([Capability::UiModal, Capability::NetHttp])));
+        assert!(req_origin.authorized(&BTreeSet::from([Capability::UiModal, Capability::NetWs])));
+        assert!(req_origin.authorized(&BTreeSet::from([Capability::UiModal, Capability::NetTcp])));
+
+        let err_cmd = HostCommand::SourceError {
+            request_id: Id(2),
+            message: "failed".into(),
+        };
+        assert!(err_cmd.authorized(&BTreeSet::from([Capability::MediaSource])));
+        assert!(err_cmd.authorized(&BTreeSet::from([Capability::UrlResolver])));
+        assert!(!err_cmd.authorized(&BTreeSet::from([Capability::UiModal])));
+
+        let manifest_cmd = HostCommand::UpdateManifest {
+            session: Id(1),
+            expected_revision: Id(1),
+            format: ManifestFormat::VirtualHls,
+            document: Id(2),
+        };
+        assert!(manifest_cmd.authorized(&BTreeSet::from([Capability::UrlResolver])));
     }
 }

@@ -205,31 +205,9 @@ fn toast(message: &str) -> HostCommand {
     }
 }
 
-#[cfg(target_arch = "wasm32")]
-mod wasm {
-    use super::*;
-    use iris_plugin_sdk::api::v2::{GuestError, Reply};
-    std::thread_local! { static PLUGIN: std::cell::RefCell<Guides> = std::cell::RefCell::new(Guides::default()); }
-    fn dispatch(value: Value) -> Reply<HostCommand> {
-        let result = iris_plugin_sdk::serde_json::from_value(value)
-            .map_err(|_| ErrorCode::InvalidArgument)
-            .and_then(|event| {
-                PLUGIN.with_borrow_mut(|plugin| {
-                    plugin.event(event, &mut iris_plugin_sdk::client::WasmHost)
-                })
-            });
-        match result {
-            Ok(ok) => Reply::Ok { ok },
-            Err(code) => Reply::Error {
-                error: GuestError {
-                    code: code as i32,
-                    message: format!("{code:?}"),
-                },
-            },
-        }
-    }
-    iris_plugin_sdk::export_plugin!(dispatch);
-}
+iris_plugin_sdk::export_typed_plugin!(Guides, |plugin, event| {
+    plugin.event(event, &mut iris_plugin_sdk::client::WasmHost)
+});
 
 #[cfg(test)]
 mod tests;

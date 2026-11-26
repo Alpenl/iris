@@ -5,7 +5,7 @@ use super::{
 };
 use crate::{
     media_uri::MediaUri,
-    store::{self, AnnotationError, Store},
+    store::{self, AnnotationError},
 };
 use iris_api::v2::{
     Capability, ErrorCode, Id,
@@ -215,53 +215,6 @@ impl SelectionGrants {
         self.get(owner, instance, generation, id)?;
         Ok(SelectionPermit(self.values[&id].clone()))
     }
-    #[allow(clippy::too_many_arguments)]
-    pub fn edit(
-        &self,
-        owner: &str,
-        instance: Id,
-        generation: Id,
-        id: Id,
-        edit: &AnnotationEdit,
-        store: &mut Store,
-    ) -> Result<(), ErrorCode> {
-        let selected = self.get(owner, instance, generation, id)?;
-        // Store operations are bounded but may clone persisted state. The host
-        // must dispatch this work away from Store callbacks and UI render paths.
-        let _scratch = self
-            .ledger
-            .reserve(owner, &[(Resource::HostBytes, 64 << 20)])?;
-        store
-            .edit_annotations(&selected.uris, &edit_to_store(edit))
-            .map_err(annotation_error_code)
-    }
-    pub fn snapshot(
-        &self,
-        owner: &str,
-        instance: Id,
-        generation: Id,
-        id: Id,
-        store: &Store,
-    ) -> Result<std::sync::Arc<super::instance::Blob>, ErrorCode> {
-        let selected = self.get(owner, instance, generation, id)?;
-        // Serialize borrowed records under a bounded scratch lease. Returned
-        // bytes retain their own reservation, including while delivery is queued.
-        let _scratch = self
-            .ledger
-            .reserve(owner, &[(Resource::HostBytes, 4 << 20)])?;
-        let empty = crate::store::Annotations::default();
-        let values: Vec<_> = selected
-            .uris
-            .iter()
-            .map(|uri| store.annotations(uri).unwrap_or(&empty))
-            .collect();
-        let bytes = crate::plugin_v2::json::encode(&values, iris_api::v2::CHUNK_LIMIT)?;
-        Ok(std::sync::Arc::new(super::instance::Blob::new(
-            &self.ledger,
-            owner,
-            bytes,
-        )?))
-    }
     pub fn revoke(&mut self) {
         for value in self.values.values() {
             value.cancel.cancel();
@@ -292,45 +245,31 @@ mod tests {
             entry_id: "one".into(),
         };
         let id = scope.approve(Id(3), Id(1), vec![uri.clone()]).unwrap();
-        let mut store = Store::default();
-        let edit = AnnotationEdit::Rating { rating: 4 };
-        assert_eq!(
-            scope.edit("b", Id(3), Id(1), id, &edit, &mut store),
+        assert!(matches!(
+            scope.permit("b", Id(3), Id(1), id),
             Err(ErrorCode::Denied)
-        );
-        assert_eq!(
-            scope.edit("a", Id(4), Id(1), id, &edit, &mut store),
+        ));
+        assert!(matches!(
+            scope.permit("a", Id(4), Id(1), id),
             Err(ErrorCode::Denied)
-        );
-        assert_eq!(
-            scope.edit("a", Id(3), Id(2), id, &edit, &mut store),
+        ));
+        assert!(matches!(
+            scope.permit("a", Id(3), Id(2), id),
             Err(ErrorCode::StaleHandle)
-        );
-        assert!(store.annotations(&uri).is_none());
-        scope
-            .edit("a", Id(3), Id(1), id, &edit, &mut store)
-            .unwrap();
-        assert_eq!(store.annotations(&uri).unwrap().rating, 4);
-        let snapshot = scope.snapshot("a", Id(3), Id(1), id, &store).unwrap();
-        let values: Vec<crate::store::Annotations> =
-            serde_json::from_slice(&snapshot.bytes).unwrap();
-        assert_eq!(values[0].rating, 4);
+        ));
         let permit = scope.permit("a", Id(3), Id(1), id).unwrap();
+        assert_eq!(permit.uris().unwrap(), std::slice::from_ref(&uri));
+        assert_eq!(
+            edit_to_store(&AnnotationEdit::Rating { rating: 4 }),
+            store::AnnotationEdit::Rating { rating: 4 }
+        );
         scope.revoke();
         assert_eq!(permit.check(), Err(ErrorCode::StaleHandle));
+        assert!(permit.uris().is_err());
         assert_eq!(ledger.used(None, Resource::Handle), 1);
         drop(permit);
-        assert!(
-            scope
-                .edit("a", Id(3), Id(1), id, &edit, &mut store)
-                .is_err()
-        );
+        assert!(scope.permit("a", Id(3), Id(1), id).is_err());
         assert_eq!(ledger.used(None, Resource::Handle), 0);
-        assert_eq!(
-            ledger.used(None, Resource::HostBytes),
-            snapshot.bytes.len() as u64
-        );
-        drop(snapshot);
         assert_eq!(ledger.used(None, Resource::HostBytes), 0);
     }
 }

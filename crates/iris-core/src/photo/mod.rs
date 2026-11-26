@@ -145,6 +145,19 @@ fn exif_to_source_transform(exif_orientation: u16) -> (Option<Mirror>, u16) {
     }
 }
 
+fn source_transform_to_exif(mirror: Option<Mirror>, rotate_cw: u16) -> u16 {
+    match (mirror, rotate_cw % 360) {
+        (None, 90) => 6,
+        (None, 180) => 3,
+        (None, 270) => 8,
+        (Some(Mirror::Horizontal), 0) | (Some(Mirror::Vertical), 180) => 2,
+        (Some(Mirror::Vertical), 0) | (Some(Mirror::Horizontal), 180) => 4,
+        (Some(Mirror::Vertical), 90) | (Some(Mirror::Horizontal), 270) => 5,
+        (Some(Mirror::Vertical), 270) | (Some(Mirror::Horizontal), 90) => 7,
+        _ => 1,
+    }
+}
+
 fn finish_header(mut h: Header, fmt: PhotoFormat) -> Photo {
     let colour = match h.colour {
         Some(ColourTag::Icc(raw)) => icc::classify_icc(&raw),
@@ -191,8 +204,9 @@ fn run_probe<R: Read + Seek>(r: &mut R, fmt: PhotoFormat) -> Header {
     h
 }
 
-/// Reads EXIF orientation (`1..=8`) from a JPEG, TIFF, WebP, or PNG file header using
-/// magic-byte sniffing first and extension fallback. Returns `1` on unknown/absent.
+/// Reads orientation (`1..=8`, matching EXIF orientation semantics) from a JPEG, TIFF,
+/// WebP, PNG, or HEIF (`irot`/`imir`) file header using magic-byte sniffing first and
+/// extension fallback. Returns `1` on unknown/absent.
 pub fn exif_orientation(path: &Path) -> u16 {
     let Ok(file) = File::open(path) else {
         return 1;
@@ -217,7 +231,10 @@ pub fn exif_orientation(path: &Path) -> u16 {
         PhotoFormat::Tiff => {
             let _ = exif::tiff(&mut r, &mut h, exif::Mode::Orientation);
         }
-        PhotoFormat::Heif => return 1,
+        PhotoFormat::Heif => {
+            let _ = heif::probe(&mut r, &mut h);
+            return source_transform_to_exif(h.mirror, h.rotate_cw);
+        }
     }
     h.exif_orientation.unwrap_or(1)
 }
@@ -247,28 +264,38 @@ pub fn probe_bytes(bytes: &[u8], name_or_ext_hint: Option<&str>) -> Photo {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use std::path::PathBuf;
+    use super::{
+        Colour, Header, Mirror, Photo, containers, exif_orientation, probe, probe_bytes,
+        source_transform_to_exif,
+    };
+    use crate::test_util::TestDir;
+    use std::path::{Path, PathBuf};
+
+    fn media_root() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../test-media/photo")
+    }
 
     fn media(rel: &str) -> Option<PathBuf> {
-        let p = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../test-media/photo")
-            .join(rel);
+        let p = media_root().join(rel);
         p.exists().then_some(p)
     }
 
     #[test]
     fn reads_colour_size_and_heif_rotation_from_test_media() {
-        for (file, want) in [
-            ("icc/red-untagged.png", None),
-            ("icc/red-srgb.png", Some("bt.709")),
-            ("icc/red-p3.png", Some("display-p3")),
-            ("icc/red-adobergb.png", Some("adobe")),
-            ("icc/red-p3-jpeg.jpg", Some("display-p3")),
-            ("icc/red-p3-webp.webp", Some("display-p3")),
-        ] {
-            let Some(p) = media(file) else { continue };
-            assert_eq!(probe(&p).colour.map(|c| c.primaries), want, "{file}");
+        let icc_dir = media_root().join("icc");
+        if icc_dir.is_dir() {
+            for (file, want) in [
+                ("icc/red-untagged.png", None),
+                ("icc/red-srgb.png", Some("bt.709")),
+                ("icc/red-p3.png", Some("display-p3")),
+                ("icc/red-adobergb.png", Some("adobe")),
+                ("icc/red-p3-jpeg.jpg", Some("display-p3")),
+                ("icc/red-p3-webp.webp", Some("display-p3")),
+            ] {
+                let p = media_root().join(file);
+                assert!(p.exists(), "missing canonical ICC fixture {file}");
+                assert_eq!(probe(&p).colour.map(|c| c.primaries), want, "{file}");
+            }
         }
         for (file, size, rotate) in [
             ("exif/exif-o6.jpg", (3000, 2000), 0),
@@ -283,7 +310,41 @@ mod tests {
                 (Some(size), rotate),
                 "{file}"
             );
+            if file == "exif/heic-o6.heic" {
+                assert_eq!(exif_orientation(&p), 6);
+            }
         }
+    }
+
+    #[test]
+    fn heif_irot_and_imir_map_to_exif_orientation() {
+        assert_eq!(source_transform_to_exif(None, 0), 1);
+        assert_eq!(source_transform_to_exif(Some(Mirror::Horizontal), 0), 2);
+        assert_eq!(source_transform_to_exif(None, 180), 3);
+        assert_eq!(source_transform_to_exif(Some(Mirror::Vertical), 0), 4);
+        assert_eq!(source_transform_to_exif(Some(Mirror::Vertical), 90), 5);
+        assert_eq!(source_transform_to_exif(None, 90), 6);
+        assert_eq!(source_transform_to_exif(Some(Mirror::Vertical), 270), 7);
+        assert_eq!(source_transform_to_exif(None, 270), 8);
+
+        // Synthetic minimal HEIF with `ftyp(heic)` + `meta` -> `iprp` -> `ipco` -> `irot(3)` (90° CW).
+        fn atom(kind: &[u8; 4], body: &[u8]) -> Vec<u8> {
+            let mut out = ((body.len() + 8) as u32).to_be_bytes().to_vec();
+            out.extend_from_slice(kind);
+            out.extend_from_slice(body);
+            out
+        }
+        let ipco = atom(b"ipco", &atom(b"irot", &[3]));
+        let iprp = atom(b"iprp", &ipco);
+        let mut meta_body = vec![0, 0, 0, 0];
+        meta_body.extend_from_slice(&iprp);
+        let mut heif = atom(b"ftyp", b"heic\0\0\0\0heic");
+        heif.extend_from_slice(&atom(b"meta", &meta_body));
+
+        let dir = TestDir::new("photo-heif-irot");
+        let file = dir.join("rotated.heic");
+        std::fs::write(&file, &heif).unwrap();
+        assert_eq!(exif_orientation(&file), 6);
     }
 
     #[test]
@@ -344,9 +405,7 @@ mod tests {
 
     #[test]
     fn probe_and_exif_orientation_sniff_magic_bytes_even_with_missing_or_wrong_extension() {
-        let dir = std::env::temp_dir().join(format!("iris-photo-sniff-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = TestDir::new("photo-sniff");
 
         // JPEG with EXIF orientation=6 saved with `.bin` extension.
         let mut tiff_exif = Vec::new();
@@ -422,7 +481,5 @@ mod tests {
             probed_o2.vf_chain(0).as_deref(),
             Some("hflip,format=rotate=0")
         );
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

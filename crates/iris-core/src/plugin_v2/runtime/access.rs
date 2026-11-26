@@ -96,7 +96,7 @@ impl Control {
             owner: self.installed.installation_id.clone(),
             capabilities: self.installed.grants.clone(),
             network: self.network.clone(),
-            files: state.services.files.clone(),
+            files: state.files.clone(),
             resources: self.setup.resources.clone(),
             cancel: state.media.clone(),
             attachments: state.attachments.clone(),

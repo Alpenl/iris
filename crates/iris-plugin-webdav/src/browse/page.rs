@@ -1,6 +1,6 @@
 use super::super::{
     media::Kind,
-    protocol::{self, WebDavConnection, WebDavListResult},
+    protocol::{self, WebDavConnection, WebDavEntry, WebDavFolder, WebDavListResult},
 };
 use iris_plugin_sdk::api::{
     SourceEntryKind,
@@ -54,10 +54,11 @@ impl Cache {
         &self,
         request: Id,
         source: &str,
-        path: &str,
+        folder_id: Option<&str>,
         query: Option<&str>,
         cursor: &str,
     ) -> Result<Vec<HostCommand>, ErrorCode> {
+        let path = protocol::normalize_dav_path(folder_id.unwrap_or("/"));
         if source != self.conn.id || path != self.listing.path || query != self.query.as_deref() {
             return Err(ErrorCode::StaleHandle);
         }
@@ -71,40 +72,67 @@ impl Cache {
         if offset == 0 {
             return Err(ErrorCode::InvalidArgument);
         }
-        self.page_at(request, offset)
+        self.page_at(request, folder_id, offset)
     }
-    pub fn first_page(&self, request: Id) -> Result<Vec<HostCommand>, ErrorCode> {
-        self.page_at(request, 0)
+    pub fn first_page(
+        &self,
+        request: Id,
+        folder_id: Option<&str>,
+    ) -> Result<Vec<HostCommand>, ErrorCode> {
+        self.page_at(request, folder_id, 0)
     }
-    fn page_at(&self, request: Id, offset: usize) -> Result<Vec<HostCommand>, ErrorCode> {
+    fn page_at(
+        &self,
+        request: Id,
+        folder_id: Option<&str>,
+        offset: usize,
+    ) -> Result<Vec<HostCommand>, ErrorCode> {
+        enum PageItem<'a> {
+            Folder(&'a WebDavFolder),
+            Entry(&'a WebDavEntry),
+        }
+        impl PageItem<'_> {
+            fn name(&self) -> &str {
+                match self {
+                    Self::Folder(f) => &f.name,
+                    Self::Entry(e) => &e.name,
+                }
+            }
+            fn into_source_entry(self) -> SourceEntry {
+                match self {
+                    Self::Folder(f) => SourceEntry {
+                        id: f.path.clone(),
+                        name: f.name.clone(),
+                        kind: SourceEntryKind::Folder,
+                        size: None,
+                        modified_secs: (f.modified_secs > 0).then_some(Id(f.modified_secs)),
+                        duration: None,
+                        subtitle: None,
+                        variants: Vec::new(),
+                        thumbnail: None,
+                    },
+                    Self::Entry(e) => SourceEntry {
+                        id: e.path.clone(),
+                        name: e.name.clone(),
+                        kind: kind(e.kind),
+                        size: Some(Id(e.size)),
+                        modified_secs: (e.modified_secs > 0).then_some(Id(e.modified_secs)),
+                        duration: None,
+                        subtitle: None,
+                        variants: Vec::new(),
+                        thumbnail: None,
+                    },
+                }
+            }
+        }
         let query = self.query.as_deref().unwrap_or("").trim().to_lowercase();
         let mut items = self
             .listing
             .subfolders
             .iter()
-            .map(|f| SourceEntry {
-                id: f.path.clone(),
-                name: f.name.clone(),
-                kind: SourceEntryKind::Folder,
-                size: None,
-                modified_secs: (f.modified_secs > 0).then_some(Id(f.modified_secs)),
-                duration: None,
-                subtitle: None,
-                variants: Vec::new(),
-                thumbnail: None,
-            })
-            .chain(self.listing.entries.iter().map(|e| SourceEntry {
-                id: e.path.clone(),
-                name: e.name.clone(),
-                kind: kind(e.kind),
-                size: Some(Id(e.size)),
-                modified_secs: (e.modified_secs > 0).then_some(Id(e.modified_secs)),
-                duration: None,
-                subtitle: None,
-                variants: Vec::new(),
-                thumbnail: None,
-            }))
-            .filter(|entry| entry.name.to_lowercase().contains(&query));
+            .map(PageItem::Folder)
+            .chain(self.listing.entries.iter().map(PageItem::Entry))
+            .filter(|item| query.is_empty() || item.name().to_lowercase().contains(&query));
         for _ in 0..offset {
             items.next().ok_or(ErrorCode::StaleHandle)?;
         }
@@ -113,15 +141,20 @@ impl Cache {
         let mut bytes = 0;
         let mut more = false;
         for item in items {
-            let len = serde_json::to_vec(&item)
+            if entries.len() >= 128 {
+                more = true;
+                break;
+            }
+            let entry = item.into_source_entry();
+            let len = serde_json::to_vec(&entry)
                 .map_err(|_| ErrorCode::Internal)?
                 .len();
-            if bytes + len > 40 * 1024 || entries.len() >= 128 {
+            if bytes + len > 40 * 1024 {
                 more = true;
                 break;
             }
             bytes += len + 1;
-            entries.push(item);
+            entries.push(entry);
         }
         if more && entries.is_empty() {
             return Err(ErrorCode::QuotaExceeded);
@@ -129,7 +162,9 @@ impl Cache {
         let next_page = more.then(|| format!("{}:{}", self.serial.0, offset + entries.len()));
         let page = SourcePage {
             source_id: self.conn.id.clone(),
-            folder_id: Some(self.listing.path.clone()),
+            // The host binds replies to the exact requested identity. None and
+            // Some("/") share a DAV path, but remain distinct browse targets.
+            folder_id: folder_id.map(str::to_owned),
             parent_id: self.listing.parent_path.clone(),
             title: if self.listing.path == "/" {
                 self.conn.name.clone()

@@ -116,8 +116,10 @@ mod enabled {
 
     #[cfg(target_os = "macos")]
     mod platform {
-        use super::*;
+        use super::forward;
+        use futures::channel::mpsc::UnboundedSender;
         use std::ffi::OsStr;
+        use std::io;
         use std::os::fd::AsRawFd;
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
         use std::os::unix::net::UnixListener;
@@ -210,9 +212,11 @@ mod enabled {
 
     #[cfg(target_os = "windows")]
     mod platform {
-        use super::*;
+        use super::{MAX_LINE, forward};
+        use futures::channel::mpsc::UnboundedSender;
         use std::ffi::OsStr;
         use std::fs::File;
+        use std::io;
         use std::os::windows::ffi::OsStrExt;
         use std::os::windows::io::AsRawHandle;
         use windows_sys::Win32::Foundation::{
@@ -281,8 +285,9 @@ mod enabled {
 
     #[cfg(test)]
     mod tests {
-        use super::*;
-        use std::io::Cursor;
+        use super::{MAX_LINE, forward};
+        use futures::channel::mpsc::unbounded;
+        use std::io::{self, Cursor};
 
         #[test]
         fn forward_trims_skips_blank_and_drops_incomplete_tail() {

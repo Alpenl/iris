@@ -1,7 +1,12 @@
-use super::event::{EventBus, JsonlFileSink};
+use super::event::EventBus;
+use super::redact::redact_url;
 use super::writer::{RotatingFile, backup_path};
-use super::*;
+use super::{
+    EVENT_SCHEMA_VERSION, EventLevel, TelemetryEvent, TelemetrySink, format_log_line, redact_json,
+    redact_text, should_flush_level, url_host,
+};
 use crate::test_util::TestDir;
+use serde_json::{Value, json};
 use std::sync::{Arc, Mutex};
 
 #[test]
@@ -25,19 +30,16 @@ fn format_log_line_redacts_secrets_and_flushes_on_typed_levels() {
 }
 
 #[test]
-fn rotating_file_preserves_prior_session_and_bounds_backups() {
+fn rotating_file_rotates_on_size_limit_and_bounds_backups() {
     let dir = TestDir::new("log-rotate");
     let path = dir.join("iris.log");
     {
-        let first = RotatingFile::open(path.clone(), 1024, 3, true).unwrap();
-        first.write_bytes(b"session-1-line\n", true).unwrap();
+        let first = RotatingFile::open(path.clone(), 1024, 3).unwrap();
+        first.write_bytes(&vec![b'a'; 1024], true).unwrap();
     }
-    // Reopening with rotate_existing_on_open preserves prior session as iris.1.log.
-    let second = RotatingFile::open(path.clone(), 1024, 3, true).unwrap();
-    assert_eq!(
-        std::fs::read_to_string(backup_path(&path, 1)).unwrap(),
-        "session-1-line\n"
-    );
+    // Reopening a file already at max_bytes rotates it into iris.1.log.
+    let second = RotatingFile::open(path.clone(), 1024, 3).unwrap();
+    assert_eq!(std::fs::read(backup_path(&path, 1)).unwrap().len(), 1024);
     // Write enough chunks to trigger multiple mid-session rotations.
     let block = vec![b'x'; 600];
     for _ in 0..8 {
@@ -75,6 +77,49 @@ fn redaction_strips_user_paths_url_tokens_and_secret_fields() {
     assert!(unix.contains("<USER_HOME>/Movies/clip.mp4"));
     assert!(unix.contains("<USER_HOME>/a.mkv"));
 
+    // R1-H03 regressions: spaces after `=`, quoted values, JSON in text, full-line Cookie/Set-Cookie,
+    // and adjacent home-path / secret after `/Users/<name>/`.
+    assert_eq!(redact_text("token= secret"), "token= <redacted>");
+    assert_eq!(redact_text(r#"token="secret""#), r#"token="<redacted>""#);
+    assert_eq!(redact_text("password='my secret'"), "password='<redacted>'");
+    assert_eq!(
+        redact_text(r#"{"token": "secret", "host": "ok"}"#),
+        r#"{"token": "<redacted>", "host": "ok"}"#
+    );
+    assert_eq!(
+        redact_text(r#"{"cookie": "a=1; b=2", "host": "ok"}"#),
+        r#"{"cookie": "<redacted>", "host": "ok"}"#
+    );
+    assert_eq!(redact_text("Cookie: a=1; b=2"), "Cookie: <redacted>");
+    assert_eq!(
+        redact_text("Set-Cookie: sid=1; HttpOnly\nnext=ok"),
+        "Set-Cookie: <redacted>\nnext=ok"
+    );
+    assert_eq!(
+        redact_text("Authorization: Token ghp_secret_pat_123"),
+        "Authorization: <redacted>"
+    );
+    assert_eq!(
+        redact_text(r#"Authorization: Digest username="alice", response="deadbeef""#),
+        "Authorization: <redacted>"
+    );
+    assert_eq!(
+        redact_text("Authorization: OAuth oauth_token=sec_1, oauth_signature=sec_2"),
+        "Authorization: <redacted>"
+    );
+    assert_eq!(
+        redact_text("Proxy-Authorization: NTLM TlRMTVNTUAABAAA\r\nHost: example.com"),
+        "Proxy-Authorization: <redacted>\r\nHost: example.com"
+    );
+    assert_eq!(
+        redact_text(r"/Users/alice/C:\Users\bob\video.mp4"),
+        r"<USER_HOME>/<USER_HOME>\video.mp4"
+    );
+    assert_eq!(
+        redact_text("/Users/alice/token=secret"),
+        "<USER_HOME>/token=<redacted>"
+    );
+
     let payload = redact_json(json!({
         "host": "upos.bilivideo.com",
         "token": "should-never-appear",
@@ -91,6 +136,85 @@ fn redaction_strips_user_paths_url_tokens_and_secret_fields() {
 }
 
 #[test]
+fn redaction_covers_ipv6_urls_delimited_userinfo_escaped_json_and_hyphen_underscore_keys() {
+    // (a) IPv6 bracketed literals, balanced/unbalanced path delimiters, and Basic Auth userinfo.
+    assert_eq!(
+        redact_text("fetch http://[2001:db8::1]:8080/play?ticket=secret_v6 failed"),
+        "fetch http://[2001:db8::1]:8080/<redacted> failed"
+    );
+    assert_eq!(
+        redact_text("[url=http://[2001:db8::1]:8080/play?ticket=secret_v6]"),
+        "[url=http://[2001:db8::1]:8080/<redacted>]"
+    );
+    assert_eq!(
+        redact_text("(https://cdn.example/Movie_(2026)_[1080p]/it's_ep1.mkv?ticket=secret_path)"),
+        "(https://cdn.example/<redacted>)"
+    );
+    let basic_auth = redact_text(
+        "dav error ('https://admin:pa)ss]w'0rd@nas.example:8443/dav/file.mkv?ticket=sec')",
+    );
+    assert!(!basic_auth.contains("pa)"), "{basic_auth}");
+    assert!(!basic_auth.contains("ss]"), "{basic_auth}");
+    assert!(!basic_auth.contains("w'0rd"), "{basic_auth}");
+    assert!(!basic_auth.contains("ticket=sec"), "{basic_auth}");
+    assert_eq!(
+        basic_auth,
+        "dav error ('https://nas.example:8443/<redacted>')"
+    );
+
+    // (b) Debug-formatted / nested JSON strings with escaped quotes `\"` and inner `\\\"`.
+    let nested = format!(
+        "{:?}",
+        r#"{"token": "secret_123", "quote_secret": "sec\"ret", "host": "ok"}"#
+    );
+    let redacted_nested = redact_text(&nested);
+    assert!(!redacted_nested.contains("secret_123"), "{redacted_nested}");
+    assert!(!redacted_nested.contains("sec\\"), "{redacted_nested}");
+    assert!(
+        redacted_nested.contains(r#"\"host\": \"ok\""#),
+        "{redacted_nested}"
+    );
+    assert_eq!(
+        redacted_nested,
+        r#""{\"token\": \"<redacted>\", \"quote_secret\": \"<redacted>\", \"host\": \"ok\"}""#
+    );
+
+    // (c) & (d) Hyphenated (`x-api-key`) and underscore-containing (`client_secret`, `csrf_token`, `id_token`) keys.
+    assert_eq!(
+        redact_text(r#"{"x-api-key": "k_live_secret", "host": "api.example"}"#),
+        r#"{"x-api-key": "<redacted>", "host": "api.example"}"#
+    );
+    assert_eq!(
+        redact_text("X-Api-Key: k_live_secret\nHost: api.example"),
+        "X-Api-Key: <redacted>\nHost: api.example"
+    );
+    assert_eq!(
+        redact_text("client_secret=cs_999&csrf_token=csrf_888&id_token=eyJ_777&monkey=ok"),
+        "client_secret=<redacted>&csrf_token=<redacted>&id_token=<redacted>&monkey=ok"
+    );
+    let json_obj = redact_json(json!({
+        "X-Api-Key": "k_live_secret",
+        "client_secret": "cs_999",
+        "csrf_token": "csrf_888",
+        "id_token": "eyJ_777",
+        "debug_body": r#"{"x-api-key": "nested_key", "id_token": "nested_jwt"}"#,
+        "host": "api.example"
+    }));
+    let dumped = json_obj.to_string();
+    for secret in [
+        "k_live_secret",
+        "cs_999",
+        "csrf_888",
+        "eyJ_777",
+        "nested_key",
+        "nested_jwt",
+    ] {
+        assert!(!dumped.contains(secret), "leaked {secret}: {dumped}");
+    }
+    assert_eq!(json_obj["host"], "api.example");
+}
+
+#[test]
 fn structured_event_bus_writes_valid_redacted_jsonl_and_notifies_custom_sinks() {
     struct MemorySink(Mutex<Vec<TelemetryEvent>>);
     impl TelemetrySink for MemorySink {
@@ -101,9 +225,9 @@ fn structured_event_bus_writes_valid_redacted_jsonl_and_notifies_custom_sinks() 
 
     let dir = TestDir::new("log-jsonl");
     let events_path = dir.join("events.jsonl");
-    let rotating = Arc::new(RotatingFile::open(events_path.clone(), 4096, 2, false).unwrap());
+    let rotating = Arc::new(RotatingFile::open(events_path.clone(), 4096, 2).unwrap());
     let bus = EventBus::new();
-    bus.register_sink(Arc::new(JsonlFileSink::new(rotating)));
+    bus.set_jsonl_file(rotating);
     let mem = Arc::new(MemorySink(Mutex::new(Vec::new())));
     bus.register_sink(mem.clone());
 
@@ -152,9 +276,9 @@ fn structured_event_bus_writes_valid_redacted_jsonl_and_notifies_custom_sinks() 
 fn concurrent_event_writes_produce_clean_uncorrupted_jsonl() {
     let dir = TestDir::new("log-concurrent");
     let events_path = dir.join("events.jsonl");
-    let rotating = Arc::new(RotatingFile::open(events_path.clone(), 64 * 1024, 2, false).unwrap());
+    let rotating = Arc::new(RotatingFile::open(events_path.clone(), 64 * 1024, 2).unwrap());
     let bus = Arc::new(EventBus::new());
-    bus.register_sink(Arc::new(JsonlFileSink::new(rotating)));
+    bus.set_jsonl_file(rotating);
 
     let handles: Vec<_> = (0..4)
         .map(|t| {

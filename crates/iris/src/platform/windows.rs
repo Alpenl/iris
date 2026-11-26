@@ -157,6 +157,14 @@ fn timeline_ticks(seconds: f64) -> i64 {
     }
 }
 
+fn smtc_playback_rate(speed: f64) -> f64 {
+    if speed.is_finite() && speed > 0. {
+        speed
+    } else {
+        1.0
+    }
+}
+
 impl MediaKeyBridge {
     pub(crate) fn attach(window: &gpui::Window) -> Option<(Self, UnboundedReceiver<MediaKey>)> {
         match Self::for_window(hwnd(window)?) {
@@ -278,7 +286,8 @@ impl MediaKeyBridge {
             MediaPlaybackStatus::Playing
         };
         self.controls.SetPlaybackStatus(status)?;
-        self.controls.SetPlaybackRate(state.speed)?;
+        self.controls
+            .SetPlaybackRate(smtc_playback_rate(state.speed))?;
         let end = TimeSpan {
             Duration: timeline_ticks(state.duration),
         };
@@ -670,8 +679,18 @@ pub(crate) mod pipe {
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_thumbnail_wic, timeline_ticks};
+    use super::{decode_thumbnail_wic, smtc_playback_rate, timeline_ticks};
     use std::path::Path;
+
+    #[test]
+    fn smtc_playback_rate_rejects_non_positive_and_non_finite_speeds() {
+        for invalid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 0.0, -0.5] {
+            assert_eq!(smtc_playback_rate(invalid), 1.0);
+        }
+        assert_eq!(smtc_playback_rate(0.5), 0.5);
+        assert_eq!(smtc_playback_rate(1.25), 1.25);
+        assert_eq!(smtc_playback_rate(2.0), 2.0);
+    }
 
     #[test]
     fn timeline_uses_nonnegative_hundred_nanosecond_ticks() {

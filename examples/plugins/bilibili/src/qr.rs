@@ -72,7 +72,6 @@ pub fn encode_qr_matrix(payload: &str) -> Vec<String> {
     place_data_bits(&mut modules, &is_func, &data, size);
 
     // Choose lowest-penalty mask among all 8 standard masks (Level L = 0b01).
-    let mut best_mask = 0u8;
     let mut best_grid = modules.clone();
     let mut best_score = u32::MAX;
     for mask in 0..8u8 {
@@ -82,11 +81,9 @@ pub fn encode_qr_matrix(payload: &str) -> Vec<String> {
         let score = penalty_score(&candidate, size);
         if score < best_score {
             best_score = score;
-            best_mask = mask;
             best_grid = candidate;
         }
     }
-    let _ = best_mask;
     best_grid
         .into_iter()
         .map(|row| {

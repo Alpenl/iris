@@ -307,8 +307,21 @@ fn overlay_mutual_exclusion_and_escape_priority_never_skip_or_stall() {
     assert_eq!(ov.popover, Some(PopoverKind::Speed));
     ov.open_settings(Some(SettingsTab::Shortcuts));
     assert!(ov.settings_open && ov.popover.is_none());
+    ov.recording_shortcut = Some(("open_file".into(), "Workspace".into()));
+    ov.open_context_menu(ContextMenu {
+        pos: Point::new(px(4.), px(4.)),
+        target: ContextTarget::Viewport,
+    });
+    assert!(ov.context_menu.is_some() && !ov.settings_open && ov.recording_shortcut.is_none());
+    ov.open_dialog(BuiltinDialog::OpenUrl);
+    ov.dialog_error = Some("err".into());
+    ov.open_context_menu(ContextMenu {
+        pos: Point::new(px(6.), px(6.)),
+        target: ContextTarget::Viewport,
+    });
+    assert!(ov.context_menu.is_some() && ov.dialog.is_none() && ov.dialog_error.is_none());
     assert!(ov.toggle_palette());
-    assert!(ov.palette_open && !ov.settings_open);
+    assert!(ov.palette_open && ov.context_menu.is_none());
     ov.open_context_menu(ContextMenu {
         pos: Point::new(px(8.), px(8.)),
         target: ContextTarget::Viewport,
@@ -317,7 +330,8 @@ fn overlay_mutual_exclusion_and_escape_priority_never_skip_or_stall() {
     ov.open_dialog(BuiltinDialog::OpenUrl);
     assert!(ov.dialog.is_some() && ov.context_menu.is_none());
 
-    // Stack all layers simultaneously and peel them one by one via `Esc`.
+    // Stack all layers simultaneously and peel them one by one via `Esc`
+    // in exact reverse Z-Order (Layer 3 modals above Layer 2 overlays).
     ov.dir_popup = DirectoryPopup::Manual;
     ov.info_open = true;
     ov.popover = Some(PopoverKind::More);
@@ -344,9 +358,9 @@ fn overlay_mutual_exclusion_and_escape_priority_never_skip_or_stall() {
     );
     let expected_tail = [
         EscapeStep::CloseBuiltinDialog,
-        EscapeStep::CloseContextMenu,
         EscapeStep::ClosePalette,
         EscapeStep::CloseSettings,
+        EscapeStep::CloseContextMenu,
         EscapeStep::ClosePopover,
         EscapeStep::CloseInfo,
         EscapeStep::CloseDirPopup,
@@ -464,4 +478,274 @@ fn inline_destructive_confirmation_arms_confirms_and_expires() {
     // close_all clears any armed confirmation.
     ov.close_all();
     assert!(!ov.is_confirming("clear-progress", t0 + ttl + Duration::from_secs(1)));
+}
+
+#[test]
+fn plugin_modal_feedback_clears_inline_error_on_non_text_edit() {
+    let mut modal_state = super::plugin_runtime::PluginModalState::default();
+    let buf = TextInputBuffers::default();
+    let modal = sample_plugin_modal();
+    assert!(
+        modal_state
+            .begin_submit(&buf, "iris.webdav", &modal)
+            .is_some()
+    );
+    modal_state.error = Some("验证失败".into());
+    modal_state.clear_feedback();
+    assert!(modal_state.submitting.is_none());
+    assert!(modal_state.error.is_none());
+}
+
+#[test]
+fn gpu_reset_recovery_skips_vid_fallback_when_restore_vid_already_queued() {
+    use iris_core::library::Kind;
+
+    assert!(super::should_recover_after_gpu_reset(
+        4,
+        4,
+        Some(Kind::Photo),
+        true,
+        true
+    ));
+    assert!(!super::should_recover_after_gpu_reset(
+        4,
+        4,
+        Some(Kind::Video),
+        true,
+        true
+    ));
+    assert!(super::should_recover_after_gpu_reset(
+        4,
+        4,
+        Some(Kind::Video),
+        false,
+        true
+    ));
+    assert!(super::should_recover_after_gpu_reset(
+        4,
+        4,
+        Some(Kind::Video),
+        true,
+        false
+    ));
+    assert!(super::should_recover_after_gpu_reset(
+        4,
+        4,
+        Some(Kind::Audio),
+        true,
+        false
+    ));
+    // A new media open (e.g. Notice::Playback open_scoped) advancing load_generation during the
+    // 120ms reset window must never trigger stale GPU-reset recovery on the new stream.
+    for kind in [
+        Some(Kind::Photo),
+        Some(Kind::Video),
+        Some(Kind::Audio),
+        None,
+    ] {
+        assert!(!super::should_recover_after_gpu_reset(
+            4, 5, kind, false, false
+        ));
+    }
+}
+
+#[test]
+fn stream_meta_cleanup_clears_matching_plugin_or_source_and_variants_popover() {
+    use super::state::{ActiveStreamMeta, CatalogState};
+    use iris_api::StreamVariant;
+
+    let sample_meta = || ActiveStreamMeta {
+        plugin_id: Some("plugin.demo".into()),
+        source_id: Some("srv-a".into()),
+        entry_id: Some("ep-1".into()),
+        variants: vec![StreamVariant {
+            id: "1080p".into(),
+            label: "1080P".into(),
+        }],
+        active_variant: Some("1080p".into()),
+    };
+
+    let mut catalog = CatalogState {
+        active_stream_meta: Some(sample_meta()),
+        ..Default::default()
+    };
+    let mut overlays = OverlayState {
+        popover: Some(PopoverKind::Variants),
+        popover_index: Some(0),
+        ..Default::default()
+    };
+
+    // Removing or disabling an unrelated plugin/source leaves active stream variants intact.
+    assert!(!catalog.clear_stream_meta_for(&mut overlays, Some("plugin.other"), None));
+    assert!(!catalog.clear_stream_meta_for(&mut overlays, Some("plugin.demo"), Some("srv-b")));
+    assert!(catalog.active_stream_meta.is_some());
+    assert_eq!(overlays.popover, Some(PopoverKind::Variants));
+
+    // Removing the matching MediaSource clears active_stream_meta and closes PopoverKind::Variants.
+    assert!(catalog.clear_stream_meta_for(&mut overlays, Some("plugin.demo"), Some("srv-a")));
+    assert!(catalog.active_stream_meta.is_none());
+    assert_eq!(overlays.popover, None);
+    assert_eq!(overlays.popover_index, None);
+
+    // Disabling/uninstalling the owning plugin clears active_stream_meta without closing unrelated popovers.
+    catalog.active_stream_meta = Some(sample_meta());
+    overlays.popover = Some(PopoverKind::Speed);
+    assert!(catalog.clear_stream_meta_for(&mut overlays, Some("plugin.demo"), None));
+    assert!(catalog.active_stream_meta.is_none());
+    assert_eq!(overlays.popover, Some(PopoverKind::Speed));
+
+    // Reloading all plugins clears any active_stream_meta and closes PopoverKind::Variants.
+    catalog.active_stream_meta = Some(sample_meta());
+    overlays.popover = Some(PopoverKind::Variants);
+    assert!(catalog.clear_stream_meta_for(&mut overlays, None, None));
+    assert!(catalog.active_stream_meta.is_none());
+    assert_eq!(overlays.popover, None);
+}
+
+#[test]
+fn plugin_playlist_resolution_and_stepping_cover_url_resolver_and_expanded_entries() {
+    use super::plugin_runtime::sources::{find_plugin_playlist_index, resolve_playlist_current};
+    use iris_api::v2::source::PlaylistEntry;
+    use iris_core::media_uri::MediaUri;
+
+    let playlist = vec![
+        PlaylistEntry {
+            source_id: "recommend".into(),
+            entry_id: "ugc:BV1xx:101".into(),
+            title: "P1".into(),
+        },
+        PlaylistEntry {
+            source_id: "recommend".into(),
+            entry_id: "ugc:BV1xx:102".into(),
+            title: "P2".into(),
+        },
+        PlaylistEntry {
+            source_id: "recommend".into(),
+            entry_id: "ugc:BV1xx:103".into(),
+            title: "P3".into(),
+        },
+    ];
+
+    // UrlResolver opening ?p=2 keeps private HttpUrl URI while matching canonical P2 in playlist.
+    let private_uri = MediaUri::HttpUrl("https://plugin.invalid/private".into());
+    let cur_p2 =
+        resolve_playlist_current(&playlist, Some("recommend"), Some("ugc:BV1xx:102"), None);
+    assert_eq!(cur_p2, Some(("recommend".into(), "ugc:BV1xx:102".into())));
+    assert_eq!(
+        find_plugin_playlist_index(
+            &playlist,
+            "community.bilibili",
+            Some("community.bilibili"),
+            cur_p2.as_ref(),
+            Some(&private_uri),
+        ),
+        Some(1)
+    );
+
+    // Parent MediaSource entry ("BV1xx") without canonical playback IDs falls back to P1.
+    let parent_uri = MediaUri::Plugin {
+        plugin_id: "community.bilibili".into(),
+        source_id: "recommend".into(),
+        entry_id: "BV1xx".into(),
+    };
+    let cur_p1 = resolve_playlist_current(&playlist, None, None, Some(("recommend", "BV1xx")));
+    assert_eq!(cur_p1, Some(("recommend".into(), "ugc:BV1xx:101".into())));
+    assert_eq!(
+        find_plugin_playlist_index(
+            &playlist,
+            "community.bilibili",
+            Some("community.bilibili"),
+            cur_p1.as_ref(),
+            Some(&parent_uri),
+        ),
+        Some(0)
+    );
+
+    // Non-plugin local media or unrelated HttpUrl never matches a stale plugin playlist.
+    let local_uri = MediaUri::Local(PathBuf::from("/tmp/movie.mp4"));
+    assert_eq!(
+        find_plugin_playlist_index(
+            &playlist,
+            "community.bilibili",
+            None,
+            cur_p1.as_ref(),
+            Some(&local_uri),
+        ),
+        None
+    );
+    assert_eq!(
+        find_plugin_playlist_index(
+            &playlist,
+            "community.bilibili",
+            None,
+            cur_p2.as_ref(),
+            Some(&private_uri),
+        ),
+        None
+    );
+    assert_eq!(
+        find_plugin_playlist_index(
+            &playlist[..1],
+            "community.bilibili",
+            Some("community.bilibili"),
+            cur_p1.as_ref(),
+            Some(&parent_uri),
+        ),
+        None
+    );
+}
+
+#[test]
+fn remote_search_query_gates_supports_search_and_trims_whitespace() {
+    use super::plugin_runtime::remote_search_query;
+
+    assert_eq!(remote_search_query(false, "anime"), None);
+    assert_eq!(remote_search_query(true, ""), None);
+    assert_eq!(remote_search_query(true, "   \t\n "), None);
+    assert_eq!(
+        remote_search_query(true, "  eva 1080p "),
+        Some("eva 1080p".into())
+    );
+}
+
+#[test]
+fn scoped_release_guards_spurious_error_toasts_and_progress_wipes() {
+    use super::events::{should_record_progress, should_suppress_playback_error_toast};
+
+    assert!(!should_suppress_playback_error_toast(false, false));
+    assert!(should_suppress_playback_error_toast(true, false));
+    assert!(should_suppress_playback_error_toast(false, true));
+    assert!(should_suppress_playback_error_toast(true, true));
+
+    assert!(should_record_progress(true, false));
+    assert!(!should_record_progress(false, false));
+    assert!(!should_record_progress(true, true));
+}
+
+#[test]
+fn stacked_consent_sheets_and_modal_error_clear_do_not_clobber_active_state() {
+    use iris_api::v2::Id;
+    use std::collections::BTreeSet;
+
+    // Stacked Origin (Id(2)) submitting while background Review (Id(1)) completes or is replaced.
+    let mut consent_busy = BTreeSet::new();
+    consent_busy.insert(Id(1));
+    consent_busy.insert(Id(2));
+    consent_busy.remove(&Id(1));
+    assert!(consent_busy.contains(&Id(2)));
+
+    // Unassociated plugin Notice::Error (`request.is_none()`) clears modal submitting state,
+    // while unrelated catalog/origin request errors (`request.is_some()`) leave modal intact.
+    let mut modal_state = super::plugin_runtime::PluginModalState::default();
+    let buf = TextInputBuffers::default();
+    let modal = sample_plugin_modal();
+    assert!(
+        modal_state
+            .begin_submit(&buf, "iris.webdav", &modal)
+            .is_some()
+    );
+    assert!(!modal_state.clear_submitting_for("other.plugin"));
+    assert!(modal_state.is_submitting("iris.webdav", "webdav-auth"));
+    assert!(modal_state.clear_submitting_for("iris.webdav"));
+    assert!(!modal_state.is_submitting("iris.webdav", "webdav-auth"));
 }

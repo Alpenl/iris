@@ -3,7 +3,6 @@
 mod client;
 mod dispatch;
 mod jobs;
-mod offline;
 mod origin;
 mod worker;
 use super::{
@@ -188,7 +187,12 @@ enum Command {
         plugin: String,
         keep_data: bool,
     },
-    Reload,
+    Reload {
+        disabled: Option<BTreeSet<String>>,
+    },
+    SyncDisabled {
+        disabled: BTreeSet<String>,
+    },
     Review {
         window: Id,
         id: Id,
@@ -290,7 +294,8 @@ impl Hub {
         snapshot: Option<PlaybackSnapshot>,
     ) -> Result<(Client, UnboundedReceiver<()>), ErrorCode> {
         if let Some(snapshot) = &snapshot {
-            crate::plugin_v2::json::encode(snapshot, iris_api::v2::MESSAGE_LIMIT - 1024)?;
+            crate::bounded_json::encode(snapshot, iris_api::v2::MESSAGE_LIMIT - 1024)
+                .map_err(super::json_error)?;
         }
         let shared = &self.0.0;
         let id = Control::new_window_id()?;
@@ -330,13 +335,10 @@ impl Hub {
         });
         gate.wake = true;
         shared.changed.notify_one();
-        Ok((
-            Client {
-                hub: self.clone(),
-                inbox,
-            },
-            rx,
-        ))
+        Ok((Client::connected(self.clone(), inbox), rx))
+    }
+    pub(crate) fn sync_disabled(&self, disabled: BTreeSet<String>) -> Result<(), ErrorCode> {
+        self.0.0.enqueue(Command::SyncDisabled { disabled })
     }
     pub fn catalog(&self) -> Arc<Catalog> {
         self.0

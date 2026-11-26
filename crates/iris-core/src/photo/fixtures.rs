@@ -1,6 +1,10 @@
-use super::*;
+use super::{
+    HttpCancel, MAX_BYTES, MAX_RANGE, MAX_REQUESTS, PREFIX, Photo, Sparse, detect_photo_format,
+    finish_header, probe_remote, run_probe,
+};
 use crate::photo::probe_bytes;
-use std::io::{BufRead, BufReader, Write};
+use std::collections::BTreeMap;
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::net::{TcpListener, TcpStream};
 use std::thread;
 

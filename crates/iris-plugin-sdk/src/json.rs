@@ -1,8 +1,34 @@
 //! Validate before decoding: serde_json alone silently accepts duplicate keys.
 use iris_api::v2::{ErrorCode, JSON_DEPTH_LIMIT};
 use serde::de::{self, DeserializeOwned, DeserializeSeed, MapAccess, SeqAccess, Visitor};
+use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::fmt;
+
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+struct BorrowedKey<'de>(Cow<'de, str>);
+
+impl<'de> de::Deserialize<'de> for BorrowedKey<'de> {
+    fn deserialize<D: de::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct KeyVisitor;
+        impl<'de> Visitor<'de> for KeyVisitor {
+            type Value = BorrowedKey<'de>;
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("JSON object key")
+            }
+            fn visit_borrowed_str<E: de::Error>(self, v: &'de str) -> Result<Self::Value, E> {
+                Ok(BorrowedKey(Cow::Borrowed(v)))
+            }
+            fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                Ok(BorrowedKey(Cow::Owned(v.to_owned())))
+            }
+            fn visit_string<E: de::Error>(self, v: String) -> Result<Self::Value, E> {
+                Ok(BorrowedKey(Cow::Owned(v)))
+            }
+        }
+        deserializer.deserialize_str(KeyVisitor)
+    }
+}
 
 struct Bounded(usize);
 
@@ -55,7 +81,7 @@ impl<'de> Visitor<'de> for Bounded {
             return Err(de::Error::custom("JSON nesting limit"));
         }
         let mut keys = BTreeSet::new();
-        while let Some(key) = map.next_key::<String>()? {
+        while let Some(key) = map.next_key::<BorrowedKey<'de>>()? {
             if !keys.insert(key) {
                 return Err(de::Error::custom("duplicate key"));
             }
@@ -113,40 +139,19 @@ pub fn encode<T: serde::Serialize>(value: &T, limit: usize) -> Result<Vec<u8>, E
     Ok(writer.bytes)
 }
 
-/// Also rejects fields ignored by nested legacy serde types. Missing defaulted
-/// fields remain legal; arbitrary map keys are preserved by their map schema.
-pub fn decode_exact<T: DeserializeOwned + serde::Serialize>(
-    bytes: &[u8],
-    limit: usize,
-) -> Result<T, ErrorCode> {
-    let wire: serde_json::Value = decode(bytes, limit)?;
-    let value: T = serde_json::from_slice(bytes).map_err(|_| ErrorCode::InvalidArgument)?;
-    let normalized = serde_json::to_value(&value).map_err(|_| ErrorCode::InvalidArgument)?;
-    fn known(input: &serde_json::Value, normalized: &serde_json::Value) -> bool {
-        match (input, normalized) {
-            (serde_json::Value::Object(a), serde_json::Value::Object(b)) => a
-                .iter()
-                .all(|(key, value)| b.get(key).is_some_and(|other| known(value, other))),
-            (serde_json::Value::Array(a), serde_json::Value::Array(b)) => {
-                a.len() == b.len() && a.iter().zip(b).all(|(a, b)| known(a, b))
-            }
-            _ => true,
-        }
-    }
-    if known(&wire, &normalized) {
-        Ok(value)
-    } else {
-        Err(ErrorCode::InvalidArgument)
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use iris_api::v2::Id;
+    use super::{decode, encode};
+    use iris_api::v2::{ErrorCode, HostCommand, Id};
+
     #[test]
     fn rejects_duplicate_nested_keys_and_noncanonical_integers() {
-        for invalid in [r#"{"x":{"a":1,"a":2}}"#, "1e999", "{} {}"] {
+        for invalid in [
+            r#"{"x":{"a":1,"a":2}}"#,
+            r#"{"a":1,"\u0061":2}"#,
+            "1e999",
+            "{} {}",
+        ] {
             assert!(decode::<serde_json::Value>(invalid.as_bytes(), 65536).is_err());
         }
         for invalid in [
@@ -163,6 +168,7 @@ mod tests {
             u64::MAX
         );
     }
+
     #[test]
     fn rejects_excess_depth_and_size_before_decode() {
         let deep = format!("{}0{}", "[".repeat(33), "]".repeat(33));
@@ -172,16 +178,17 @@ mod tests {
             ErrorCode::QuotaExceeded
         );
     }
+
     #[test]
     fn encoding_budget_counts_escaped_bytes() {
         assert_eq!(encode(&"\0\0", 13), Err(ErrorCode::QuotaExceeded));
         assert_eq!(encode(&"\0\0", 14).unwrap(), br#""\u0000\u0000""#);
     }
+
     #[test]
-    fn v2_commands_require_decimal_ids_and_reject_unknown_nested_fields() {
-        use iris_api::v2::HostCommand;
-        let valid=br#"{"command":"provide_source_page","request_id":"18446744073709551615","page":{"source_id":"s","title":"t","entries":[{"id":"e","name":"n","kind":"video","size":"9007199254740993","modified_secs":"0"}]}}"#;
-        let command: HostCommand = decode_exact(valid, 65536).unwrap();
+    fn v2_commands_require_decimal_ids_and_reject_unknown_fields() {
+        let valid = br#"{"command":"provide_source_page","request_id":"18446744073709551615","page":{"source_id":"s","title":"t","entries":[{"id":"e","name":"n","kind":"video","size":"9007199254740993","modified_secs":"0"}]}}"#;
+        let command: HostCommand = decode(valid, 65536).unwrap();
         let wire = encode(&command, 65536).unwrap();
         assert!(
             String::from_utf8(wire)
@@ -191,13 +198,15 @@ mod tests {
         let numeric = String::from_utf8(valid.to_vec())
             .unwrap()
             .replace("\"9007199254740993\"", "9007199254740993");
-        assert!(decode_exact::<HostCommand>(numeric.as_bytes(), 65536).is_err());
+        assert!(decode::<HostCommand>(numeric.as_bytes(), 65536).is_err());
         let unknown =
-            br#"{"command":"set_status","badge":{"id":"i","text":"t","arbitrary_path":"secret"}}"#;
-        assert!(decode_exact::<HostCommand>(unknown, 65536).is_err());
+            br#"{"command":"source_error","request_id":"1","message":"none","extra":"nope"}"#;
+        assert!(decode::<HostCommand>(unknown, 65536).is_err());
+        let unknown_nested_variant = br#"{"command":"provide_source_page","request_id":"1","page":{"source_id":"s","folder_id":null,"parent_id":null,"title":"t","entries":[{"id":"e","name":"n","kind":"video","size":null,"modified_secs":null,"duration":null,"subtitle":null,"variants":[{"id":"v1","label":"1080P","extra":1}],"thumbnail":null}],"next_page":null,"auth_hint":null}}"#;
+        assert!(decode::<HostCommand>(unknown_nested_variant, 65536).is_err());
         let resolver = std::collections::BTreeSet::from([iris_api::v2::Capability::UrlResolver]);
         assert!(!command.authorized(&resolver));
-        let response: HostCommand = decode_exact(
+        let response: HostCommand = decode(
             br#"{"command":"source_error","request_id":"1","message":"none"}"#,
             65536,
         )

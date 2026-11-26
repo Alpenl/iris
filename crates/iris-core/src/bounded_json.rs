@@ -2,6 +2,7 @@
 //! Validates nesting depth, byte size, finite floats, and duplicate keys before decoding.
 
 use serde::de::{self, DeserializeOwned, DeserializeSeed, MapAccess, SeqAccess, Visitor};
+use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::fmt;
 
@@ -23,6 +24,33 @@ impl fmt::Display for BoundedJsonError {
 }
 
 impl std::error::Error for BoundedJsonError {}
+
+/// Borrows unescaped JSON object keys directly from the input slice, avoiding
+/// per-key heap allocations during duplicate-key validation.
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+struct BorrowedKey<'de>(Cow<'de, str>);
+
+impl<'de> de::Deserialize<'de> for BorrowedKey<'de> {
+    fn deserialize<D: de::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct KeyVisitor;
+        impl<'de> Visitor<'de> for KeyVisitor {
+            type Value = BorrowedKey<'de>;
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("JSON object key")
+            }
+            fn visit_borrowed_str<E: de::Error>(self, v: &'de str) -> Result<Self::Value, E> {
+                Ok(BorrowedKey(Cow::Borrowed(v)))
+            }
+            fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                Ok(BorrowedKey(Cow::Owned(v.to_owned())))
+            }
+            fn visit_string<E: de::Error>(self, v: String) -> Result<Self::Value, E> {
+                Ok(BorrowedKey(Cow::Owned(v)))
+            }
+        }
+        deserializer.deserialize_str(KeyVisitor)
+    }
+}
 
 struct Bounded(usize);
 
@@ -75,7 +103,7 @@ impl<'de> Visitor<'de> for Bounded {
             return Err(de::Error::custom("JSON nesting limit"));
         }
         let mut keys = BTreeSet::new();
-        while let Some(key) = map.next_key::<String>()? {
+        while let Some(key) = map.next_key::<BorrowedKey<'de>>()? {
             if !keys.insert(key) {
                 return Err(de::Error::custom("duplicate key"));
             }
@@ -162,12 +190,17 @@ pub fn decode_exact<T: DeserializeOwned + serde::Serialize>(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{BoundedJsonError, decode, encode};
 
     #[test]
     fn rejects_duplicate_keys_depth_and_escaped_overflow() {
         assert_eq!(
             decode::<serde_json::Value>(br#"{"x":{"a":1,"a":2}}"#, 65536),
+            Err(BoundedJsonError::Invalid)
+        );
+        // Escaped duplicate key matches unescaped key via owned Cow fallback.
+        assert_eq!(
+            decode::<serde_json::Value>(br#"{"a":1,"\u0061":2}"#, 65536),
             Err(BoundedJsonError::Invalid)
         );
         let deep = format!("{}0{}", "[".repeat(33), "]".repeat(33));

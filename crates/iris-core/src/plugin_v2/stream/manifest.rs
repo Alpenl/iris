@@ -35,7 +35,8 @@ pub fn compile(
     }
     let mut build = match format {
         ManifestFormat::VirtualHls => {
-            let input: VirtualHls = crate::plugin_v2::json::decode_exact(bytes, INPUT_LIMIT)?;
+            let input: VirtualHls = crate::bounded_json::decode_exact(bytes, INPUT_LIMIT)
+                .map_err(crate::plugin_v2::json_error)?;
             let mut build = Build::new(input.resources.clone(), Profile::Hls, local)?;
             hls::render(input, &mut build)?;
             build
@@ -170,7 +171,7 @@ pub(crate) fn logical(value: &str) -> Result<(), ErrorCode> {
         || value == "."
         || !value
             .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b"_- .".contains(&b) && b != b' ')
+            .all(|b| b.is_ascii_alphanumeric() || b"_-.".contains(&b))
     {
         return Err(ErrorCode::InvalidArgument);
     }

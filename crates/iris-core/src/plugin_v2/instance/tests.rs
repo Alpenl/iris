@@ -24,7 +24,6 @@ fn instance(bytes: &[u8]) -> Instance {
         grants: BTreeSet::new(),
         ledger: Ledger::default(),
         cancel,
-        services: Box::new(NoServices),
     })
     .unwrap()
 }
@@ -142,7 +141,6 @@ fn cache_keeps_active_modules_and_instance_reservation_until_drop() {
         grants: BTreeSet::new(),
         ledger: ledger.clone(),
         cancel: cancel.clone(),
-        services: Box::new(NoServices),
     })
     .unwrap();
     assert!(
@@ -154,7 +152,6 @@ fn cache_keeps_active_modules_and_instance_reservation_until_drop() {
             grants: BTreeSet::new(),
             ledger: ledger.clone(),
             cancel: cancel.clone(),
-            services: Box::new(NoServices),
         })
         .is_err()
     );
@@ -201,4 +198,37 @@ fn output_blob_transfer_is_atomic_and_keeps_its_ledger_lease() {
     drop(output);
     assert_eq!(ledger.used(None, Resource::Handle), 0);
     assert_eq!(ledger.used(None, Resource::HostBytes), 0);
+}
+
+#[test]
+fn wasm_start_cannot_invoke_host_imports_before_ready() {
+    let bad_state = ErrorCode::BadState.as_i64();
+    let bad_state_i32 = ErrorCode::BadState as i32;
+    let bytes = wat::parse_str(format!(
+        r#"(module
+        (import "iris_v2" "host_clock" (func $clock (param i32) (result i64)))
+        (import "iris_v2" "host_random" (func $random (param i32 i32) (result i32)))
+        (import "iris_v2" "host_blob_len" (func $blob_len (param i64) (result i64)))
+        (import "iris_v2" "host_blob_read" (func $blob_read (param i64 i64 i32 i32) (result i64)))
+        (import "iris_v2" "host_close" (func $close (param i64) (result i32)))
+        (import "iris_v2" "host_crypto" (func $crypto (param i32 i32 i32 i32 i32 i32) (result i64)))
+        (memory (export "memory") 1 4)
+        (func $start
+            (if (i64.ne (call $clock (i32.const 0)) (i64.const {bad_state})) (then unreachable))
+            (if (i32.ne (call $random (i32.const 64) (i32.const 8)) (i32.const {bad_state_i32})) (then unreachable))
+            (if (i64.ne (call $blob_len (i64.const 1)) (i64.const {bad_state})) (then unreachable))
+            (if (i64.ne (call $blob_read (i64.const 1) (i64.const 0) (i32.const 64) (i32.const 8)) (i64.const {bad_state})) (then unreachable))
+            (if (i32.ne (call $close (i64.const 1)) (i32.const {bad_state_i32})) (then unreachable))
+            (if (i64.ne (call $crypto (i32.const 64) (i32.const 2) (i32.const 64) (i32.const 0) (i32.const 128) (i32.const 32)) (i64.const {bad_state})) (then unreachable)))
+        (start $start)
+        (func (export "iris_abi_version") (result i32) i32.const 2)
+        (func (export "iris_alloc") (param i32) (result i32) i32.const 1024)
+        (func (export "iris_dealloc") (param i32 i32))
+        (func (export "iris_on_event") (param i32 i32) (result i64)
+            (if (i64.lt_s (call $clock (i32.const 1)) (i64.const 0)) (then unreachable))
+            i64.const 0))"#
+    ))
+    .unwrap();
+    let mut guest = instance(&bytes);
+    assert!(matches!(guest.on_event(b"{}"), Ok(Reply::Ok { ok }) if ok.is_empty()));
 }

@@ -137,45 +137,6 @@ pub enum RemoteSubtitle {
     InlineText(String),
 }
 
-impl RemoteSubtitle {
-    /// Prefetches a remote subtitle (up to 8 MiB) off the UI thread into [`RemoteSubtitle::InlineText`].
-    pub fn prefetch(
-        url: &str,
-        headers: &BTreeMap<String, String>,
-        cancel: &crate::vfs::HttpCancel,
-    ) -> Result<Self> {
-        let url = crate::vfs::validate_stream_url(url)?;
-        let scope = crate::vfs::http_client::NetworkScope::new(url.clone());
-        let text = fetch_subtitle(&url, headers, &url, &scope, cancel)?;
-        Ok(Self::InlineText(text))
-    }
-
-    /// Fetches an attachment within the media's network scope. Its explicit
-    /// credentials belong to its own origin, including after redirects.
-    pub fn prefetch_for_media(
-        media_url: &url::Url,
-        subtitle_url: &url::Url,
-        media_headers: &BTreeMap<String, String>,
-        subtitle_headers: &BTreeMap<String, String>,
-        cancel: &crate::vfs::HttpCancel,
-    ) -> Result<Self> {
-        let media_url = crate::vfs::validate_stream_url(media_url.as_str())?;
-        let subtitle_url = crate::vfs::validate_stream_url(subtitle_url.as_str())?;
-        let scope = crate::vfs::http_client::NetworkScope::new(media_url.clone());
-        let (headers, credentials) = if subtitle_headers.is_empty()
-            && media_url.origin() == subtitle_url.origin()
-            && subtitle_url.username().is_empty()
-            && subtitle_url.password().is_none()
-        {
-            (media_headers, &media_url)
-        } else {
-            (subtitle_headers, &subtitle_url)
-        };
-        let text = fetch_subtitle(&subtitle_url, headers, credentials, &scope, cancel)?;
-        Ok(Self::InlineText(text))
-    }
-}
-
 pub(super) fn fetch_subtitle(
     url: &url::Url,
     headers: &BTreeMap<String, String>,
@@ -247,6 +208,21 @@ pub struct MediaStats {
     pub audio_bitrate: Option<f64>,
     pub photo_colour: Option<&'static str>,
     pub photo_exif: Option<ExifSummary>,
+}
+
+/// Read-only backend diagnostic snapshot exposed for integration verification.
+#[derive(Clone, Debug, Default)]
+pub struct BackendDiagnostics {
+    pub mpv_version: String,
+    pub ffmpeg_version: String,
+    pub access_references: String,
+    pub demuxer: String,
+    pub file_format: String,
+    pub vf: String,
+    pub out_pixel_format: String,
+    pub avsync: Option<f64>,
+    pub track_count: u32,
+    pub paused: bool,
 }
 
 #[derive(Debug)]

@@ -1,5 +1,10 @@
 use super::recent::MAX_RECENT;
-use super::*;
+use super::{MAX_RECORDS, Record, RecordEdit, Records, Store, prune_records, push_hex};
+use crate::fs_util;
+use crate::media_uri::MediaUri;
+use crate::test_util::TestDir;
+use std::collections::BTreeMap;
+use std::path::Path;
 
 fn hex_str(s: &str) -> String {
     let mut out = String::new();
@@ -7,16 +12,9 @@ fn hex_str(s: &str) -> String {
     out
 }
 
-fn test_dir(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("iris-store-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
-}
-
 #[test]
 fn scrub_current_files_even_past_the_recent_limit() {
-    let dir = test_dir("wide-scrub");
+    let dir = TestDir::new("store-wide-scrub");
     let wide = "https://cdn.test/video?ticket=secret"
         .encode_utf16()
         .flat_map(u16::to_le_bytes)
@@ -31,7 +29,7 @@ fn scrub_current_files_even_past_the_recent_limit() {
     recent.push_str(&key);
     std::fs::write(dir.join("recent.tsv"), recent).unwrap();
     std::fs::write(dir.join("records.tsv"), format!("{key}\t1\t10\t20\n")).unwrap();
-    let store = Store::load_from_dir(&dir);
+    let store = Store::load_from_dir(dir.path());
     assert_eq!(store.recent().len(), MAX_RECENT);
     assert!(store.records().is_empty());
     assert!(
@@ -40,13 +38,12 @@ fn scrub_current_files_even_past_the_recent_limit() {
             .contains(&key)
     );
     assert!(std::fs::read(dir.join("records.tsv")).unwrap().is_empty());
-    std::fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]
 fn session_only_links_never_become_records_or_history() {
-    let dir = test_dir("privacy");
-    let mut store = Store::load_from_dir(&dir);
+    let dir = TestDir::new("store-privacy");
+    let mut store = Store::load_from_dir(dir.path());
     for raw in [
         "https://user:password@example.test/clip.mp4",
         "https://bearer@example.test/clip.mp4",
@@ -67,16 +64,15 @@ fn session_only_links_never_become_records_or_history() {
     store.push_recent(&public);
     assert!(store.remember(&public, 40., 120., false));
     assert!(store.toggle_favorite(&public));
-    let reopened = Store::load_from_dir(&dir);
+    let reopened = Store::load_from_dir(dir.path());
     assert_eq!(reopened.recent(), std::slice::from_ref(&public));
     assert_eq!(reopened.resume(&public), 40.);
     assert!(reopened.is_favorite(&public));
-    std::fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]
 fn scrub_existing_files_and_retire_both_legacy_lists_before_clear() {
-    let dir = test_dir("scrub");
+    let dir = TestDir::new("store-scrub");
     let unsafe_keys = [
         hex_str("https://a.test/1?ticket=private"),
         hex_str("https://secret@a.test/2"),
@@ -94,7 +90,7 @@ fn scrub_existing_files_and_retire_both_legacy_lists_before_clear() {
         .unwrap();
         std::fs::write(dir.join(recent), format!("{stable}\n{key}\n")).unwrap();
     }
-    let mut store = Store::load_from_dir(&dir);
+    let mut store = Store::load_from_dir(dir.path());
     assert_eq!(store.records().len(), 1);
     assert_eq!(store.recent(), std::slice::from_ref(&plugin));
     assert!(store.is_favorite(&plugin));
@@ -112,18 +108,17 @@ fn scrub_existing_files_and_retire_both_legacy_lists_before_clear() {
     store.clear_recent();
     assert!(store.remove_favorite(&plugin));
     assert!(store.reset_progress(&plugin));
-    let reopened = Store::load_from_dir(&dir);
+    let reopened = Store::load_from_dir(dir.path());
     assert!(reopened.records().is_empty());
     assert!(reopened.recent().is_empty());
-    std::fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]
 fn failed_flush_retains_edits_and_preserves_previous_data() {
-    let dir = test_dir("retry");
+    let dir = TestDir::new("store-retry");
     let first = MediaUri::parse("first.mkv");
     let second = MediaUri::parse("second.mkv");
-    let mut store = Store::load_from_dir(&dir);
+    let mut store = Store::load_from_dir(dir.path());
     assert!(store.toggle_favorite(&first));
     store.push_recent(&first);
     // Make the existing files unreadable as TSV without permission tricks or sleeps.
@@ -143,20 +138,19 @@ fn failed_flush_retains_edits_and_preserves_previous_data() {
     }
     store.save();
     assert!(!store.is_dirty());
-    let reopened = Store::load_from_dir(&dir);
+    let reopened = Store::load_from_dir(dir.path());
     assert!(reopened.is_favorite(&first));
     assert_eq!(reopened.resume(&second), 45.);
     assert_eq!(reopened.recent(), &[second, first]);
-    std::fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]
 fn stale_instances_merge_fields_and_never_restore_unrelated_deletes() {
-    let dir = test_dir("merge");
+    let dir = TestDir::new("store-merge");
     let x = MediaUri::parse("x.mkv");
     let y = MediaUri::parse("y.mkv");
-    let mut a = Store::load_from_dir(&dir);
-    let mut b = Store::load_from_dir(&dir);
+    let mut a = Store::load_from_dir(dir.path());
+    let mut b = Store::load_from_dir(dir.path());
     assert!(a.remember(&x, 30., 100., false));
     assert!(b.toggle_favorite(&x));
     a.save();
@@ -172,35 +166,31 @@ fn stale_instances_merge_fields_and_never_restore_unrelated_deletes() {
     assert!(b.remove_favorite(&x));
     assert!(a.remember(&y, 50., 100., false));
     a.save();
-    let reopened = Store::load_from_dir(&dir);
+    let reopened = Store::load_from_dir(dir.path());
     assert!(!reopened.records().contains_key(&x.to_uri_string()));
     assert_eq!(reopened.recent(), std::slice::from_ref(&y));
     assert!(reopened.is_favorite(&y));
     assert_eq!(reopened.resume(&y), 50.);
-    std::fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]
 fn progress_pending_before_another_instances_reset_does_not_undo_it() {
-    let dir = test_dir("pending-reset");
+    let dir = TestDir::new("store-pending-reset");
     let x = MediaUri::parse("episode.mkv");
-    let mut first = Store::load_from_dir(&dir);
+    let mut first = Store::load_from_dir(dir.path());
     assert!(first.remember(&x, 30., 100., false));
     first.save();
-    let mut second = Store::load_from_dir(&dir);
+    let mut second = Store::load_from_dir(dir.path());
     assert!(first.remember(&x, 35., 100., false));
     assert!(second.reset_progress(&x));
     first.save();
     assert_eq!(first.resume(&x), 0.);
-    assert!(Store::load_from_dir(&dir).records().is_empty());
-    std::fs::remove_dir_all(dir).unwrap();
+    assert!(Store::load_from_dir(dir.path()).records().is_empty());
 }
 
 #[test]
 fn unified_store_roundtrips_and_migrates_legacy_path_and_webdav_tsvs() {
-    let dir = std::env::temp_dir().join(format!("iris-store-unified-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = TestDir::new("store-unified");
 
     // Seed legacy `records.tsv` (raw local path) + legacy `uri_records.tsv` (`webdav://` URI)
     // + legacy `recent.tsv` + `recent_uris.tsv` + corrupt row.
@@ -230,8 +220,9 @@ fn unified_store_roundtrips_and_migrates_legacy_path_and_webdav_tsvs() {
     )
     .unwrap();
 
-    let mut store = Store::load_from_dir(&dir);
-    assert!(store.is_favorite_path(Path::new(legacy_local)));
+    let mut store = Store::load_from_dir(dir.path());
+    let local_uri = MediaUri::from(Path::new(legacy_local));
+    assert!(store.is_favorite(&local_uri));
     assert_eq!(store.resume_path(Path::new(legacy_local)), 25.0);
 
     let upgraded_webdav = MediaUri::Plugin {
@@ -240,7 +231,7 @@ fn unified_store_roundtrips_and_migrates_legacy_path_and_webdav_tsvs() {
         entry_id: "/Movies/Sci Fi/ep1.mkv".into(),
     };
     assert!(store.is_favorite(&upgraded_webdav));
-    assert_eq!(store.progress_ratio_uri(&upgraded_webdav), Some(0.25));
+    assert_eq!(store.progress_ratio(&upgraded_webdav), Some(0.25));
     assert_eq!(store.recent().len(), 2);
 
     // A synchronous flush acknowledges changes only after the write succeeds.
@@ -256,7 +247,7 @@ fn unified_store_roundtrips_and_migrates_legacy_path_and_webdav_tsvs() {
 
     assert!(!dir.join("uri_records.tsv").exists());
     assert!(!dir.join("recent_uris.tsv").exists());
-    let mut reloaded = Store::load_from_dir(&dir);
+    let mut reloaded = Store::load_from_dir(dir.path());
     assert!(reloaded.is_favorite(&upgraded_webdav));
     assert_eq!(reloaded.resume(&cloud_item), 15.0);
 
@@ -266,8 +257,6 @@ fn unified_store_roundtrips_and_migrates_legacy_path_and_webdav_tsvs() {
     assert!(reloaded.is_favorite(&upgraded_webdav));
     assert_eq!(reloaded.resume(&upgraded_webdav), 0.0);
     assert_eq!(reloaded.resume(&cloud_item), 0.0);
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -298,9 +287,9 @@ fn record_pruning_retains_favorites_and_just_edited_progress() {
 
 #[test]
 fn locked_records_keep_pending_edits_for_the_next_save() {
-    let dir = test_dir("records-lock");
+    let dir = TestDir::new("store-records-lock");
     let clip = MediaUri::parse("new.mp4");
-    let mut store = Store::load_from_dir(&dir);
+    let mut store = Store::load_from_dir(dir.path());
     let lock = fs_util::lock_file(&dir.join("records.lock")).unwrap();
     assert!(store.toggle_favorite(&clip));
     assert!(store.is_dirty());
@@ -308,21 +297,20 @@ fn locked_records_keep_pending_edits_for_the_next_save() {
     drop(lock);
     store.save();
     assert!(!store.is_dirty());
-    assert!(Store::load_from_dir(&dir).is_favorite(&clip));
-    std::fs::remove_dir_all(dir).unwrap();
+    assert!(Store::load_from_dir(dir.path()).is_favorite(&clip));
 }
 
 #[test]
 fn opening_while_locked_loads_history_and_preserves_the_resume_baseline() {
-    let dir = test_dir("startup-lock");
+    let dir = TestDir::new("store-startup-lock");
     let clip = MediaUri::parse("resume.mkv");
-    let mut writer = Store::load_from_dir(&dir);
+    let mut writer = Store::load_from_dir(dir.path());
     assert!(writer.toggle_favorite(&clip));
     assert!(writer.remember(&clip, 30., 100., false));
     writer.push_recent(&clip);
 
     let lock = fs_util::lock_file(&dir.join("records.lock")).unwrap();
-    let mut reader = Store::load_from_dir(&dir);
+    let mut reader = Store::load_from_dir(dir.path());
     assert_eq!(reader.recent(), std::slice::from_ref(&clip));
     assert!(reader.is_favorite(&clip));
     assert_eq!(reader.resume(&clip), 30.);
@@ -330,31 +318,41 @@ fn opening_while_locked_loads_history_and_preserves_the_resume_baseline() {
     drop(lock);
 
     reader.save();
-    assert_eq!(Store::load_from_dir(&dir).resume(&clip), 40.);
-    std::fs::remove_dir_all(dir).unwrap();
+    assert_eq!(Store::load_from_dir(dir.path()).resume(&clip), 40.);
 }
 
 #[cfg(windows)]
 #[test]
 fn windows_legacy_unc_record_migrates_to_local_path_encoding() {
-    let dir = test_dir("legacy-unc");
+    let dir = TestDir::new("store-legacy-unc");
     let raw = hex_str("file://nas/media/clip.mp4");
     let path = dir.join("records.tsv");
     std::fs::write(&path, format!("{raw}\t1\t10\t20\n")).unwrap();
     let expected = MediaUri::from(Path::new(r"\\nas\media\clip.mp4"));
-    let store = Store::load_from_dir(&dir);
+    let store = Store::load_from_dir(dir.path());
     assert!(store.is_favorite(&expected));
     assert!(
         std::fs::read_to_string(path)
             .unwrap()
             .starts_with(&hex_str(&expected.to_uri_string()))
     );
-    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[cfg(windows)]
+#[test]
+fn push_recent_path_strips_windows_verbatim_prefix_for_in_memory_dedup() {
+    let dir = TestDir::new("store-recent-verbatim");
+    let mut store = Store::load_from_dir(dir.path());
+    let ordinary = Path::new(r"C:\Media\clip.mp4");
+    let verbatim = Path::new(r"\\?\C:\Media\clip.mp4");
+    store.push_recent(&MediaUri::from(ordinary));
+    store.push_recent_path(verbatim);
+    assert_eq!(store.recent(), &[MediaUri::from(ordinary)]);
 }
 
 #[test]
 fn recent_titles_persist_sanitize_preserve_and_backfill_legacy_entries() {
-    let dir = test_dir("recent-titles");
+    let dir = TestDir::new("store-recent-titles");
     let bv1 = MediaUri::Plugin {
         plugin_id: "community.bilibili".into(),
         source_id: "recommend".into(),
@@ -377,7 +375,7 @@ fn recent_titles_persist_sanitize_preserve_and_backfill_legacy_entries() {
     )
     .unwrap();
 
-    let mut store = Store::load_from_dir(&dir);
+    let mut store = Store::load_from_dir(dir.path());
     assert_eq!(store.recent(), &[bv1.clone(), bv2.clone()]);
     assert_eq!(store.recent_title(&bv1), None);
     assert_eq!(store.recent_display_name(&bv1), "BV1nqyBzqEgd");
@@ -401,7 +399,7 @@ fn recent_titles_persist_sanitize_preserve_and_backfill_legacy_entries() {
     assert_eq!(store.recent_display_name(&bv1), "第一个测试标题");
 
     // Reloading from disk round-trips both titles cleanly.
-    let mut reopened = Store::load_from_dir(&dir);
+    let mut reopened = Store::load_from_dir(dir.path());
     assert_eq!(reopened.recent(), &[bv1.clone(), bv2.clone()]);
     assert_eq!(reopened.recent_display_name(&bv1), "第一个测试标题");
     assert_eq!(reopened.recent_display_name(&bv2), "【4K】实拍 演示 视频");
@@ -410,5 +408,44 @@ fn recent_titles_persist_sanitize_preserve_and_backfill_legacy_entries() {
     reopened.clear_recent();
     assert!(reopened.recent().is_empty());
     assert_eq!(reopened.recent_title(&bv1), None);
-    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn in_flight_progress_flush_never_resurrects_first_play_progress_after_reset_or_clear() {
+    let dir = TestDir::new("store-flush-reset");
+    let first_play = MediaUri::parse("first-play.mkv");
+    let second_play = MediaUri::parse("second-play.mkv");
+    let mut store = Store::load_from_dir(dir.path());
+
+    // 1. First-time progress prepared for background flush, then reset_progress runs before flush.run().
+    assert!(store.remember(&first_play, 25., 100., false));
+    let flush1 = store.prepare_progress_flush().unwrap();
+    assert!(store.reset_progress(&first_play));
+    let applied1 = flush1.run();
+    assert!(applied1.is_none());
+    store.finish_progress_flush(applied1);
+    assert_eq!(store.resume(&first_play), 0.);
+    assert!(Store::load_from_dir(dir.path()).records().is_empty());
+
+    // 2. First-time progress prepared for background flush, then clear_progress runs before flush.run().
+    assert!(store.remember(&second_play, 40., 120., false));
+    let flush2 = store.prepare_progress_flush().unwrap();
+    assert_eq!(store.clear_progress(), 1);
+    let applied2 = flush2.run();
+    assert!(applied2.is_none());
+    store.finish_progress_flush(applied2);
+    assert_eq!(store.resume(&second_play), 0.);
+    assert!(Store::load_from_dir(dir.path()).records().is_empty());
+
+    // 3. Previously saved progress cleared by another window while background flush is in flight.
+    assert!(store.remember(&first_play, 20., 100., false));
+    store.save();
+    let mut other_window = Store::load_from_dir(dir.path());
+    assert!(store.remember(&first_play, 35., 100., false));
+    let flush3 = store.prepare_progress_flush().unwrap();
+    assert!(other_window.reset_progress(&first_play));
+    let applied3 = flush3.run();
+    assert!(applied3.as_ref().is_some_and(BTreeMap::is_empty));
+    store.finish_progress_flush(applied3);
+    assert!(Store::load_from_dir(dir.path()).records().is_empty());
 }

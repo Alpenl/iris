@@ -156,21 +156,34 @@ impl MediaUri {
             {
                 use std::os::unix::ffi::OsStringExt;
                 let bytes: Vec<u8> = percent_decode_str(enc_local).collect();
-                if !bytes.contains(&0) {
+                if !bytes.is_empty() && !bytes.contains(&0) {
                     return Self::from(PathBuf::from(std::ffi::OsString::from_vec(bytes)));
                 }
             }
             #[cfg(not(unix))]
             if let Ok(decoded) = percent_decode_str(enc_local).decode_utf8()
+                && !decoded.is_empty()
                 && !decoded.contains('\0')
             {
                 return Self::from(PathBuf::from(decoded.into_owned()));
             }
+            return MediaUri::Local(PathBuf::new());
         }
 
-        #[cfg(windows)]
-        if let Some(encoded) = strip_prefix_ci(s, "iris-local-windows:")
-            && let Ok(bytes) = URL_SAFE_NO_PAD.decode(encoded)
+        if let Some(encoded) = strip_prefix_ci(s, "iris-local-windows:") {
+            return Self::parse_iris_local_windows(encoded);
+        }
+
+        if let Some(path) = Self::local_file_uri_path(s) {
+            return Self::from(path);
+        }
+
+        Self::from(PathBuf::from(s))
+    }
+
+    #[cfg(windows)]
+    fn parse_iris_local_windows(encoded: &str) -> Self {
+        if let Ok(bytes) = URL_SAFE_NO_PAD.decode(encoded)
             && !bytes.is_empty()
             && bytes.len().is_multiple_of(2)
         {
@@ -186,12 +199,12 @@ impl MediaUri {
                 return Self::from(PathBuf::from(std::ffi::OsString::from_wide(&units)));
             }
         }
+        MediaUri::Local(PathBuf::new())
+    }
 
-        if let Some(path) = Self::local_file_uri_path(s) {
-            return Self::from(path);
-        }
-
-        Self::from(PathBuf::from(s))
+    #[cfg(not(windows))]
+    fn parse_iris_local_windows(_encoded: &str) -> Self {
+        MediaUri::Local(PathBuf::new())
     }
 
     /// Parses a persisted URI string, upgrading legacy `webdav://` / `iris-webdav://` records
@@ -311,7 +324,8 @@ impl MediaUri {
                     && url.query().is_none()
                     && url.fragment().is_none()
             }),
-            Self::Local(_) | Self::Plugin { .. } => true,
+            Self::Local(path) => !path.as_os_str().is_empty(),
+            Self::Plugin { .. } => true,
         }
     }
 
@@ -451,7 +465,37 @@ fn starts_with_known_scheme(s: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::MediaUri;
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn malformed_iris_local_schemes_do_not_fall_back_to_literal_paths() {
+        for bad in [
+            "iris-local:",
+            "iris-local:foo%00bar",
+            "iris-local-windows:!!!invalid!!!",
+            "iris-local-windows:",
+            "iris-local-windows:AAA",
+        ] {
+            let parsed = MediaUri::parse(bad);
+            assert_eq!(parsed, MediaUri::Local(PathBuf::new()), "{bad}");
+            assert!(!parsed.may_share_identity(), "{bad}");
+            assert_eq!(parsed.to_uri_string(), "", "{bad}");
+        }
+        #[cfg(windows)]
+        {
+            let parsed = MediaUri::parse("iris-local:%ff%fe");
+            assert_eq!(parsed, MediaUri::Local(PathBuf::new()));
+            assert!(!parsed.may_share_identity());
+        }
+        #[cfg(not(windows))]
+        {
+            let parsed = MediaUri::parse("iris-local-windows:QQA");
+            assert_eq!(parsed, MediaUri::Local(PathBuf::new()));
+            assert!(!parsed.may_share_identity());
+            assert_eq!(parsed.to_uri_string(), "");
+        }
+    }
 
     #[test]
     fn three_primitives_roundtrip_and_local_emits_file_uri() {

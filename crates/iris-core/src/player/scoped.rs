@@ -121,6 +121,27 @@ impl Session {
         settings: &Settings,
         resume: f64,
     ) -> Result<()> {
+        self.open_scoped_inner(playback, uri, settings, resume, true)
+    }
+
+    pub(super) fn reopen_scoped_after_gpu_reset(
+        &mut self,
+        playback: Arc<ScopedPlayback>,
+        uri: MediaUri,
+        settings: &Settings,
+        resume: f64,
+    ) -> Result<()> {
+        self.open_scoped_inner(playback, uri, settings, resume, false)
+    }
+
+    fn open_scoped_inner(
+        &mut self,
+        playback: Arc<ScopedPlayback>,
+        uri: MediaUri,
+        settings: &Settings,
+        resume: f64,
+        user_open: bool,
+    ) -> Result<()> {
         ensure!(
             !matches!(uri, MediaUri::Local(_)),
             "plugin media cannot adopt a local identity"
@@ -130,13 +151,22 @@ impl Session {
             &self.source,
             MediaSourceState::PluginScoped { playback: old, .. } if Arc::ptr_eq(old, &playback)
         );
-        if same_stream {
-            playback.stream.advance_seek()?;
-        }
+        let unpause_after_eof = if user_open {
+            if same_stream {
+                playback.stream.advance_seek()?;
+            }
+            self.should_unpause_after_eof()
+        } else {
+            false
+        };
         self.reset_backend_for_load()?;
         self.on_eof.set(settings.on_eof);
         let mut owned = options(playback.profile);
-        if settings.resume_playback && !playback.is_live && resume.is_finite() && resume > 0. {
+        let apply_resume = (!user_open || settings.resume_playback)
+            && !playback.is_live
+            && resume.is_finite()
+            && resume > 0.;
+        if apply_resume {
             owned.push(("start", format!("+{resume:.3}")));
         }
         owned.push(("loop-file", self.loop_value(playback.is_live).into()));
@@ -181,6 +211,9 @@ impl Session {
             is_live,
             None,
         );
+        if unpause_after_eof {
+            self.finish_eof_unpause();
+        }
         crate::logging::event(
             crate::logging::EventLevel::Info,
             "player",
@@ -209,10 +242,9 @@ impl Session {
     }
 
     pub(super) fn discard_scoped(&mut self) {
-        if let MediaSourceState::PluginScoped { playback, .. } =
-            std::mem::replace(&mut self.source, MediaSourceState::Idle)
-        {
+        if let MediaSourceState::PluginScoped { playback, .. } = &self.source {
             playback.stream.stop();
+            self.source = MediaSourceState::Idle;
         }
         self.event_pump.set_scoped(empty_scoped());
     }
@@ -221,25 +253,47 @@ impl Session {
         let MediaSourceState::PluginScoped { pending_tracks, .. } = &mut self.source else {
             return;
         };
-        for track in std::mem::take(pending_tracks) {
+        let tracks = std::mem::take(pending_tracks);
+        if tracks.is_empty() {
+            return;
+        }
+        if restore_attachment_policy(&self.mpv).is_err() {
+            log::error!("could not restore scoped attachment policy");
+            return;
+        }
+        for track in tracks {
             let command = if track.audio { "audio-add" } else { "sub-add" };
-            let flags = if track.default { "select" } else { "auto" };
-            if self
-                .mpv
-                .command_async(&[
-                    command,
-                    &track.url,
-                    flags,
-                    &track.label,
-                    track.lang.as_deref().unwrap_or(""),
-                ])
-                .is_err()
-            {
-                log::warn!("could not attach scoped media track");
+            let flags = if track.default && self.deferred_local_subs.is_empty() {
+                "select"
+            } else {
+                "auto"
+            };
+            match super::next_command_receipt().and_then(|receipt| {
+                self.mpv
+                    .command_with_reply(
+                        receipt,
+                        &[
+                            command,
+                            &track.url,
+                            flags,
+                            &track.label,
+                            track.lang.as_deref().unwrap_or(""),
+                        ],
+                    )
+                    .map(|()| receipt)
+                    .map_err(anyhow::Error::from)
+            }) {
+                Ok(receipt) => {
+                    self.in_flight_scoped_adds.insert(receipt);
+                }
+                Err(_) => {
+                    log::warn!("could not attach scoped media track");
+                }
             }
         }
     }
 }
 
 #[cfg(test)]
+#[path = "scoped/tests/lifecycle.rs"]
 mod tests;

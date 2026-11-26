@@ -48,8 +48,6 @@ pub(super) struct WebDavConnection {
     #[serde(default)]
     pub auth: WebDavAuth,
     #[serde(default)]
-    pub allow_insecure_auth: bool,
-    #[serde(default)]
     pub credential_key: Option<String>,
 }
 
@@ -199,9 +197,6 @@ impl WebDavConnection {
 
     pub(super) fn root_segments(&self) -> Result<(Url, Vec<String>)> {
         let mut base_url = validate_stream_url(&self.endpoint)?;
-        if has_userinfo(&base_url) {
-            bail!("Use the dedicated WebDAV credential fields for this connection");
-        }
         base_url.set_query(None);
         base_url.set_fragment(None);
         let mut segs = href_segments(base_url.path()).context("invalid WebDAV endpoint path")?;

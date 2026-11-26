@@ -83,31 +83,20 @@ fn pages_require_owner_view_generation_and_exact_cursor_without_overwriting_on_r
     assert_eq!(ledger.used(None, Resource::HostBytes), 0);
 }
 #[test]
-fn closing_a_view_cancels_taken_thumbnails_and_keeps_actual_worker_reservations() {
+fn closing_a_view_cancels_in_flight_requests_and_keeps_actual_worker_reservations() {
     let ledger = Ledger::default();
     let mut table = SourceRequests::new(ledger.clone());
     let (view, request) = table.open_view("a", Id(1), target()).unwrap();
     let page = table
-        .accept_page("a", request.id, Id(1), page("media", None))
+        .accept_page("a", request.id, Id(1), page("media", Some("p2")))
         .unwrap();
     drop(request);
-    let thumb = table
-        .issue(
-            "a",
-            Id(1),
-            RequestTarget::Thumbnail {
-                view,
-                entry: "media".into(),
-            },
-        )
-        .unwrap();
-    let worker = table.take("a", thumb.id, Id(1)).unwrap();
-    drop(thumb);
+    let next = table.next_page("a", view, "p2").unwrap();
     let close = table.close_view("a", view).unwrap();
-    assert!(close.contains(&worker.id));
-    assert!(worker.cancel.is_cancelled());
+    assert!(close.contains(&next.id));
+    assert!(next.cancel.is_cancelled());
     assert_eq!(ledger.used(None, Resource::Handle), 1);
-    drop((worker, page));
+    drop((next, page));
     assert_eq!(ledger.used(None, Resource::Handle), 0);
     let (_, old) = table.open_view("a", Id(2), target()).unwrap();
     table.cancel_owner("a");

@@ -1,7 +1,7 @@
 //! Bilibili WBI parameter signing (RFC 1321 MD5 + 64-byte mixin table),
 //! `buvid3` device token formatting, and BV/av/ep/ss/live URL target parsing.
 
-use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
+use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, percent_decode_str, utf8_percent_encode};
 use url::Url;
 
 const MIXIN_KEY_ENC_TAB: [usize; 64] = [
@@ -123,6 +123,41 @@ pub fn mixin_key(img_key: &str, sub_key: &str) -> Option<String> {
 
 pub fn encode_query_component(raw: &str) -> String {
     utf8_percent_encode(raw, WBI_ENCODE_SET).to_string()
+}
+
+pub fn percent_decode_utf8(raw: &str) -> Option<String> {
+    percent_decode_str(raw)
+        .decode_utf8()
+        .ok()
+        .map(|s| s.into_owned())
+}
+
+/// Parses `iris-plugin://community.bilibili/<source>/<entry>` (or `plugin://`),
+/// UTF-8 percent-decoding `<source>` and `<entry>` to match `MediaUri::Plugin`.
+pub fn parse_plugin_uri(uri: &str) -> Option<(String, String)> {
+    let rest =
+        strip_prefix_ci(uri, "iris-plugin://").or_else(|| strip_prefix_ci(uri, "plugin://"))?;
+    let mut parts = rest.splitn(3, '/');
+    let plugin_id = percent_decode_utf8(parts.next()?)?;
+    if plugin_id != "community.bilibili" {
+        return None;
+    }
+    let source_id = percent_decode_utf8(parts.next()?)?;
+    let entry_id = percent_decode_utf8(parts.next()?)?;
+    if source_id.is_empty() || entry_id.is_empty() {
+        return None;
+    }
+    Some((source_id, entry_id))
+}
+
+fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
+    if s.len() >= prefix.len()
+        && s.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
+    {
+        Some(&s[prefix.len()..])
+    } else {
+        None
+    }
 }
 
 pub fn sign_wbi_query(params: &[(&str, String)], mixin: &str, wts_secs: u64) -> String {

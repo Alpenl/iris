@@ -228,12 +228,14 @@ impl IrisWindow {
             } else {
                 DirectoryPopup::Manual
             };
+            self.sync_view_timer(cx);
             self.bump_activity(cx);
             cx.notify();
             return;
         }
         self.settings.directory_open = !self.settings.directory_open;
         self.persist_user_settings();
+        self.sync_view_timer(cx);
         if self.settings.directory_open {
             self.scroll_directory_to_current();
             cx.notify();
@@ -259,6 +261,7 @@ impl IrisWindow {
             self.persist_user_settings();
         }
         self.catalog.sidebar_mode = SidebarMode::Files;
+        self.sync_view_timer(cx);
         self.text_inputs.search_open = !self.text_inputs.search_open;
         if self.text_inputs.search_open {
             self.text_inputs.search_focus.focus(window);
@@ -280,14 +283,16 @@ impl IrisWindow {
             return;
         }
         if let ActiveSource::Plugin(ps) = &self.catalog.active_source {
-            let (pid, sid, fid) = (
+            let (pid, sid, fid, supports_search) = (
                 ps.plugin_id.clone(),
                 ps.source_id.clone(),
                 ps.folder_id.clone(),
+                ps.supports_search,
             );
-            let q = (!self.text_inputs.search_input.is_empty())
-                .then(|| self.text_inputs.search_input.text().trim().to_string())
-                .filter(|s| !s.is_empty());
+            let q = super::plugin_runtime::remote_search_query(
+                supports_search && self.text_inputs.search_open,
+                self.text_inputs.search_input.text(),
+            );
             self.browse_plugin_source(&pid, &sid, fid, None, q, cx);
             return;
         }
@@ -312,9 +317,9 @@ impl IrisWindow {
                 {
                     return;
                 }
-                this.catalog
-                    .local_dir
-                    .set(Some(folder), scan.entries, scan.subfolders);
+                this.catalog.local_dir.folder = Some(folder);
+                this.catalog.local_dir.entries = scan.entries;
+                this.catalog.local_dir.subfolders = scan.subfolders;
                 this.rebuild_directory_rows();
                 this.scroll_directory_to_current();
                 this.ensure_filmstrip_thumbnails(cx);
@@ -407,6 +412,7 @@ impl IrisWindow {
             | EscapeStep::ClosePopover
             | EscapeStep::CloseDirPopup
             | EscapeStep::BlurSidebarForm => {
+                self.sync_view_timer(cx);
                 self.focus.focus(window);
                 self.bump_activity(cx);
                 cx.notify();
@@ -471,17 +477,26 @@ impl IrisWindow {
     }
 
     pub(super) fn rotate_cw(&mut self, _: &RotateCw, _: &mut Window, cx: &mut Context<Self>) {
-        self.active_mut().image.reset();
-        self.command(Command::RotateMedia(90), cx);
-        self.apply_image_view(cx);
-        self.show_osd("顺时针旋转 90°", cx);
+        self.rotate_media(90, "顺时针旋转 90°", cx);
     }
 
     pub(super) fn rotate_ccw(&mut self, _: &RotateCcw, _: &mut Window, cx: &mut Context<Self>) {
+        self.rotate_media(-90, "逆时针旋转 90°", cx);
+    }
+
+    fn rotate_media(&mut self, degrees: i64, label: &'static str, cx: &mut Context<Self>) {
+        if let Err(error) = self
+            .active_mut()
+            .session
+            .execute(Command::RotateMedia(degrees))
+        {
+            log::warn!("rotate media failed: {error:#}");
+            self.show_error_toast(super::strings::errors::player_action_error(&error), cx);
+            return;
+        }
         self.active_mut().image.reset();
-        self.command(Command::RotateMedia(-90), cx);
         self.apply_image_view(cx);
-        self.show_osd("逆时针旋转 90°", cx);
+        self.show_osd(label, cx);
     }
 
     pub(super) fn toggle_hflip(&mut self, _: &ToggleHFlip, _: &mut Window, cx: &mut Context<Self>) {

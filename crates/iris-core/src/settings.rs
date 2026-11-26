@@ -216,7 +216,7 @@ impl Settings {
 
     pub fn load_from(path: &Path) -> Self {
         let mut s = Self::default();
-        let Ok(text) = std::fs::read_to_string(path) else {
+        let Ok(text) = fs_util::retry_sharing_violation(|| std::fs::read_to_string(path)) else {
             return s;
         };
         for line in text.lines() {
@@ -593,7 +593,11 @@ fn parse_bool(v: &str) -> Option<bool> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{
+        DEFAULT_UI_FONT_SCALE, Hwdec, MAX_DIRECTORY_WIDTH, MAX_UI_FONT_SCALE, OnEof, PhotoDefault,
+        Settings, Side, SubLang, VideoWheel,
+    };
+    use crate::library::{SortBy, SortOrder};
 
     #[test]
     fn settings_roundtrip_and_clamps_invalid_values() {

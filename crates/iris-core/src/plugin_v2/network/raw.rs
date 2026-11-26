@@ -57,7 +57,7 @@ pub(crate) enum RawState {
     Closed,
 }
 
-pub(crate) fn validate_headers(headers: &Headers) -> Result<(), ErrorCode> {
+pub(crate) fn validate_headers(headers: &[(String, String)]) -> Result<(), ErrorCode> {
     let mut total = 0usize;
     if headers.len() > 128 {
         return Err(ErrorCode::QuotaExceeded);
@@ -143,6 +143,9 @@ fn begin(
         Some(deadline.min(Instant::now() + Duration::from_secs(30))),
     )
     .map_err(|error| transport_error(error, &grant, &cancel))?;
+    transport
+        .set_body_deadline(Some(deadline))
+        .map_err(|e| io_error(e, &grant, &cancel))?;
     let origin = Origin::of(&request.url)?;
     let host = if origin.host.contains(':') {
         format!("[{}]", origin.host)
@@ -466,5 +469,65 @@ mod tests {
             cross_origin_referer("http://site.example/path?a=1", &http_cdn).as_deref(),
             Some("http://site.example/")
         );
+    }
+
+    #[test]
+    fn raw_open_restores_full_control_deadline_after_30s_connect_cap() {
+        use crate::plugin_v2::{ledger::Ledger, network::NetworkGrant};
+        use iris_api::v2::{Capability, NetworkDeclaration};
+        use std::collections::BTreeSet;
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url_str = format!("http://{}/upload", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (_sock, _) = listener.accept().unwrap();
+        });
+
+        let ledger = Ledger::default();
+        let grant = NetworkGrant::new(
+            "raw-deadline-test".into(),
+            BTreeSet::from([Capability::NetHttp]),
+            NetworkDeclaration::default(),
+            &ledger,
+        )
+        .unwrap();
+        let origin = grant
+            .confirm_origin(
+                &url_str,
+                TransportKind::Http,
+                &["127.0.0.1".parse().unwrap()],
+            )
+            .unwrap();
+        let req_grant = grant
+            .request(&url_str, TransportKind::Http, Some(origin))
+            .unwrap();
+        let state = open(
+            RawRequest {
+                method: "POST".into(),
+                url: Url::parse(&url_str).unwrap(),
+                headers: Vec::new(),
+                follow_redirects: false,
+                timeout: Duration::from_secs(60),
+                cookies: None,
+            },
+            None,
+            true,
+            req_grant,
+            HttpCancel::default(),
+        )
+        .unwrap();
+        let RawState::Upload(upload) = state else {
+            panic!("expected Upload state");
+        };
+        let Transport::Plain(timed) = &upload.connection.transport else {
+            panic!("expected Plain transport");
+        };
+        assert!(
+            timed.remaining_deadline_for_test().unwrap()
+                >= Instant::now() + Duration::from_secs(45),
+            "transport deadline must reflect full 60s request budget rather than 30s connect cap"
+        );
+        server.join().unwrap();
     }
 }

@@ -99,7 +99,7 @@ fn vault_lock(path: &Path) -> Result<std::fs::File> {
 }
 
 fn try_vault_read_lock(path: &Path) -> Result<Option<std::fs::File>> {
-    match fs_util::lock_file_with_timeout(path, VAULT_READ_LOCK_TIMEOUT) {
+    match fs_util::lock_file_shared_with_timeout(path, VAULT_READ_LOCK_TIMEOUT) {
         Ok(file) => Ok(Some(file)),
         Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(None),
         Err(e) => Err(e).context("could not lock credential vault"),
@@ -625,7 +625,14 @@ fn apply_secret_edit(map: &mut ScopedSecrets, scope: &str, key: &str, secret: Op
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    #[cfg(any(debug_assertions, feature = "devtools"))]
+    use super::{
+        CredentialIndex, VaultBackend, VaultError, VaultErrorKind, read_json_map, test_file_lock,
+        test_file_lock_path, try_vault_read_lock,
+    };
+    use super::{CredentialVault, MAX_SECRET_BYTES, MAX_SECRETS_PER_SCOPE, windows_target_name};
+    #[cfg(any(debug_assertions, feature = "devtools"))]
+    use crate::test_util::TestDir;
 
     #[test]
     fn windows_credential_names_distinguish_case_and_scope_boundary() {
@@ -646,8 +653,7 @@ mod tests {
     #[cfg(any(debug_assertions, feature = "devtools"))]
     #[test]
     fn vault_read_and_lock_failures_leave_existing_data_intact() {
-        let dir = std::env::temp_dir().join(format!("iris-vault-lock-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = TestDir::new("vault-lock");
         let path = dir.join("vault.json");
         let vault = CredentialVault {
             backend: VaultBackend::TestFile(path.clone()),
@@ -665,8 +671,24 @@ mod tests {
 
         let previous = br#"{"scope":{"old_key":"saved"}}"#;
         std::fs::write(&path, previous).unwrap();
+
+        // Shared read locks allow concurrent readers without hitting Busy.
+        let shared = try_vault_read_lock(&test_file_lock_path(&path))
+            .unwrap()
+            .expect("shared read lock");
+        assert_eq!(
+            vault.try_get_secret("scope", "old_key").unwrap().as_deref(),
+            Some("saved")
+        );
+        drop(shared);
+
         let lock = test_file_lock(&path).unwrap();
-        // Contended reads still observe the atomic snapshot instead of logging out.
+        // Exclusive writer blocks strict try_get_secret with Busy, while fallback get_secret reads snapshot.
+        let busy_err = vault.try_get_secret("scope", "old_key").unwrap_err();
+        assert_eq!(
+            busy_err.downcast_ref::<VaultError>().map(|e| e.kind),
+            Some(VaultErrorKind::Busy)
+        );
         assert_eq!(
             vault.get_secret("scope", "old_key").as_deref(),
             Some("saved")
@@ -677,7 +699,6 @@ mod tests {
         drop(lock);
         vault.set_secret("scope", "new_key", Some("new")).unwrap();
         assert_eq!(vault.list_scope("scope").len(), 2);
-        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

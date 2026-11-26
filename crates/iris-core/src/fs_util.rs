@@ -47,6 +47,19 @@ pub(crate) fn lock_file(path: &Path) -> io::Result<std::fs::File> {
 }
 
 pub(crate) fn lock_file_with_timeout(path: &Path, timeout: Duration) -> io::Result<std::fs::File> {
+    lock_file_impl(path, timeout, false)
+}
+
+/// Acquires a shared (reader) lock on `path`, allowing concurrent readers while
+/// blocking exclusive writers until all shared locks are released.
+pub(crate) fn lock_file_shared_with_timeout(
+    path: &Path,
+    timeout: Duration,
+) -> io::Result<std::fs::File> {
+    lock_file_impl(path, timeout, true)
+}
+
+fn lock_file_impl(path: &Path, timeout: Duration, shared: bool) -> io::Result<std::fs::File> {
     create_parent(path)?;
     let lock = retry_sharing_violation(|| {
         std::fs::OpenOptions::new()
@@ -58,7 +71,12 @@ pub(crate) fn lock_file_with_timeout(path: &Path, timeout: Duration) -> io::Resu
     })?;
     let deadline = std::time::Instant::now() + timeout;
     loop {
-        match lock.try_lock() {
+        let attempt = if shared {
+            lock.try_lock_shared()
+        } else {
+            lock.try_lock()
+        };
+        match attempt {
             Ok(()) => return Ok(lock),
             Err(std::fs::TryLockError::WouldBlock) => {
                 let now = std::time::Instant::now();
@@ -106,6 +124,10 @@ pub(crate) fn atomic_write(path: &Path, bytes: impl AsRef<[u8]>) -> std::io::Res
 
 /// Atomically writes sensitive `bytes` to `path` with owner-only `0600` permissions
 /// on Unix, with data synchronized before rename and sharing-lock retries on Windows.
+///
+/// Platform note (Windows): Windows does not apply Unix mode bits; the created file
+/// inherits the parent directory's DACL (user-private under `%APPDATA%\Iris`, or the
+/// overridden directory's ACL when `IRIS_SETTINGS` / `IRIS_TEST_VAULT` is configured).
 pub(crate) fn atomic_write_private(path: &Path, bytes: impl AsRef<[u8]>) -> std::io::Result<()> {
     write_impl(path, bytes.as_ref(), true)
 }
@@ -164,7 +186,14 @@ fn write_impl(path: &Path, bytes: &[u8], private: bool) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    #[cfg(windows)]
+    use super::retry_sharing_violation;
+    use super::{
+        atomic_write, atomic_write_private, lock_file_shared_with_timeout, lock_file_with_timeout,
+    };
+    use std::io;
+    use std::path::Path;
+    use std::time::Duration;
 
     #[cfg(windows)]
     #[test]
@@ -182,6 +211,18 @@ mod tests {
             .unwrap();
             assert_eq!(calls, 2);
         }
+    }
+
+    #[test]
+    fn shared_file_locks_allow_concurrent_readers_and_block_writers() {
+        let dir = crate::test_util::TestDir::new("fs-shared-lock");
+        let lock_path = dir.join("vault.lock");
+        let r1 = lock_file_shared_with_timeout(&lock_path, Duration::from_millis(50)).unwrap();
+        let r2 = lock_file_shared_with_timeout(&lock_path, Duration::from_millis(50)).unwrap();
+        let err = lock_file_with_timeout(&lock_path, Duration::from_millis(15)).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+        drop((r1, r2));
+        let _w = lock_file_with_timeout(&lock_path, Duration::from_millis(50)).unwrap();
     }
 
     #[test]

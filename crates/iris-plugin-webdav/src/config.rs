@@ -45,7 +45,20 @@ pub(super) fn decode_servers(raw: Option<&str>) -> Result<Vec<WebDavConnection>,
 pub(super) fn secret_key(conn: &WebDavConnection) -> String {
     conn.credential_key
         .clone()
-        .unwrap_or_else(|| format!("secret.{}", conn.id))
+        .unwrap_or_else(|| legacy_secret_key(&conn.id))
+}
+pub(super) fn legacy_secret_key(id: &str) -> String {
+    let direct = format!("secret.{id}");
+    if is_valid_id(&direct) {
+        return direct;
+    }
+    let mut hi: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut lo: u64 = 0x8422_2325_cbf2_9ce4;
+    for &byte in id.as_bytes() {
+        hi = (hi ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3);
+        lo = (lo.rotate_left(5) ^ u64::from(byte)).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    }
+    format!("secret.h{hi:016x}{lo:016x}")
 }
 fn write_state(servers: &[WebDavConnection], host: &mut impl Host) -> Result<Id, ErrorCode> {
     let raw = serde_json::to_string(servers).map_err(|_| ErrorCode::Internal)?;
@@ -94,7 +107,12 @@ impl WebDav {
         if self.config_owner.is_some() {
             return modal::toast("另一项连接配置正在保存，请稍后重试");
         }
-        let mut validated = match modal::validate_modal_submit(&self.servers, modal, values) {
+        let mut validated = match modal::validate_modal_submit(
+            &self.servers,
+            modal,
+            state.editing.as_deref(),
+            values,
+        ) {
             Ok(value) => value,
             Err(e) => return modal::toast(e),
         };
@@ -105,10 +123,13 @@ impl WebDav {
         if validated.secret.is_some() {
             let mut entropy = [0; 16];
             if let Err(e) = host.random(&mut entropy) {
-                return modal::toast(format!("无法生成凭据版本：{e:?}"));
+                return modal::toast(format!(
+                    "无法生成凭据版本：{}",
+                    iris_plugin_sdk::error_message(e)
+                ));
             }
             let suffix: String = entropy.iter().map(|b| format!("{b:02x}")).collect();
-            let key = format!("cred.{}.{}", validated.conn.id, suffix);
+            let key = format!("cred.{suffix}");
             validated.conn.credential_key = Some(key.clone());
             new_key = Some(key);
         }
@@ -148,7 +169,10 @@ impl WebDav {
                 });
                 Vec::new()
             }
-            Err(e) => modal::toast(format!("配置尚未保存：{e:?}")),
+            Err(e) => modal::toast(format!(
+                "配置尚未保存：{}",
+                iris_plugin_sdk::error_message(e)
+            )),
         }
     }
     pub(super) fn remove_config(
@@ -164,6 +188,14 @@ impl WebDav {
         let Some(conn) = self.servers.iter().find(|c| c.id == source) else {
             return Vec::new();
         };
+        if state.editing.as_deref() == Some(source) {
+            state.editing = None;
+        }
+        for win in self.windows.values_mut() {
+            if win.editing.as_deref() == Some(source) {
+                win.editing = None;
+            }
+        }
         let old_key = (conn.auth != WebDavAuth::None).then(|| secret_key(conn));
         let servers: Vec<_> = self
             .servers
@@ -184,7 +216,10 @@ impl WebDav {
                 });
                 Vec::new()
             }
-            Err(e) => modal::toast(format!("连接尚未移除：{e:?}")),
+            Err(e) => modal::toast(format!(
+                "连接尚未移除：{}",
+                iris_plugin_sdk::error_message(e)
+            )),
         }
     }
     pub(super) fn config_completed(
@@ -221,7 +256,10 @@ impl WebDav {
                     }
                     Err(e) => {
                         Transaction::cleanup(tx.new_key, host);
-                        return Ok(modal::toast(format!("新配置尚未保存：{e:?}")));
+                        return Ok(modal::toast(format!(
+                            "新配置尚未保存：{}",
+                            iris_plugin_sdk::error_message(e)
+                        )));
                     }
                 }
                 Ok(Vec::new())
@@ -229,14 +267,31 @@ impl WebDav {
             Phase::State => {
                 self.servers = tx.servers;
                 state.cache = None;
-                for state in self.windows.values_mut() {
-                    state.cache = None;
+                if state
+                    .editing
+                    .as_deref()
+                    .is_some_and(|id| !self.servers.iter().any(|c| c.id == id))
+                {
+                    state.editing = None;
+                }
+                for win in self.windows.values_mut() {
+                    win.cache = None;
+                    if win
+                        .editing
+                        .as_deref()
+                        .is_some_and(|id| !self.servers.iter().any(|c| c.id == id))
+                    {
+                        win.editing = None;
+                    }
                 }
                 Transaction::cleanup(tx.old_key, host);
                 let mut commands = vec![HostCommand::SetSources {
                     sources: modal::source_descriptors(&self.servers),
                 }];
                 if let Some(id) = tx.modal {
+                    if id == modal::EDIT_MODAL_ID {
+                        state.editing = None;
+                    }
                     commands.push(HostCommand::CloseModal { id: Some(id) });
                 }
                 commands.extend(modal::toast("WebDAV 配置已保存"));

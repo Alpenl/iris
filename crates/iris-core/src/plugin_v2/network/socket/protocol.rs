@@ -29,7 +29,7 @@ impl Protocol {
         if !ws {
             return Ok(Self::Tcp(wire));
         }
-        raw::validate_headers(&headers.to_vec())?;
+        raw::validate_headers(headers)?;
         let mut request = url
             .as_str()
             .into_client_request()
@@ -125,9 +125,6 @@ impl Protocol {
                         Err(e) if pending(&e) => return Ok(false),
                         Err(e) => return Err(io_error(e)),
                     }
-                }
-                if *offset < bytes.len() {
-                    return Ok(false);
                 }
                 match s.flush() {
                     Ok(()) => Ok(true),

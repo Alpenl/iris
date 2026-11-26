@@ -54,7 +54,7 @@ impl OverlayClock {
     pub fn paused(&self) -> bool {
         self.paused
     }
-    pub fn duration_ms(&self) -> Option<u64> {
+    fn duration_ms(&self) -> Option<u64> {
         self.duration.map(|d| (d * 1000.) as u64)
     }
     pub fn effectively_paused(&self, now: Instant) -> bool {

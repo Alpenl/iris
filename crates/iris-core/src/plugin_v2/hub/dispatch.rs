@@ -41,12 +41,20 @@ impl Worker {
                 let Some(state) = self.windows.get_mut(&window) else {
                     return;
                 };
+                let old_generation = state.generation;
                 state.generation = generation;
                 let mut failed = Vec::new();
                 for (id, plugin) in &mut self.plugins {
                     if plugin.attached.contains(&window)
                         && let Some(control) = &mut plugin.control
                     {
+                        if plugin.failure.is_some() {
+                            if generation.media != old_generation.media {
+                                let _ = control.close_window(window);
+                                plugin.attached.remove(&window);
+                            }
+                            continue;
+                        }
                         match control
                             .advance_window(window, generation)
                             .and_then(|_| control.window_access(window))
@@ -174,13 +182,37 @@ impl Worker {
                     }
                 }
             }
-            Command::Reload => {
-                for plugin in self.plugins.values_mut() {
+            Command::Reload { disabled } => {
+                if let Some(disabled) = disabled {
+                    self.config.disabled = disabled;
+                }
+                for (id, plugin) in &mut self.plugins {
+                    let enabled = !self.config.disabled.contains(id);
+                    plugin.enabled = enabled;
                     plugin.stop();
-                    plugin.restart = plugin.enabled;
+                    plugin.restart = enabled;
+                    if !enabled {
+                        plugin.failure = None;
+                    }
                 }
                 self.rescan = true;
                 self.dirty = true;
+            }
+            Command::SyncDisabled { disabled } => {
+                self.config.disabled = disabled;
+                for (id, plugin) in &mut self.plugins {
+                    let enabled = !self.config.disabled.contains(id);
+                    if plugin.enabled != enabled {
+                        plugin.enabled = enabled;
+                        plugin.restart = enabled;
+                        if enabled {
+                            plugin.failure = None;
+                        } else {
+                            plugin.stop();
+                        }
+                        self.dirty = true;
+                    }
+                }
             }
             Command::Review { window, id, path } => {
                 if let Err(error) = self.review(window, id, path) {
@@ -244,6 +276,9 @@ impl Worker {
             state.snapshot = Some(snapshot.clone());
         }
         let plugin = self.plugins.get(plugin).ok_or(ErrorCode::StaleHandle)?;
+        if let Some(error) = plugin.failure {
+            return Err(error);
+        }
         if !plugin.enabled || !plugin.attached.contains(&window) {
             return Err(ErrorCode::Backpressure);
         }
@@ -277,16 +312,21 @@ impl Worker {
         }
         let lease = self.reserve_job_lease()?;
         let review = self.reviews.remove(&id).unwrap().review.unwrap();
+        let is_bundled = review.is_bundled();
+        let bootstrap = self.config.bootstrap.clone();
         let mut installer = self.config.installer.clone();
         let setup = self.config.runtime.clone();
         let result = self.submit_reserved(false, "install", lease, move || Work::Installed {
             window,
             id,
             result: guarded(|| {
-                let (installed, superseded_archived) =
+                let (installed, superseded) =
                     review.approve_with_cleanup(&mut installer, grants, keep)?;
-                if let Some(old_id) = superseded_archived {
+                for old_id in superseded {
                     super::jobs::remove_installation_data(&setup, &old_id);
+                }
+                if is_bundled && let Some(bootstrap) = bootstrap {
+                    bootstrap.migrate_installed(&installed, &setup)?;
                 }
                 Ok(installed)
             }),

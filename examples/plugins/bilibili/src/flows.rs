@@ -1,10 +1,23 @@
 //! Async task completions, HTTP body buffering, WebVTT artifact staging, and danmaku windows.
 
-use super::*;
-use iris_plugin_sdk::api::v2::{
-    task::{CredentialBucket, Task},
-    task_result::{HttpResult, ReadResult, StoreWrite},
+mod account;
+mod resolve;
+
+use crate::{
+    ActiveHttp, BilibiliPlugin, HttpFlow, PendingWbiBrowse, WindowState, auth::WbiKeys, catalog,
+    danmaku, ui,
 };
+use iris_plugin_sdk::{
+    api::v2::{
+        ErrorCode, HostCommand, Id, LogLevel,
+        task::Task,
+        task_result::{HttpResult, ReadResult, StoreWrite},
+    },
+    client::{Host, completed},
+    error_message,
+    serde_json::{self, Value},
+};
+use std::collections::BTreeMap;
 
 const MAX_HTTP_BODY: usize = 8 * 1024 * 1024;
 
@@ -23,6 +36,42 @@ impl BilibiliPlugin {
         host: &mut impl Host,
         now_secs: u64,
     ) -> Vec<HostCommand> {
+        if let Some(cursor) = cursor.as_deref().filter(|c| c.starts_with("local:")) {
+            let target = catalog::PageTarget {
+                account_epoch: self.account_epoch,
+                source: source_id,
+                folder: folder_id,
+                query,
+                filters,
+            };
+            let result = state
+                .browse_page
+                .as_mut()
+                .filter(|cache| {
+                    (!cache.requires_auth() || self.session.is_authenticated())
+                        && cache.matches(&target, cursor)
+                })
+                .ok_or_else(|| "目录分页已失效，请刷新目录".to_owned())
+                .and_then(catalog::PageCache::next);
+            if state
+                .browse_page
+                .as_ref()
+                .is_some_and(|cache| !cache.has_more())
+            {
+                state.browse_page = None;
+            }
+            return match result {
+                Ok(page) => vec![HostCommand::ProvideSourcePage {
+                    request_id,
+                    page: Box::new(page),
+                }],
+                Err(message) => vec![HostCommand::SourceError {
+                    request_id,
+                    message,
+                }],
+            };
+        }
+        state.browse_page = None;
         let plan = match catalog::plan_browse(
             &source_id,
             folder_id.as_deref(),
@@ -35,23 +84,67 @@ impl BilibiliPlugin {
         ) {
             Ok(p) => p,
             Err(message) => {
-                return vec![HostCommand::SourceError {
+                let mut cmds = Vec::new();
+                if now_secs == 0 && self.wbi.mixin().is_some() {
+                    cmds.push(HostCommand::Log {
+                        level: LogLevel::Error,
+                        message: "bilibili: system wall clock unavailable (now_ms == 0); refusing to WBI-sign browse request".into(),
+                    });
+                }
+                cmds.push(HostCommand::SourceError {
                     request_id,
                     message,
-                }];
+                });
+                return cmds;
             }
         };
-        if plan.needs_wbi && !retried_wbi {
-            let _ = self.start_http(
-                state,
-                "GET",
-                "https://api.bilibili.com/x/web-interface/nav".into(),
-                true,
-                None,
-                HttpFlow::Nav { open_modal: false },
-                host,
-            );
+        if plan.needs_wbi || (plan.needs_mid && (!retried_wbi || source_id == "favorites")) {
+            if plan.needs_wbi && now_secs == 0 {
+                return vec![
+                    HostCommand::Log {
+                        level: LogLevel::Error,
+                        message: "bilibili: system wall clock unavailable (now_ms == 0); refusing to WBI-sign browse request".into(),
+                    },
+                    HostCommand::SourceError {
+                        request_id,
+                        message: "系统时钟不可用，无法生成 B站 WBI 签名".into(),
+                    },
+                ];
+            }
+            if retried_wbi {
+                let message = if plan.needs_mid {
+                    "未能获取哔哩哔哩账号 UID，请检查 SESSDATA 是否有效或重新登录"
+                } else {
+                    "获取 B站 WBI 签名密钥失败，请稍后重试"
+                };
+                return vec![HostCommand::SourceError {
+                    request_id,
+                    message: message.into(),
+                }];
+            }
+            if let Err(e) = self.ensure_nav_in_flight(state, host) {
+                return vec![HostCommand::SourceError {
+                    request_id,
+                    message: format!("刷新 B站账号/WBI 状态失败：{}", error_message(e)),
+                }];
+            }
+            if state.pending_wbi_browse.len() < 8 {
+                state.pending_wbi_browse.push(PendingWbiBrowse {
+                    request_id,
+                    source_id,
+                    folder_id,
+                    cursor,
+                    query,
+                    filters,
+                });
+                return Vec::new();
+            }
+            return vec![HostCommand::SourceError {
+                request_id,
+                message: "待重试的 B站 目录请求过多，请稍后重试".into(),
+            }];
         }
+        let used_mixin = self.wbi.mixin();
         if let Err(e) = self.start_http(
             state,
             "GET",
@@ -59,10 +152,12 @@ impl BilibiliPlugin {
             true,
             Some(request_id),
             HttpFlow::Browse {
+                account_epoch: self.account_epoch,
                 request_id,
                 source_id,
                 kind: plan.kind,
                 retried_wbi,
+                used_mixin,
                 query,
                 folder_id,
                 cursor,
@@ -72,13 +167,13 @@ impl BilibiliPlugin {
         ) {
             return vec![HostCommand::SourceError {
                 request_id,
-                message: format!("无法发起目录请求：{e:?}"),
+                message: format!("无法发起目录请求：{}", error_message(e)),
             }];
         }
         Vec::new()
     }
 
-    pub(super) fn persist_prefs(&self, host: &mut impl Host) {
+    pub(crate) fn persist_prefs(&self, host: &mut impl Host) {
         if let Ok(raw) = serde_json::to_string(&self.prefs) {
             let _ = host.submit(&Task::StateWrite {
                 key: "prefs".into(),
@@ -95,32 +190,48 @@ impl BilibiliPlugin {
         host: &mut impl Host,
         now_secs: u64,
     ) -> Result<Vec<HostCommand>, ErrorCode> {
+        if state.logout_secret_op.is_some_and(|(id, _)| id == op) {
+            state.logout_secret_op = None;
+            return Ok(Vec::new());
+        }
+        if state.background_secret_ops.remove(&op) {
+            if state.background_secret_ops.is_empty() {
+                state.background_secret_epoch = None;
+            }
+            return Ok(Vec::new());
+        }
         if state
             .secret_write_op
             .as_ref()
-            .is_some_and(|(id, _, _)| *id == op)
+            .is_some_and(|(id, ..)| *id == op)
         {
-            let (_, next_session, close_modal) = state.secret_write_op.take().unwrap();
+            let (_, account_epoch, next_session, close_modal) =
+                state.secret_write_op.take().unwrap();
+            if account_epoch != self.account_epoch {
+                return Ok(Vec::new());
+            }
             if completed::<StoreWrite>(result).is_ok_and(|w| w.stored) {
-                self.session = next_session;
-                state.qr = None;
-                let _ = self.start_http(
-                    state,
-                    "GET",
-                    "https://api.bilibili.com/x/web-interface/nav".into(),
-                    true,
-                    None,
-                    HttpFlow::Nav { open_modal: false },
-                    host,
-                );
-                let mut cmds = self.sync_ui(state);
+                let mut cmds = self.commit_session(state, next_session, host);
+                let nav_pending_mid = self.session.dede_user_id.is_empty()
+                    && self.ensure_nav_in_flight(state, host).is_ok();
+                if !nav_pending_mid {
+                    let _ = self.ensure_nav_in_flight(state, host);
+                }
+                cmds.extend(self.sync_ui(state));
                 cmds.extend(self.maybe_sync_sources());
                 if close_modal {
                     cmds.push(HostCommand::CloseModal {
                         id: Some("bili.login".into()),
                     });
                 }
-                cmds.extend(ui::refresh_all_sources());
+                for cmd in ui::refresh_all_sources() {
+                    if nav_pending_mid
+                        && matches!(&cmd, HostCommand::RefreshSource { source_id } if matches!(source_id.as_str(), "favorites" | "bangumi"))
+                    {
+                        continue;
+                    }
+                    cmds.push(cmd);
+                }
                 cmds.push(ui::toast("哔哩哔哩登录成功"));
                 return Ok(cmds);
             }
@@ -165,7 +276,7 @@ impl BilibiliPlugin {
                             if matches!(job.flow, HttpFlow::SubtitleBcc { .. }) {
                                 self.pump_next_subtitle(state, host);
                             }
-                            return Ok(self.fail_http_flow(&job.flow, e));
+                            return Ok(self.fail_http_flow(state, &job.flow, e));
                         }
                     }
                 }
@@ -173,13 +284,13 @@ impl BilibiliPlugin {
                     if matches!(job.flow, HttpFlow::SubtitleBcc { .. }) {
                         self.pump_next_subtitle(state, host);
                     }
-                    return Ok(self.fail_http_flow(&job.flow, ErrorCode::BadState));
+                    return Ok(self.fail_http_flow(state, &job.flow, ErrorCode::BadState));
                 }
                 Err(e) => {
                     if matches!(job.flow, HttpFlow::SubtitleBcc { .. }) {
                         self.pump_next_subtitle(state, host);
                     }
-                    return Ok(self.fail_http_flow(&job.flow, e));
+                    return Ok(self.fail_http_flow(state, &job.flow, e));
                 }
             }
         }
@@ -194,7 +305,7 @@ impl BilibiliPlugin {
                     if matches!(job.flow, HttpFlow::SubtitleBcc { .. }) {
                         self.pump_next_subtitle(state, host);
                     }
-                    return Ok(self.fail_http_flow(&job.flow, ErrorCode::QuotaExceeded));
+                    return Ok(self.fail_http_flow(state, &job.flow, ErrorCode::QuotaExceeded));
                 }
                 job.body.extend_from_slice(&chunk);
                 if read.eof {
@@ -218,7 +329,7 @@ impl BilibiliPlugin {
                         if matches!(job.flow, HttpFlow::SubtitleBcc { .. }) {
                             self.pump_next_subtitle(state, host);
                         }
-                        Ok(self.fail_http_flow(&job.flow, e))
+                        Ok(self.fail_http_flow(state, &job.flow, e))
                     }
                 }
             }
@@ -229,14 +340,35 @@ impl BilibiliPlugin {
                 if matches!(job.flow, HttpFlow::SubtitleBcc { .. }) {
                     self.pump_next_subtitle(state, host);
                 }
-                Ok(self.fail_http_flow(&job.flow, e))
+                Ok(self.fail_http_flow(state, &job.flow, e))
             }
         }
     }
 
-    pub(super) fn fail_http_flow(&self, flow: &HttpFlow, code: ErrorCode) -> Vec<HostCommand> {
+    pub(crate) fn fail_http_flow(
+        &self,
+        state: &mut WindowState,
+        flow: &HttpFlow,
+        code: ErrorCode,
+    ) -> Vec<HostCommand> {
         let denied_hint = "（请确认已授予插件网络权限，且代理未对 *.bilibili.com 返回 198.18.0.0/15 或 2001:2::/48 等 Fake-IP）";
         match flow {
+            HttpFlow::Nav { .. } => {
+                let message = format!("刷新 B站 WBI 签名密钥失败 ({})", error_message(code));
+                std::mem::take(&mut state.pending_wbi_browse)
+                    .into_iter()
+                    .map(|item| item.request_id)
+                    .chain(
+                        std::mem::take(&mut state.pending_wbi_playurl)
+                            .into_iter()
+                            .map(|item| item.request_id),
+                    )
+                    .map(|request_id| HostCommand::SourceError {
+                        request_id,
+                        message: message.clone(),
+                    })
+                    .collect()
+            }
             HttpFlow::Browse { request_id, .. }
             | HttpFlow::ShortRedirect { request_id, .. }
             | HttpFlow::ResolveView { request_id, .. }
@@ -245,16 +377,19 @@ impl BilibiliPlugin {
             | HttpFlow::ResolveLivePlay { request_id, .. } => vec![HostCommand::SourceError {
                 request_id: *request_id,
                 message: if code == ErrorCode::Denied {
-                    format!("哔哩哔哩网络请求被拒绝：{code:?}{denied_hint}")
+                    format!(
+                        "哔哩哔哩网络请求被拒绝：{}{denied_hint}",
+                        error_message(code)
+                    )
                 } else {
-                    format!("哔哩哔哩网络请求失败 ({code:?})")
+                    format!("哔哩哔哩网络请求失败 ({})", error_message(code))
                 },
             }],
             HttpFlow::QrGenerate { .. } | HttpFlow::QrPoll { manual: true, .. } => {
                 vec![ui::toast(if code == ErrorCode::Denied {
-                    format!("通行证请求失败：{code:?}{denied_hint}")
+                    format!("通行证请求失败：{}{denied_hint}", error_message(code))
                 } else {
-                    format!("通行证请求失败：{code:?}")
+                    format!("通行证请求失败：{}", error_message(code))
                 })]
             }
             _ => Vec::new(),
@@ -275,7 +410,7 @@ impl BilibiliPlugin {
                     if matches!(job.flow, HttpFlow::SubtitleBcc { .. }) {
                         self.pump_next_subtitle(state, host);
                     }
-                    return self.fail_http_flow(&job.flow, ErrorCode::Unsupported);
+                    return self.fail_http_flow(state, &job.flow, ErrorCode::Unsupported);
                 }
             };
             return self.finish_decoded_http(state, job.flow, job.headers, decoded, host, now_secs);
@@ -332,7 +467,7 @@ impl BilibiliPlugin {
             }
             other => {
                 let Ok(json) = serde_json::from_slice::<Value>(&body) else {
-                    return self.fail_http_flow(&other, ErrorCode::InvalidArgument);
+                    return self.fail_http_flow(state, &other, ErrorCode::InvalidArgument);
                 };
                 self.finish_json_flow(state, other, &json, &headers, host, now_secs)
             }
@@ -349,110 +484,61 @@ impl BilibiliPlugin {
         now_secs: u64,
     ) -> Vec<HostCommand> {
         match flow {
-            HttpFlow::Nav { open_modal } => {
-                auth::apply_nav_response(json, &mut self.session, &mut self.wbi, now_secs);
-                if state.needs_wbi_player_v2 && self.wbi.mixin().is_some() {
-                    state.needs_wbi_player_v2 = false;
-                    if let (Some(media), Some(cid)) = (state.active_media, state.active_cid) {
-                        let (bvid, aid) = (state.active_bvid.clone(), state.active_aid);
-                        self.request_player_v2(state, media, &bvid, aid, cid, true, host, now_secs);
-                    }
-                }
-                let mut cmds = self.sync_ui(state);
-                if open_modal {
-                    cmds.push(HostCommand::OpenModal {
-                        modal: Box::new(ui::build_login_modal(state.qr.as_ref())),
-                    });
-                }
-                cmds
-            }
-            HttpFlow::QrGenerate { open_modal } => match auth::parse_qr_generate(json) {
-                Ok(qr) => {
-                    state.qr = Some(qr);
-                    let mut cmds = self.sync_ui(state);
-                    if open_modal {
-                        cmds.push(HostCommand::OpenModal {
-                            modal: Box::new(ui::build_login_modal(state.qr.as_ref())),
-                        });
-                    }
-                    cmds
-                }
-                Err(msg) => vec![ui::toast(msg)],
-            },
-            HttpFlow::QrPoll { open_modal, manual } => {
-                match auth::parse_qr_poll(json, headers, &self.session.buvid3) {
-                    Ok(QrPollOutcome::Waiting(hint)) => {
-                        let changed = state.qr.as_ref().is_some_and(|qr| qr.status_hint != hint);
-                        if let Some(qr) = &mut state.qr {
-                            qr.status_hint = hint.clone();
-                        }
-                        let mut cmds = Vec::new();
-                        if manual || changed {
-                            cmds.extend(self.sync_ui(state));
-                            if open_modal {
-                                cmds.push(HostCommand::OpenModal {
-                                    modal: Box::new(ui::build_login_modal(state.qr.as_ref())),
-                                });
-                            }
-                        }
-                        if manual {
-                            cmds.push(ui::toast(hint));
-                        }
-                        cmds
-                    }
-                    Ok(QrPollOutcome::Expired(hint)) => {
-                        state.qr = None;
-                        let mut cmds = self.sync_ui(state);
-                        if open_modal {
-                            cmds.push(HostCommand::OpenModal {
-                                modal: Box::new(ui::build_login_modal(state.qr.as_ref())),
-                            });
-                        }
-                        cmds.push(ui::toast(hint));
-                        cmds
-                    }
-                    Ok(QrPollOutcome::Success(next_session)) => {
-                        let Ok(encoded) = serde_json::to_string(&next_session) else {
-                            return vec![ui::toast("序列化登录会话失败")];
-                        };
-                        match host.submit(&Task::SecretWrite {
-                            bucket: CredentialBucket::Plugin,
-                            key: "bili.session".into(),
-                            value: Some(encoded),
-                        }) {
-                            Ok(op) => {
-                                state.secret_write_op = Some((op, next_session, true));
-                                Vec::new()
-                            }
-                            Err(e) => vec![ui::toast(format!("保存扫码凭据失败：{e:?}"))],
-                        }
-                    }
-                    Err(msg) => {
-                        if manual {
-                            vec![ui::toast(msg)]
-                        } else {
-                            Vec::new()
-                        }
-                    }
-                }
+            flow @ (HttpFlow::Nav { .. }
+            | HttpFlow::QrGenerate { .. }
+            | HttpFlow::QrPoll { .. }) => {
+                self.finish_account_json_flow(state, flow, json, headers, host, now_secs)
             }
             HttpFlow::Browse {
+                account_epoch,
                 request_id,
                 source_id,
                 kind,
                 retried_wbi,
+                used_mixin,
                 query,
                 folder_id,
                 cursor,
                 filters,
             } => {
-                if json.get("code").and_then(Value::as_i64) == Some(-403) && !retried_wbi {
-                    self.wbi = WbiKeys::default();
-                    return self.begin_browse(
-                        state, request_id, source_id, folder_id, cursor, query, filters, true,
-                        host, now_secs,
-                    );
+                if account_epoch != self.account_epoch {
+                    return vec![HostCommand::SourceError {
+                        request_id,
+                        message: "账号状态已变更，请刷新目录重试".into(),
+                    }];
                 }
+                if json.get("code").and_then(Value::as_i64) == Some(-403) && !retried_wbi {
+                    let current_mixin = self.wbi.mixin();
+                    if current_mixin.is_some() && current_mixin != used_mixin {
+                        return self.begin_browse(
+                            state, request_id, source_id, folder_id, cursor, query, filters, true,
+                            host, now_secs,
+                        );
+                    }
+                    self.wbi = WbiKeys::default();
+                    if let Err(e) = self.ensure_nav_in_flight(state, host) {
+                        return vec![HostCommand::SourceError {
+                            request_id,
+                            message: format!("刷新 B站 WBI 签名密钥失败：{}", error_message(e)),
+                        }];
+                    }
+                    if state.pending_wbi_browse.len() < 8 {
+                        state.pending_wbi_browse.push(PendingWbiBrowse {
+                            request_id,
+                            source_id,
+                            folder_id,
+                            cursor,
+                            query,
+                            filters,
+                        });
+                        return Vec::new();
+                    }
+                    return vec![HostCommand::SourceError {
+                        request_id,
+                        message: "待重试的 B站 目录请求过多，请稍后重试".into(),
+                    }];
+                }
+                let requires_auth = kind.requires_auth();
                 match catalog::parse_browse_response(
                     &source_id,
                     &kind,
@@ -460,6 +546,8 @@ impl BilibiliPlugin {
                     self.session.is_authenticated(),
                 ) {
                     Ok(mut page) => {
+                        // Authentication and root pages must echo the same view identity.
+                        page.folder_id = folder_id.clone();
                         catalog::dedup_browse_page(
                             &mut state.browse_seen,
                             &mut state.browse_cursors,
@@ -470,10 +558,28 @@ impl BilibiliPlugin {
                             cursor.as_deref(),
                             &mut page,
                         );
-                        vec![HostCommand::ProvideSourcePage {
-                            request_id,
-                            page: Box::new(page),
-                        }]
+                        let target = catalog::PageTarget {
+                            account_epoch: self.account_epoch,
+                            source: source_id,
+                            folder: folder_id,
+                            query,
+                            filters,
+                        };
+                        let mut cache =
+                            catalog::PageCache::new(target, request_id, requires_auth, page);
+                        match cache.next() {
+                            Ok(page) => {
+                                state.browse_page = cache.has_more().then_some(cache);
+                                vec![HostCommand::ProvideSourcePage {
+                                    request_id,
+                                    page: Box::new(page),
+                                }]
+                            }
+                            Err(message) => vec![HostCommand::SourceError {
+                                request_id,
+                                message,
+                            }],
+                        }
                     }
                     Err(message) => vec![HostCommand::SourceError {
                         request_id,
@@ -481,120 +587,32 @@ impl BilibiliPlugin {
                     }],
                 }
             }
-            HttpFlow::ResolveView {
-                request_id,
-                source_id,
-                requested_entry_id,
-                cid,
-                page,
-                variant,
-            } => match playback::parse_ugc_view(json, cid, page, &source_id) {
-                Ok(meta) => self.request_vod_playurl(
-                    state,
-                    request_id,
-                    requested_entry_id,
-                    meta,
-                    variant,
-                    host,
-                    now_secs,
-                ),
-                Err(message) => vec![HostCommand::SourceError {
-                    request_id,
-                    message,
-                }],
-            },
-            HttpFlow::ResolveSeason {
-                request_id,
-                source_id,
-                requested_entry_id,
-                target_ep,
-                variant,
-            } => match playback::parse_pgc_season(json, target_ep, &source_id) {
-                Ok(meta) => self.request_vod_playurl(
-                    state,
-                    request_id,
-                    requested_entry_id,
-                    meta,
-                    variant,
-                    host,
-                    now_secs,
-                ),
-                Err(message) => vec![HostCommand::SourceError {
-                    request_id,
-                    message,
-                }],
-            },
-            HttpFlow::ResolveVodPlay {
-                request_id,
-                requested_entry_id,
-                meta,
-                variant,
-            } => {
-                match playback::build_vod_media(
-                    json,
-                    &meta,
-                    variant.as_deref(),
-                    &self.prefs,
-                    &self.session,
-                ) {
-                    Ok(media) => {
-                        self.remember_cid(state, &meta, &requested_entry_id);
-                        vec![HostCommand::ResolveStream {
-                            request_id,
-                            media: Box::new(media),
-                        }]
-                    }
-                    Err(message) => vec![HostCommand::SourceError {
-                        request_id,
-                        message,
-                    }],
-                }
+            flow @ (HttpFlow::ResolveView { .. }
+            | HttpFlow::ResolveSeason { .. }
+            | HttpFlow::ResolveVodPlay { .. }
+            | HttpFlow::ResolveLivePlay { .. }) => {
+                self.finish_resolve_json_flow(state, flow, json, host, now_secs)
             }
-            HttpFlow::ResolveLivePlay {
-                request_id,
-                room_id,
-                source_id,
-                variant,
-            } => match playback::build_live_media(
-                json,
-                room_id,
-                variant.as_deref(),
-                None,
-                &source_id,
-                &self.session,
-            ) {
-                Ok(media) => {
-                    state.last_resolved_cid = None;
-                    vec![HostCommand::ResolveStream {
-                        request_id,
-                        media: Box::new(media),
-                    }]
-                }
-                Err(message) => vec![HostCommand::SourceError {
-                    request_id,
-                    message,
-                }],
-            },
             HttpFlow::PlayerV2 {
                 media,
                 cid,
                 retried_wbi,
+                used_mixin,
             } => {
                 if state.active_media != Some(media) || state.active_cid != Some(cid) {
                     return Vec::new();
                 }
                 if json.get("code").and_then(Value::as_i64) == Some(-403) && !retried_wbi {
+                    let current_mixin = self.wbi.mixin();
+                    if current_mixin.is_some() && current_mixin != used_mixin {
+                        let (bvid, aid) = (state.active_bvid.clone(), state.active_aid);
+                        return self.request_player_v2(
+                            state, media, &bvid, aid, cid, true, host, now_secs,
+                        );
+                    }
                     self.wbi = WbiKeys::default();
                     state.needs_wbi_player_v2 = true;
-                    let _ = self.start_http(
-                        state,
-                        "GET",
-                        "https://api.bilibili.com/x/web-interface/nav".into(),
-                        true,
-                        None,
-                        HttpFlow::Nav { open_modal: false },
-                        host,
-                    );
+                    let _ = self.ensure_nav_in_flight(state, host);
                     return Vec::new();
                 }
                 let (chapters, subtitles) = danmaku::parse_player_v2_info(json);
@@ -620,66 +638,6 @@ impl BilibiliPlugin {
                 }
             }
             _ => Vec::new(),
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn request_vod_playurl(
-        &self,
-        state: &mut WindowState,
-        request_id: Id,
-        requested_entry_id: String,
-        meta: VideoMeta,
-        variant: Option<String>,
-        host: &mut impl Host,
-        now_secs: u64,
-    ) -> Vec<HostCommand> {
-        let qn = self.prefs.preferred_qn.to_string();
-        let url = if let Some(ep_id) = meta.ep_id {
-            format!(
-                "https://api.bilibili.com/pgc/player/web/v2/playurl?ep_id={ep_id}&cid={}&qn={qn}&fnval=4048&fnver=0&fourk=1",
-                meta.cid
-            )
-        } else {
-            let mut params = vec![
-                ("cid", meta.cid.to_string()),
-                ("qn", qn),
-                ("fnval", "4048".into()),
-                ("fnver", "0".into()),
-                ("fourk", "1".into()),
-            ];
-            if !meta.bvid.is_empty() {
-                params.push(("bvid", meta.bvid.clone()));
-            } else {
-                params.push(("aid", meta.aid.to_string()));
-            }
-            let query = if let Some(mixin) = self.wbi.mixin() {
-                wbi::sign_wbi_query(&params, &mixin, now_secs)
-            } else {
-                wbi::unsigned_query(&params)
-            };
-            format!("https://api.bilibili.com/x/player/wbi/playurl?{query}")
-        };
-        if let Err(e) = self.start_http(
-            state,
-            "GET",
-            url,
-            true,
-            Some(request_id),
-            HttpFlow::ResolveVodPlay {
-                request_id,
-                requested_entry_id,
-                meta: Box::new(meta),
-                variant,
-            },
-            host,
-        ) {
-            vec![HostCommand::SourceError {
-                request_id,
-                message: format!("无法请求播放流：{e:?}"),
-            }]
-        } else {
-            Vec::new()
         }
     }
 }

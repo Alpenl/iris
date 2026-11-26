@@ -1,12 +1,14 @@
 use super::{
+    actor::Bridge,
     engine::{CompiledModule, RuntimeEngine},
+    json_error,
     ledger::{Ledger, Reservation, Resource},
 };
-use crate::plugin_v2::json::decode;
+use crate::bounded_json::{decode, decode_exact};
 use crate::vfs::HttpCancel;
 use iris_api::v2::{
     CHUNK_LIMIT, COMMAND_LIMIT, Capability, ErrorCode, HostCommand, Id, MESSAGE_LIMIT, Reply, Role,
-    task::Task, unpack,
+    unpack,
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -66,33 +68,6 @@ impl Blob {
     }
 }
 
-/// Implementations only validate and enqueue. I/O must never run from an import.
-pub trait Services: Send {
-    fn on_window(&mut self, _window: Option<Id>) {}
-    fn on_request(&mut self, _cancel: Option<HttpCancel>) {}
-    fn on_event(&mut self, _generation: iris_api::v2::Generation, _read: Option<Id>) {}
-    fn submit(&mut self, task: Task, blobs: &BTreeMap<u64, Arc<Blob>>) -> Result<u64, ErrorCode>;
-    fn close(&mut self, handle: u64) -> Result<(), ErrorCode>;
-    fn reply(&mut self, request: u64, blob: Arc<Blob>, eof: bool) -> Result<usize, ErrorCode>;
-    fn fail(&mut self, request: u64, error: ErrorCode) -> Result<(), ErrorCode>;
-}
-
-pub struct NoServices;
-impl Services for NoServices {
-    fn submit(&mut self, _: Task, _: &BTreeMap<u64, Arc<Blob>>) -> Result<u64, ErrorCode> {
-        Err(ErrorCode::Denied)
-    }
-    fn close(&mut self, _: u64) -> Result<(), ErrorCode> {
-        Err(ErrorCode::StaleHandle)
-    }
-    fn reply(&mut self, _: u64, _: Arc<Blob>, _: bool) -> Result<usize, ErrorCode> {
-        Err(ErrorCode::StaleHandle)
-    }
-    fn fail(&mut self, _: u64, _: ErrorCode) -> Result<(), ErrorCode> {
-        Err(ErrorCode::StaleHandle)
-    }
-}
-
 pub(crate) struct State {
     pub role: Role,
     pub grants: BTreeSet<Capability>,
@@ -100,7 +75,7 @@ pub(crate) struct State {
     pub ledger: Ledger,
     pub blobs: BTreeMap<u64, Arc<Blob>>,
     pub blob_handles: BTreeMap<u64, Reservation>,
-    pub services: Box<dyn Services>,
+    pub services: Option<Bridge>,
     pub cancel: Arc<AtomicBool>,
     pub started: Instant,
     pub deadline: Instant,
@@ -129,7 +104,6 @@ pub struct InstanceConfig {
     pub grants: BTreeSet<Capability>,
     pub ledger: Ledger,
     pub cancel: Arc<AtomicBool>,
-    pub services: Box<dyn Services>,
 }
 
 pub struct Instance {
@@ -147,10 +121,14 @@ pub struct Instance {
 
 impl Instance {
     pub(crate) fn request_scope(&mut self, cancel: Option<HttpCancel>) {
-        self.store.data_mut().services.on_request(cancel);
+        if let Some(services) = self.store.data_mut().services.as_mut() {
+            services.on_request(cancel);
+        }
     }
     pub(crate) fn begin_event(&mut self, generation: iris_api::v2::Generation, read: Option<Id>) {
-        self.store.data_mut().services.on_event(generation, read);
+        if let Some(services) = self.store.data_mut().services.as_mut() {
+            services.on_event(generation, read);
+        }
     }
     pub(crate) fn adopt_blob(&mut self, id: Id, blob: DetachedBlob) -> Result<(), ErrorCode> {
         if !self.healthy {
@@ -197,11 +175,12 @@ impl Instance {
 
     pub fn new(config: InstanceConfig) -> Result<Self, ErrorCode> {
         let reservation = Self::reserve(&config.ledger, &config.owner, config.role)?;
-        Self::with_reservation(config, reservation)
+        Self::with_reservation(config, None, reservation)
     }
 
     pub(crate) fn with_reservation(
         config: InstanceConfig,
+        services: Option<Bridge>,
         reservation: Reservation,
     ) -> Result<Self, ErrorCode> {
         let InstanceConfig {
@@ -212,7 +191,6 @@ impl Instance {
             grants,
             ledger,
             cancel,
-            services,
         } = config;
         let memory_limit = if role == Role::Control {
             128 << 20
@@ -251,9 +229,9 @@ impl Instance {
             Ok(UpdateDeadline::Continue(1))
         });
         store.set_epoch_deadline(1);
-        let linker = super::imports::linker(engine.engine())?;
-        let _execution = engine.execution();
-        let instance = linker
+        let _execution = engine.execution()?;
+        let instance = engine
+            .linker()
             .instantiate(&mut store, &module.module)
             .map_err(|_| {
                 store
@@ -359,7 +337,7 @@ impl Instance {
         if !self.healthy {
             return Err(ErrorCode::BadState);
         }
-        decode::<serde_json::Value>(input, MESSAGE_LIMIT)?;
+        decode::<serde_json::Value>(input, MESSAGE_LIMIT).map_err(json_error)?;
         if input.is_empty() {
             return Err(ErrorCode::InvalidArgument);
         }
@@ -370,13 +348,13 @@ impl Instance {
         self.store.data_mut().deadline = Instant::now() + budget;
         self.store.data().check_live()?;
         self.store.set_epoch_deadline(1);
-        let _execution = self.engine.execution();
+        let _execution = self.engine.execution()?;
         let result = self.invoke(input).and_then(|bytes| {
             if bytes.is_empty() {
                 return Ok(Reply::Ok { ok: Vec::new() });
             }
             let reply: Reply<HostCommand> =
-                crate::plugin_v2::json::decode_exact(&bytes, MESSAGE_LIMIT)?;
+                decode_exact(&bytes, MESSAGE_LIMIT).map_err(json_error)?;
             match &reply {
                 Reply::Ok { ok } if ok.len() > COMMAND_LIMIT => {
                     return Err(ErrorCode::QuotaExceeded);

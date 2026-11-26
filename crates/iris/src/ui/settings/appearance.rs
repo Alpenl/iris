@@ -439,6 +439,7 @@ impl IrisWindow {
                     cx.listener(|this, _, _, cx| {
                         this.settings.directory_open = !this.settings.directory_open;
                         this.preset_rt.record_user_edit(&this.settings);
+                        this.sync_view_timer(cx);
                         if this.settings.directory_open {
                             this.scroll_directory_to_current();
                         }

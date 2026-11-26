@@ -3,13 +3,18 @@
 mod migration;
 pub mod smoke;
 use super::{
-    installation::{Approval, InstallationEntry, Installer},
+    installation::{Approval, InstallationEntry, Installed, Installer, Review},
+    json_error,
     package::{Package, Provenance},
     runtime::Setup,
 };
 use iris_api::v2::ErrorCode;
 use serde::Deserialize;
-use std::{collections::BTreeMap, path::PathBuf};
+use std::{
+    collections::BTreeMap,
+    path::PathBuf,
+    sync::{Arc, atomic::AtomicBool},
+};
 
 const GUIDES: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -24,10 +29,8 @@ const INDEX: &[u8] = include_bytes!(concat!(
     "/../../Resources/Plugins/index.json"
 ));
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct Index {
     schema: u32,
-    source_sha256: String,
     packages: Vec<Entry>,
 }
 #[derive(Deserialize)]
@@ -45,6 +48,17 @@ struct Pin {
     sha256: [u8; 32],
     content_sha256: [u8; 32],
     version: String,
+    bytes: Arc<[u8]>,
+}
+
+pub(crate) struct OfficialUpgrade {
+    pub plugin_id: String,
+    pub review: Review,
+}
+
+pub(crate) struct BootstrapScan {
+    pub entries: Vec<InstallationEntry>,
+    pub pending_reviews: Vec<OfficialUpgrade>,
 }
 
 #[derive(Clone)]
@@ -56,17 +70,19 @@ pub struct Bootstrap {
 impl Bootstrap {
     /// Only parses a small embedded index; no filesystem, hashing, or compilation.
     pub fn embedded(legacy_root: PathBuf) -> Result<Self, ErrorCode> {
-        let index: Index = crate::plugin_v2::json::decode(INDEX, 16 * 1024)?;
-        if index.schema != 1 || index.packages.len() != 2 || hex(&index.source_sha256).is_err() {
+        let index: Index = crate::bounded_json::decode(INDEX, 16 * 1024).map_err(json_error)?;
+        if index.schema != 1 || index.packages.len() != 2 {
             return Err(ErrorCode::InvalidArgument);
         }
         let mut pins = BTreeMap::new();
         let mut entries = BTreeMap::new();
         for entry in index.packages {
-            if !matches!(entry.id.as_str(), "iris.guides" | "iris.webdav")
-                || entry.file != format!("{}.irisplugin", entry.id)
-                || entry.version.is_empty()
-            {
+            let raw: &[u8] = match entry.id.as_str() {
+                "iris.guides" => GUIDES,
+                "iris.webdav" => WEBDAV,
+                _ => return Err(ErrorCode::InvalidArgument),
+            };
+            if entry.file != format!("{}.irisplugin", entry.id) || entry.version.is_empty() {
                 return Err(ErrorCode::InvalidArgument);
             }
             let sha256 = hex(&entry.sha256)?;
@@ -80,6 +96,7 @@ impl Bootstrap {
                     sha256,
                     content_sha256,
                     version: entry.version,
+                    bytes: Arc::from(raw),
                 },
             );
         }
@@ -92,17 +109,47 @@ impl Bootstrap {
     pub fn pins(&self) -> BTreeMap<String, [u8; 32]> {
         self.pins.clone()
     }
+    pub(crate) fn migrate_installed(
+        &self,
+        installed: &Installed,
+        setup: &Setup,
+    ) -> Result<(), ErrorCode> {
+        if matches!(installed.plugin_id.as_str(), "iris.guides" | "iris.webdav") {
+            migration::migrate(&self.legacy_root, installed, setup)
+        } else {
+            Ok(())
+        }
+    }
     /// A failed official migration disables that installation's load; unrelated
     /// user packages can still load. No guest observes partially migrated state.
     pub fn entries(
         &self,
-        mut installer: Installer,
+        installer: Installer,
         setup: &Setup,
     ) -> Result<Vec<InstallationEntry>, ErrorCode> {
+        self.scan(installer, setup, &AtomicBool::new(false))
+            .map(|scan| scan.entries)
+    }
+    pub(crate) fn scan(
+        &self,
+        mut installer: Installer,
+        setup: &Setup,
+        cancel: &AtomicBool,
+    ) -> Result<BootstrapScan, ErrorCode> {
         let mut failures = BTreeMap::new();
-        for (id, bytes) in [("iris.guides", GUIDES), ("iris.webdav", WEBDAV)] {
-            if let Err(error) = self.ensure(&mut installer, setup, id, bytes) {
-                failures.insert(id.to_owned(), error);
+        let mut pending_reviews = Vec::new();
+        for (id, pin) in &self.entries {
+            match self.ensure(&mut installer, setup, id, &pin.bytes, cancel) {
+                Ok(None) => {}
+                Ok(Some(upgrade)) => {
+                    // Hold the expanded official upgrade behind explicit user review
+                    // rather than silently enlarging grants or silently bricking it.
+                    failures.insert(id.clone(), ErrorCode::Denied);
+                    pending_reviews.push(upgrade);
+                }
+                Err(error) => {
+                    failures.insert(id.clone(), error);
+                }
             }
         }
         let mut entries = installer.entries()?;
@@ -116,7 +163,10 @@ impl Bootstrap {
                 });
             }
         }
-        Ok(entries)
+        Ok(BootstrapScan {
+            entries,
+            pending_reviews,
+        })
     }
     fn ensure(
         &self,
@@ -124,7 +174,8 @@ impl Bootstrap {
         setup: &Setup,
         id: &str,
         bytes: &[u8],
-    ) -> Result<(), ErrorCode> {
+        cancel: &AtomicBool,
+    ) -> Result<Option<OfficialUpgrade>, ErrorCode> {
         let _memory = setup.resources.ledger.reserve(
             "official-bootstrap",
             &[(super::ledger::Resource::HostBytes, 64 << 20)],
@@ -142,8 +193,7 @@ impl Bootstrap {
         }
         let previous = installer.record(id)?;
         // An application update does not silently enlarge an existing grant.
-        // Narrowed user grants remain valid when the official manifest itself
-        // did not add new requested capabilities beyond the previously reviewed object.
+        // Expanded official manifests route through explicit host review/approval.
         if let Some(p) = previous.as_ref()
             && p.digest != package.digest
         {
@@ -157,7 +207,12 @@ impl Bootstrap {
                     .iter()
                     .any(|cap| !p.grants.contains(cap) && !prior_declared.contains(cap))
             {
-                return Err(ErrorCode::Denied);
+                let review =
+                    Review::from_bundled(bytes.to_vec(), installer, &setup.resources, cancel)?;
+                return Ok(Some(OfficialUpgrade {
+                    plugin_id: id.to_owned(),
+                    review,
+                }));
             }
         }
         let approval = || Approval {
@@ -191,7 +246,8 @@ impl Bootstrap {
             }
             _ => installer.install_bundled(bytes, approval())?,
         };
-        migration::migrate(&self.legacy_root, &installed, setup)
+        self.migrate_installed(&installed, setup)?;
+        Ok(None)
     }
 }
 fn hex(value: &str) -> Result<[u8; 32], ErrorCode> {

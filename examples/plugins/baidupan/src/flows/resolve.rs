@@ -1,10 +1,17 @@
 //! Media playback resolution flows (PCS Locate v4, OpenAPI dlink/DLNA, and cloud HLS).
 
-use super::super::*;
 use crate::{
-    auth::{AuthMode, OFFICIAL_DLINK_USER_AGENT},
-    playback::{OpenApiLinkKind, ResolveStrategy, ResolveTarget, StreamingParse},
+    BaiduPanPlugin, HttpFlow, OAuthRetry, WindowState,
+    auth::{self, AuthMode, OFFICIAL_DLINK_USER_AGENT},
+    catalog, media,
+    playback::{self, OpenApiLinkKind, ResolveStrategy, ResolveTarget, StreamingParse},
     sign::encode_query_component,
+};
+use iris_plugin_sdk::{
+    api::v2::{HostCommand, Id, LogLevel},
+    client::Host,
+    error_message,
+    serde_json::{self, Value},
 };
 
 impl BaiduPanPlugin {
@@ -50,13 +57,17 @@ impl BaiduPanPlugin {
             .map(|c| catalog::build_sibling_playlist(c, source_id, &path, kind))
             .unwrap_or_default();
 
+        let resolved_fs_id =
+            cached_item.map_or(fs_id, |m| if m.fs_id != 0 { m.fs_id } else { fs_id });
+        let canonical_entry_id = catalog::encode_entry_id(resolved_fs_id, &path);
+
         let target = ResolveTarget {
-            fs_id: cached_item.map_or(fs_id, |m| if m.fs_id != 0 { m.fs_id } else { fs_id }),
+            fs_id: resolved_fs_id,
             path,
             name,
             kind,
             source_id: source_id.to_owned(),
-            entry_id: entry_id.to_owned(),
+            entry_id: canonical_entry_id,
             playlist,
         };
 
@@ -66,6 +77,7 @@ impl BaiduPanPlugin {
                 request_id,
                 target,
                 profile,
+                variant,
                 None,
                 false,
                 retried_oauth,
@@ -76,7 +88,7 @@ impl BaiduPanPlugin {
                 request_id,
                 target,
                 preferred_line,
-                variant.is_some(),
+                variant,
                 retried_oauth,
                 host,
                 now_secs,
@@ -91,11 +103,12 @@ impl BaiduPanPlugin {
         request_id: Id,
         target: ResolveTarget,
         preferred_line: usize,
-        explicit_variant: bool,
+        original_variant: Option<String>,
         retried_oauth: bool,
         host: &mut impl Host,
         now_secs: u64,
     ) -> Vec<HostCommand> {
+        let explicit_variant = original_variant.is_some();
         match self.session.mode {
             AuthMode::Cookie => {
                 if self.session.uid == 0 {
@@ -103,6 +116,18 @@ impl BaiduPanPlugin {
                         request_id,
                         message: "尚未获取到账号 UID，请先点击「刷新配额」或重新登录".into(),
                     }];
+                }
+                if now_secs == 0 {
+                    return vec![
+                        HostCommand::Log {
+                            level: LogLevel::Error,
+                            message: "baidupan: system wall clock unavailable (now_ms == 0); refusing to sign PCS Locate request".into(),
+                        },
+                        HostCommand::SourceError {
+                            request_id,
+                            message: "系统时钟不可用，无法生成百度网盘直链签名".into(),
+                        },
+                    ];
                 }
                 let url = playback::build_locate_download_url(
                     &target.path,
@@ -128,7 +153,7 @@ impl BaiduPanPlugin {
                 ) {
                     return vec![HostCommand::SourceError {
                         request_id,
-                        message: format!("无法发起 PCS Locate 取链请求：{e:?}"),
+                        message: format!("无法发起 PCS Locate 取链请求：{}", error_message(e)),
                     }];
                 }
                 Vec::new()
@@ -161,6 +186,7 @@ impl BaiduPanPlugin {
                         request_id,
                         target: Box::new(target),
                         preferred_line,
+                        original_variant,
                         api_kind,
                         retried_oauth,
                     },
@@ -168,7 +194,7 @@ impl BaiduPanPlugin {
                 ) {
                     return vec![HostCommand::SourceError {
                         request_id,
-                        message: format!("无法发起开放平台取链请求：{e:?}"),
+                        message: format!("无法发起开放平台取链请求：{}", error_message(e)),
                     }];
                 }
                 Vec::new()
@@ -183,6 +209,7 @@ impl BaiduPanPlugin {
         request_id: Id,
         target: ResolveTarget,
         profile: String,
+        original_variant: Option<String>,
         ad_token: Option<&str>,
         retried_ad_token: bool,
         retried_oauth: bool,
@@ -201,6 +228,7 @@ impl BaiduPanPlugin {
                 request_id,
                 target: Box::new(target),
                 profile,
+                original_variant,
                 retried_ad_token,
                 retried_oauth,
             },
@@ -208,7 +236,7 @@ impl BaiduPanPlugin {
         ) {
             return vec![HostCommand::SourceError {
                 request_id,
-                message: format!("无法请求云端转码流：{e:?}"),
+                message: format!("无法请求云端转码流：{}", error_message(e)),
             }];
         }
         Vec::new()
@@ -267,6 +295,7 @@ impl BaiduPanPlugin {
                                 *target,
                                 "M3U8_AUTO_1080".into(),
                                 None,
+                                None,
                                 false,
                                 false,
                                 host,
@@ -283,6 +312,7 @@ impl BaiduPanPlugin {
                 request_id,
                 target,
                 preferred_line,
+                original_variant,
                 api_kind,
                 retried_oauth,
             } => {
@@ -294,7 +324,7 @@ impl BaiduPanPlugin {
                 };
                 match playback::parse_openapi_dlink(&json, api_kind) {
                     Ok(dlink) => {
-                        if api_kind == OpenApiLinkKind::Official {
+                        let direct_url = if api_kind == OpenApiLinkKind::Official {
                             let with_token = format!(
                                 "{dlink}&access_token={}",
                                 encode_query_component(&self.session.access_token)
@@ -312,7 +342,7 @@ impl BaiduPanPlugin {
                                         request_id,
                                         target: target.clone(),
                                         preferred_line,
-                                        fallback_dlink: with_token,
+                                        fallback_dlink: with_token.clone(),
                                     },
                                     host,
                                 )
@@ -320,11 +350,14 @@ impl BaiduPanPlugin {
                             {
                                 return Vec::new();
                             }
-                        }
+                            with_token
+                        } else {
+                            dlink
+                        };
                         let ua = playback::user_agent_for_openapi(api_kind);
                         match playback::build_direct_resolved_media(
                             &target,
-                            &[dlink],
+                            &[direct_url],
                             preferred_line,
                             ua,
                         ) {
@@ -350,7 +383,7 @@ impl BaiduPanPlugin {
                                 request_id,
                                 source_id: target.source_id.clone(),
                                 entry_id: target.entry_id.clone(),
-                                variant: Some(format!("orig.{preferred_line}")),
+                                variant: original_variant,
                             };
                             if self
                                 .start_oauth_refresh(state, &self.session, retry, host)
@@ -401,6 +434,7 @@ impl BaiduPanPlugin {
                 request_id,
                 target,
                 profile,
+                original_variant,
                 retried_ad_token,
                 retried_oauth,
             } => match playback::parse_streaming_response(body, final_url) {
@@ -410,6 +444,7 @@ impl BaiduPanPlugin {
                         request_id,
                         *target,
                         profile,
+                        original_variant,
                         Some(&ad_token),
                         true,
                         retried_oauth,
@@ -445,7 +480,7 @@ impl BaiduPanPlugin {
                             request_id,
                             source_id: target.source_id.clone(),
                             entry_id: target.entry_id.clone(),
-                            variant: Some(format!("hls.{profile}")),
+                            variant: original_variant,
                         };
                         if self
                             .start_oauth_refresh(state, &self.session, retry, host)
@@ -471,9 +506,6 @@ impl BaiduPanPlugin {
         }
         let info = (target.path.clone(), target.name.clone());
         state.last_resolved_video = Some(info.clone());
-        if self.video_lookup.len() >= 128 {
-            self.video_lookup.clear();
-        }
         self.video_lookup.insert(target.entry_id.clone(), info);
     }
 }

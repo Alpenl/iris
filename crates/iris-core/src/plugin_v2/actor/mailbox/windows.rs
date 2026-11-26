@@ -73,14 +73,111 @@ impl Mailbox {
         // a completing operation. Admission remains closed during this interval.
         self.executor.window_changed(window, Some(generation));
         let mut state = self.lock();
-        let scope = state
-            .windows
-            .get_mut(&window)
-            .ok_or(ErrorCode::StaleHandle)?;
+        let Some(scope) = state.windows.get_mut(&window) else {
+            drop(state);
+            self.executor.window_changed(window, None);
+            return Err(ErrorCode::StaleHandle);
+        };
         if scope.generation != generation {
             return Err(ErrorCode::StaleHandle);
         }
         scope.ready = true;
+        Ok(())
+    }
+    /// Atomically opens `window` and queues its initial `WindowOpened` event.
+    /// If admission fails (e.g. mailbox event backpressure or byte quota), rolls
+    /// back without queueing a phantom `Message::Closed` notification.
+    pub fn open_window_with_event(
+        &self,
+        window: Id,
+        generation: Generation,
+        bytes: Vec<u8>,
+    ) -> Result<(), ErrorCode> {
+        if self.role != Role::Control || window.0 == 0 {
+            return Err(ErrorCode::Denied);
+        }
+        let lease = self.ledger.reserve(
+            &self.owner,
+            &[(Resource::Handle, 1), (Resource::HostBytes, 4096)],
+        )?;
+        let memory = self.ledger.reserve(
+            &self.owner,
+            &[(Resource::HostBytes, (MESSAGE_LIMIT * 32) as u64)],
+        )?;
+        let body: iris_api::v2::HostEvent<serde_json::Value> =
+            crate::bounded_json::decode(&bytes, MESSAGE_LIMIT - 512)
+                .map_err(crate::plugin_v2::json_error)?;
+        if matches!(
+            body,
+            iris_api::v2::HostEvent::Window { .. }
+                | iris_api::v2::HostEvent::Init { .. }
+                | iris_api::v2::HostEvent::Shutdown
+                | iris_api::v2::HostEvent::WindowClosed { .. }
+        ) {
+            return Err(ErrorCode::InvalidArgument);
+        }
+        {
+            let mut state = self.lock();
+            if self.cancel.load(Ordering::Acquire) {
+                return Err(ErrorCode::Cancelled);
+            }
+            if state.windows.contains_key(&window) {
+                return Err(ErrorCode::BadState);
+            }
+            if state.windows.len() >= 4 || state.closed.len() >= 8 {
+                return Err(ErrorCode::QuotaExceeded);
+            }
+            if state.events.len() >= 32 {
+                return Err(ErrorCode::Backpressure);
+            }
+            state.windows.insert(
+                window,
+                WindowContext {
+                    generation,
+                    cancel: HttpCancel::default(),
+                    ready: false,
+                    _lease: lease,
+                },
+            );
+        }
+        self.executor.window_changed(window, Some(generation));
+        let mut state = self.lock();
+        if self.cancel.load(Ordering::Acquire) {
+            return Err(ErrorCode::Cancelled);
+        }
+        let Some(scope) = state.windows.get(&window) else {
+            drop(state);
+            self.executor.window_changed(window, None);
+            return Err(ErrorCode::StaleHandle);
+        };
+        if scope.generation != generation {
+            return Err(ErrorCode::StaleHandle);
+        }
+        if state.events.len() >= 32 {
+            let removed = state.windows.remove(&window);
+            state.events.retain(|m| m.window() != Some(window));
+            state.completions.retain(|m| m.window() != Some(window));
+            drop(state);
+            if let Some(scope) = removed {
+                scope.cancel.cancel();
+            }
+            self.executor.window_changed(window, None);
+            return Err(ErrorCode::Backpressure);
+        }
+        if let Some(scope) = state.windows.get_mut(&window) {
+            scope.ready = true;
+        }
+        state.events.push_back(Message::Event {
+            bytes,
+            initialization: false,
+            request_cancel: None,
+            generation,
+            window: Some(window),
+            read: None,
+            attachment: None,
+            _memory: memory,
+        });
+        self.changed.notify_one();
         Ok(())
     }
     pub fn advance_window(&self, window: Id, generation: Generation) -> Result<(), ErrorCode> {
@@ -117,10 +214,11 @@ impl Mailbox {
         cancel.cancel();
         self.executor.window_changed(window, Some(generation));
         let mut state = self.lock();
-        let scope = state
-            .windows
-            .get_mut(&window)
-            .ok_or(ErrorCode::StaleHandle)?;
+        let Some(scope) = state.windows.get_mut(&window) else {
+            drop(state);
+            self.executor.window_changed(window, None);
+            return Err(ErrorCode::StaleHandle);
+        };
         if scope.generation != generation {
             return Err(ErrorCode::StaleHandle);
         }
@@ -138,12 +236,10 @@ impl Mailbox {
             state.events.retain(|m| m.window() != Some(window));
             state.completions.retain(|m| m.window() != Some(window));
             state.sweep = true;
-            let generation = state.generation;
             // The window's existing reservation pays for its final notification.
             // New windows are backpressured while close callbacks accumulate.
             state.closed.push_back(Message::Closed {
                 window,
-                generation,
                 _lease: scope._lease,
             });
             scope.cancel
@@ -180,7 +276,8 @@ impl Mailbox {
             &[(Resource::HostBytes, (MESSAGE_LIMIT * 32) as u64)],
         )?;
         let body: iris_api::v2::HostEvent<serde_json::Value> =
-            crate::plugin_v2::json::decode(&bytes, MESSAGE_LIMIT - 512)?;
+            crate::bounded_json::decode(&bytes, MESSAGE_LIMIT - 512)
+                .map_err(crate::plugin_v2::json_error)?;
         if matches!(
             body,
             iris_api::v2::HostEvent::Window { .. }
@@ -213,5 +310,17 @@ impl Mailbox {
         });
         self.changed.notify_one();
         Ok(())
+    }
+}
+
+impl super::super::Actor {
+    pub(crate) fn open_window_with_event(
+        &self,
+        window: Id,
+        generation: Generation,
+        bytes: Vec<u8>,
+    ) -> Result<(), ErrorCode> {
+        self.shared
+            .open_window_with_event(window, generation, bytes)
     }
 }

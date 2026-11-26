@@ -1,11 +1,17 @@
 //! One owning thread per bounded Store. No UI caller joins a Store or I/O job.
+mod bridge;
 mod mailbox;
 mod operation;
+mod read;
+pub(crate) use bridge::Bridge;
 pub use operation::{Completion, Operation};
+use read::ReadSlot;
+pub use read::{ReadResult, ReadTicket};
 
 use super::{
     engine::{CompiledModule, RuntimeEngine},
-    instance::{Blob, DetachedBlob, Instance, InstanceConfig, Services, next_id},
+    instance::{Blob, DetachedBlob, Instance, InstanceConfig, next_id},
+    json_error,
     ledger::{Ledger, Reservation, Resource},
     pool::IoPool,
 };
@@ -15,13 +21,12 @@ use iris_api::v2::{
 };
 use mailbox::{Mailbox, Message};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     sync::{
-        Arc, Mutex,
+        Arc, Condvar, Mutex,
         atomic::{AtomicUsize, Ordering},
-        mpsc::{self, Receiver, SyncSender},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 pub struct TaskContext {
@@ -53,7 +58,7 @@ impl IoOutcome {
         self.discard = Some(Discard(Some(Box::new(cleanup))));
         self
     }
-    fn acknowledge(&mut self) {
+    pub(crate) fn acknowledge(&mut self) {
         if let Some(mut discard) = self.discard.take() {
             discard.0 = None;
         }
@@ -115,9 +120,17 @@ impl Update {
     }
 }
 
+#[derive(Default)]
+struct UpdateQueue {
+    items: VecDeque<Update>,
+    closed: bool,
+}
+
+type SharedUpdates = Arc<(Mutex<UpdateQueue>, Condvar)>;
+
 pub struct Actor {
     shared: Arc<Mailbox>,
-    updates: Receiver<Update>,
+    updates: SharedUpdates,
 }
 
 pub struct Spawn {
@@ -146,7 +159,8 @@ impl Actor {
             config.executor.clone(),
             config.wake,
         )?);
-        let (tx, updates) = mpsc::sync_channel(32);
+        let updates: SharedUpdates = Arc::new((Mutex::new(UpdateQueue::default()), Condvar::new()));
+        let thread_updates = updates.clone();
         let thread_shared = shared.clone();
         std::thread::Builder::new()
             .name(format!("iris-v2-{:?}", config.role))
@@ -169,12 +183,12 @@ impl Actor {
                             grants: config.grants,
                             ledger: config.ledger,
                             cancel: thread_shared.cancel.clone(),
-                            services: Box::new(bridge),
                         },
+                        Some(bridge),
                         reservation,
                     )?;
                     thread_shared.set_status(Status::Ready);
-                    run(&mut instance, &thread_shared, tx)
+                    run(&mut instance, &thread_shared, &thread_updates)
                 }))
                 .unwrap_or(Err(ErrorCode::Internal));
                 thread_shared.stop();
@@ -241,11 +255,14 @@ impl Actor {
         let id = Id(next_id()?);
         let blob = DetachedBlob::reserve(&self.shared.ledger, &self.shared.owner, blob)?;
         object.insert("context_blob".into(), serde_json::json!(id));
-        let bytes = crate::plugin_v2::json::encode(&event, MESSAGE_LIMIT)?;
+        let bytes = crate::bounded_json::encode(&event, MESSAGE_LIMIT).map_err(json_error)?;
         self.shared.send(bytes, Some((id, blob)))
     }
     pub fn poll(&self) -> Option<Update> {
-        while let Ok(update) = self.updates.try_recv() {
+        let (lock, cv) = &*self.updates;
+        let mut queue = lock.lock().unwrap_or_else(|e| e.into_inner());
+        while let Some(update) = queue.items.pop_front() {
+            cv.notify_one();
             if !self.shared.cancel.load(Ordering::Acquire)
                 && self.shared.is_current(update.window, update.generation)
                 && !update.is_cancelled()
@@ -267,10 +284,11 @@ impl Actor {
         }
         let id = Id(next_id()?);
         let blob = DetachedBlob::reserve(&self.shared.ledger, &self.shared.owner, blob)?;
-        let bytes = crate::plugin_v2::json::encode(
+        let bytes = crate::bounded_json::encode(
             &serde_json::json!({"event":"stream_context_changed","session":session,"generation":generation,"context_blob":id}),
             MESSAGE_LIMIT,
-        )?;
+        )
+        .map_err(json_error)?;
         self.shared
             .refresh_context(expected, generation, bytes, (id, blob))
     }
@@ -282,11 +300,18 @@ impl Actor {
     }
     pub fn stop(&self) {
         self.shared.stop();
-        while self.updates.try_recv().is_ok() {}
+        let (lock, cv) = &*self.updates;
+        let mut queue = lock.lock().unwrap_or_else(|e| e.into_inner());
+        queue.closed = true;
+        queue.items.clear();
+        cv.notify_all();
     }
     pub fn is_quiescent(&self) -> bool {
         if self.shared.cancel.load(Ordering::Acquire) {
-            while self.updates.try_recv().is_ok() {}
+            let (lock, cv) = &*self.updates;
+            let mut queue = lock.lock().unwrap_or_else(|e| e.into_inner());
+            queue.items.clear();
+            cv.notify_all();
         }
         self.shared.done.load(Ordering::Acquire)
             && self.shared.outstanding.load(Ordering::Acquire) == 0
@@ -312,30 +337,7 @@ impl Drop for Actor {
     }
 }
 
-pub struct ReadResult {
-    pub blob: Arc<Blob>,
-    pub eof: bool,
-}
-pub struct ReadTicket {
-    request: u64,
-    shared: Arc<Mailbox>,
-    rx: Receiver<Result<ReadResult, ErrorCode>>,
-}
-impl ReadTicket {
-    /// PlaybackRelay calls this on its worker, never while holding a Store.
-    pub fn receive(&self, timeout: Duration) -> Result<ReadResult, ErrorCode> {
-        self.rx
-            .recv_timeout(timeout)
-            .map_err(|_| ErrorCode::Timeout)?
-    }
-}
-impl Drop for ReadTicket {
-    fn drop(&mut self) {
-        self.shared.cancel_read(self.request);
-    }
-}
-
-struct TaskLease {
+pub(super) struct TaskLease {
     _reservation: Reservation,
     _read: Option<Arc<mailbox::ReadLease>>,
     outstanding: Arc<AtomicUsize>,
@@ -343,9 +345,9 @@ struct TaskLease {
     operations: Arc<Mutex<BTreeMap<u64, PendingOperation>>>,
 }
 #[derive(Clone)]
-struct PendingOperation {
-    cancel: HttpCancel,
-    window: Option<Id>,
+pub(super) struct PendingOperation {
+    pub(super) cancel: HttpCancel,
+    pub(super) window: Option<Id>,
 }
 impl Drop for TaskLease {
     fn drop(&mut self) {
@@ -360,18 +362,16 @@ impl Drop for TaskLease {
 fn run(
     instance: &mut Instance,
     shared: &Arc<Mailbox>,
-    tx: SyncSender<Update>,
+    updates: &SharedUpdates,
 ) -> Result<(), ErrorCode> {
-    let mut delivered_reads = BTreeSet::new();
     while let Some(mut message) = shared.next() {
         let (global, windows) = shared.contexts();
         instance.retain_contexts(global, &windows);
         if matches!(message, Message::Sweep) {
-            delivered_reads.clear();
             continue;
         }
-        if let Message::Cancelled { request, .. } = &message
-            && !delivered_reads.remove(&request.0)
+        if let Message::Cancelled { read, .. } = &message
+            && !read.delivered
         {
             continue;
         }
@@ -380,9 +380,10 @@ fn run(
             &[(Resource::HostBytes, (MESSAGE_LIMIT * 32) as u64)],
         )?;
         let generation = match &message {
-            Message::Event { generation, .. }
-            | Message::Completed { generation, .. }
-            | Message::Closed { generation, .. } => *generation,
+            Message::Event { generation, .. } | Message::Completed { generation, .. } => {
+                *generation
+            }
+            Message::Closed { .. } => global,
             Message::Cancelled { read, .. } => read.generation,
             Message::Sweep => unreachable!(),
         };
@@ -393,9 +394,16 @@ fn run(
         };
         let window = message.window();
         let request_cancel = message.request_cancel();
+        let is_closed = matches!(&message, Message::Closed { .. });
         let session_event =
             window.is_none() && matches!(&message, Message::Event { read: None, .. });
-        let generation = if session_event {
+        // Terminal `Message::Closed` is only gated on actor cancellation, never global generation.
+        let generation = if is_closed {
+            if shared.cancel.load(Ordering::Acquire) {
+                continue;
+            }
+            global
+        } else if session_event {
             let Some(current) = shared.is_session_current(generation) else {
                 continue;
             };
@@ -452,7 +460,8 @@ fn run(
                 let result = match result {
                     Ok(outcome) => {
                         let mut value = outcome.value.clone();
-                        let size = crate::plugin_v2::json::encode(&value, MESSAGE_LIMIT - 1024);
+                        let size = crate::bounded_json::encode(&value, MESSAGE_LIMIT - 1024)
+                            .map_err(json_error);
                         let delivered = if let Err(error) = size {
                             Err(error)
                         } else if let Some(blob) = &outcome.blob {
@@ -480,11 +489,13 @@ fn run(
             }
         };
         let bytes = if let Some(window) = window {
-            let body: serde_json::Value = crate::plugin_v2::json::decode(&bytes, MESSAGE_LIMIT)?;
-            crate::plugin_v2::json::encode(
+            let body: serde_json::Value =
+                crate::bounded_json::decode(&bytes, MESSAGE_LIMIT).map_err(json_error)?;
+            crate::bounded_json::encode(
                 &serde_json::json!({"event":"window", "window":window,"generation":generation,"body":body}),
                 MESSAGE_LIMIT,
-            )?
+            )
+            .map_err(json_error)?
         } else {
             bytes
         };
@@ -504,8 +515,9 @@ fn run(
         }
         if let Some(id) = read
             && matches!(&message, Message::Event { .. })
+            && !shared.deliver_read(id)
         {
-            delivered_reads.insert(id.0);
+            continue;
         }
         instance.begin_event(generation, read);
         let initialization = matches!(
@@ -541,7 +553,7 @@ fn run(
                     &shared.owner,
                     &[(Resource::HostBytes, (MESSAGE_LIMIT * 32) as u64)],
                 )?;
-                let mut update = Update {
+                let update = Update {
                     commands: ok,
                     blobs,
                     generation,
@@ -549,36 +561,9 @@ fn run(
                     request_cancel,
                     _memory: memory,
                 };
-                let mut sent = false;
-                for attempt in 0..1000 {
-                    match tx.try_send(update) {
-                        Ok(()) => {
-                            sent = true;
-                            break;
-                        }
-                        Err(mpsc::TrySendError::Disconnected(_)) => {
-                            return Err(ErrorCode::Cancelled);
-                        }
-                        Err(mpsc::TrySendError::Full(returned)) => {
-                            update = returned;
-                            if shared.cancel.load(Ordering::Acquire) {
-                                return Err(ErrorCode::Cancelled);
-                            }
-                            if !shared.is_current(window, generation) || update.is_cancelled() {
-                                sent = true;
-                                break;
-                            }
-                            if attempt == 0 {
-                                (shared.wake)();
-                            }
-                            std::thread::sleep(Duration::from_millis(5));
-                        }
-                    }
+                if push_update(updates, shared, update, window, generation)? {
+                    (shared.wake)();
                 }
-                if !sent {
-                    return Err(ErrorCode::Backpressure);
-                }
-                (shared.wake)();
             }
             Reply::Error { error } => {
                 return Err(ErrorCode::from_i32(error.code).unwrap_or(ErrorCode::Internal));
@@ -592,139 +577,44 @@ fn run(
     Ok(())
 }
 
-struct Bridge {
-    shared: Arc<Mailbox>,
-    io: IoPool,
-    generation: Generation,
-    read: Option<Id>,
+fn push_update(
+    updates: &SharedUpdates,
+    shared: &Arc<Mailbox>,
+    update: Update,
     window: Option<Id>,
-    request_cancel: Option<HttpCancel>,
-}
-impl Services for Bridge {
-    fn on_request(&mut self, cancel: Option<HttpCancel>) {
-        self.request_cancel = cancel;
-    }
-    fn on_window(&mut self, window: Option<Id>) {
-        self.window = window;
-    }
-    fn on_event(&mut self, generation: Generation, read: Option<Id>) {
-        self.generation = generation;
-        self.read = read;
-    }
-    fn submit(&mut self, task: Task, blobs: &BTreeMap<u64, Arc<Blob>>) -> Result<u64, ErrorCode> {
-        let shared = &self.shared;
-        let mailbox::IoContext {
-            generation,
-            cancel,
-            read: read_lease,
-        } = shared.io_context(self.read, self.window)?;
-        if let Some(parent) = &self.request_cancel {
-            parent.link(&cancel).map_err(|_| ErrorCode::Cancelled)?;
-        }
-        if self.generation.media != generation.media
-            || self.generation.seek != generation.seek
-            || (self.window.is_some() && self.generation != generation)
-        {
-            return Err(ErrorCode::StaleHandle);
-        }
-        let reservation = shared.ledger.reserve(
-            &shared.owner,
-            &[
-                (Resource::Task, 1),
-                (Resource::HostBytes, (MESSAGE_LIMIT * 32) as u64),
-            ],
-        )?;
-        let context = TaskContext {
-            instance_id: Id(shared.id),
-            window: self.window,
-            owner: shared.owner.clone(),
-            role: shared.role,
-            generation: self.generation,
-            cancel: cancel.clone(),
-            ledger: shared.ledger.clone(),
-        };
-        let operation = shared.executor.prepare(task, blobs, context)?;
-        let id = next_id()?;
-        shared.outstanding.fetch_add(1, Ordering::AcqRel);
-        let lease = TaskLease {
-            _reservation: reservation,
-            _read: read_lease,
-            outstanding: shared.outstanding.clone(),
-            operation: id,
-            operations: shared.operations.clone(),
-        };
-        shared
-            .operations
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(
-                id,
-                PendingOperation {
-                    cancel: cancel.clone(),
-                    window: self.window,
-                },
-            );
-        let weak = Arc::downgrade(shared);
-        let generation = self.generation;
-        let read = self.read;
-        let window = self.window;
-        let request_cancel = self.request_cancel.clone();
-        if cancel.is_cancelled() {
+    generation: Generation,
+) -> Result<bool, ErrorCode> {
+    let (lock, cv) = &**updates;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut woke = false;
+    let mut queue = lock.lock().unwrap_or_else(|e| e.into_inner());
+    while queue.items.len() >= 32 {
+        if queue.closed || shared.cancel.load(Ordering::Acquire) {
             return Err(ErrorCode::Cancelled);
         }
-        operation.dispatch(
-            &self.io,
-            shared.role,
-            &shared.owner,
-            Box::new(move |result| {
-                let result = if cancel.is_cancelled() {
-                    // Finish rollback before publishing the terminal event; a
-                    // shadowed unused Result could otherwise outlive delivery.
-                    drop(result);
-                    Err(ErrorCode::Cancelled)
-                } else {
-                    result
-                };
-                if let Some(shared) = weak.upgrade() {
-                    shared.complete(Message::Completed {
-                        operation: id,
-                        result,
-                        generation,
-                        read,
-                        window,
-                        request_cancel,
-                        _lease: lease,
-                    });
-                }
-            }),
-        )?;
-        Ok(id)
-    }
-    fn close(&mut self, handle: u64) -> Result<(), ErrorCode> {
-        // Drop the operation-map lock before cancellation: the wake callback
-        // can synchronously finish I/O and release its TaskLease.
-        let pending = self
-            .shared
-            .operations
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&handle)
-            .cloned();
-        if let Some(pending) = pending {
-            if pending.window != self.window || pending.cancel.is_cancelled() {
-                return Err(ErrorCode::StaleHandle);
-            }
-            pending.cancel.cancel();
-            return Ok(());
+        if !shared.is_current(window, generation) || update.is_cancelled() {
+            return Ok(false);
         }
-        self.shared.executor.close_in(self.window, handle)
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            return Err(ErrorCode::Backpressure);
+        };
+        if !woke {
+            woke = true;
+            drop(queue);
+            (shared.wake)();
+            queue = lock.lock().unwrap_or_else(|e| e.into_inner());
+            continue;
+        }
+        queue = cv
+            .wait_timeout(queue, remaining.min(Duration::from_millis(50)))
+            .unwrap_or_else(|e| e.into_inner())
+            .0;
     }
-    fn reply(&mut self, request: u64, blob: Arc<Blob>, eof: bool) -> Result<usize, ErrorCode> {
-        self.shared.reply(request, blob, eof)
+    if queue.closed || shared.cancel.load(Ordering::Acquire) {
+        return Err(ErrorCode::Cancelled);
     }
-    fn fail(&mut self, request: u64, error: ErrorCode) -> Result<(), ErrorCode> {
-        self.shared.fail(request, error)
-    }
+    queue.items.push_back(update);
+    Ok(true)
 }
 
 #[cfg(test)]

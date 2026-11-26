@@ -3,6 +3,8 @@ use iris_plugin_sdk::api::v2::{Role, task::CredentialBucket};
 use serde_json::json;
 use std::collections::VecDeque;
 
+mod regressions;
+
 #[derive(Default)]
 struct Mock {
     next: u64,
@@ -261,6 +263,7 @@ fn bounded_http_reads_produce_pages_and_cached_playback_without_extra_propfind()
     };
     assert_eq!(page.entries[2].name, "ep2.mp4");
     assert_eq!(page.entries.len(), 128);
+    assert_eq!(page.folder_id, None);
     assert!(host.closed.contains(&Id(990)));
     let next = plugin
         .event(
@@ -269,7 +272,7 @@ fn bounded_http_reads_produce_pages_and_cached_playback_without_extra_propfind()
                 HostEvent::SourceBrowse {
                     request_id: Id(101),
                     source_id: "nas".into(),
-                    folder_id: Some("/".into()),
+                    folder_id: page.folder_id.clone(),
                     page: page.next_page.clone(),
                     query: None,
                     filters: Default::default(),
@@ -279,7 +282,7 @@ fn bounded_http_reads_produce_pages_and_cached_playback_without_extra_propfind()
         )
         .unwrap();
     assert!(
-        matches!(&next[0], HostCommand::ProvideSourcePage { page, .. } if page.entries.len() == 72 && page.next_page.is_none())
+        matches!(&next[0], HostCommand::ProvideSourcePage { page, .. } if page.entries.len() == 72 && page.next_page.is_none() && page.folder_id.is_none())
     );
     plugin
         .event(
@@ -324,12 +327,26 @@ fn credentials_are_versioned_before_config_commit_and_uncertain_writes_reload() 
         ("username".into(), "test".into()),
         ("secret".into(), "new-password".into()),
     ]);
+    for window in [1, 2] {
+        plugin
+            .event(
+                scoped(
+                    window,
+                    HostEvent::SourceManage {
+                        source_id: "nas".into(),
+                        action: iris_plugin_sdk::api::SourceManageAction::Configure,
+                    },
+                ),
+                &mut host,
+            )
+            .unwrap();
+    }
     plugin
         .event(
             scoped(
                 1,
                 HostEvent::ModalSubmit {
-                    id: "webdav.edit:nas".into(),
+                    id: "webdav.edit".into(),
                     values: fields.clone(),
                 },
             ),
@@ -338,7 +355,7 @@ fn credentials_are_versioned_before_config_commit_and_uncertain_writes_reload() 
         .unwrap();
     let (id, task) = host.pop();
     assert!(
-        matches!(task, Task::SecretWrite { key, value:Some(v), .. } if key.starts_with("cred.nas.") && v == "new-password")
+        matches!(task, Task::SecretWrite { key, value:Some(v), .. } if key.starts_with("cred.") && v == "new-password")
     );
     assert_eq!(plugin.servers[0].name, "NAS");
     let busy = plugin
@@ -346,7 +363,7 @@ fn credentials_are_versioned_before_config_commit_and_uncertain_writes_reload() 
             scoped(
                 2,
                 HostEvent::ModalSubmit {
-                    id: "webdav.edit:nas".into(),
+                    id: "webdav.edit".into(),
                     values: fields,
                 },
             ),
@@ -368,7 +385,7 @@ fn credentials_are_versioned_before_config_commit_and_uncertain_writes_reload() 
     else {
         panic!("configuration must follow successful secret write")
     };
-    assert!(saved.contains("cred.nas."));
+    assert!(saved.contains("cred."));
     assert!(!saved.contains("new-password"));
     // A window can disappear after the atomic filesystem commit but before receipt.
     plugin
@@ -435,6 +452,8 @@ fn xml_and_modal_reject_scope_escape_and_dtd() {
         ("auth".into(), "basic".into()),
         ("username".into(), "different".into()),
     ]);
-    assert!(modal::validate_modal_submit(&plugin.servers, "webdav.edit:nas", &values).is_err());
+    assert!(
+        modal::validate_modal_submit(&plugin.servers, "webdav.edit", Some("nas"), &values).is_err()
+    );
     assert!(config::decode_servers(Some("not JSON")).is_err());
 }

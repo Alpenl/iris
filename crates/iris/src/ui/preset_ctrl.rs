@@ -95,15 +95,14 @@ impl IrisWindow {
             })
             .map(|p| p.id.clone())
             .collect();
-        let snap = self.plugin_snapshot();
         for pid in theme_plugin_ids {
             if !self.settings.disabled_plugins.iter().any(|d| d == &pid) {
                 self.settings.disabled_plugins.push(pid.clone());
             }
             self.text_inputs.clear_plugin_sidebar_fields(&pid);
-            let report = self
-                .plugins
-                .set_enabled_with_snapshot(&pid, false, snap.clone());
+            self.cleanup_plugin_playback(Some(&pid), None);
+            let snap = self.plugin_snapshot();
+            let report = self.plugins.set_enabled_with_snapshot(&pid, false, snap);
             self.apply_poll_report(report, Some(window), cx);
         }
         while let Some((plugin, _)) = self.plugins.active_modal() {
@@ -113,6 +112,7 @@ impl IrisWindow {
         self.reconcile_active_source();
         self.plugin_view.modal.focus_pending = true;
         self.sync_plugin_modal_focus(window);
+        self.sync_view_timer(cx);
         self.settings.theme_id = "graphite".into();
         self.settings.floating_dock = false;
         self.settings.compact_controls = false;
@@ -134,6 +134,7 @@ impl IrisWindow {
             self.overlays.dir_popup = DirectoryPopup::Manual;
             self.bump_activity(cx);
         }
+        self.sync_view_timer(cx);
         cx.notify();
     }
 
@@ -182,7 +183,6 @@ impl IrisWindow {
 
         if prev_disabled != self.settings.disabled_plugins {
             let all_ids: Vec<String> = self.plugins.list().iter().map(|p| p.id.clone()).collect();
-            let snap = self.plugin_snapshot();
             for pid in all_ids {
                 let enable = !self.settings.disabled_plugins.iter().any(|d| d == &pid);
                 if enable == !prev_disabled.iter().any(|d| d == &pid) {
@@ -190,10 +190,10 @@ impl IrisWindow {
                 }
                 if !enable {
                     self.text_inputs.clear_plugin_sidebar_fields(&pid);
+                    self.cleanup_plugin_playback(Some(&pid), None);
                 }
-                let report = self
-                    .plugins
-                    .set_enabled_with_snapshot(&pid, enable, snap.clone());
+                let snap = self.plugin_snapshot();
+                let report = self.plugins.set_enabled_with_snapshot(&pid, enable, snap);
                 self.apply_poll_report(report, Some(window), cx);
             }
             self.reconcile_active_source();
@@ -207,6 +207,7 @@ impl IrisWindow {
         if let Some(mode) = trans.sidebar_mode {
             self.catalog.sidebar_mode = mode;
         }
+        self.sync_view_timer(cx);
         platform::set_always_on_top(window, self.settings.always_on_top);
         if let Some((w, h)) = trans.window_size {
             if window.is_fullscreen() {

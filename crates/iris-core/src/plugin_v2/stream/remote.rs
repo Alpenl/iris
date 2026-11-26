@@ -11,7 +11,6 @@ use crate::{
         network::{
             NetworkGrant, RequestGrant, TransportKind,
             cookies::CookieJar,
-            normalize_url,
             raw::{self, RawRequest, RawState},
         },
     },
@@ -62,6 +61,14 @@ impl RemoteFactory {
         resource: &RemoteResource,
         size: Option<u64>,
     ) -> Result<Arc<RemoteReader>, ErrorCode> {
+        self.reader_with_mode(resource, size, false)
+    }
+    fn reader_with_mode(
+        &self,
+        resource: &RemoteResource,
+        size: Option<u64>,
+        verified: bool,
+    ) -> Result<Arc<RemoteReader>, ErrorCode> {
         if resource.url.len() > 4096
             || resource.headers.len() > 64
             || resource
@@ -81,16 +88,13 @@ impl RemoteFactory {
         }) {
             return Err(ErrorCode::Denied);
         }
-        let grant = self.grant.request_tracked(
+        let (grant, url) = self.grant.request_normalized(
             &resource.url,
             TransportKind::Http,
             resource.origin_grant,
             self.activity.clone(),
         )?;
-        grant.check_credentials(
-            &normalize_url(&resource.url, TransportKind::Http)?,
-            &resource.headers,
-        )?;
+        grant.check_credentials(&url, &resource.headers)?;
         let retained = 4096
             + resource.url.len()
             + resource
@@ -102,11 +106,15 @@ impl RemoteFactory {
             .ledger
             .reserve(self.owner(), &[(Resource::HostBytes, retained as u64)])?;
         Ok(Arc::new(RemoteReader {
-            factory: self.clone(),
-            resource: resource.clone(),
-            grant,
-            expected: size,
-            metadata: Arc::new(Mutex::new(None)),
+            target: Arc::new(RemoteTarget {
+                factory: self.clone(),
+                resource: resource.clone(),
+                url,
+                grant,
+                expected: size,
+                verified,
+                metadata: Mutex::new(None),
+            }),
             _memory: memory,
         }))
     }
@@ -137,7 +145,7 @@ impl RemoteFactory {
         }
         let sources = std::iter::once(primary)
             .chain(fallback)
-            .map(|s| self.reader(s, Some(identity.size.0)))
+            .map(|s| self.reader_with_mode(s, Some(identity.size.0), true))
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Arc::new(VerifiedReader {
             factory: self.clone(),
@@ -154,15 +162,34 @@ struct Metadata {
     size: Option<u64>,
     etag: Option<String>,
 }
-#[derive(Clone)]
 struct RemoteTarget {
     factory: RemoteFactory,
     resource: RemoteResource,
+    url: url::Url,
     grant: Arc<RequestGrant>,
     expected: Option<u64>,
-    metadata: Arc<Mutex<Option<Metadata>>>,
+    verified: bool,
+    metadata: Mutex<Option<Metadata>>,
 }
 impl RemoteTarget {
+    fn has_etag(&self) -> bool {
+        !self.verified
+            && self
+                .metadata
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+                .is_some_and(|m| m.etag.is_some())
+    }
+    fn known_size(&self) -> Option<u64> {
+        self.expected.or_else(|| {
+            self.metadata
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+                .and_then(|m| m.size)
+        })
+    }
     fn open_range(
         &self,
         method: &str,
@@ -185,6 +212,7 @@ impl RemoteTarget {
             };
             headers.push(("Range".into(), value));
             if send_if_range
+                && !self.verified
                 && let Some(etag) = self
                     .metadata
                     .lock()
@@ -206,7 +234,7 @@ impl RemoteTarget {
         let state = raw::open(
             RawRequest {
                 method: method.into(),
-                url: normalize_url(&self.resource.url, TransportKind::Http)?,
+                url: self.url.clone(),
                 headers,
                 follow_redirects: true,
                 timeout,
@@ -223,76 +251,34 @@ impl RemoteTarget {
             cancel,
         })
     }
-}
-pub struct RemoteReader {
-    factory: RemoteFactory,
-    resource: RemoteResource,
-    grant: Arc<RequestGrant>,
-    expected: Option<u64>,
-    metadata: Arc<Mutex<Option<Metadata>>>,
-    _memory: Reservation,
-}
-struct Response {
-    state: RawState,
-    _memory: Reservation,
-    cancel: HttpCancel,
-}
-impl Drop for Response {
-    fn drop(&mut self) {
-        self.cancel.cancel();
-    }
-}
-impl RemoteReader {
-    fn target(&self) -> RemoteTarget {
-        RemoteTarget {
-            factory: self.factory.clone(),
-            resource: self.resource.clone(),
-            grant: self.grant.clone(),
-            expected: self.expected,
-            metadata: self.metadata.clone(),
-        }
-    }
-    fn open_range(
-        &self,
-        method: &str,
-        range: Option<(u64, Option<u64>)>,
-        send_if_range: bool,
-        host_bytes: u64,
-        cancel: &HttpCancel,
-        deadline: Instant,
-    ) -> Result<Response, ErrorCode> {
-        self.target()
-            .open_range(method, range, send_if_range, host_bytes, cancel, deadline)
-    }
-    fn open(
-        &self,
-        method: &str,
-        range: Option<(u64, u64)>,
-        cancel: &HttpCancel,
-        deadline: Instant,
-    ) -> Result<Response, ErrorCode> {
-        let range = range
-            .map(|(start, len)| {
-                let end = start
-                    .checked_add(len.checked_sub(1).ok_or(ErrorCode::RangeInvalid)?)
-                    .ok_or(ErrorCode::RangeInvalid)?;
-                Ok::<_, ErrorCode>((start, Some(end)))
-            })
-            .transpose()?;
-        self.open_range(method, range, true, 2 << 20, cancel, deadline)
-    }
     fn remember(
         &self,
         headers: &[(String, String)],
         size: Option<u64>,
         require_etag_continuity: bool,
     ) -> Result<(), ErrorCode> {
-        let etag = unique(headers, "etag")?
-            .filter(|s| s.len() >= 2 && s.starts_with('"') && s.ends_with('"') && s.len() <= 1024)
-            .map(str::to_owned);
         if self.expected.is_some() && size.is_some() && size != self.expected {
             return Err(ErrorCode::RangeInvalid);
         }
+        if self.verified {
+            let mut metadata = self.metadata.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(old) = metadata.as_ref()
+                && old.size.is_some()
+                && size.is_some()
+                && old.size != size
+            {
+                return Err(ErrorCode::StaleHandle);
+            }
+            let next_size = size.or_else(|| metadata.as_ref().and_then(|m| m.size));
+            *metadata = Some(Metadata {
+                size: next_size,
+                etag: None,
+            });
+            return Ok(());
+        }
+        let etag = unique(headers, "etag")?
+            .filter(|s| s.len() >= 2 && s.starts_with('"') && s.ends_with('"') && s.len() <= 1024)
+            .map(str::to_owned);
         let mut metadata = self.metadata.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(old) = metadata.as_ref()
             && (old.size.is_some() && size.is_some() && old.size != size
@@ -313,6 +299,22 @@ impl RemoteReader {
         *metadata = Some(Metadata { size, etag });
         Ok(())
     }
+}
+pub struct RemoteReader {
+    target: Arc<RemoteTarget>,
+    _memory: Reservation,
+}
+struct Response {
+    state: RawState,
+    _memory: Reservation,
+    cancel: HttpCancel,
+}
+impl Drop for Response {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+    }
+}
+impl RemoteReader {
     fn read_until(
         &self,
         offset: u64,
@@ -321,14 +323,8 @@ impl RemoteReader {
         deadline: Instant,
     ) -> Result<ReadResult, ErrorCode> {
         check_read(offset, len, cancel)?;
-        self.grant.check_live()?;
-        let known = self.expected.or_else(|| {
-            self.metadata
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .as_ref()
-                .and_then(|m| m.size)
-        });
+        self.target.grant.check_live()?;
+        let known = self.target.known_size();
         if known.is_some_and(|size| offset > size) {
             return Err(ErrorCode::RangeInvalid);
         }
@@ -336,7 +332,18 @@ impl RemoteReader {
             return self.blob(Vec::new(), true);
         }
         let len = known.map_or(u64::from(len), |size| (size - offset).min(u64::from(len)));
-        let mut response = self.open("GET", Some((offset, len)), cancel, deadline)?;
+        let end = offset
+            .checked_add(len.checked_sub(1).ok_or(ErrorCode::RangeInvalid)?)
+            .ok_or(ErrorCode::RangeInvalid)?;
+        let (mut response, retried) = self.target.open_range_with_fallback(
+            Some((offset, Some(end))),
+            known,
+            true,
+            offset > 0,
+            2 << 20,
+            cancel,
+            || deadline,
+        )?;
         let RawState::Response(raw) = &response.state else {
             return Err(ErrorCode::Internal);
         };
@@ -346,7 +353,7 @@ impl RemoteReader {
                 .and_then(|v| v.strip_prefix("bytes */"))
                 .ok_or(ErrorCode::RangeInvalid)?;
             let total = super::range::decimal(total)?;
-            self.remember(&raw.headers, Some(total), false)?;
+            self.target.remember(&raw.headers, Some(total), false)?;
             if offset != total {
                 return Err(ErrorCode::RangeInvalid);
             }
@@ -381,7 +388,11 @@ impl RemoteReader {
                 ErrorCode::IoError
             });
         };
-        self.remember(&raw.headers, total, true)?;
+        if retried {
+            self.target.remember_stream(&raw.headers, total, true)?;
+        } else {
+            self.target.remember(&raw.headers, total, true)?;
+        }
         let whole = raw.status == 200;
         let mut bytes = vec![0; expected as usize];
         let mut used = 0;
@@ -407,14 +418,14 @@ impl RemoteReader {
         if cancel.is_cancelled() {
             return Err(ErrorCode::Cancelled);
         }
-        self.grant.check_live()?;
+        self.target.grant.check_live()?;
         self.blob(bytes, total == Some(end) || whole && eof)
     }
     fn blob(&self, bytes: Vec<u8>, eof: bool) -> Result<ReadResult, ErrorCode> {
         Ok(ReadResult {
             blob: Arc::new(Blob::new(
-                &self.factory.ledger,
-                self.factory.owner(),
+                &self.target.factory.ledger,
+                self.target.factory.owner(),
                 bytes,
             )?),
             eof,
@@ -423,14 +434,15 @@ impl RemoteReader {
 }
 impl Reader for RemoteReader {
     fn size(&self, cancel: &HttpCancel) -> Result<Option<u64>, ErrorCode> {
-        self.grant.check_live()?;
+        self.target.grant.check_live()?;
         if cancel.is_cancelled() {
             return Err(ErrorCode::Cancelled);
         }
-        if let Some(size) = self.expected {
+        if let Some(size) = self.target.expected {
             return Ok(Some(size));
         }
         if let Some(metadata) = self
+            .target
             .metadata
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -438,9 +450,11 @@ impl Reader for RemoteReader {
         {
             return Ok(metadata.size);
         }
-        let response = self.open(
+        let response = self.target.open_range(
             "HEAD",
             None,
+            false,
+            2 << 20,
             cancel,
             Instant::now() + Duration::from_secs(30),
         )?;
@@ -457,7 +471,7 @@ impl Reader for RemoteReader {
         let size = unique(&raw.headers, "content-length")?
             .map(super::range::decimal)
             .transpose()?;
-        self.remember(&raw.headers, size, true)?;
+        self.target.remember(&raw.headers, size, true)?;
         Ok(size)
     }
     fn read_at(&self, offset: u64, len: u32, cancel: &HttpCancel) -> Result<ReadResult, ErrorCode> {
@@ -491,7 +505,7 @@ impl Reader for VerifiedReader {
             return Err(ErrorCode::Cancelled);
         }
         for source in &self.sources {
-            source.grant.check_live()?;
+            source.target.grant.check_live()?;
         }
         Ok(Some(self.size))
     }

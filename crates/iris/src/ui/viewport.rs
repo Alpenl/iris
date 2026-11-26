@@ -68,6 +68,14 @@ impl Viewport {
         }
     }
 
+    pub(super) fn commit_media_open_generation(&mut self) -> u64 {
+        let prev = self.load_generation;
+        self.load_generation += 1;
+        self.pending_subtitles.advance(prev, self.load_generation);
+        self.loading_visible = false;
+        self.load_generation
+    }
+
     pub(super) fn refresh_cached_stats(&mut self, full: bool) {
         if full || self.cached_stats.is_none() {
             self.cached_stats = Some(self.session.media_stats());

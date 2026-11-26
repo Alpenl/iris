@@ -8,29 +8,67 @@ use crate::{
 };
 use iris_api::v2::{ErrorCode, stream::RemoteResource};
 use std::{
-    sync::{Arc, Mutex, TryLockError, Weak},
+    sync::{Arc, Condvar, Mutex, Weak},
     time::{Duration, Instant},
 };
 struct State {
     next: Instant,
     error: Option<ErrorCode>,
+    refreshing: bool,
 }
 struct Live {
     session: Weak<StreamSession>,
     factory: RemoteFactory,
     source: RemoteResource,
-    state: Mutex<State>,
+    state: Arc<Mutex<State>>,
+    changed: Arc<Condvar>,
+}
+struct RefreshGuard<'a> {
+    live: &'a Live,
+    armed: bool,
+}
+impl Drop for RefreshGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            let mut state = self.live.state.lock().unwrap_or_else(|e| e.into_inner());
+            state.refreshing = false;
+            self.live.changed.notify_all();
+        }
+    }
 }
 impl Refresh for Live {
     fn refresh(&self, cancel: &HttpCancel) -> Result<(), ErrorCode> {
-        let mut state = match self.state.try_lock() {
-            Ok(state) => state,
-            Err(TryLockError::WouldBlock) => return Ok(()),
-            Err(TryLockError::Poisoned(_)) => return Err(ErrorCode::Internal),
-        };
+        if cancel.is_cancelled() {
+            return Err(ErrorCode::Cancelled);
+        }
+        let state_arc = Arc::clone(&self.state);
+        let changed_arc = Arc::clone(&self.changed);
+        let _cancel_reg = cancel
+            .register_callback(Arc::new(move || {
+                let _guard = state_arc.lock().unwrap_or_else(|e| e.into_inner());
+                changed_arc.notify_all();
+            }))
+            .map_err(|_| ErrorCode::Cancelled)?;
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        while state.refreshing {
+            if cancel.is_cancelled() {
+                return Err(ErrorCode::Cancelled);
+            }
+            state = self.changed.wait(state).unwrap_or_else(|e| e.into_inner());
+        }
+        if cancel.is_cancelled() {
+            return Err(ErrorCode::Cancelled);
+        }
         if Instant::now() < state.next {
             return state.error.map_or(Ok(()), Err);
         }
+        state.refreshing = true;
+        drop(state);
+
+        let mut guard = RefreshGuard {
+            live: self,
+            armed: true,
+        };
         let session = self.session.upgrade().ok_or(ErrorCode::Cancelled)?;
         let result = (|| {
             let document = convert(&self.factory, &self.source, cancel)?;
@@ -39,7 +77,10 @@ impl Refresh for Live {
             session.commit(prepared)?;
             Ok::<_, ErrorCode>(document)
         })();
-        match result {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.refreshing = false;
+        guard.armed = false;
+        let outcome = match result {
             Ok(document) => {
                 state.next = Instant::now()
                     + if document.live {
@@ -57,7 +98,9 @@ impl Refresh for Live {
                 }
                 Err(error)
             }
-        }
+        };
+        self.changed.notify_all();
+        outcome
     }
 }
 pub fn attach(
@@ -72,9 +115,11 @@ pub fn attach(
         session: Arc::downgrade(session),
         factory: session.factory.clone(),
         source,
-        state: Mutex::new(State {
+        state: Arc::new(Mutex::new(State {
             next: Instant::now() + document.refresh_after,
             error: None,
-        }),
+            refreshing: false,
+        })),
+        changed: Arc::new(Condvar::new()),
     }))
 }

@@ -468,6 +468,10 @@ impl IrisWindow {
         let (pid_s, sid_s) = (pid.clone(), src.id.clone());
         let (pid_cfg, sid_cfg) = (pid.clone(), src.id.clone());
         let (pid_rm, sid_rm) = (pid.clone(), src.id.clone());
+        let auth_id = plugin_source_row_id("pl-src-auth", &pid, row_ix);
+        let cfg_id = plugin_source_row_id("pl-src-cfg", &pid, row_ix);
+        let rm_id = plugin_source_row_id("pl-src-rm", &pid, row_ix);
+        let open_id = plugin_source_row_id("pl-src-open", &pid, row_ix);
         let rm_key = format!("rm-src:{pid}:{}", src.id);
         let auth_cmd = src.auth_command_id;
 
@@ -499,33 +503,29 @@ impl IrisWindow {
                         .flex_none()
                         .when_some(auth_cmd.filter(|_| src.requires_auth), |row, cmd_id| {
                             let pid_auth = pid_s.clone();
-                            row.child(
-                                chip_button(("pl-src-auth", row_ix), "登录", true, t).on_click(
-                                    cx.listener(move |this, _, w, cx| {
-                                        this.invoke_plugin_command(&pid_auth, &cmd_id, w, cx);
-                                    }),
-                                ),
-                            )
+                            row.child(chip_button(auth_id, "登录", true, t).on_click(cx.listener(
+                                move |this, _, w, cx| {
+                                    this.invoke_plugin_command(&pid_auth, &cmd_id, w, cx);
+                                },
+                            )))
                         })
                         .when(src.configurable, |row| {
-                            row.child(
-                                chip_button(("pl-src-cfg", row_ix), "配置", false, t).on_click(
-                                    cx.listener(move |this, _, w, cx| {
-                                        this.manage_plugin_source(
-                                            &pid_cfg,
-                                            &sid_cfg,
-                                            SourceManageAction::Configure,
-                                            w,
-                                            cx,
-                                        );
-                                    }),
-                                ),
-                            )
+                            row.child(chip_button(cfg_id, "配置", false, t).on_click(cx.listener(
+                                move |this, _, w, cx| {
+                                    this.manage_plugin_source(
+                                        &pid_cfg,
+                                        &sid_cfg,
+                                        SourceManageAction::Configure,
+                                        w,
+                                        cx,
+                                    );
+                                },
+                            )))
                         })
                         .when(src.removable, |row| {
                             row.child(
                                 button(
-                                    ("pl-src-rm", row_ix),
+                                    rm_id,
                                     if confirm_rm {
                                         "再次点击确认"
                                     } else {
@@ -554,17 +554,38 @@ impl IrisWindow {
                                 )),
                             )
                         })
-                        .child(
-                            chip_button(("pl-src-open", row_ix), "浏览", false, t).on_click(
-                                cx.listener(move |this, _, w, cx| {
-                                    this.overlays.settings_open = false;
-                                    this.focus.focus(w);
-                                    this.browse_plugin_source(&pid_s, &sid_s, None, None, None, cx);
-                                }),
-                            ),
-                        ),
+                        .child(chip_button(open_id, "浏览", false, t).on_click(cx.listener(
+                            move |this, _, w, cx| {
+                                this.overlays.settings_open = false;
+                                this.focus.focus(w);
+                                this.browse_plugin_source(&pid_s, &sid_s, None, None, None, cx);
+                            },
+                        ))),
                 )
             })
             .into_any_element()
+    }
+}
+
+fn plugin_source_row_id(kind: &str, pid: &str, row_ix: usize) -> SharedString {
+    SharedString::from(format!("{kind}:{}:{pid}:{row_ix}", pid.len()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::plugin_source_row_id;
+
+    #[test]
+    fn plugin_source_row_ids_do_not_collide_across_plugins() {
+        let a0 = plugin_source_row_id("pl-src-open", "iris.webdav", 0);
+        let b0 = plugin_source_row_id("pl-src-open", "community.baidupan", 0);
+        let c0 = plugin_source_row_id("pl-src-open", "a:b", 0);
+        let d0 = plugin_source_row_id("pl-src-open", "a", 0);
+        assert_ne!(a0, b0);
+        assert_ne!(c0, d0);
+        assert_ne!(
+            plugin_source_row_id("pl-src-open", "iris.webdav", 0),
+            plugin_source_row_id("pl-src-open", "iris.webdav", 1)
+        );
     }
 }

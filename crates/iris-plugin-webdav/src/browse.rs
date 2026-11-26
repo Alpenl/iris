@@ -16,8 +16,14 @@ use serde_json::Value;
 use std::rc::Rc;
 
 pub(super) enum Intent {
-    Browse { path: String, query: Option<String> },
-    Resolve { entry: String },
+    Browse {
+        path: String,
+        folder_id: Option<String>,
+        query: Option<String>,
+    },
+    Resolve {
+        entry: String,
+    },
 }
 enum Phase {
     Origin(Id),
@@ -284,7 +290,10 @@ impl Job {
             },
         )?;
         let (commands, next_cache) = match &self.intent {
-            Intent::Browse { .. } => (cache.first_page(self.request)?, Some(Box::new(cache))),
+            Intent::Browse { folder_id, .. } => (
+                cache.first_page(self.request, folder_id.as_deref())?,
+                Some(Box::new(cache)),
+            ),
             Intent::Resolve { entry } => (
                 cache.resolve(self.request, entry, &self.headers, self.grant)?,
                 None,

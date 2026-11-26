@@ -27,8 +27,8 @@ fn review_compiles_without_executing_and_approval_uses_the_reviewed_bytes() {
     let review = Review::read(&path, &installer, &resources, &AtomicBool::new(false)).unwrap();
     let digest = review.digest();
     std::fs::write(&path, package(&wasm, "Replaced after review")).unwrap();
-    let installed = review
-        .approve(&mut installer, BTreeSet::new(), false)
+    let (installed, _) = review
+        .approve_with_cleanup(&mut installer, BTreeSet::new(), false)
         .unwrap();
     assert_eq!(installed.digest, digest);
     assert_eq!(
@@ -38,11 +38,26 @@ fn review_compiles_without_executing_and_approval_uses_the_reviewed_bytes() {
     let review = Review::read(&path, &installer, &resources, &AtomicBool::new(false)).unwrap();
     let other = Review::read(&path, &installer, &resources, &AtomicBool::new(false)).unwrap();
     other
-        .approve(&mut installer, BTreeSet::new(), false)
+        .approve_with_cleanup(&mut installer, BTreeSet::new(), false)
         .unwrap();
     assert_eq!(
-        review.approve(&mut installer, BTreeSet::new(), true),
+        review.approve_with_cleanup(&mut installer, BTreeSet::new(), true),
         Err(ErrorCode::StaleHandle)
+    );
+    let mut expired = Review::read(&path, &installer, &resources, &AtomicBool::new(false)).unwrap();
+    expired.expires = Instant::now() - Duration::from_secs(1);
+    assert_eq!(
+        expired.approve_with_cleanup(&mut installer, BTreeSet::new(), false),
+        Err(ErrorCode::StaleHandle)
+    );
+    let mut refreshed =
+        Review::read(&path, &installer, &resources, &AtomicBool::new(false)).unwrap();
+    refreshed.expires = Instant::now() - Duration::from_secs(1);
+    refreshed.refresh_expiry();
+    assert!(
+        refreshed
+            .approve_with_cleanup(&mut installer, BTreeSet::new(), false)
+            .is_ok()
     );
     assert_eq!(resources.ledger.used(None, Resource::HostBytes), 0);
     assert!(

@@ -7,27 +7,35 @@ use crate::plugin_v2::stream::{
 use iris_api::v2::{
     ErrorCode, Id,
     stream::{
-        ByteRange, HlsKey, HlsSegment, HlsTrack, ResourceBinding, ResourceKind, ResourceSpan,
+        ByteRange, HlsKey, HlsSegment, HlsTrack, ResourceExtension, ResourceKind, ResourceSpan,
         TrackKind,
     },
 };
 use std::collections::{BTreeMap, BTreeSet};
 
-pub(super) fn parse(
+pub fn parse_media(
     text: &str,
-    resources: &BTreeMap<String, ResourceBinding>,
+    kind: TrackKind,
+    mut bind: impl FnMut(&str, ResourceKind, ResourceExtension) -> Result<String, ErrorCode>,
 ) -> Result<(HlsTrack, bool), ErrorCode> {
     if text.len() > INPUT_LIMIT {
         return Err(ErrorCode::QuotaExceeded);
     }
     let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    if text
+        .lines()
+        .any(|l| l.starts_with("#EXT-X-STREAM-INF:") || l.starts_with("#EXT-X-MEDIA:"))
+    {
+        return Err(ErrorCode::Unsupported);
+    }
+    let fragmented = text.lines().any(|l| l.starts_with("#EXT-X-MAP:"));
     let mut lines = text.lines();
     if lines.next() != Some("#EXTM3U") {
         return Err(ErrorCode::InvalidArgument);
     }
     let mut track = HlsTrack {
         id: "media".into(),
-        kind: TrackKind::Video,
+        kind,
         group: None,
         label: "Media".into(),
         lang: None,
@@ -57,14 +65,22 @@ pub(super) fn parse(
             return Err(ErrorCode::InvalidArgument);
         }
         if !line.starts_with('#') {
-            logical(line)?;
             if track.segments.len() >= RESOURCE_LIMIT {
                 return Err(ErrorCode::QuotaExceeded);
             }
-            let resource = resources.get(line).ok_or(ErrorCode::InvalidArgument)?;
-            if track.segments.is_empty() && resource.kind == ResourceKind::Subtitle {
-                track.kind = TrackKind::Subtitle;
-            }
+            let (res_kind, res_ext) = match kind {
+                TrackKind::Subtitle => (ResourceKind::Subtitle, ResourceExtension::Vtt),
+                _ => (
+                    ResourceKind::Media,
+                    if fragmented {
+                        ResourceExtension::M4s
+                    } else {
+                        ResourceExtension::Ts
+                    },
+                ),
+            };
+            let resource_id = bind(line, res_kind, res_ext)?;
+            logical(&resource_id)?;
             let range = range
                 .take()
                 .map(|(len, offset): (u64, Option<u64>)| {
@@ -74,7 +90,7 @@ pub(super) fn parse(
                             let previous = track
                                 .segments
                                 .last()
-                                .filter(|s| s.resource.resource_id == line)
+                                .filter(|s| s.resource.resource_id == resource_id)
                                 .ok_or(ErrorCode::RangeInvalid)?;
                             range_end(
                                 previous
@@ -102,10 +118,7 @@ pub(super) fn parse(
                 return Err(ErrorCode::InvalidArgument);
             }
             track.segments.push(HlsSegment {
-                resource: ResourceSpan {
-                    resource_id: line.into(),
-                    range,
-                },
+                resource: ResourceSpan { resource_id, range },
                 duration_ms: Id(duration.take().ok_or(ErrorCode::InvalidArgument)?),
                 init: init.clone(),
                 key: key.as_ref().map(|(resource_id, iv)| HlsKey {
@@ -173,7 +186,8 @@ pub(super) fn parse(
             }
             "#EXT-X-MAP" => {
                 let mut attrs = attributes(value.ok_or(ErrorCode::InvalidArgument)?)?;
-                let resource_id = take(&mut attrs, "URI", true)?;
+                let uri = take(&mut attrs, "URI", true)?;
+                let resource_id = bind(&uri, ResourceKind::Init, ResourceExtension::Mp4)?;
                 logical(&resource_id)?;
                 let range = attrs
                     .remove("BYTERANGE")
@@ -203,7 +217,8 @@ pub(super) fn parse(
                         return Err(ErrorCode::Unsupported);
                     }
                     let uri = take(&mut attrs, "URI", true)?;
-                    logical(&uri)?;
+                    let resource_id = bind(&uri, ResourceKind::Key, ResourceExtension::Key)?;
+                    logical(&resource_id)?;
                     let iv = attrs
                         .remove("IV")
                         .map(|(v, quoted)| {
@@ -222,7 +237,7 @@ pub(super) fn parse(
                             return Err(ErrorCode::Unsupported);
                         }
                     }
-                    Some((uri, iv))
+                    Some((resource_id, iv))
                 };
                 if !attrs.is_empty() {
                     return Err(ErrorCode::Unsupported);
@@ -256,7 +271,9 @@ pub(super) fn parse(
         || track
             .segments
             .iter()
-            .any(|s| s.duration_ms.0.div_ceil(1000) > target)
+            // RFC 8216 §4.3.3.1 compares durations rounded to the nearest second.
+            // Parsed durations are bounded to 24 hours, so adding 500 is safe.
+            .any(|s| (s.duration_ms.0 + 500) / 1000 > target)
     {
         return Err(ErrorCode::InvalidArgument);
     }
@@ -322,7 +339,7 @@ fn take(
     Ok(value)
 }
 
-pub(super) fn attributes(mut input: &str) -> Result<BTreeMap<String, (String, bool)>, ErrorCode> {
+pub fn attributes(mut input: &str) -> Result<BTreeMap<String, (String, bool)>, ErrorCode> {
     let mut out = BTreeMap::new();
     loop {
         let (name, rest) = input.split_once('=').ok_or(ErrorCode::InvalidArgument)?;

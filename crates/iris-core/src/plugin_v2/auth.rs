@@ -4,7 +4,7 @@ use super::{
     actor::{Completion, Executor, IoOutcome, Operation, TaskContext},
     instance::{Blob, next_id},
     ledger::{Activity, Ledger, Reservation, Resource},
-    network::{NetworkGrant, TransportKind, duplex, normalize_url},
+    network::{NetworkGrant, TransportKind, normalize_url},
 };
 use crate::vfs::HttpCancel;
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -27,9 +27,14 @@ use url::Url;
 /// The UI hook only queues a bounded, user-visible browser-open request and wakes
 /// the UI loop. It must not open a browser or wait on the calling Store thread.
 pub type BrowserOpen = Arc<dyn Fn(Id, Generation, &str) -> Result<(), ErrorCode> + Send + Sync>;
+struct WindowScope {
+    generation: Option<Generation>,
+    browser: BrowserOpen,
+}
 struct State {
     instance: Option<Id>,
-    generation: Option<Generation>,
+    global_generation: Option<Generation>,
+    windows: BTreeMap<Id, WindowScope>,
     stopped: bool,
     transactions: BTreeMap<u64, Arc<Transaction>>,
 }
@@ -43,6 +48,7 @@ struct Inner {
 }
 struct Transaction {
     id: Id,
+    window: Option<Id>,
     instance: Id,
     generation: Generation,
     redirect: Url,
@@ -70,11 +76,22 @@ impl AuthExecutor {
             activity: Activity::default(),
             state: Mutex::new(State {
                 instance: None,
-                generation: None,
+                global_generation: None,
+                windows: BTreeMap::new(),
                 stopped: false,
                 transactions: BTreeMap::new(),
             }),
         }))
+    }
+    pub(crate) fn open_window(&self, window: Id, generation: Generation, browser: BrowserOpen) {
+        let mut state = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.windows.insert(
+            window,
+            WindowScope {
+                generation: Some(generation),
+                browser,
+            },
+        );
     }
     fn bind(&self, context: &TaskContext) -> Result<(), ErrorCode> {
         if context.role != Role::Control || context.owner != self.0.network.owner() {
@@ -87,14 +104,28 @@ impl AuthExecutor {
         if state.instance.is_some_and(|i| i != context.instance_id) {
             return Err(ErrorCode::Denied);
         }
-        if state
-            .generation
-            .is_some_and(|g| g.media != context.generation.media)
-        {
-            return Err(ErrorCode::StaleHandle);
-        }
         state.instance = Some(context.instance_id);
-        state.generation = Some(context.generation);
+        match context.window {
+            None => {
+                if state
+                    .global_generation
+                    .is_some_and(|g| g.media != context.generation.media)
+                {
+                    return Err(ErrorCode::StaleHandle);
+                }
+                state.global_generation = Some(context.generation);
+            }
+            Some(win) => {
+                let scope = state.windows.get_mut(&win).ok_or(ErrorCode::StaleHandle)?;
+                if scope
+                    .generation
+                    .is_some_and(|g| g.media != context.generation.media)
+                {
+                    return Err(ErrorCode::StaleHandle);
+                }
+                scope.generation = Some(context.generation);
+            }
+        }
         Ok(())
     }
     fn begin(
@@ -143,13 +174,17 @@ impl AuthExecutor {
                 .map_err(|_| ErrorCode::IoError)?;
             let wake =
                 Arc::new(Waker::new(poll.registry(), Token(1)).map_err(|_| ErrorCode::IoError)?);
-            let cancel_wake = duplex::cancellation_wake(&context.cancel, wake.clone())?;
+            let cancel_wake = context
+                .cancel
+                .register_shared_wake(wake.clone())
+                .map_err(|_| ErrorCode::Cancelled)?;
             let state = random()?;
             let verifier = random()?;
             let challenge =
                 URL_SAFE_NO_PAD.encode(digest::digest(&digest::SHA256, verifier.as_bytes()));
             let transaction = Arc::new(Transaction {
                 id: Id(next_id()?),
+                window: context.window,
                 instance: context.instance_id,
                 generation: context.generation,
                 redirect: Url::parse(&format!("http://{address}{path}"))
@@ -174,11 +209,16 @@ impl AuthExecutor {
             let id = transaction.id.0;
             {
                 let mut state = this.0.state.lock().unwrap_or_else(|e| e.into_inner());
+                let scope_gen = match transaction.window {
+                    None => state.global_generation,
+                    Some(win) => match state.windows.get(&win) {
+                        Some(scope) => scope.generation,
+                        None => return Err(ErrorCode::Cancelled),
+                    },
+                };
                 if state.stopped
                     || transaction.cancel.is_cancelled()
-                    || state
-                        .generation
-                        .is_some_and(|g| g.media != transaction.generation.media)
+                    || scope_gen.is_some_and(|g| g.media != transaction.generation.media)
                 {
                     return Err(ErrorCode::Cancelled);
                 }
@@ -208,7 +248,7 @@ impl AuthExecutor {
                 })
                 .is_err()
             {
-                this.close(id)?;
+                this.close_in(context.window, id)?;
                 return Err(ErrorCode::Internal);
             }
             Ok(result)
@@ -221,16 +261,26 @@ impl AuthExecutor {
         origin: Option<Id>,
         context: TaskContext,
     ) -> Result<Operation, ErrorCode> {
-        let transaction = self
-            .0
-            .state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .transactions
-            .get(&id.0)
-            .cloned()
-            .ok_or(ErrorCode::StaleHandle)?;
-        if transaction.instance != context.instance_id
+        let (transaction, browser) = {
+            let state = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
+            let transaction = state
+                .transactions
+                .get(&id.0)
+                .cloned()
+                .ok_or(ErrorCode::StaleHandle)?;
+            let browser = match context.window {
+                None => self.0.browser.clone(),
+                Some(win) => state
+                    .windows
+                    .get(&win)
+                    .ok_or(ErrorCode::StaleHandle)?
+                    .browser
+                    .clone(),
+            };
+            (transaction, browser)
+        };
+        if transaction.window != context.window
+            || transaction.instance != context.instance_id
             || transaction.generation.media != context.generation.media
         {
             return Err(ErrorCode::StaleHandle);
@@ -253,7 +303,6 @@ impl AuthExecutor {
         {
             return Err(ErrorCode::InvalidArgument);
         }
-        let browser = self.0.browser.clone();
         Ok(Operation::deferred(move |done| {
             grant.check_live()?;
             context
@@ -316,14 +365,19 @@ impl Executor for AuthExecutor {
         }
     }
     fn close(&self, id: u64) -> Result<(), ErrorCode> {
-        let transaction = self
-            .0
-            .state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        self.close_in(None, id)
+    }
+    fn close_in(&self, window: Option<Id>, id: u64) -> Result<(), ErrorCode> {
+        let mut state = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state
             .transactions
-            .remove(&id)
-            .ok_or(ErrorCode::StaleHandle)?;
+            .get(&id)
+            .is_none_or(|tx| tx.window != window)
+        {
+            return Err(ErrorCode::StaleHandle);
+        }
+        let transaction = state.transactions.remove(&id).unwrap();
+        drop(state);
         transaction.cancel.cancel();
         Ok(())
     }
@@ -331,6 +385,7 @@ impl Executor for AuthExecutor {
         let transactions = {
             let mut state = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
             state.stopped = true;
+            state.windows.clear();
             std::mem::take(&mut state.transactions)
         };
         for (_, transaction) in transactions {
@@ -338,19 +393,62 @@ impl Executor for AuthExecutor {
         }
     }
     fn generation_changed(&self, generation: Generation) {
-        let transactions = {
+        let cancelled = {
             let mut state = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
             let media_changed = state
-                .generation
+                .global_generation
                 .is_some_and(|old| old.media != generation.media);
-            state.generation = Some(generation);
+            state.global_generation = Some(generation);
             if media_changed {
-                std::mem::take(&mut state.transactions)
+                let ids: Vec<_> = state
+                    .transactions
+                    .iter()
+                    .filter_map(|(&id, tx)| tx.window.is_none().then_some(id))
+                    .collect();
+                ids.into_iter()
+                    .filter_map(|id| state.transactions.remove(&id))
+                    .collect::<Vec<_>>()
             } else {
-                BTreeMap::new()
+                Vec::new()
             }
         };
-        for (_, transaction) in transactions {
+        for transaction in cancelled {
+            transaction.cancel.cancel();
+        }
+    }
+    fn window_changed(&self, window: Id, generation: Option<Generation>) {
+        let cancelled = {
+            let mut state = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
+            let cancel_all = match generation {
+                Some(next) => {
+                    if let Some(scope) = state.windows.get_mut(&window) {
+                        let media_changed =
+                            scope.generation.is_some_and(|old| old.media != next.media);
+                        scope.generation = Some(next);
+                        media_changed
+                    } else {
+                        false
+                    }
+                }
+                None => {
+                    state.windows.remove(&window);
+                    true
+                }
+            };
+            if cancel_all {
+                let ids: Vec<_> = state
+                    .transactions
+                    .iter()
+                    .filter_map(|(&id, tx)| (tx.window == Some(window)).then_some(id))
+                    .collect();
+                ids.into_iter()
+                    .filter_map(|id| state.transactions.remove(&id))
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            }
+        };
+        for transaction in cancelled {
             transaction.cancel.cancel();
         }
     }

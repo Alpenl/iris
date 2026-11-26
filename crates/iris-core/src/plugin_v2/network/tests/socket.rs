@@ -80,7 +80,9 @@ fn dispatch(pool: &IoPool, operation: Operation) -> mpsc::Receiver<Result<IoOutc
     rx
 }
 fn wait(rx: mpsc::Receiver<Result<IoOutcome, ErrorCode>>) -> IoOutcome {
-    rx.recv_timeout(Duration::from_secs(4)).unwrap().unwrap()
+    let mut outcome = rx.recv_timeout(Duration::from_secs(4)).unwrap().unwrap();
+    outcome.acknowledge();
+    outcome
 }
 fn run(pool: &IoPool, executor: &NetworkExecutor, task: Task, ledger: &Ledger) -> IoOutcome {
     wait(dispatch(
@@ -98,6 +100,80 @@ fn released(ledger: &Ledger, resource: Resource) {
     while ledger.used(None, resource) > 0 {
         assert!(Instant::now() < end, "socket resource not reclaimed");
         std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[test]
+fn discarded_socket_opens_close_transports_and_restore_quota() {
+    for ws in [false, true] {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (accepted, connections) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            for _ in 0..8 {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                if ws {
+                    let mut socket = tungstenite::accept(stream).unwrap();
+                    loop {
+                        match socket.read() {
+                            Err(_) | Ok(tungstenite::Message::Close(_)) => break,
+                            _ => {}
+                        }
+                    }
+                } else {
+                    assert_eq!(stream.read(&mut [0; 1]).unwrap(), 0);
+                }
+                accepted.send(()).unwrap();
+            }
+        });
+        let (_grant, executor, origin, ledger) = setup(port, ws);
+        let baseline = ledger.used(None, Resource::HostBytes);
+        let resource = if ws {
+            Resource::WebSocket
+        } else {
+            Resource::Tcp
+        };
+        let pool = IoPool::new().unwrap();
+        for attempt in 0..8 {
+            let task = if ws {
+                Task::WsConnect {
+                    url: format!("ws://127.0.0.1:{port}/"),
+                    headers: Vec::new(),
+                    origin_grant: Some(origin),
+                }
+            } else {
+                Task::TcpConnect {
+                    host: "127.0.0.1".into(),
+                    port,
+                    tls: false,
+                    origin_grant: Some(origin),
+                }
+            };
+            let context = context(&ledger);
+            let cancel = context.cancel.clone();
+            let result = dispatch(
+                &pool,
+                executor.prepare(task, &BTreeMap::new(), context).unwrap(),
+            )
+            .recv_timeout(Duration::from_secs(4))
+            .unwrap()
+            .unwrap();
+            let handle = id(&result);
+            assert_eq!(ledger.used(None, resource), 1);
+            if attempt % 2 == 0 {
+                cancel.cancel();
+            }
+            drop(result);
+            connections.recv_timeout(Duration::from_secs(4)).unwrap();
+            released(&ledger, resource);
+            assert_eq!(ledger.used(None, Resource::Handle), 0);
+            assert_eq!(ledger.used(None, Resource::HostBytes), baseline);
+            assert_eq!(executor.close(handle.0), Err(ErrorCode::StaleHandle));
+        }
+        server.join().unwrap();
     }
 }
 
@@ -312,4 +388,190 @@ fn websocket_rejects_oversized_frame_before_allocating_payload() {
     executor.close(handle.0).unwrap();
     server.join().unwrap();
     released(&ledger, Resource::WebSocket);
+}
+
+#[test]
+fn tcp_connect_succeeds_via_approved_origin_grant_without_static_tcp_targets() {
+    use crate::plugin_v2::network::consent::OriginStore;
+
+    for caps in [
+        BTreeSet::from([Capability::NetTcp]),
+        BTreeSet::from([Capability::NetHttp, Capability::NetTcp]),
+    ] {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let mut got = [0u8; 4];
+            stream.read_exact(&mut got).unwrap();
+            assert_eq!(&got, b"ping");
+            stream.write_all(b"pong").unwrap();
+        });
+
+        let owner = format!("{:032x}", crate::plugin_v2::instance::next_id().unwrap());
+        let root = std::env::temp_dir().join(format!(
+            "iris-tcp-origin-grant-{}-{owner}",
+            std::process::id()
+        ));
+        let ledger = Ledger::default();
+        let store = OriginStore::new(root.clone(), owner.clone(), ledger.clone()).unwrap();
+        // Empty NetworkDeclaration: zero static tcp_targets!
+        let grant = NetworkGrant::new(
+            owner.clone(),
+            caps.clone(),
+            NetworkDeclaration::default(),
+            &ledger,
+        )
+        .unwrap();
+        let cancel = HttpCancel::default();
+        let raw_origin = format!("tcp://127.0.0.1:{port}");
+        let review = store.review(&grant, &raw_origin, &cancel).unwrap();
+        let approved = store.approve(&grant, review, false, &cancel).unwrap();
+
+        let executor =
+            NetworkExecutor::new(grant.clone(), ledger.clone(), BTreeSet::new()).unwrap();
+        let pool = IoPool::new().unwrap();
+        let ctx = || TaskContext {
+            instance_id: Id(10),
+            window: None,
+            owner: owner.clone(),
+            role: Role::Control,
+            generation: Generation::default(),
+            cancel: HttpCancel::default(),
+            ledger: ledger.clone(),
+        };
+
+        // OriginLookup works with both http:// and tcp:// syntax.
+        for lookup_str in [format!("http://127.0.0.1:{port}"), raw_origin.clone()] {
+            let (tx, rx) = mpsc::channel();
+            executor
+                .prepare(
+                    Task::OriginLookup { origin: lookup_str },
+                    &BTreeMap::new(),
+                    ctx(),
+                )
+                .unwrap()
+                .dispatch(
+                    &pool,
+                    Role::Control,
+                    &owner,
+                    Box::new(move |r| {
+                        let _ = tx.send(r);
+                    }),
+                )
+                .unwrap();
+            let looked_up = wait(rx);
+            assert_eq!(
+                looked_up.value["origin_grant"].as_str().unwrap(),
+                approved.origin_grant.0.to_string()
+            );
+        }
+
+        // TLS mismatch (tls: true on plaintext grant) and ungranted TCP must fail closed.
+        assert_eq!(
+            executor
+                .prepare(
+                    Task::TcpConnect {
+                        host: "127.0.0.1".into(),
+                        port,
+                        tls: true,
+                        origin_grant: Some(approved.origin_grant),
+                    },
+                    &BTreeMap::new(),
+                    ctx(),
+                )
+                .err(),
+            Some(ErrorCode::Denied)
+        );
+        assert_eq!(
+            executor
+                .prepare(
+                    Task::TcpConnect {
+                        host: "127.0.0.1".into(),
+                        port,
+                        tls: false,
+                        origin_grant: None,
+                    },
+                    &BTreeMap::new(),
+                    ctx(),
+                )
+                .err(),
+            Some(ErrorCode::Denied)
+        );
+
+        let (tx, rx) = mpsc::channel();
+        executor
+            .prepare(
+                Task::TcpConnect {
+                    host: "127.0.0.1".into(),
+                    port,
+                    tls: false,
+                    origin_grant: Some(approved.origin_grant),
+                },
+                &BTreeMap::new(),
+                ctx(),
+            )
+            .unwrap()
+            .dispatch(
+                &pool,
+                Role::Control,
+                &owner,
+                Box::new(move |r| {
+                    let _ = tx.send(r);
+                }),
+            )
+            .unwrap();
+        let handle = id(&wait(rx));
+
+        let blobs = BTreeMap::from([(
+            1,
+            Arc::new(Blob::new(&ledger, &owner, b"ping".to_vec()).unwrap()),
+        )]);
+        let (tx, rx) = mpsc::channel();
+        executor
+            .prepare(
+                Task::TcpWrite {
+                    handle,
+                    blob: Id(1),
+                },
+                &blobs,
+                ctx(),
+            )
+            .unwrap()
+            .dispatch(
+                &pool,
+                Role::Control,
+                &owner,
+                Box::new(move |r| {
+                    let _ = tx.send(r);
+                }),
+            )
+            .unwrap();
+        assert_eq!(wait(rx).value["written"], "4");
+
+        let (tx, rx) = mpsc::channel();
+        executor
+            .prepare(Task::TcpRead { handle, len: 4 }, &BTreeMap::new(), ctx())
+            .unwrap()
+            .dispatch(
+                &pool,
+                Role::Control,
+                &owner,
+                Box::new(move |r| {
+                    let _ = tx.send(r);
+                }),
+            )
+            .unwrap();
+        assert_eq!(wait(rx).blob.as_ref().unwrap().bytes, b"pong");
+
+        store.revoke(&grant, &raw_origin, &cancel).unwrap();
+        executor.close(handle.0).unwrap();
+        server.join().unwrap();
+        released(&ledger, Resource::Tcp);
+        drop((executor, pool, store, grant, blobs));
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

@@ -1,8 +1,47 @@
-param([Parameter(Mandatory=$true)][string]$File)
+param(
+    [Parameter(Mandatory=$true)][string]$File,
+    [string]$SignTool = ''
+)
 $ErrorActionPreference = 'Stop'
 $env:NoDefaultCurrentDirectoryInExePath = '1'
 foreach ($name in 'IRIS_WINDOWS_PFX', 'IRIS_WINDOWS_PFX_PASSWORD', 'IRIS_TIMESTAMP_URL') {
     if (-not [Environment]::GetEnvironmentVariable($name)) { throw "Signed release requires $name" }
+}
+
+function Test-TrustedRootedPath([string]$Candidate) {
+    if ([string]::IsNullOrWhiteSpace($Candidate)) { return $false }
+    if (-not [IO.Path]::IsPathRooted($Candidate)) { return $false }
+    $root = [IO.Path]::GetPathRoot($Candidate)
+    if ([string]::IsNullOrEmpty($root)) { return $false }
+    return $root.StartsWith('\\') -or (
+        $root.Length -ge 3 -and $root[1] -eq ':' -and ($root[2] -eq '\' -or $root[2] -eq '/')
+    )
+}
+
+function Resolve-SignTool() {
+    $explicit = if (-not [string]::IsNullOrWhiteSpace($SignTool)) {
+        $SignTool.Trim()
+    } else {
+        $envOverride = [Environment]::GetEnvironmentVariable('IRIS_SIGNTOOL')
+        if (-not [string]::IsNullOrWhiteSpace($envOverride)) { $envOverride.Trim() } else { '' }
+    }
+    if ($explicit) {
+        if (-not (Test-TrustedRootedPath $explicit) -or -not (Test-Path -LiteralPath $explicit -PathType Leaf)) {
+            throw "SignTool must be an existing absolute path to signtool.exe: $explicit"
+        }
+        return [IO.Path]::GetFullPath($explicit)
+    }
+    $rawPath = [Environment]::GetEnvironmentVariable('PATH')
+    if (-not [string]::IsNullOrEmpty($rawPath)) {
+        foreach ($dir in ($rawPath -split [IO.Path]::PathSeparator)) {
+            if (-not (Test-TrustedRootedPath $dir)) { continue }
+            $candidate = Join-Path $dir 'signtool.exe'
+            if (Test-Path -LiteralPath $candidate -PathType Leaf) {
+                return [IO.Path]::GetFullPath($candidate)
+            }
+        }
+    }
+    throw 'signtool.exe not found; pass -SignTool, set IRIS_SIGNTOOL, or add the Windows SDK bin directory as an absolute PATH entry'
 }
 
 function ConvertTo-Win32Arg([string]$Value) {
@@ -26,13 +65,11 @@ function ConvertTo-Win32Arg([string]$Value) {
     return $sb.ToString()
 }
 
+$resolvedSignTool = Resolve-SignTool
+
 function Invoke-SignTool([string[]]$Arguments) {
-    $exe = (Get-Command signtool -CommandType Application -ErrorAction Stop |
-        Where-Object { [IO.Path]::IsPathRooted($_.Source) } |
-        Select-Object -First 1).Source
-    if (-not $exe) { throw 'signtool.exe not found in PATH' }
     $psi = New-Object System.Diagnostics.ProcessStartInfo
-    $psi.FileName = $exe
+    $psi.FileName = $resolvedSignTool
     $psi.Arguments = (($Arguments | ForEach-Object { ConvertTo-Win32Arg $_ }) -join ' ')
     $psi.UseShellExecute = $false
     $proc = [System.Diagnostics.Process]::Start($psi)

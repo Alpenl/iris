@@ -5,7 +5,7 @@ use std::path::Path;
 use crate::library::Kind;
 
 use super::Session;
-use super::model::{AudioDevice, Chapter, MediaStats, Track, TrackKind};
+use super::model::{AudioDevice, BackendDiagnostics, Chapter, MediaStats, Track, TrackKind};
 
 impl Session {
     pub fn tracks_of(&self, kind: TrackKind) -> Vec<&Track> {
@@ -31,8 +31,25 @@ impl Session {
             .rfind(|(_, c)| c.time <= time + 0.05)
     }
 
-    pub fn chapter_at(&self, time: f64) -> Option<&Chapter> {
-        self.chapter_index_at(time).map(|(_, c)| c)
+    /// Queries a fixed read-only set of backend properties for headless verification.
+    pub fn backend_diagnostics(&self) -> BackendDiagnostics {
+        let prop_str = |name: &str| self.mpv.get_property_string(name).unwrap_or_default();
+        BackendDiagnostics {
+            mpv_version: prop_str("mpv-version"),
+            ffmpeg_version: prop_str("ffmpeg-version"),
+            access_references: prop_str("access-references"),
+            demuxer: prop_str("demuxer"),
+            file_format: prop_str("file-format"),
+            vf: prop_str("vf"),
+            out_pixel_format: prop_str("video-out-params/pixelformat"),
+            avsync: self
+                .mpv
+                .get_property_f64("avsync")
+                .ok()
+                .filter(|v| v.is_finite()),
+            track_count: prop_str("track-list/count").parse::<u32>().unwrap_or(0),
+            paused: prop_str("pause") == "yes",
+        }
     }
 
     /// Queries available audio output devices reported by libmpv.
@@ -263,7 +280,12 @@ pub(super) fn parse_audio_device_list_json(raw: &str) -> Vec<AudioDevice> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::library::Kind;
+
+    use super::{
+        Session, TrackKind, parse_audio_device_list_json, parse_chapter_list_json,
+        parse_track_list_json,
+    };
 
     #[test]
     fn heif_resolution_and_mirrors_follow_display_axes() {

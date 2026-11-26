@@ -12,7 +12,7 @@ use super::protocol::validate_stream_url;
 use super::protocol::{WebDavAuth, WebDavConnection, normalize_dav_path};
 
 pub(super) const ADD_MODAL_ID: &str = "webdav.add";
-pub(super) const EDIT_MODAL_PREFIX: &str = "webdav.edit:";
+pub(super) const EDIT_MODAL_ID: &str = "webdav.edit";
 
 pub(super) fn toast(msg: impl Into<String>) -> Vec<HostCommand> {
     vec![HostCommand::ShowToast {
@@ -31,19 +31,39 @@ fn input_widget(id: &str, label: &str, value: &str, placeholder: &str, secret: b
     }
 }
 
+fn clean_descriptor_text(raw: &str, max_bytes: usize) -> String {
+    let mut out = String::with_capacity(raw.len().min(max_bytes));
+    for ch in raw.chars() {
+        if ch.is_control() {
+            continue;
+        }
+        if out.len() + ch.len_utf8() > max_bytes {
+            break;
+        }
+        out.push(ch);
+    }
+    out
+}
+
 pub(super) fn source_descriptors(servers: &[WebDavConnection]) -> Vec<SourceDescriptor> {
     servers
         .iter()
         .map(|c| {
-            let subtitle = if c.base_path.is_empty() || c.base_path == "/" {
+            let raw_subtitle = if c.base_path.is_empty() || c.base_path == "/" {
                 c.endpoint.clone()
             } else {
                 format!("{} · {}", c.endpoint, c.base_path)
             };
+            let name = clean_descriptor_text(&c.name, 256);
+            let subtitle = clean_descriptor_text(&raw_subtitle, 256);
             SourceDescriptor {
                 id: c.id.clone(),
-                name: c.name.clone(),
-                subtitle: Some(subtitle),
+                name: if name.trim().is_empty() {
+                    c.id.clone()
+                } else {
+                    name
+                },
+                subtitle: (!subtitle.is_empty()).then_some(subtitle),
                 icon: Some("globe".into()),
                 badge: Some("WebDAV".into()),
                 supports_search: true,
@@ -93,10 +113,7 @@ fn allocate_id(servers: &[WebDavConnection], name: &str, endpoint: &str) -> Stri
 
 pub(super) fn build_modal(existing: Option<&WebDavConnection>, has_secret: bool) -> PluginModal {
     let (modal_id, title) = match existing {
-        Some(c) => (
-            format!("{EDIT_MODAL_PREFIX}{}", c.id),
-            format!("编辑 WebDAV · {}", c.name),
-        ),
+        Some(c) => (EDIT_MODAL_ID.into(), format!("编辑 WebDAV · {}", c.name)),
         None => (ADD_MODAL_ID.into(), "添加 WebDAV 服务器".into()),
     };
     let (auth_key, username) = match existing.map(|c| &c.auth) {
@@ -175,20 +192,21 @@ pub(super) struct ValidatedServer {
 pub(super) fn validate_modal_submit(
     servers: &[WebDavConnection],
     modal_id: &str,
+    editing_id: Option<&str>,
     values: &BTreeMap<String, String>,
 ) -> Result<ValidatedServer, String> {
     let edit = if modal_id == ADD_MODAL_ID {
         None
-    } else {
-        let id = modal_id
-            .strip_prefix(EDIT_MODAL_PREFIX)
-            .ok_or("未知的配置表单")?;
+    } else if modal_id == EDIT_MODAL_ID {
+        let id = editing_id.ok_or("未找到正在编辑的连接，请重新打开配置")?;
         Some(
             servers
                 .iter()
                 .find(|s| s.id == id)
                 .ok_or("连接已被移除，请重新打开配置")?,
         )
+    } else {
+        return Err("未知的配置表单".into());
     };
     if edit.is_none() && servers.len() >= 32 {
         return Err("最多配置 32 个 WebDAV 服务器".into());
@@ -200,6 +218,7 @@ pub(super) fn validate_modal_submit(
     let secret = field("secret");
     if name.is_empty()
         || name.len() > 256
+        || name.chars().any(char::is_control)
         || endpoint.len() > 4096
         || field("base_path").len() > 4096
         || username.len() > 256
@@ -231,19 +250,14 @@ pub(super) fn validate_modal_submit(
         || allocate_id(servers, name, url.as_str()),
         |old| old.id.clone(),
     );
-    let credential_key = (reuse && auth != WebDavAuth::None).then(|| {
-        edit.unwrap()
-            .credential_key
-            .clone()
-            .unwrap_or_else(|| format!("secret.{id}"))
-    });
+    let credential_key =
+        (reuse && auth != WebDavAuth::None).then(|| super::config::secret_key(edit.unwrap()));
     let conn = WebDavConnection {
         id,
         name: name.into(),
         endpoint: url.into(),
         base_path: normalize_dav_path(field("base_path")),
         auth,
-        allow_insecure_auth: false,
         credential_key,
     };
     conn.root_segments().map_err(|_| "根目录路径无效")?;

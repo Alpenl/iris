@@ -60,7 +60,6 @@ icons! {
     VolumeMute => "volume-mute",
     Video => "video",
     Photo => "photo",
-    Swap => "swap",
     Fit => "fit",
     Plus => "plus",
     Minus => "minus",
@@ -159,6 +158,7 @@ mod tests {
             assert!(svg.starts_with("<svg ") && svg.ends_with("</svg>"));
         }
 
+        assert_eq!(Icon::from_name("swap"), None);
         assert_eq!(Icon::from_name("nonexistent-icon"), None);
     }
 }

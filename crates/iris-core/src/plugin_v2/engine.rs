@@ -1,5 +1,5 @@
 //! In-memory compilation only. Active modules are part of the cache budget.
-use super::package::WASM_LIMIT;
+use super::{imports, instance::State, package::WASM_LIMIT};
 use iris_api::v2::ErrorCode;
 use ring::digest::{SHA256, digest};
 use std::{
@@ -10,7 +10,7 @@ use std::{
     },
     time::Duration,
 };
-use wasmtime::{Config, Engine, ExternType, Module};
+use wasmtime::{Config, Engine, ExternType, Linker, Module};
 
 const CACHE_LIMIT: usize = 256 << 20;
 
@@ -24,11 +24,13 @@ struct Cache {
     waiting: usize,
 }
 struct Timer {
-    state: Mutex<(usize, bool)>,
+    /// `(active_executions, stopping, thread_started)`
+    state: Mutex<(usize, bool, bool)>,
     changed: Condvar,
 }
 struct Inner {
     engine: Engine,
+    linker: Linker<State>,
     cache: Mutex<Cache>,
     changed: Condvar,
     timer: Arc<Timer>,
@@ -49,15 +51,50 @@ impl RuntimeEngine {
             .wasm_relaxed_simd(false)
             .max_wasm_stack(512 << 10);
         let engine = Engine::new(&config).map_err(|_| ErrorCode::Internal)?;
+        let linker = imports::linker(&engine)?;
         let timer = Arc::new(Timer {
-            state: Mutex::new((0, false)),
+            state: Mutex::new((0, false, false)),
             changed: Condvar::new(),
         });
-        let thread_timer = timer.clone();
-        let thread_engine = engine.clone();
-        std::thread::Builder::new()
-            .name("iris-wasm-epoch".into())
-            .spawn(move || {
+        let inner = Arc::new(Inner {
+            engine,
+            linker,
+            cache: Mutex::new(Cache {
+                modules: BTreeMap::new(),
+                compiling: 0,
+                waiting: 0,
+            }),
+            changed: Condvar::new(),
+            timer,
+        });
+        Ok(Self(inner))
+    }
+
+    pub(crate) fn engine(&self) -> &Engine {
+        &self.0.engine
+    }
+    pub(crate) fn linker(&self) -> &Linker<State> {
+        &self.0.linker
+    }
+    pub(crate) fn execution(&self) -> Result<ExecutionGuard, ErrorCode> {
+        self.execution_with(|job| {
+            std::thread::Builder::new()
+                .name("iris-wasm-epoch".into())
+                .spawn(job)
+                .map(|_| ())
+                .map_err(|_| ErrorCode::Internal)
+        })
+    }
+    fn execution_with(
+        &self,
+        spawn: impl FnOnce(Box<dyn FnOnce() + Send>) -> Result<(), ErrorCode>,
+    ) -> Result<ExecutionGuard, ErrorCode> {
+        let mut state = self.0.timer.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.0 += 1;
+        if !state.2 && !state.1 {
+            let thread_timer = self.0.timer.clone();
+            let thread_engine = self.0.engine.clone();
+            if let Err(err) = spawn(Box::new(move || {
                 let mut state = thread_timer.state.lock().unwrap_or_else(|e| e.into_inner());
                 loop {
                     while state.0 == 0 && !state.1 {
@@ -78,31 +115,16 @@ impl RuntimeEngine {
                         thread_engine.increment_epoch();
                     }
                 }
-            })
-            .map_err(|_| ErrorCode::Internal)?;
-        let inner = Arc::new(Inner {
-            engine,
-            cache: Mutex::new(Cache {
-                modules: BTreeMap::new(),
-                compiling: 0,
-                waiting: 0,
-            }),
-            changed: Condvar::new(),
-            timer,
-        });
-        Ok(Self(inner))
-    }
-
-    pub(crate) fn engine(&self) -> &Engine {
-        &self.0.engine
-    }
-    pub(crate) fn execution(&self) -> ExecutionGuard {
-        let mut state = self.0.timer.state.lock().unwrap_or_else(|e| e.into_inner());
-        state.0 += 1;
+            })) {
+                state.0 -= 1;
+                return Err(err);
+            }
+            state.2 = true;
+        }
         if state.0 == 1 {
             self.0.timer.changed.notify_one();
         }
-        ExecutionGuard(self.clone())
+        Ok(ExecutionGuard(self.clone()))
     }
 
     /// Run only on a background worker. Compilation cannot be epoch-interrupted;
@@ -181,17 +203,6 @@ impl RuntimeEngine {
         cache.modules.insert(key, module.clone());
         Ok(module)
     }
-
-    pub fn cached_bytes(&self) -> usize {
-        self.0
-            .cache
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .modules
-            .values()
-            .map(|m| m.cost)
-            .sum()
-    }
 }
 
 impl Drop for ExecutionGuard {
@@ -246,4 +257,83 @@ fn validate_module(module: Module) -> Result<Module, ErrorCode> {
         }
     }
     Ok(module)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RuntimeEngine;
+    use crate::plugin_v2::{
+        instance::{Instance, InstanceConfig},
+        ledger::{Ledger, Resource},
+    };
+    use iris_api::v2::{ErrorCode, Role};
+    use std::{
+        collections::BTreeSet,
+        sync::{Arc, atomic::AtomicBool},
+    };
+
+    impl RuntimeEngine {
+        pub(crate) fn cached_bytes(&self) -> usize {
+            self.0
+                .cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .modules
+                .values()
+                .map(|m| m.cost)
+                .sum()
+        }
+    }
+
+    #[test]
+    fn execution_spawn_failure_rolls_back_active_count_and_fails_closed() {
+        let engine = RuntimeEngine::new().unwrap();
+        let wasm = wat::parse_str(
+            r#"(module
+            (memory (export "memory") 1 2)
+            (func (export "iris_abi_version") (result i32) i32.const 2)
+            (func (export "iris_alloc") (param i32) (result i32) i32.const 1024)
+            (func (export "iris_dealloc") (param i32 i32))
+            (func (export "iris_on_event") (param i32 i32) (result i64) i64.const 0))"#,
+        )
+        .unwrap();
+        let module = engine.compile(&wasm, &AtomicBool::new(false)).unwrap();
+        let ledger = Ledger::default();
+
+        assert_eq!(
+            engine.execution_with(|_| Err(ErrorCode::Internal)).err(),
+            Some(ErrorCode::Internal)
+        );
+        assert_eq!(
+            *engine
+                .0
+                .timer
+                .state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()),
+            (0, false, false)
+        );
+
+        let inst = Instance::new(InstanceConfig {
+            engine: engine.clone(),
+            module,
+            role: Role::Control,
+            owner: "epoch-ok".into(),
+            grants: BTreeSet::new(),
+            ledger: ledger.clone(),
+            cancel: Arc::new(AtomicBool::new(false)),
+        })
+        .unwrap();
+        assert!(
+            engine
+                .0
+                .timer
+                .state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .2
+        );
+        drop(inst);
+        assert_eq!(ledger.used(None, Resource::WasmBytes), 0);
+    }
 }

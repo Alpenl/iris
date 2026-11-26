@@ -8,16 +8,16 @@ mod playback;
 mod window;
 use super::{
     actor::{Actor, Spawn},
-    auth::{AuthExecutor, BrowserOpen},
     engine::{CompiledModule, RuntimeEngine},
-    files::{FileExecutor, FileSetup},
+    files::FileExecutor,
     installation::{Installed, Installer},
     instance::next_id,
+    json_error,
     ledger::{Ledger, Reservation, Resource},
-    network::{NetworkExecutor, NetworkGrant, consent::OriginStore},
+    network::{NetworkGrant, consent::OriginStore},
     pool::IoPool,
-    services::{HostServices, WindowServices},
-    storage::{Storage, StorageExecutor},
+    services::ControlServices,
+    storage::Storage,
 };
 use crate::{vault::CredentialVault, vfs::HttpCancel};
 use iris_api::v2::{
@@ -28,7 +28,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     path::PathBuf,
     sync::{
-        Arc, OnceLock,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
 };
@@ -49,9 +49,16 @@ impl Resources {
         })
     }
     /// The product must share these budgets/cache/pools across every window.
+    /// Transient initialization errors are never cached permanently.
     pub fn global() -> Result<Self, ErrorCode> {
-        static RESOURCES: OnceLock<Result<Resources, ErrorCode>> = OnceLock::new();
-        RESOURCES.get_or_init(Self::new).clone()
+        static RESOURCES: Mutex<Option<Resources>> = Mutex::new(None);
+        let mut slot = RESOURCES.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(resources) = slot.as_ref() {
+            return Ok(resources.clone());
+        }
+        let resources = Self::new()?;
+        *slot = Some(resources.clone());
+        Ok(resources)
     }
 }
 #[derive(Clone)]
@@ -64,7 +71,7 @@ pub struct Setup {
 }
 struct WindowState {
     generation: Generation,
-    services: HostServices,
+    files: FileExecutor,
     media: HttpCancel,
     attachments: Arc<super::enhancement::AttachmentRegistry>,
 }
@@ -101,8 +108,7 @@ pub struct Control {
     setup: Setup,
     network: NetworkGrant,
     origins: OriginStore,
-    storage: Arc<Storage>,
-    services: Arc<WindowServices>,
+    services: Arc<ControlServices>,
     actor: Option<Actor>,
     windows: BTreeMap<Id, WindowState>,
     sources: Vec<SourceDescriptor>,
@@ -147,7 +153,9 @@ impl Control {
         if installed.grants.iter().any(|c| {
             matches!(
                 c,
-                iris_api::v2::Capability::NetHttp | iris_api::v2::Capability::NetWs
+                iris_api::v2::Capability::NetHttp
+                    | iris_api::v2::Capability::NetWs
+                    | iris_api::v2::Capability::NetTcp
             )
         }) {
             origins.restore(&network, &HttpCancel::default())?;
@@ -158,19 +166,14 @@ impl Control {
             setup.vault.clone(),
             setup.resources.ledger.clone(),
         )?);
-        let global = Self::make_services(
-            &setup,
-            &installed,
-            &network,
-            &storage,
-            None,
-            Arc::new(|_, _, _| Err(ErrorCode::Denied)),
-        )?;
-        let services = Arc::new(WindowServices::new(
+        let services = Arc::new(ControlServices::new(
             installed.installation_id.clone(),
             setup.resources.ledger.clone(),
-            Arc::new(global),
-        ));
+            network.clone(),
+            storage,
+            installed.grants.clone(),
+            setup.temporary_directory.join(&installed.installation_id),
+        )?);
         let actor = module
             .as_ref()
             .map(|module| {
@@ -199,10 +202,10 @@ impl Control {
                 features: BTreeSet::from(["window_scope".into(), "async_storage".into()]),
                 snapshot: None,
             };
-            actor.send(crate::plugin_v2::json::encode(
-                &event,
-                iris_api::v2::MESSAGE_LIMIT,
-            )?)?;
+            actor.send(
+                crate::bounded_json::encode(&event, iris_api::v2::MESSAGE_LIMIT)
+                    .map_err(json_error)?,
+            )?;
         }
         if cancel.load(Ordering::Acquire) {
             return Err(ErrorCode::Cancelled);
@@ -223,7 +226,6 @@ impl Control {
             setup,
             network,
             origins,
-            storage,
             services,
             actor,
             windows: BTreeMap::new(),
@@ -232,37 +234,6 @@ impl Control {
             stopped: false,
             quarantined: None,
             _lease: lease,
-        })
-    }
-    fn make_services(
-        setup: &Setup,
-        installed: &Installed,
-        network: &NetworkGrant,
-        storage: &Arc<Storage>,
-        window: Option<Id>,
-        browser: BrowserOpen,
-    ) -> Result<HostServices, ErrorCode> {
-        Ok(HostServices {
-            network: NetworkExecutor::new(
-                network.clone(),
-                setup.resources.ledger.clone(),
-                BTreeSet::new(),
-            )?,
-            auth: AuthExecutor::new(network.clone(), setup.resources.ledger.clone(), browser),
-            files: FileExecutor::new(FileSetup {
-                network: network.clone(),
-                ledger: setup.resources.ledger.clone(),
-                capabilities: installed.grants.clone(),
-                temporary_directory: setup
-                    .temporary_directory
-                    .join(&installed.installation_id)
-                    .join(window.map_or_else(|| "global".into(), |id| id.0.to_string())),
-            })?,
-            storage: StorageExecutor::new(
-                storage.clone(),
-                network.clone(),
-                installed.grants.clone(),
-            )?,
         })
     }
     pub fn manifest(&self) -> &Manifest {
@@ -282,13 +253,6 @@ impl Control {
     }
     pub fn origins(&self) -> &OriginStore {
         &self.origins
-    }
-    pub fn window_files(&self, window: Id) -> Result<&FileExecutor, ErrorCode> {
-        self.live()?;
-        self.windows
-            .get(&window)
-            .map(|w| &w.services.files)
-            .ok_or(ErrorCode::StaleHandle)
     }
     pub fn new_window_id() -> Result<Id, ErrorCode> {
         next_id().map(Id)

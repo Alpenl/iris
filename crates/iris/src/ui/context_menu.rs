@@ -196,7 +196,7 @@ impl IrisWindow {
                     menu_row(
                         "cm-vp-ab",
                         Some(Icon::Repeat),
-                        "设置 A / B 点或清除区间",
+                        super::strings::actions::action_title("cycle_ab_loop"),
                         self.key_hint("cycle_ab_loop"),
                         st.ab_start.is_some(),
                         t,
@@ -212,7 +212,7 @@ impl IrisWindow {
                         menu_row(
                             "cm-vp-ab-clear",
                             None,
-                            "清除 A-B 循环",
+                            super::strings::actions::action_title("clear_ab_loop"),
                             self.key_hint("clear_ab_loop"),
                             false,
                             t,
@@ -253,7 +253,7 @@ impl IrisWindow {
                 menu_row(
                     "cm-vp-rot",
                     Some(Icon::Rotate),
-                    "顺时针旋转 90°",
+                    super::strings::actions::action_title("rotate_cw"),
                     self.key_hint("rotate_cw"),
                     false,
                     t,
@@ -268,7 +268,7 @@ impl IrisWindow {
                 menu_row(
                     "cm-vp-shot",
                     Some(Icon::Camera),
-                    "保存当前帧截图",
+                    super::strings::actions::action_title("take_screenshot"),
                     self.key_hint("take_screenshot"),
                     false,
                     t,
@@ -303,7 +303,7 @@ impl IrisWindow {
             menu_row(
                 "cm-vp-open",
                 Some(Icon::FolderOpen),
-                "打开本地文件…",
+                super::strings::actions::action_title("open_file"),
                 self.key_hint("open_file"),
                 false,
                 t,
@@ -353,7 +353,7 @@ impl IrisWindow {
                 menu_row(
                     "cm-vp-reset-ui",
                     Some(Icon::Sliders),
-                    "恢复默认外观",
+                    super::strings::chrome::RESET_APPEARANCE_LABEL,
                     None,
                     true,
                     t,
@@ -389,7 +389,7 @@ impl IrisWindow {
             menu_row(
                 "cm-vp-settings",
                 Some(Icon::Settings),
-                "设置…",
+                super::strings::actions::action_title("open_settings"),
                 self.key_hint("open_settings"),
                 false,
                 t,

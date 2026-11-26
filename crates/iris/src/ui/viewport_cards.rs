@@ -176,7 +176,7 @@ impl IrisWindow {
                             "open-file",
                             Icon::FolderOpen,
                             false,
-                            "打开本地文件…",
+                            super::strings::actions::action_title("open_file"),
                             open_local_key,
                         )
                         .on_click(cx.listener(|this, _, w, cx| this.open_file(&OpenFile, w, cx))),

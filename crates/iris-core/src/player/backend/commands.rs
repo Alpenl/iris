@@ -1,4 +1,6 @@
-use anyhow::Result;
+use std::path::Path;
+
+use anyhow::{Result, ensure};
 
 use crate::library::Kind;
 
@@ -6,11 +8,53 @@ use super::super::MediaSourceState;
 use super::{AspectMode, Command, MAX_SPEED, MIN_SPEED, PlayerActionError, Session};
 
 impl Session {
+    pub(in crate::player) fn has_in_flight_track_adds(&self) -> bool {
+        !self.in_flight_scoped_adds.is_empty() || self.enhancements.tracks.has_pending_adds()
+    }
+
+    fn needs_attachment_policy(&self) -> bool {
+        matches!(self.source, MediaSourceState::PluginScoped { .. })
+            || self.enhancements.tracks.has_any_tracks()
+    }
+
+    fn load_resolved_local_subtitle(&mut self, resolved: &Path) -> Result<()> {
+        // Temporarily clear per-file lavf/demuxer restrictions only once no async
+        // plugin/scoped track additions remain in flight, then immediately restore
+        // the scoped attachment policy whenever scoped playback or plugin tracks exist.
+        let _ = super::references::disable_hls(&self.mpv);
+        let target = resolved.to_string_lossy();
+        let sub_add = self.mpv.command(&["sub-add", &target, "select"]);
+        let restore = if self.needs_attachment_policy() {
+            super::super::scoped::restore_attachment_policy(&self.mpv)
+        } else {
+            Ok(())
+        };
+        if restore.is_err() {
+            log::error!("could not restore scoped attachment policy");
+        }
+        sub_add?;
+        restore?;
+        self.mpv.command_async(&["set", "sub-visibility", "yes"])?;
+        self.tracks_dirty = true;
+        Ok(())
+    }
+
+    pub(in crate::player) fn flush_deferred_local_subs(&mut self) {
+        if !self.state.loaded || self.has_in_flight_track_adds() {
+            return;
+        }
+        for path in std::mem::take(&mut self.deferred_local_subs) {
+            if let Err(err) = self.load_resolved_local_subtitle(&path) {
+                log::warn!("deferred local subtitle load failed: {err:#}");
+            }
+        }
+    }
+
     pub fn execute(&mut self, command: Command) -> Result<()> {
         if let Some(time) = self.plugin_chapter_seek(&command) {
             return self.execute(Command::SeekAbsolute(time));
         }
-        if matches!(
+        if (matches!(
             command,
             Command::SeekRelative(_)
                 | Command::SeekAbsolute(_)
@@ -23,7 +67,8 @@ impl Session {
                 | Command::NextChapter
                 | Command::PrevChapter
                 | Command::SelectChapter(_)
-        ) && let MediaSourceState::PluginScoped { playback, .. } = &self.source
+        ) || (matches!(command, Command::TogglePlayback) && self.state.ended))
+            && let MediaSourceState::PluginScoped { playback, .. } = &self.source
         {
             playback.stream.advance_seek()?;
         }
@@ -156,12 +201,15 @@ impl Session {
                 {
                     return Err(PlayerActionError::SubtitleFileNotFound.into());
                 }
-                if !matches!(self.source, MediaSourceState::PluginScoped { .. }) {
-                    let _ = super::references::disable_hls(&self.mpv);
+                ensure!(
+                    self.state.loaded && matches!(self.kind, Some(Kind::Video | Kind::Audio)),
+                    "subtitle attachment requires loaded video or audio media"
+                );
+                if self.has_in_flight_track_adds() {
+                    self.deferred_local_subs.push(resolved);
+                } else {
+                    self.load_resolved_local_subtitle(&resolved)?;
                 }
-                let target = resolved.to_string_lossy();
-                self.mpv.command_async(&["sub-add", &target, "select"])?;
-                self.mpv.command_async(&["set", "sub-visibility", "yes"])?;
             }
             Command::NextAudio => self.mpv.command_async(&["cycle", "audio"])?,
             Command::SelectAudio(Some(id)) => {

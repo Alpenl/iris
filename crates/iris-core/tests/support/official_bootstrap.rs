@@ -5,15 +5,8 @@ use iris_core::vfs::HttpCancel;
 #[test]
 #[ignore = "official embedded Wasm lifecycle; scripts/test-plugin-v2-official.py"]
 fn embedded_distribution_bootstraps_before_window_start_and_respects_disabled_plugins() {
-    let root = std::env::temp_dir().join(format!(
-        "iris-bootstrap-runtime-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    let legacy = root.join("plugin_state");
+    let root = TestDir::new("iris-bootstrap-runtime");
+    let legacy = root.path().join("plugin_state");
     std::fs::create_dir_all(&legacy).unwrap();
     std::fs::write(legacy.join("iris.guides.json"), br#"{"mode":"thirds"}"#).unwrap();
     let servers = serde_json::json!([{"id":"original-source-id","name":"Migrated NAS","endpoint":"https://nas.example/dav/"}]).to_string();
@@ -23,17 +16,17 @@ fn embedded_distribution_bootstraps_before_window_start_and_respects_disabled_pl
     )
     .unwrap();
     let resources = Resources::new().unwrap();
-    let bootstrap = Bootstrap::embedded(root.clone()).unwrap();
+    let bootstrap = Bootstrap::embedded(root.path().to_path_buf()).unwrap();
     let installer = Installer::with_bundled(
-        root.join("packages"),
+        root.path().join("packages"),
         resources.ledger.clone(),
         bootstrap.pins(),
     );
     let vault = CredentialVault::in_memory();
     let setup = Setup {
         resources: resources.clone(),
-        state_directory: root.join("state"),
-        temporary_directory: root.join("temp"),
+        state_directory: root.path().join("state"),
+        temporary_directory: root.path().join("temp"),
         vault: vault.clone(),
         wake: Arc::new(|| {}),
     };
@@ -61,7 +54,7 @@ fn embedded_distribution_bootstraps_before_window_start_and_respects_disabled_pl
     assert_eq!(resources.ledger.used(None, Resource::ControlStore), 1);
     let installed = installer.record("iris.webdav").unwrap().unwrap();
     let state = Storage::new(
-        root.join("state"),
+        root.path().join("state"),
         installed.installation_id,
         vault,
         resources.ledger.clone(),
@@ -85,6 +78,4 @@ fn embedded_distribution_bootstraps_before_window_start_and_respects_disabled_pl
     assert_eq!(resources.ledger.used(None, Resource::ControlStore), 2);
     drop((catalog, ui, hub, state, installer));
     wait(|| resources.ledger.used(None, Resource::HostBytes) == 0);
-    assert!(root.starts_with(std::env::temp_dir()));
-    std::fs::remove_dir_all(root).unwrap();
 }

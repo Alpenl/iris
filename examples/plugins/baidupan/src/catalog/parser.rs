@@ -294,8 +294,7 @@ pub fn parse_browse_response(
 
 fn finalize_entries(entries: &mut Vec<SourceEntry>) {
     let mut seen = BTreeSet::new();
-    let mut out = Vec::with_capacity(entries.len().min(60));
-    let mut bytes = 0usize;
+    let mut out = Vec::with_capacity(entries.len());
     for mut entry in entries.drain(..) {
         if entry.id.is_empty() || entry.id.len() > 2048 || !seen.insert(entry.id.clone()) {
             continue;
@@ -309,11 +308,6 @@ fn finalize_entries(entries: &mut Vec<SourceEntry>) {
             .take()
             .map(|s| sanitize_text(&s, 240))
             .filter(|s| !s.is_empty());
-        let len = serde_json::to_vec(&entry).map(|v| v.len()).unwrap_or(1024);
-        if bytes + len > 40 * 1024 || out.len() >= 60 {
-            break;
-        }
-        bytes += len + 1;
         out.push(entry);
     }
     *entries = out;

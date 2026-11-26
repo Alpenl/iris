@@ -1,7 +1,7 @@
 use super::{Bootstrap, GUIDES, WEBDAV};
 use crate::plugin_v2::{
     engine::RuntimeEngine,
-    instance::{Instance, InstanceConfig, NoServices},
+    instance::{Instance, InstanceConfig},
     ledger::{Ledger, Resource},
     package::{Package, Provenance},
 };
@@ -40,7 +40,6 @@ pub fn check() -> Result<serde_json::Value, ErrorCode> {
             grants: package.manifest.permissions.iter().copied().collect(),
             ledger: ledger.clone(),
             cancel,
-            services: Box::new(NoServices),
         })?;
         let instantiate = start.elapsed();
         let start = Instant::now();

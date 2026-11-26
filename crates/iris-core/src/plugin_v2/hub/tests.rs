@@ -157,12 +157,18 @@ fn ready(client: &Client, id: &str) -> bool {
         .iter()
         .any(|p| p.id == id && p.status == PluginStatus::Ready)
 }
+fn client_inbox(client: &Client) -> &Arc<Inbox> {
+    match &client.state {
+        client::ClientState::Connected { inbox, .. } => inbox,
+        client::ClientState::Unavailable { .. } => panic!("expected connected client"),
+    }
+}
 
 #[test]
 fn wasm_fixture_recognizes_both_json_member_orders() {
     use crate::plugin_v2::{
         engine::RuntimeEngine,
-        instance::{Instance, InstanceConfig, NoServices},
+        instance::{Instance, InstanceConfig},
     };
     let package = Package::from_zip(&package("test.order"), Provenance::User).unwrap();
     let engine = RuntimeEngine::new().unwrap();
@@ -176,7 +182,6 @@ fn wasm_fixture_recognizes_both_json_member_orders() {
         grants: BTreeSet::from([Capability::Notifications]),
         ledger: Default::default(),
         cancel,
-        services: Box::new(NoServices),
     })
     .unwrap();
     for input in [br#"{"event":"window","window":"1","generation":{"media":"0","seek":"0","context":"0"},"body":{"event":"window_opened","snapshot":null}}"#.as_slice(),
@@ -303,7 +308,7 @@ fn stale_batches_cannot_cross_media_generations() {
     let (client, _) = hub.open_window(Generation::default(), None).unwrap();
     wait(|| toast(&client));
     ping(&client, "test.generation");
-    wait(|| !client.inbox.notices.lock().unwrap().is_empty());
+    wait(|| !client_inbox(&client).notices.lock().unwrap().is_empty());
     client
         .advance(Generation {
             media: Id(1),
@@ -411,7 +416,7 @@ fn presentation_slots_keep_accounting_and_only_dirty_changed_values() {
     );
     assert!(report.notices.is_empty());
     // Wait for the callback output, then verify the value-equality redraw gate.
-    wait(|| !ui.client().inbox.notices.lock().unwrap().is_empty());
+    wait(|| !client_inbox(ui.client()).notices.lock().unwrap().is_empty());
     assert!(!ui.poll().dirty.sidebar);
     let report =
         ui.set_enabled_with_snapshot("test.presentation", false, PlaybackSnapshot::default());
@@ -427,8 +432,23 @@ fn presentation_slots_keep_accounting_and_only_dirty_changed_values() {
 #[test]
 fn media_lifecycle_coalesces_past_a_full_ordinary_queue() {
     // No coordinator thread: deterministically hold a fully occupied mailbox.
-    let (client, _) = Client::unavailable(ErrorCode::Internal);
-    client.hub.0.0.gate.lock().unwrap().shutdown = false;
+    let ledger = crate::plugin_v2::ledger::Ledger::default();
+    let lease = ledger
+        .reserve("test-mailbox", &[(Resource::HostBytes, 1 << 20)])
+        .unwrap();
+    let shared = Arc::new(Shared {
+        gate: Mutex::new(Gate::default()),
+        changed: Condvar::new(),
+        catalog: Mutex::new(Arc::new(Catalog {
+            revision: 0,
+            plugins: Vec::new(),
+        })),
+        ledger,
+        _lease: lease,
+    });
+    let hub = Hub(Arc::new(Connection(shared.clone())));
+    let (client, _) = hub.open_window(Generation::default(), None).unwrap();
+    shared.gate.lock().unwrap().commands.clear();
     for _ in 0..64 {
         client.update_snapshot(PlaybackSnapshot::default()).unwrap();
     }
@@ -443,7 +463,7 @@ fn media_lifecycle_coalesces_past_a_full_ordinary_queue() {
                 ..Generation::default()
             })
             .unwrap();
-        assert_eq!(client.hub.0.0.gate.lock().unwrap().commands.len(), 65);
+        assert_eq!(shared.gate.lock().unwrap().commands.len(), 65);
     }
     assert_eq!(client.generation().seek, Id(99));
     assert_eq!(
@@ -612,3 +632,286 @@ fn uninstall_supports_full_wipe_and_optional_credential_retention_with_opt_in_re
     drop((client, binding, summary, hub));
     wait(|| f.resources.ledger.used(None, Resource::HostBytes) == 0);
 }
+
+#[test]
+fn unavailable_client_emits_error_once_without_hub_state() {
+    let (client, _rx) = Client::unavailable(ErrorCode::Internal);
+    assert_eq!(client.window_id(), Id(0));
+    let first = client.poll();
+    assert_eq!(first.len(), 1);
+    assert!(matches!(
+        first[0],
+        Notice::Error {
+            plugin: None,
+            request: None,
+            code: ErrorCode::Internal,
+            message: None
+        }
+    ));
+    assert!(client.poll().is_empty());
+    assert_eq!(client.reload(), Err(ErrorCode::Cancelled));
+    assert_eq!(
+        client.advance(Generation {
+            media: Id(1),
+            ..Generation::default()
+        }),
+        Err(ErrorCode::Cancelled)
+    );
+}
+
+#[test]
+fn websocket_only_plugin_can_request_and_receive_ws_origin_consent() {
+    let mut f = Fixture::new();
+    let bytes = package_with(
+        "test.ws_origin",
+        &[Capability::UiModal, Capability::NetWs],
+        r#"{"ok":[{"command":"request_origin","request_id":"77","origin":"ws://192.168.1.50:8080/live"}]}"#,
+        true,
+    );
+    let record = f.install_bytes(&bytes);
+    let hub = f.hub();
+    let (client, _) = hub.open_window(Generation::default(), None).unwrap();
+    let mut review = None;
+    wait(|| {
+        for notice in client.poll() {
+            if let Notice::Origin(value) = notice {
+                review = Some(value);
+            }
+        }
+        review.is_some()
+    });
+    let review = review.unwrap();
+    assert_eq!(review.origin, "http://192.168.1.50:8080");
+    assert!(review.private && review.plaintext);
+    client.confirm_origin(review.id, true, false).unwrap();
+    wait(|| {
+        client
+            .poll()
+            .iter()
+            .any(|n| matches!(n, Notice::OriginClosed(id) if *id == review.id))
+    });
+    assert!(
+        ready(&client, "test.ws_origin"),
+        "NetWs-only plugin must remain Ready after ws:// origin consent"
+    );
+    let path = f
+        .setup
+        .state_directory
+        .join("origins")
+        .join(format!("{}.json", record.installation_id));
+    assert!(path.exists());
+    drop((review, client, hub));
+    wait(|| f.resources.ledger.used(None, Resource::HostBytes) == 0);
+}
+
+#[test]
+fn overwrite_reinstall_without_keep_identity_scrubs_prior_data_and_object() {
+    let mut f = Fixture::new();
+    let v1 = package_with(
+        "test.overwrite",
+        &[Capability::Notifications],
+        r#"{"ok":[{"command":"show_toast","message":"v1"}]}"#,
+        false,
+    );
+    let old = f.install_bytes(&v1);
+    let old_scope = format!("plugin-v2.{}", old.installation_id);
+    f.setup
+        .vault
+        .set_secret(&old_scope, "token", Some("secret"))
+        .unwrap();
+    let old_state = f
+        .setup
+        .state_directory
+        .join(format!("{}.json", old.installation_id));
+    let old_origin = f
+        .setup
+        .state_directory
+        .join("origins")
+        .join(format!("{}.json", old.installation_id));
+    std::fs::create_dir_all(old_origin.parent().unwrap()).unwrap();
+    std::fs::write(&old_state, b"{}").unwrap();
+    std::fs::write(&old_origin, b"{}").unwrap();
+    let old_object = f.root.join("packages/objects").join(&old.object);
+    assert!(old_object.exists());
+
+    let v2 = package_with(
+        "test.overwrite",
+        &[Capability::Notifications],
+        r#"{"ok":[{"command":"show_toast","message":"v2"}]}"#,
+        false,
+    );
+    let v2_path = f.root.join("v2.irisplugin");
+    std::fs::write(&v2_path, &v2).unwrap();
+
+    let hub = f.hub();
+    let (client, _) = hub.open_window(Generation::default(), None).unwrap();
+    wait(|| ready(&client, "test.overwrite"));
+    let review_id = client.review(v2_path).unwrap();
+    wait(|| {
+        client
+            .poll()
+            .iter()
+            .any(|n| matches!(n, Notice::Review(r) if r.id == review_id))
+    });
+    client
+        .approve(
+            review_id,
+            BTreeSet::from([Capability::Notifications]),
+            false,
+        )
+        .unwrap();
+    wait(|| {
+        f.installer
+            .record("test.overwrite")
+            .unwrap()
+            .is_some_and(|r| r.installation_id != old.installation_id)
+    });
+    wait(|| !old_state.exists() && !old_origin.exists() && !old_object.exists());
+    assert_eq!(f.setup.vault.get_secret(&old_scope, "token"), None);
+    drop((client, hub));
+    wait(|| f.resources.ledger.used(None, Resource::HostBytes) == 0);
+}
+
+#[test]
+fn reload_with_snapshot_respects_updated_disabled_set() {
+    use crate::plugin_v2::ui::PluginManager;
+    let mut f = Fixture::new();
+    f.install("test.toggle");
+    let hub = f.hub();
+    let (client, _) = hub.open_window(Generation::default(), None).unwrap();
+    let mut ui = PluginManager::new(client, None);
+    wait(|| {
+        ui.poll();
+        ui.client()
+            .catalog()
+            .plugins
+            .iter()
+            .any(|p| p.id == "test.toggle" && p.status == PluginStatus::Ready)
+    });
+    ui.reload_with_snapshot(&["test.toggle".into()], PlaybackSnapshot::default());
+    wait(|| {
+        ui.poll();
+        ui.client()
+            .catalog()
+            .plugins
+            .iter()
+            .any(|p| p.id == "test.toggle" && p.status == PluginStatus::Disabled)
+    });
+    ui.reload_with_snapshot(&[], PlaybackSnapshot::default());
+    wait(|| {
+        ui.poll();
+        ui.client()
+            .catalog()
+            .plugins
+            .iter()
+            .any(|p| p.id == "test.toggle" && p.status == PluginStatus::Ready)
+    });
+    drop((ui, hub));
+    wait(|| f.resources.ledger.used(None, Resource::HostBytes) == 0);
+}
+
+#[test]
+fn official_upgrade_with_expanded_capabilities_routes_through_hub_review() {
+    let f = Fixture::new();
+    let make_official = |version: &str, perms: &[Capability]| {
+        let wasm = wat::parse_str(
+            r#"(module
+            (memory (export "memory") 1 4)
+            (func (export "iris_abi_version") (result i32) i32.const 2)
+            (func (export "iris_alloc") (param i32) (result i32) i32.const 1024)
+            (func (export "iris_dealloc") (param i32 i32))
+            (func (export "iris_on_event") (param i32 i32) (result i64) i64.const 0))"#,
+        )
+        .unwrap();
+        let manifest = serde_json::json!({
+            "id": "iris.expand", "name": "Expand", "version": version,
+            "protocol": 2, "abi": 2, "entry": "plugin.wasm", "permissions": perms
+        });
+        let mut archive = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        for (name, bytes) in [
+            ("plugin.json", serde_json::to_vec(&manifest).unwrap()),
+            ("plugin.wasm", wasm),
+        ] {
+            archive
+                .start_file(name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            archive.write_all(&bytes).unwrap();
+        }
+        archive.finish().unwrap().into_inner()
+    };
+
+    let b1 = crate::plugin_v2::official::Bootstrap::custom(
+        f.root.clone(),
+        vec![(
+            "iris.expand".into(),
+            "1".into(),
+            make_official("1", &[Capability::UiOverlay]),
+        )],
+    )
+    .unwrap();
+    let i1 = Installer::with_bundled(
+        f.root.join("packages"),
+        f.resources.ledger.clone(),
+        b1.pins(),
+    );
+    let hub1 = Hub::new(Config {
+        bootstrap: Some(b1),
+        installer: i1.clone(),
+        runtime: f.setup.clone(),
+        disabled: BTreeSet::new(),
+    })
+    .unwrap();
+    let (c1, _) = hub1.open_window(Generation::default(), None).unwrap();
+    wait(|| ready(&c1, "iris.expand"));
+    let v1_id = i1.record("iris.expand").unwrap().unwrap().installation_id;
+    drop((c1, hub1));
+    wait(|| f.resources.ledger.used(None, Resource::ControlStore) == 0);
+
+    let b2 = crate::plugin_v2::official::Bootstrap::custom(
+        f.root.clone(),
+        vec![(
+            "iris.expand".into(),
+            "2".into(),
+            make_official("2", &[Capability::UiOverlay, Capability::Notifications]),
+        )],
+    )
+    .unwrap();
+    let i2 = Installer::with_bundled(
+        f.root.join("packages"),
+        f.resources.ledger.clone(),
+        b2.pins(),
+    );
+    let hub2 = Hub::new(Config {
+        bootstrap: Some(b2),
+        installer: i2.clone(),
+        runtime: f.setup.clone(),
+        disabled: BTreeSet::new(),
+    })
+    .unwrap();
+    let (c2, _) = hub2.open_window(Generation::default(), None).unwrap();
+    let mut review_id = None;
+    wait(|| {
+        for n in c2.poll() {
+            if let Notice::Review(r) = n
+                && r.manifest.id == "iris.expand"
+            {
+                review_id = Some(r.id);
+            }
+        }
+        review_id.is_some()
+    });
+    c2.approve(
+        review_id.unwrap(),
+        BTreeSet::from([Capability::UiOverlay, Capability::Notifications]),
+        true,
+    )
+    .unwrap();
+    wait(|| ready(&c2, "iris.expand"));
+    let v2 = i2.record("iris.expand").unwrap().unwrap();
+    assert_eq!(v2.installation_id, v1_id);
+    assert!(v2.grants.contains(&Capability::Notifications));
+    drop((c2, hub2));
+    wait(|| f.resources.ledger.used(None, Resource::HostBytes) == 0);
+}
+
+mod control_recovery;

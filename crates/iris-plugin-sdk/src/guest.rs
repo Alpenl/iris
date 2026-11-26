@@ -1,9 +1,7 @@
 //! These are guest-local pointers. The Wasm sandbox, not Rust references, is the
 //! host isolation boundary. No guest memory borrow survives a host callback.
-use iris_api::v2::{
-    CHUNK_LIMIT, ErrorCode, Id, MESSAGE_LIMIT, Reply, crypto::CryptoSpec, task::Task,
-};
-use serde::Serialize;
+use iris_api::v2::{CHUNK_LIMIT, ErrorCode, Id, MESSAGE_LIMIT, Reply, task::Task};
+use serde::{Serialize, de::DeserializeOwned};
 
 #[link(wasm_import_module = "iris_v2")]
 unsafe extern "C" {
@@ -14,14 +12,6 @@ unsafe extern "C" {
     fn host_close(handle: i64) -> i32;
     fn host_stream_reply(request: i64, blob: i64, flags: i32) -> i64;
     fn host_stream_fail(request: i64, code: i32) -> i32;
-    fn host_crypto(
-        spec_ptr: u32,
-        spec_len: u32,
-        in_ptr: u32,
-        in_len: u32,
-        out_ptr: u32,
-        out_cap: u32,
-    ) -> i64;
     fn host_random(dst: u32, len: u32) -> i32;
     fn host_clock(kind: i32) -> i64;
 }
@@ -140,30 +130,6 @@ pub fn fail_stream(request: Id, error: ErrorCode) -> Result<(), ErrorCode> {
     result(unsafe { host_stream_fail(id, error as i32) } as i64).map(|_| ())
 }
 
-pub fn crypto(spec: &CryptoSpec, input: &[u8], capacity: usize) -> Result<Vec<u8>, ErrorCode> {
-    if input.len() > CHUNK_LIMIT || capacity > CHUNK_LIMIT + 16 {
-        return Err(ErrorCode::QuotaExceeded);
-    }
-    let spec = serde_json::to_vec(spec).map_err(|_| ErrorCode::InvalidArgument)?;
-    let mut output = vec![0; capacity];
-    // SAFETY: all ranges are valid and input/output storage does not overlap.
-    let n = result(unsafe {
-        host_crypto(
-            spec.as_ptr() as u32,
-            spec.len() as u32,
-            input.as_ptr() as u32,
-            input.len() as u32,
-            output.as_mut_ptr() as u32,
-            capacity as u32,
-        )
-    })? as usize;
-    if n > capacity {
-        return Err(ErrorCode::Internal);
-    }
-    output.truncate(n);
-    Ok(output)
-}
-
 pub fn random(bytes: &mut [u8]) -> Result<(), ErrorCode> {
     if bytes.len() > MESSAGE_LIMIT {
         return Err(ErrorCode::QuotaExceeded);
@@ -188,7 +154,7 @@ pub fn allocate(len: u32) -> u32 {
 /// `ptr,len` must be a live SDK allocation, returned exactly once by the host.
 #[doc(hidden)]
 pub unsafe fn deallocate(ptr: u32, len: u32) {
-    if ptr == 0 && len == 0 {
+    if ptr == 0 || len == 0 {
         return;
     }
     let raw = std::ptr::slice_from_raw_parts_mut(ptr as *mut u8, len as usize);
@@ -198,37 +164,25 @@ pub unsafe fn deallocate(ptr: u32, len: u32) {
     }
 }
 
-/// # Safety
-/// The caller supplies a live input allocation borrowed for this call only.
-#[doc(hidden)]
-pub unsafe fn dispatch<C: Serialize>(
-    ptr: u32,
-    len: u32,
-    handler: fn(serde_json::Value) -> Reply<C>,
-) -> u64 {
-    if len as usize > MESSAGE_LIMIT {
-        return 0;
-    }
-    // SAFETY: host allocated input and retains ownership until return.
-    let input = unsafe { std::slice::from_raw_parts(ptr as *const u8, len as usize) };
-    let response = match crate::json::decode(input, MESSAGE_LIMIT) {
-        Ok(event) => handler(event),
-        Err(error) => Reply::Error {
-            error: iris_api::v2::GuestError {
-                code: error as i32,
-                message: "invalid event".into(),
-            },
+fn error_reply<C>(code: ErrorCode, message: &str) -> Reply<C> {
+    Reply::Error {
+        error: iris_api::v2::GuestError {
+            code: code as i32,
+            message: message.into(),
         },
-    };
-    let output = match crate::json::encode(&response, MESSAGE_LIMIT) {
+    }
+}
+
+fn encode_reply<C: Serialize>(response: &Reply<C>) -> u64 {
+    let output = match crate::json::encode(response, MESSAGE_LIMIT) {
         Ok(output) => output,
         Err(error) => {
-            let fallback: Reply<()> = Reply::Error {
-                error: iris_api::v2::GuestError {
-                    code: error as i32,
-                    message: "encoded reply exceeded message limit".into(),
-                },
+            let message = if error == ErrorCode::QuotaExceeded {
+                "encoded reply exceeded message limit"
+            } else {
+                crate::error_message(error)
             };
+            let fallback: Reply<()> = error_reply(error, message);
             let Ok(output) = crate::json::encode(&fallback, MESSAGE_LIMIT) else {
                 return 0;
             };
@@ -241,4 +195,66 @@ pub unsafe fn dispatch<C: Serialize>(
     let len = output.len() as u32;
     let ptr = Box::into_raw(output.into_boxed_slice()) as *mut u8 as u32;
     iris_api::v2::pack(ptr, len)
+}
+
+/// # Safety
+/// The caller supplies a live input allocation borrowed for this call only.
+#[doc(hidden)]
+pub unsafe fn dispatch<C: Serialize>(
+    ptr: u32,
+    len: u32,
+    handler: fn(serde_json::Value) -> Reply<C>,
+) -> u64 {
+    if len as usize > MESSAGE_LIMIT {
+        return encode_reply::<()>(&error_reply(
+            ErrorCode::QuotaExceeded,
+            "event exceeded message limit",
+        ));
+    }
+    if ptr == 0 || len == 0 {
+        return encode_reply::<()>(&error_reply(ErrorCode::InvalidArgument, "invalid event"));
+    }
+    // SAFETY: ptr is non-null and host allocated input and retains ownership until return.
+    let input = unsafe { std::slice::from_raw_parts(ptr as *const u8, len as usize) };
+    let response = match crate::json::decode(input, MESSAGE_LIMIT) {
+        Ok(event) => handler(event),
+        Err(error) => error_reply(
+            error,
+            if error == ErrorCode::QuotaExceeded {
+                "event exceeded message limit"
+            } else {
+                "invalid event"
+            },
+        ),
+    };
+    encode_reply(&response)
+}
+
+/// # Safety
+/// The caller supplies a live input allocation borrowed for this call only.
+#[doc(hidden)]
+pub unsafe fn dispatch_typed<E: DeserializeOwned, C: Serialize>(
+    ptr: u32,
+    len: u32,
+    handler: fn(E) -> Result<Vec<C>, ErrorCode>,
+) -> u64 {
+    if len as usize > MESSAGE_LIMIT {
+        return encode_reply::<()>(&error_reply(
+            ErrorCode::QuotaExceeded,
+            "event exceeded message limit",
+        ));
+    }
+    if ptr == 0 || len == 0 {
+        return encode_reply::<()>(&error_reply(
+            ErrorCode::InvalidArgument,
+            crate::error_message(ErrorCode::InvalidArgument),
+        ));
+    }
+    // SAFETY: ptr is non-null and host allocated input and retains ownership until return.
+    let input = unsafe { std::slice::from_raw_parts(ptr as *const u8, len as usize) };
+    let response = match crate::json::decode::<E>(input, MESSAGE_LIMIT).and_then(handler) {
+        Ok(ok) => Reply::Ok { ok },
+        Err(code) => error_reply(code, crate::error_message(code)),
+    };
+    encode_reply(&response)
 }

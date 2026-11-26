@@ -1,6 +1,6 @@
 //! Minimal pure-Rust PNG-to-QR-matrix extractor so Baidu Passport's official
 //! `passport.baidu.com/v2/api/qrcode` PNG image (`245x245`, 1-bit palette) is
-//! rendered faithfully inside Iris's native `Widget::QrCode` grid.
+//! rendered faithfully inside Iris's native `Widget::PixelGrid` grid.
 
 use miniz_oxide::inflate::decompress_to_vec_zlib_with_limit;
 
@@ -9,7 +9,7 @@ const MAX_PNG_DIM: usize = 1024;
 const MAX_DECODED_BYTES: usize = 4 * 1024 * 1024;
 
 /// Decodes a Baidu Passport QR PNG into a square `'1'` / `'0'` module matrix
-/// (`21..=96` modules wide, matching Iris UI's `Widget::QrCode` constraints).
+/// (`21..=96` modules wide, matching Iris UI's `Widget::PixelGrid` constraints).
 pub fn decode_qr_png_to_matrix(png: &[u8]) -> Result<Vec<String>, String> {
     let (width, height, dark) = decode_png_dark_pixels(png)?;
 
@@ -103,6 +103,15 @@ fn decode_png_dark_pixels(png: &[u8]) -> Result<(usize, usize, Vec<bool>), Strin
             return Err("PNG 数据截断".into());
         }
         let data = &png[data_start..data_end];
+        let expected_crc = u32::from_be_bytes([
+            png[data_end],
+            png[data_end + 1],
+            png[data_end + 2],
+            png[data_end + 3],
+        ]);
+        if crc32_chunk(kind, data) != expected_crc {
+            return Err("PNG 块 CRC 校验失败".into());
+        }
         pos = data_end + 4;
 
         match kind {
@@ -270,6 +279,18 @@ fn unfilter_scanline(
         other => return Err(format!("不支持的 PNG 滤镜类型 {other}")),
     }
     Ok(())
+}
+
+pub(crate) fn crc32_chunk(kind: &[u8], data: &[u8]) -> u32 {
+    let mut crc = 0xFFFF_FFFFu32;
+    for &byte in kind.iter().chain(data) {
+        crc ^= u32::from(byte);
+        for _ in 0..8 {
+            let mask = (crc & 1).wrapping_neg();
+            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+        }
+    }
+    !crc
 }
 
 fn paeth(a: u8, b: u8, c: u8) -> u8 {

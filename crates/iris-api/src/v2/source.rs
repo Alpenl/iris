@@ -14,7 +14,7 @@ pub struct SourceDescriptor {
     /// A host icon name, never a URL or filesystem path.
     pub icon: Option<String>,
     /// Optional short host-rendered badge tag (e.g. `"WebDAV"`, `"云源"`), at most 24 bytes.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub badge: Option<String>,
     #[serde(default)]
     pub supports_search: bool,
@@ -36,14 +36,20 @@ impl SourceDescriptor {
             if !crate::is_valid_id(&source.id)
                 || source.name.trim().is_empty()
                 || source.name.len() > 256
+                || source.name.chars().any(char::is_control)
                 || !ids.insert(&source.id)
                 || source
-                    .icon
+                    .subtitle
                     .as_ref()
-                    .is_some_and(|i| !crate::is_valid_id(i) || i.len() > 64)
+                    .is_some_and(|s| s.len() > 256 || s.chars().any(char::is_control))
+                || source.icon.as_ref().is_some_and(|i| !crate::is_valid_id(i))
                 || source.badge.as_ref().is_some_and(|b| {
                     b.trim().is_empty() || b.len() > 24 || b.chars().any(char::is_control)
                 })
+                || source
+                    .auth_command_id
+                    .as_ref()
+                    .is_some_and(|id| !crate::is_valid_id(id))
             {
                 return Err("invalid source descriptor");
             }
@@ -126,4 +132,55 @@ pub struct PlaylistEntry {
     pub source_id: String,
     pub entry_id: String,
     pub title: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SourceDescriptor;
+
+    fn valid_source() -> SourceDescriptor {
+        SourceDescriptor {
+            id: "nas.main".into(),
+            name: "Home NAS".into(),
+            subtitle: Some("https://nas.local".into()),
+            icon: Some("folder".into()),
+            badge: Some("WebDAV".into()),
+            supports_search: true,
+            requires_auth: true,
+            auth_command_id: Some("login".into()),
+            configurable: true,
+            removable: true,
+        }
+    }
+
+    #[test]
+    fn source_descriptor_validate_all_checks_subtitle_and_auth_command_id() {
+        assert!(SourceDescriptor::validate_all(&[valid_source()]).is_ok());
+
+        let mut bad_sub_len = valid_source();
+        bad_sub_len.subtitle = Some("a".repeat(257));
+        assert!(SourceDescriptor::validate_all(&[bad_sub_len]).is_err());
+
+        let mut bad_sub_ctrl = valid_source();
+        bad_sub_ctrl.subtitle = Some("line1\nline2".into());
+        assert!(SourceDescriptor::validate_all(&[bad_sub_ctrl]).is_err());
+
+        let mut bad_auth = valid_source();
+        bad_auth.auth_command_id = Some("../escape".into());
+        assert!(SourceDescriptor::validate_all(&[bad_auth]).is_err());
+
+        let mut bad_name_ctrl = valid_source();
+        bad_name_ctrl.name = "NAS\0".into();
+        assert!(SourceDescriptor::validate_all(&[bad_name_ctrl]).is_err());
+
+        let mut none_badge = valid_source();
+        none_badge.badge = None;
+        let encoded = serde_json::to_value(&none_badge).unwrap();
+        assert_eq!(encoded.get("badge"), Some(&serde_json::Value::Null));
+        let explicit_null: SourceDescriptor = serde_json::from_str(
+            r#"{"id":"nas.main","name":"Home NAS","subtitle":null,"icon":null,"badge":null,"auth_command_id":null}"#,
+        )
+        .unwrap();
+        assert_eq!(explicit_null.badge, None);
+    }
 }

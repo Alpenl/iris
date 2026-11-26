@@ -56,8 +56,19 @@ fn handle(value: Value) -> Result<Vec<HostCommand>, ErrorCode> {
         });
     }
     match value["event"].as_str() {
-        Some("init") if value["role"] == "control" && value["capabilities"].as_array().is_some_and(|caps| caps.iter().any(|cap| cap == "media_source")) => {
-            out.push(HostCommand::SetSources { sources: vec![iris_plugin_sdk::api::v2::source::SourceDescriptor { id: "fixture.source".into(), name: "Fixture source".into(), ..Default::default() }] });
+        Some("init")
+            if value["role"] == "control"
+                && value["capabilities"]
+                    .as_array()
+                    .is_some_and(|caps| caps.iter().any(|cap| cap == "media_source")) =>
+        {
+            out.push(HostCommand::SetSources {
+                sources: vec![iris_plugin_sdk::api::v2::source::SourceDescriptor {
+                    id: "fixture.source".into(),
+                    name: "Fixture source".into(),
+                    ..Default::default()
+                }],
+            });
         }
         Some("source_resolve") => {
             let context = guest::Blob::new(&[0xa5])?.transfer();
@@ -68,18 +79,29 @@ fn handle(value: Value) -> Result<Vec<HostCommand>, ErrorCode> {
             slow()?;
         }
         Some("command") if value["id"] == "ping" => {
-            out.push(HostCommand::ShowToast { message: "pong".into() });
+            out.push(HostCommand::ShowToast {
+                message: "pong".into(),
+            });
         }
         Some("command") if value["id"] == "store_write" => {
-            guest::submit(&Task::StateWrite { key: "fixture".into(), value: Some("persistent-value".into()) })?;
+            guest::submit(&Task::StateWrite {
+                key: "fixture".into(),
+                value: Some("persistent-value".into()),
+            })?;
         }
         Some("command") if value["id"] == "store_read" => {
-            guest::submit(&Task::StateRead { key: "fixture".into() })?;
+            guest::submit(&Task::StateRead {
+                key: "fixture".into(),
+            })?;
         }
         Some("command") if value["id"] == "snapshot" => {
-            out.push(HostCommand::ShowToast { message: value["snapshot"]["uri"].as_str().unwrap_or("none").into() });
+            out.push(HostCommand::ShowToast {
+                message: value["snapshot"]["uri"].as_str().unwrap_or("none").into(),
+            });
         }
-        Some("command") if value["id"] == "spin" => loop { std::hint::spin_loop(); },
+        Some("command") if value["id"] == "spin" => loop {
+            std::hint::spin_loop();
+        },
         Some("stream_init" | "stream_context_changed") => {
             let id: Id = serde_json::from_value(value["context_blob"].clone())
                 .map_err(|_| ErrorCode::InvalidArgument)?;
@@ -95,11 +117,18 @@ fn handle(value: Value) -> Result<Vec<HostCommand>, ErrorCode> {
         }
         Some("completed") => {
             if value["result"]["ok"]["stored"] == true {
-                guest::submit(&Task::StateRead { key: "fixture".into() })?;
+                guest::submit(&Task::StateRead {
+                    key: "fixture".into(),
+                })?;
                 return Ok(out);
             }
             if value["result"]["ok"].get("store_value").is_some() {
-                out.push(HostCommand::ShowToast { message: value["result"]["ok"]["store_value"].as_str().unwrap_or("absent").into() });
+                out.push(HostCommand::ShowToast {
+                    message: value["result"]["ok"]["store_value"]
+                        .as_str()
+                        .unwrap_or("absent")
+                        .into(),
+                });
                 return Ok(out);
             }
             let id: Id = serde_json::from_value(value["operation_id"].clone())

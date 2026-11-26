@@ -14,27 +14,38 @@ import tempfile
 import time
 
 
+def sample_process_metrics(process):
+    """Return (working_set_bytes, peak_working_set_bytes, cpu_seconds) for a running Popen."""
+    if os.name == "nt":
+        from ctypes import wintypes
+
+        class Counters(ctypes.Structure):
+            _fields_ = [("cb", wintypes.DWORD), ("faults", wintypes.DWORD),
+                        *[(name, ctypes.c_size_t) for name in ("peak_ws", "ws", "peak_paged", "paged", "peak_nonpaged", "nonpaged", "pagefile", "peak_pagefile")]]
+
+        psapi = ctypes.WinDLL("psapi", use_last_error=True)
+        psapi.GetProcessMemoryInfo.argtypes = [wintypes.HANDLE, ctypes.POINTER(Counters), wintypes.DWORD]
+        counters = Counters()
+        counters.cb = ctypes.sizeof(counters)
+        handle = wintypes.HANDLE(int(process._handle))
+        if not psapi.GetProcessMemoryInfo(handle, ctypes.byref(counters), counters.cb):
+            return None, None, None
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel.GetProcessTimes.argtypes = [wintypes.HANDLE, *([ctypes.POINTER(wintypes.FILETIME)] * 4)]
+        fields = [wintypes.FILETIME() for _ in range(4)]
+        if not kernel.GetProcessTimes(handle, *(ctypes.byref(v) for v in fields)):
+            return counters.ws, counters.peak_ws, None
+        cpu = sum((v.dwHighDateTime << 32) | v.dwLowDateTime for v in fields[2:]) / 10_000_000
+        return counters.ws, counters.peak_ws, cpu
+
+    result = subprocess.run(["ps", "-o", "rss=", "-p", str(process.pid)], capture_output=True, text=True)
+    rss = int(result.stdout) * 1024 if result.stdout.strip().isdigit() else None
+    return rss, rss, None
+
+
 def windows_sample(process):
-    from ctypes import wintypes
-
-    class Counters(ctypes.Structure):
-        _fields_ = [("cb", wintypes.DWORD), ("faults", wintypes.DWORD),
-                    *[(name, ctypes.c_size_t) for name in ("peak_ws", "ws", "peak_paged", "paged", "peak_nonpaged", "nonpaged", "pagefile", "peak_pagefile")]]
-
-    psapi = ctypes.WinDLL("psapi", use_last_error=True)
-    psapi.GetProcessMemoryInfo.argtypes = [wintypes.HANDLE, ctypes.POINTER(Counters), wintypes.DWORD]
-    counters = Counters()
-    counters.cb = ctypes.sizeof(counters)
-    handle = wintypes.HANDLE(int(process._handle))
-    if not psapi.GetProcessMemoryInfo(handle, ctypes.byref(counters), counters.cb):
-        return None, None
-    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
-    kernel.GetProcessTimes.argtypes = [wintypes.HANDLE, *([ctypes.POINTER(wintypes.FILETIME)] * 4)]
-    fields = [wintypes.FILETIME() for _ in range(4)]
-    if not kernel.GetProcessTimes(handle, *(ctypes.byref(v) for v in fields)):
-        return counters.peak_ws, None
-    cpu = sum((v.dwHighDateTime << 32) | v.dwLowDateTime for v in fields[2:]) / 10_000_000
-    return counters.peak_ws, cpu
+    _, peak_ws, cpu = sample_process_metrics(process)
+    return peak_ws, cpu
 
 
 def measure(executable):
@@ -46,14 +57,9 @@ def measure(executable):
             while process.poll() is None:
                 if time.monotonic() - start > 180:
                     raise TimeoutError("plugin runtime benchmark exceeded 180 seconds")
-                if os.name == "nt":
-                    sample, cpu_sample = windows_sample(process)
-                    rss = max(rss, sample or 0)
-                    cpu = cpu_sample if cpu_sample is not None else cpu
-                else:
-                    result = subprocess.run(["ps", "-o", "rss=", "-p", str(process.pid)], capture_output=True, text=True)
-                    if result.stdout.strip().isdigit():
-                        rss = max(rss, int(result.stdout) * 1024)
+                _, sample, cpu_sample = sample_process_metrics(process)
+                rss = max(rss, sample or 0)
+                cpu = cpu_sample if cpu_sample is not None else cpu
                 time.sleep(0.02)
         finally:
             if process.poll() is None:
@@ -116,7 +122,7 @@ def main():
                 failures.append("regression: " + field)
         result["baseline_failures"] = failures
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
+    args.output.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8", newline="\n")
     if failures:
         raise SystemExit("; ".join(failures))
 

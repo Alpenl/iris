@@ -84,14 +84,17 @@ impl Fixture {
     }
     fn open(&self, control: &mut Control) -> Id {
         let id = Control::new_window_id().unwrap();
-        control
-            .open_window(
+        let prepared = control
+            .window_preparation(
                 id,
                 Generation::default(),
                 None,
                 Arc::new(|_, _, _| Err(ErrorCode::Denied)),
             )
+            .unwrap()
+            .prepare()
             .unwrap();
+        control.attach_window(prepared).unwrap();
         id
     }
     fn command(&self, control: &mut Control, window: Id, command: &str) -> String {

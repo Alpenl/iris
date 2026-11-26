@@ -6,6 +6,7 @@ use gpui::{
     StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder, px,
 };
 use iris_core::player::{self, AspectMode, Command, TrackKind, format_time};
+use iris_core::{catalog::PlayQueue, media_uri::MediaUri};
 
 use super::super::IrisWindow;
 use super::super::actions::{
@@ -20,6 +21,15 @@ use super::super::state::PopoverKind;
 use super::{anchor_wrap, dock_sep};
 use crate::assets::Icon;
 use crate::theme::{FONT_MONO, ThemeTokens};
+
+fn can_step_queue(queue: &PlayQueue, current: Option<&MediaUri>, delta: isize) -> bool {
+    match current {
+        Some(current) => queue
+            .step(current, delta, true)
+            .is_some_and(|next| &next.uri != current),
+        None => !queue.is_empty(),
+    }
+}
 
 impl IrisWindow {
     pub(super) fn render_plugin_toolbar_slot(
@@ -98,6 +108,14 @@ impl IrisWindow {
         cx: &mut Context<Self>,
     ) -> Option<impl IntoElement> {
         let meta = self.catalog.active_stream_meta.as_ref()?;
+        if meta
+            .plugin_id
+            .as_deref()
+            .is_some_and(|pid| !self.plugins.client().is_ready(pid))
+            || self.active().session.current_media_uri().is_none()
+        {
+            return None;
+        }
         let label = meta
             .active_variant
             .as_deref()
@@ -116,11 +134,17 @@ impl IrisWindow {
         Some(anchor_wrap(self.chrome.probes.anchor_variants.clone(), btn))
     }
 
-    fn can_step_media(&self) -> bool {
+    fn can_step_media(&self, delta: isize) -> bool {
+        let current = self
+            .active()
+            .pending_path
+            .clone()
+            .map(MediaUri::Local)
+            .or_else(|| self.active().session.current_media_uri());
         if !self.queue.is_empty() {
-            return self.queue.len() > 1;
+            return can_step_queue(&self.queue, current.as_ref(), delta);
         }
-        self.catalog.playable_count > 1 || self.plugin_view.playlist.len() > 1
+        self.catalog.playable_count > 1 || self.can_step_plugin_playlist(current.as_ref(), delta)
     }
 
     fn step_button(
@@ -135,7 +159,7 @@ impl IrisWindow {
         } else {
             (Icon::Next, "下一个", "open_next")
         };
-        if !self.can_step_media() {
+        if !self.can_step_media(delta) {
             return icon_button_disabled(id, glyph, false, t)
                 .tooltip(tip("当前列表仅有一项", None));
         }
@@ -553,3 +577,6 @@ impl IrisWindow {
             .child(dock_sep(compact, t))
     }
 }
+
+#[cfg(test)]
+mod tests;

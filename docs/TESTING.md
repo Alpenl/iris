@@ -20,9 +20,8 @@ libmpv 可通过 `MPV_LIB_DIR` 指定。Windows x64 MSVC 默认查找工作区 `
 
 | 脚本 | 内容 | 依赖 |
 |---|---|---|
-| `scripts/make-test-media.sh` | 1080p60 H.264、4K30 HEVC 10bit、带中文字幕的 2.39:1 MKV、几张大照片 | ffmpeg |
 | `scripts/make-photo-test-media.sh` | `test-media/photo/` 下的照片边界素材：EXIF 方向 1/3/6/8 的 JPEG 和方向 6 的 HEIC；48 MP 分块 HEIC；无标签 / sRGB / P3 / Adobe RGB 的纯色块；20000×3000、4000×40000、12000×12000 的巨图；JPEG 和 HEIC 各 20 张约 48 MP 的翻页图（每张宽度不同，用来识别是哪一张）| ffmpeg、exiftool、sips、swift（Command Line Tools）|
-| `scripts/make-webp-test-media.py` | `test-media/photo/icc/` 下 sRGB / P3 / Adobe RGB 的无损 WebP 色块（本机 FFmpeg 没有 WebP 编码器，改用 Pillow）| Pillow（带 WebP）、macOS ColorSync 配置文件 |
+| `scripts/make-webp-test-media.py` | `test-media/photo/icc/` 下 sRGB / P3 / Adobe RGB 的无损 WebP 色块（加 `--all-formats` 同时生成 PNG/JPEG 对照色块；自动查找同目录 `p3.icc`/`adobergb.icc` 或 macOS ColorSync 配置文件）| Pillow（带 WebP）|
 
 ## 照片实测脚本
 

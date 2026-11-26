@@ -49,7 +49,6 @@ impl IrisWindow {
                     view.auth_hint = p.auth_hint.clone();
                     view.next_page = p.next_page.clone();
                     if !append {
-                        view.entries.clear();
                         self.plugin_view.pages.clear();
                         self.plugin_view.source_filters = p.filters.clone();
                         self.plugin_view.filter_values = p
@@ -62,18 +61,7 @@ impl IrisWindow {
                             })
                             .collect();
                     }
-                    // The accepted-page reservation remains live and covers decoded UI rows.
-                    view.entries
-                        .extend(p.entries.iter().map(|e| iris_api::SourceEntry {
-                            id: e.id.clone(),
-                            name: e.name.clone(),
-                            kind: e.kind,
-                            size: e.size.map(|v| v.0),
-                            modified_secs: e.modified_secs.map(|v| v.0),
-                            duration: e.duration,
-                            subtitle: e.subtitle.clone(),
-                            variants: e.variants.clone(),
-                        }));
+                    // The accepted-page reservation remains live and backs decoded UI rows directly.
                     self.store.backfill_plugin_recent_titles(
                         pid,
                         &p.source_id,
@@ -118,6 +106,18 @@ impl IrisWindow {
                             super::super::strings::chrome::DEFAULT_PLUGIN_MEDIA_TITLE.into()
                         });
                 }
+                let requested_target = match &ticket.target {
+                    RequestTarget::Resolve { source, entry, .. } => {
+                        Some((source.as_str(), entry.as_str()))
+                    }
+                    _ => None,
+                };
+                let playlist_current = super::sources::resolve_playlist_current(
+                    &playlist,
+                    playback.source_id.as_deref(),
+                    playback.entry_id.as_deref(),
+                    requested_target,
+                );
                 let (uri, private, variant) = match &ticket.target {
                     RequestTarget::Resolve {
                         source,
@@ -149,7 +149,7 @@ impl IrisWindow {
                 let stream_variants = playback.variants.clone();
                 let resolved_variant = playback.active_variant.clone();
                 let settings = self.settings.clone();
-                self.active_mut().loading_visible = false;
+                self.active_mut().commit_media_open_generation();
                 match self.active_mut().session.open_scoped(
                     Arc::new(playback).into_scoped(),
                     uri.clone(),
@@ -158,6 +158,8 @@ impl IrisWindow {
                 ) {
                     Ok(()) => {
                         self.active_mut().session.set_private_identity(private);
+                        self.plugin_view.stream_plugin = Some(pid.clone());
+                        self.plugin_view.playlist_current = playlist_current;
                         self.plugin_view.playlist = playlist;
                         self.plugin_view.playlist_binding = Some(binding.clone());
                         self.catalog.active_stream_meta = match uri {
@@ -167,12 +169,15 @@ impl IrisWindow {
                                 entry_id,
                             } => {
                                 let entry_variants = match &self.catalog.active_source {
-                                    ActiveSource::Plugin(view) => view
-                                        .entries
-                                        .iter()
-                                        .find(|e| e.id == entry_id)
-                                        .map(|e| e.variants.clone())
-                                        .unwrap_or_default(),
+                                    ActiveSource::Plugin(view)
+                                        if view.plugin_id == plugin_id
+                                            && view.source_id == source_id =>
+                                    {
+                                        self.plugin_source_entries(&source_id)
+                                            .find(|e| e.id == entry_id)
+                                            .map(|e| e.variants.clone())
+                                            .unwrap_or_default()
+                                    }
                                     _ => Vec::new(),
                                 };
                                 Some(ActiveStreamMeta {
@@ -202,26 +207,6 @@ impl IrisWindow {
                 cx.notify();
             }
             Notice::Error {
-                plugin: Some(plugin),
-                request: Some(id),
-                code,
-                message,
-            } => {
-                log::warn!(
-                    "plugin request error ({plugin}, req={}): {code:?} {message:?}",
-                    id.0
-                );
-                if self.plugin_view.consent_busy == Some(id) {
-                    self.plugin_view.consent_busy = None;
-                }
-                self.handle_source_error(
-                    &plugin,
-                    &id.0.to_string(),
-                    message.unwrap_or_else(|| describe_error_code(code)),
-                    cx,
-                );
-            }
-            Notice::Error {
                 plugin,
                 request,
                 code,
@@ -232,24 +217,34 @@ impl IrisWindow {
                     plugin.as_deref().unwrap_or("unknown")
                 );
                 if let Some(id) = request {
-                    if self.plugin_view.consent_busy == Some(id) {
-                        self.plugin_view.consent_busy = None;
-                    }
-                    if code != iris_api::v2::ErrorCode::Backpressure
+                    self.plugin_view.consent_busy.remove(&id);
+                } else if let Some(pid) = plugin.as_deref()
+                    && self.plugin_view.modal.clear_submitting_for(pid)
+                {
+                    cx.notify();
+                }
+                let detail = message.unwrap_or_else(|| describe_error_code(code));
+                let matched_source = if let (Some(pid), Some(id)) = (plugin.as_deref(), request) {
+                    self.handle_source_error(pid, &id.0.to_string(), detail.clone(), cx)
+                } else {
+                    false
+                };
+                if !matched_source {
+                    if let Some(id) = request
+                        && code != iris_api::v2::ErrorCode::Backpressure
                         && self.plugin_view.review.as_ref().is_some_and(|r| r.id == id)
                     {
                         self.plugin_view.review = None;
                         self.plugin_view.review_created = None;
+                        self.restore_modal_focus_if_unblocked();
+                    }
+                    if should_fallback_error_toast(matched_source, code) {
+                        self.show_toast(
+                            format!("{} · {detail}", plugin.as_deref().unwrap_or("插件")),
+                            cx,
+                        );
                     }
                 }
-                self.show_toast(
-                    format!(
-                        "{} · {}",
-                        plugin.as_deref().unwrap_or("插件"),
-                        message.unwrap_or_else(|| describe_error_code(code))
-                    ),
-                    cx,
-                );
             }
             Notice::Browser {
                 binding,
@@ -262,40 +257,46 @@ impl IrisWindow {
                 }
             }
             Notice::Review(review) => {
+                let new_id = review.id;
                 if let Some(old) = self.plugin_view.review.replace(review) {
                     let _ = self.plugins.client().dismiss_review(old.id);
+                    self.plugin_view.consent_busy.remove(&old.id);
                 }
+                self.plugin_view.consent_busy.remove(&new_id);
                 self.plugin_view.review_created = Some(std::time::Instant::now());
                 self.plugin_view.keep_identity = false;
-                self.plugin_view.consent_busy = None;
                 self.overlays.close_all();
                 cx.notify();
             }
             Notice::Origin(origin) => {
+                let new_id = origin.id;
                 if let Some(old) = self.plugin_view.origin.replace(origin) {
                     let _ = self.plugins.client().confirm_origin(old.id, false, false);
+                    self.plugin_view.consent_busy.remove(&old.id);
                 }
+                self.plugin_view.consent_busy.remove(&new_id);
                 self.plugin_view.insecure_auth = false;
-                self.plugin_view.consent_busy = None;
                 self.overlays.close_all();
                 cx.notify();
             }
             Notice::OriginClosed(id) => {
-                if self.plugin_view.consent_busy == Some(id) {
-                    self.plugin_view.consent_busy = None;
-                }
+                self.plugin_view.consent_busy.remove(&id);
                 if self.plugin_view.origin.as_ref().is_some_and(|o| o.id == id) {
                     self.plugin_view.origin = None;
+                    self.restore_modal_focus_if_unblocked();
                     cx.notify();
                 }
             }
             Notice::Installed(record) => {
-                self.plugin_view.review = None;
+                if let Some(old) = self.plugin_view.review.take() {
+                    self.plugin_view.consent_busy.remove(&old.id);
+                }
                 self.plugin_view.review_created = None;
-                self.plugin_view.consent_busy = None;
+                self.restore_modal_focus_if_unblocked();
                 self.show_toast(format!("已安装 {}", record.plugin_id), cx);
             }
             Notice::Uninstalled(plugin_id) => {
+                self.cleanup_plugin_playback(Some(&plugin_id), None);
                 self.reconcile_active_source();
                 self.sync_theme_tokens(cx);
                 self.show_toast(format!("已删除插件 {plugin_id}"), cx);
@@ -306,6 +307,47 @@ impl IrisWindow {
     }
 }
 
+fn should_fallback_error_toast(matched_source: bool, code: iris_api::v2::ErrorCode) -> bool {
+    !matched_source && code != iris_api::v2::ErrorCode::Cancelled
+}
+
 pub(in crate::ui) fn describe_error_code(code: iris_api::v2::ErrorCode) -> String {
     super::super::strings::errors::plugin_error_code(code)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_fallback_error_toast;
+    use crate::ui::state::{CatalogState, PendingResolve};
+    use iris_api::v2::ErrorCode;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn unmatched_plugin_request_error_falls_back_to_toast_unless_cancelled() {
+        let mut catalog = CatalogState {
+            pending_resolve: Some(PendingResolve {
+                req_id: "10".into(),
+                deadline: Instant::now() + Duration::from_secs(30),
+                plugin_id: "demo".into(),
+                source_id: "src".into(),
+                entry_id: "item".into(),
+                title: None,
+                _timeout: None,
+            }),
+            ..Default::default()
+        };
+        // Non-catalog request (e.g. Origin approval failure id=99) does not match CatalogState.
+        let matched = catalog.take_error("demo", "99").is_some();
+        assert!(!matched);
+        assert!(should_fallback_error_toast(matched, ErrorCode::Denied));
+        assert!(!should_fallback_error_toast(matched, ErrorCode::Cancelled));
+
+        // Catalog resolve request id=10 matches and handles its own toast.
+        let matched_resolve = catalog.take_error("demo", "10").is_some();
+        assert!(matched_resolve);
+        assert!(!should_fallback_error_toast(
+            matched_resolve,
+            ErrorCode::IoError
+        ));
+    }
 }

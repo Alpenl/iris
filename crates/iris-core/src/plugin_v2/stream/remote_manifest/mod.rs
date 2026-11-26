@@ -8,6 +8,7 @@ use super::{
     remote::{Fetched, RemoteFactory},
 };
 use crate::{plugin_v2::ledger::Resource, vfs::HttpCancel};
+pub use hls_parse::{attributes as parse_hls_attributes, parse_media as parse_hls_media};
 use iris_api::v2::{ErrorCode, stream::*};
 use std::collections::BTreeMap;
 use url::Url;
@@ -39,24 +40,21 @@ pub fn convert(
     let text = std::str::from_utf8(&fetched.bytes)
         .map_err(|_| ErrorCode::InvalidArgument)?
         .trim_start_matches('\u{feff}');
-    let (format, bytes, live, interval) = if text.starts_with("#EXTM3U") {
-        let document = hls::parse(&fetched, &mut build)?;
-        let live = document.live;
-        let target = document
-            .tracks
-            .iter()
-            .filter_map(|t| t.segments.iter().map(|s| s.duration_ms.0).max())
-            .min()
-            .unwrap_or(2000);
-        (
-            ManifestFormat::VirtualHls,
-            crate::plugin_v2::json::encode(&document, manifest::INPUT_LIMIT)?,
-            live,
-            (target / 2).clamp(250, 5000),
-        )
-    } else {
+    if !text.starts_with("#EXTM3U") {
         return Err(ErrorCode::Unsupported);
-    };
+    }
+    let document = hls::parse(&fetched, &mut build)?;
+    let live = document.live;
+    let target = document
+        .tracks
+        .iter()
+        .filter_map(|t| t.segments.iter().map(|s| s.duration_ms.0).max())
+        .min()
+        .unwrap_or(2000);
+    let format = ManifestFormat::VirtualHls;
+    let bytes = crate::bounded_json::encode(&document, manifest::INPUT_LIMIT)
+        .map_err(crate::plugin_v2::json_error)?;
+    let interval = (target / 2).clamp(250, 5000);
     let memory = factory.ledger().reserve(
         factory.owner(),
         &[(Resource::HostBytes, bytes.len() as u64)],

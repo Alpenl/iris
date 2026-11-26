@@ -1,6 +1,7 @@
-//! Versioned structured diagnostic events and pluggable local/future-telemetry sink abstraction.
+//! Versioned structured diagnostic events written directly to `events.jsonl`,
+//! with an optional test/extension sink hook.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -11,7 +12,7 @@ use serde_json::Value;
 use super::redact::redact_json;
 use super::writer::RotatingFile;
 
-/// Wire schema version for structured diagnostic & future telemetry events.
+/// Wire schema version for structured diagnostic events.
 pub const EVENT_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -23,19 +24,7 @@ pub enum EventLevel {
     Error,
 }
 
-impl EventLevel {
-    pub(super) fn to_log_level(self) -> log::Level {
-        match self {
-            Self::Debug => log::Level::Debug,
-            Self::Info => log::Level::Info,
-            Self::Warn => log::Level::Warn,
-            Self::Error => log::Level::Error,
-        }
-    }
-}
-
-/// Canonical, privacy-sanitized event envelope written to `events.jsonl` and
-/// dispatched to any registered [`TelemetrySink`].
+/// Canonical, privacy-sanitized event envelope written to `events.jsonl`.
 #[derive(Clone, Debug, Serialize)]
 pub struct TelemetryEvent {
     pub schema: u32,
@@ -52,42 +41,20 @@ pub struct TelemetryEvent {
     pub fields: Value,
 }
 
-/// Extension point for local exporters or future opt-in telemetry uploaders.
+/// Optional observer hook (e.g. integration test collectors).
 /// Implementations must be non-panicking and thread-safe.
 pub trait TelemetrySink: Send + Sync {
     fn record(&self, event: &TelemetryEvent);
     fn flush(&self) {}
 }
 
-pub(super) struct JsonlFileSink {
-    file: Arc<RotatingFile>,
-}
-
-impl JsonlFileSink {
-    pub(super) fn new(file: Arc<RotatingFile>) -> Self {
-        Self { file }
-    }
-}
-
-impl TelemetrySink for JsonlFileSink {
-    fn record(&self, event: &TelemetryEvent) {
-        if let Ok(mut line) = serde_json::to_string(event) {
-            line.push('\n');
-            let flush = matches!(event.level, EventLevel::Warn | EventLevel::Error);
-            let _ = self.file.write_bytes(line.as_bytes(), flush);
-        }
-    }
-
-    fn flush(&self) {
-        self.file.flush();
-    }
-}
-
 pub(super) struct EventBus {
     session_id: String,
     started_at: Instant,
     seq: AtomicU64,
-    sinks: Mutex<Vec<Arc<dyn TelemetrySink>>>,
+    jsonl: OnceLock<Arc<RotatingFile>>,
+    has_extra_sinks: AtomicBool,
+    extra_sinks: Mutex<Vec<Arc<dyn TelemetrySink>>>,
 }
 
 impl EventBus {
@@ -96,7 +63,9 @@ impl EventBus {
             session_id: generate_session_id(),
             started_at: Instant::now(),
             seq: AtomicU64::new(0),
-            sinks: Mutex::new(Vec::new()),
+            jsonl: OnceLock::new(),
+            has_extra_sinks: AtomicBool::new(false),
+            extra_sinks: Mutex::new(Vec::new()),
         }
     }
 
@@ -108,14 +77,29 @@ impl EventBus {
         self.started_at.elapsed().as_millis() as u64
     }
 
+    pub(super) fn set_jsonl_file(&self, file: Arc<RotatingFile>) {
+        let _ = self.jsonl.set(file);
+    }
+
     pub(super) fn register_sink(&self, sink: Arc<dyn TelemetrySink>) {
-        self.sinks
+        self.extra_sinks
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .push(sink);
+        self.has_extra_sinks.store(true, Ordering::Release);
     }
 
     pub(super) fn emit(
+        &self,
+        level: EventLevel,
+        category: &'static str,
+        event: &'static str,
+        fields: Value,
+    ) -> TelemetryEvent {
+        self.emit_sanitized(level, category, event, redact_json(fields))
+    }
+
+    pub(super) fn emit_sanitized(
         &self,
         level: EventLevel,
         category: &'static str,
@@ -138,21 +122,41 @@ impl EventBus {
             level,
             category,
             event,
-            fields: redact_json(fields),
+            fields,
         };
-        let sinks: Vec<Arc<dyn TelemetrySink>> =
-            self.sinks.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        for sink in sinks {
-            sink.record(&payload);
+        if let Some(file) = self.jsonl.get()
+            && let Ok(mut line) = serde_json::to_string(&payload)
+        {
+            line.push('\n');
+            let flush = matches!(payload.level, EventLevel::Warn | EventLevel::Error);
+            let _ = file.write_bytes(line.as_bytes(), flush);
+        }
+        if self.has_extra_sinks.load(Ordering::Acquire) {
+            let sinks: Vec<Arc<dyn TelemetrySink>> = self
+                .extra_sinks
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            for sink in sinks {
+                sink.record(&payload);
+            }
         }
         payload
     }
 
     pub(super) fn flush(&self) {
-        let sinks: Vec<Arc<dyn TelemetrySink>> =
-            self.sinks.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        for sink in sinks {
-            sink.flush();
+        if let Some(file) = self.jsonl.get() {
+            file.flush();
+        }
+        if self.has_extra_sinks.load(Ordering::Acquire) {
+            let sinks: Vec<Arc<dyn TelemetrySink>> = self
+                .extra_sinks
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            for sink in sinks {
+                sink.flush();
+            }
         }
     }
 }

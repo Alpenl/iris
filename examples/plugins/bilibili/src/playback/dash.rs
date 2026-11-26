@@ -94,17 +94,21 @@ pub(super) fn build_dash_media(
         .unwrap_or(0);
     let chosen = &reps[chosen_idx];
 
-    let variants: Vec<StreamVariant> = reps
-        .iter()
-        .take(16)
+    let mut listed: Vec<_> = reps.iter().take(16).collect();
+    if chosen_idx >= 16 {
+        listed[15] = chosen;
+    }
+    let variants: Vec<StreamVariant> = listed
+        .into_iter()
         .map(|r| StreamVariant {
             id: r.variant_id.clone(),
             label: format!("{} · {}", qn_label(r.qn), r.codec_tag.to_uppercase()),
         })
         .collect();
 
-    // Prefer reliable high-bitrate AAC as default, while keeping Hi-Res FLAC and Dolby selectable.
-    let mut audio_candidates: Vec<(String, &Value)> = Vec::new();
+    // Prefer reliable high-bitrate AAC as default, then preserve Hi-Res FLAC and
+    // Dolby ahead of lower-bitrate AAC fallbacks so >=3 AAC tracks never crowd them out.
+    let mut standard_aac: Vec<(String, &Value)> = Vec::new();
     if let Some(arr) = dash.get("audio").and_then(Value::as_array) {
         let mut standard: Vec<&Value> = arr.iter().collect();
         standard.sort_by_key(|a| {
@@ -123,8 +127,13 @@ pub(super) fn build_dash_media(
                 .unwrap_or(128_000)
                 / 1000)
                 .max(32);
-            audio_candidates.push((format!("{bw_kbps}kbps AAC"), a));
+            standard_aac.push((format!("{bw_kbps}kbps AAC"), a));
         }
+    }
+    let mut audio_candidates: Vec<(String, &Value)> = Vec::new();
+    let mut aac_iter = standard_aac.into_iter();
+    if let Some(best_aac) = aac_iter.next() {
+        audio_candidates.push(best_aac);
     }
     if let Some(flac) = dash.pointer("/flac/audio").filter(|v| !v.is_null()) {
         audio_candidates.push(("Hi-Res 无损".into(), flac));
@@ -136,6 +145,7 @@ pub(super) fn build_dash_media(
     {
         audio_candidates.push(("杜比音效".into(), dolby));
     }
+    audio_candidates.extend(aac_iter);
 
     let mut audio_tracks = Vec::new();
     for (label, node) in audio_candidates {

@@ -3,18 +3,24 @@
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
-use std::io::{self, BufRead, Read};
+use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
 use crate::fs_util;
 use crate::media_uri::MediaUri;
 mod annotations;
 mod recent;
+mod tsv;
 pub use annotations::{
     AnnotationEdit, AnnotationError, AnnotationPage, AnnotationSnapshot, AnnotationTarget,
     Annotations, ColorLabel, TimeMarker,
 };
 use recent::read_recent;
+use tsv::{canonical_hex_matches, decode_any_media_uri, push_hex, read_tsv};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Record {
@@ -28,25 +34,31 @@ const MAX_RECORD_KEY: usize = 128 * 1024;
 const MAX_RECORD_BYTES: usize = 16 * 1024 * 1024;
 // Two fixed-point f64 fields (up to 313 bytes each), flag and separators.
 const MAX_RECORD_FIELDS: usize = 640;
-const HEX: &[u8; 16] = b"0123456789abcdef";
 
 type Records = BTreeMap<String, Record>;
 
 #[derive(Clone, Debug, Default)]
 struct RecordEdit {
     favorite: Option<bool>,
-    progress_before: Option<(f64, f64)>,
+    progress_before: Option<Option<(f64, f64)>>,
     progress: Option<(f64, f64)>,
 }
 
 pub struct ProgressFlush {
     dir: PathBuf,
     edits: BTreeMap<String, RecordEdit>,
+    aborted: Arc<AtomicBool>,
 }
 
 impl ProgressFlush {
     pub fn run(self) -> Option<BTreeMap<String, (f64, f64)>> {
+        if self.aborted.load(Ordering::Acquire) {
+            return None;
+        }
         let _lock = fs_util::lock_file(&self.dir.join("records.lock")).ok()?;
+        if self.aborted.load(Ordering::Acquire) {
+            return None;
+        }
         let path = self.dir.join("records.tsv");
         let mut records = Records::new();
         let (_, scrub) = Store::read_records(&path, &mut records).ok()?;
@@ -58,7 +70,7 @@ impl ProgressFlush {
             };
             let old = records.get(key).copied();
             let mut record = old.unwrap_or_default();
-            if edit.matches_progress(record) {
+            if edit.matches_progress(old) {
                 record.position = position;
                 record.duration = duration;
                 applied.insert(key.clone(), (position, duration));
@@ -79,19 +91,26 @@ impl ProgressFlush {
 }
 
 impl RecordEdit {
-    fn remember_progress(&mut self, before: (f64, f64), after: (f64, f64)) {
+    fn remember_progress(&mut self, before: Option<(f64, f64)>, after: (f64, f64)) {
         if self.progress.is_none() {
             self.progress_before = Some(before);
         }
         self.progress = Some(after);
     }
 
-    fn matches_progress(&self, record: Record) -> bool {
+    fn matches_progress(&self, old: Option<Record>) -> bool {
         // TSV rounds to milliseconds. A conflicting on-disk edit, including a
         // reset by another window while this save was pending, takes precedence.
-        self.progress_before.is_none_or(|(pos, dur)| {
-            (record.position - pos).abs() <= 0.000_501 && (record.duration - dur).abs() <= 0.000_501
-        })
+        match self.progress_before {
+            None => true,
+            Some(None) => old.is_none_or(|record| {
+                record.position.abs() <= 0.000_501 && record.duration.abs() <= 0.000_501
+            }),
+            Some(Some((pos, dur))) => old.is_some_and(|record| {
+                (record.position - pos).abs() <= 0.000_501
+                    && (record.duration - dur).abs() <= 0.000_501
+            }),
+        }
     }
 }
 
@@ -103,6 +122,7 @@ pub struct Store {
     recent_titles: BTreeMap<String, String>,
     edits: BTreeMap<String, RecordEdit>,
     in_flight: BTreeMap<String, (f64, f64)>,
+    in_flight_abort: Option<Arc<AtomicBool>>,
     recent_pushes: Vec<(MediaUri, Option<String>)>,
     recent_title_updates: BTreeMap<String, (String, bool)>,
     clear_all_progress: bool,
@@ -168,15 +188,8 @@ impl Store {
         &mut self,
         snapshot: AnnotationSnapshot,
     ) -> Result<(), AnnotationError> {
-        self.annotations.accept(snapshot)
-    }
-    /// The plugin manager must first resolve an explicit host selection grant.
-    pub fn edit_annotations(
-        &mut self,
-        uris: &[MediaUri],
-        edit: &AnnotationEdit,
-    ) -> Result<(), AnnotationError> {
-        self.annotations.edit(uris, edit)
+        self.annotations.accept(snapshot);
+        Ok(())
     }
 
     pub fn favorites(&self) -> Vec<MediaUri> {
@@ -242,10 +255,17 @@ impl Store {
         })
     }
 
+    fn abort_in_flight_flush(&mut self) {
+        if let Some(abort) = self.in_flight_abort.take() {
+            abort.store(true, Ordering::Release);
+        }
+    }
+
     pub fn save(&mut self) {
         if !self.is_dirty() {
             return;
         }
+        self.abort_in_flight_flush();
         let Some(dir) = self.target_dir() else { return };
         let _lock = match fs_util::lock_file(&dir.join("records.lock")) {
             Ok(lock) => lock,
@@ -258,8 +278,7 @@ impl Store {
     }
 
     pub fn prepare_progress_flush(&mut self) -> Option<ProgressFlush> {
-        if self.annotations.dirty()
-            || self.refresh_records
+        if self.refresh_records
             || self.refresh_recent
             || self.clear_all_progress
             || self.clear_all_recent
@@ -272,14 +291,18 @@ impl Store {
             return None;
         }
         let dir = self.target_dir()?;
+        self.abort_in_flight_flush();
         for (k, e) in &self.edits {
             if let Some(prog) = e.progress {
                 self.in_flight.insert(k.clone(), prog);
             }
         }
+        let aborted = Arc::new(AtomicBool::new(false));
+        self.in_flight_abort = Some(aborted.clone());
         Some(ProgressFlush {
             dir,
             edits: self.edits.clone(),
+            aborted,
         })
     }
 
@@ -289,6 +312,7 @@ impl Store {
     }
 
     pub fn finish_progress_flush(&mut self, applied: Option<BTreeMap<String, (f64, f64)>>) {
+        self.in_flight_abort = None;
         let Some(applied) = applied else {
             self.in_flight.clear();
             return;
@@ -299,7 +323,7 @@ impl Store {
                 if edit.favorite.is_none() && edit.progress == Some(done) {
                     true
                 } else {
-                    edit.progress_before = Some(done);
+                    edit.progress_before = Some(Some(done));
                     false
                 }
             } else {
@@ -312,9 +336,6 @@ impl Store {
     }
 
     fn sync(&mut self, dir: &Path) {
-        if self.annotations.save().is_err() {
-            log::warn!("personal annotation edits remain pending");
-        }
         if (self.refresh_records || self.clear_all_progress || !self.edits.is_empty())
             && let Err(e) = self.sync_records(dir)
         {
@@ -331,8 +352,7 @@ impl Store {
     }
 
     pub fn is_dirty(&self) -> bool {
-        self.annotations.dirty()
-            || self.refresh_records
+        self.refresh_records
             || self.refresh_recent
             || self.clear_all_progress
             || self.clear_all_recent
@@ -365,10 +385,12 @@ impl Store {
                 record.favorite = favorite;
             }
             if let Some((position, duration)) = edit.progress
-                && (edit.matches_progress(record)
+                && (edit.matches_progress(old)
                     || self.in_flight.get(key).is_some_and(|&(pos, dur)| {
-                        (record.position - pos).abs() <= 0.000_501
-                            && (record.duration - dur).abs() <= 0.000_501
+                        old.is_some_and(|r| {
+                            (r.position - pos).abs() <= 0.000_501
+                                && (r.duration - dur).abs() <= 0.000_501
+                        })
                     }))
             {
                 record.position = position;
@@ -414,10 +436,6 @@ impl Store {
             .is_some_and(|r| r.favorite)
     }
 
-    pub fn is_favorite_path(&self, path: &Path) -> bool {
-        self.is_favorite(&MediaUri::Local(path.to_path_buf()))
-    }
-
     pub fn toggle_favorite(&mut self, uri: &MediaUri) -> bool {
         if !uri.may_share_identity() {
             return false;
@@ -437,10 +455,6 @@ impl Store {
         fav
     }
 
-    pub fn toggle_favorite_path(&mut self, path: &Path) -> bool {
-        self.toggle_favorite(&MediaUri::Local(path.to_path_buf()))
-    }
-
     pub fn remove_favorite(&mut self, uri: &MediaUri) -> bool {
         let key = uri.to_uri_string();
         if let Some(r) = self.records.get_mut(&key)
@@ -457,10 +471,6 @@ impl Store {
         false
     }
 
-    pub fn remove_favorite_path(&mut self, path: &Path) -> bool {
-        self.remove_favorite(&MediaUri::Local(path.to_path_buf()))
-    }
-
     pub fn progress_ratio(&self, uri: &MediaUri) -> Option<f32> {
         let r = self.records.get(&uri.to_uri_string())?;
         if r.duration > 0. && r.position >= 5. && r.position < r.duration - 5. {
@@ -468,14 +478,6 @@ impl Store {
         } else {
             None
         }
-    }
-
-    pub fn progress_ratio_uri(&self, uri: &MediaUri) -> Option<f32> {
-        self.progress_ratio(uri)
-    }
-
-    pub fn progress_ratio_path(&self, path: &Path) -> Option<f32> {
-        self.progress_ratio(&MediaUri::Local(path.to_path_buf()))
     }
 
     pub fn resume(&self, uri: &MediaUri) -> f64 {
@@ -486,7 +488,7 @@ impl Store {
     }
 
     pub fn resume_path(&self, path: &Path) -> f64 {
-        self.resume(&MediaUri::Local(path.to_path_buf()))
+        self.resume(&MediaUri::from(path))
     }
 
     pub fn remember(&mut self, uri: &MediaUri, position: f64, duration: f64, eof: bool) -> bool {
@@ -502,12 +504,13 @@ impl Store {
             return false;
         }
         let previous = self.records.get(&key).copied();
-        let before = previous.map_or((0., 0.), |r| (r.position, r.duration));
+        let before = previous.map(|r| (r.position, r.duration));
         if eof {
             let Some(r) = previous else { return false };
             if r.favorite && r.position == 0. && r.duration == 0. {
                 return false;
             }
+            self.abort_in_flight_flush();
             self.edits
                 .entry(key.clone())
                 .or_default()
@@ -550,25 +553,28 @@ impl Store {
     }
 
     pub fn remember_path(&mut self, path: &Path, position: f64, duration: f64, eof: bool) -> bool {
-        self.remember(
-            &MediaUri::Local(path.to_path_buf()),
-            position,
-            duration,
-            eof,
-        )
+        self.remember(&MediaUri::from(path), position, duration, eof)
     }
 
     pub fn reset_progress(&mut self, uri: &MediaUri) -> bool {
         let key = uri.to_uri_string();
-        let Some(r) = self.records.get_mut(&key) else {
+        let Some(r) = self.records.get(&key).copied() else {
             return false;
         };
         if r.position <= 0. && r.duration <= 0. {
             return false;
         }
-        r.position = 0.;
-        r.duration = 0.;
-        if !r.favorite {
+        self.abort_in_flight_flush();
+        if r.favorite {
+            self.records.insert(
+                key.clone(),
+                Record {
+                    position: 0.,
+                    duration: 0.,
+                    ..r
+                },
+            );
+        } else {
             self.records.remove(&key);
         }
         let edit = self.edits.entry(key).or_default();
@@ -578,11 +584,8 @@ impl Store {
         true
     }
 
-    pub fn reset_progress_path(&mut self, path: &Path) -> bool {
-        self.reset_progress(&MediaUri::Local(path.to_path_buf()))
-    }
-
     pub fn clear_progress(&mut self) -> usize {
+        self.abort_in_flight_flush();
         let cleared = clear_record_progress(&mut self.records);
         self.edits.retain(|_, edit| {
             edit.progress = None;
@@ -593,51 +596,6 @@ impl Store {
         self.save();
         cleared
     }
-}
-
-// Stream the old unbounded files while limiting each row's allocation.
-fn read_tsv(path: &Path, mut row: impl FnMut(&str) -> bool) -> io::Result<(bool, bool)> {
-    let file = match fs_util::retry_sharing_violation(|| std::fs::File::open(path)) {
-        Ok(file) => file,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok((false, false)),
-        Err(e) => return Err(e),
-    };
-    let mut reader = io::BufReader::new(file);
-    let mut line = Vec::new();
-    let mut scrub = false;
-    const MAX_LINE: usize = MAX_RECORD_KEY * 2 + MAX_RECORD_FIELDS;
-    loop {
-        line.clear();
-        let n = reader
-            .by_ref()
-            .take(MAX_LINE as u64 + 1)
-            .read_until(b'\n', &mut line)?;
-        if n == 0 {
-            break;
-        }
-        if n > MAX_LINE {
-            scrub = true;
-            if !line.ends_with(b"\n") {
-                reader.skip_until(b'\n')?;
-            }
-        } else if let Ok(text) = std::str::from_utf8(&line) {
-            scrub |= row(text.trim_end_matches(['\r', '\n']));
-        } else {
-            scrub = true;
-        }
-    }
-    Ok((true, scrub))
-}
-
-fn canonical_hex_matches(raw: &str, key: &str) -> bool {
-    raw.len() == key.len() * 2
-        && raw
-            .as_bytes()
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .zip(key.bytes())
-            .all(|(hex, byte)| *hex == [HEX[(byte >> 4) as usize], HEX[(byte & 15) as usize]])
 }
 
 fn record_bytes(records: &Records) -> usize {
@@ -686,81 +644,6 @@ fn clear_record_progress(records: &mut Records) -> usize {
         r.favorite
     });
     cleared
-}
-
-fn push_hex(bytes: &[u8], out: &mut String) {
-    out.reserve(bytes.len() * 2);
-    for &b in bytes {
-        out.push(HEX[(b >> 4) as usize] as char);
-        out.push(HEX[(b & 0x0F) as usize] as char);
-    }
-}
-
-/// Decodes a hex-encoded canonical URI, legacy UTF-8 path/WebDAV URI, or legacy OS path.
-fn decode_any_media_uri(hex_text: &str) -> Option<MediaUri> {
-    if hex_text.is_empty()
-        || !hex_text.len().is_multiple_of(2)
-        || hex_text.len() > MAX_RECORD_KEY * 2
-        || !hex_text.is_ascii()
-    {
-        return None;
-    }
-    let bytes: Vec<u8> = (0..hex_text.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&hex_text[i..i + 2], 16))
-        .collect::<Result<_, _>>()
-        .ok()?;
-    if bytes.is_empty() {
-        return None;
-    }
-    if !bytes.contains(&0)
-        && let Ok(s) = std::str::from_utf8(&bytes)
-        && !s.is_empty()
-    {
-        #[cfg(windows)]
-        if let Some(path) = MediaUri::legacy_unc_file_uri_path(s) {
-            return Some(MediaUri::from(path));
-        }
-        return Some(MediaUri::parse_persisted(s));
-    }
-    // Legacy Windows paths used UTF-16LE, including in data directories subsequently
-    // moved to Unix. Decode textual URIs before treating any bytes as an opaque OS path.
-    #[cfg(unix)]
-    if !bytes.contains(&0) {
-        use std::os::unix::ffi::OsStringExt;
-        return Some(MediaUri::Local(std::ffi::OsString::from_vec(bytes).into()));
-    }
-    if !bytes.len().is_multiple_of(2) {
-        return None;
-    }
-    let units: Vec<u16> = bytes
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .copied()
-        .map(u16::from_le_bytes)
-        .collect();
-    if units.contains(&0) {
-        return None;
-    }
-    if let Ok(text) = String::from_utf16(&units) {
-        #[cfg(windows)]
-        if let Some(path) = MediaUri::legacy_unc_file_uri_path(&text) {
-            return Some(MediaUri::from(path));
-        }
-        return Some(MediaUri::parse_persisted(&text));
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::ffi::OsStringExt;
-        Some(MediaUri::Local(
-            std::ffi::OsString::from_wide(&units).into(),
-        ))
-    }
-    #[cfg(unix)]
-    {
-        None
-    }
 }
 
 #[cfg(test)]

@@ -7,7 +7,8 @@ use super::{
 use crate::{
     logging,
     loopback_http::{
-        ClientHub, ClientWatch, read_request, write_all_cancellable, write_chunk_cancellable,
+        ClientHub, ClientWatch, HttpMethod, HttpRequestError, parse_http_request, read_request,
+        write_all_cancellable, write_chunk_cancellable,
     },
     plugin_v2::{
         actor::ReadResult,
@@ -262,46 +263,29 @@ fn serve(
         .map_err(io)?;
     let bytes = read_request(socket, Duration::from_secs(5), HEADER_LIMIT)
         .map_err(|e| map_watch_io(e, cancel))?;
-    let mut slots = [httparse::EMPTY_HEADER; 32];
-    let mut request = httparse::Request::new(&mut slots);
-    let used = match request
-        .parse(&bytes)
-        .map_err(|_| ErrorCode::InvalidArgument)?
-    {
-        httparse::Status::Complete(n) => n,
-        _ => return Err(ErrorCode::InvalidArgument),
-    };
-    if used != bytes.len()
-        || !matches!(request.method, Some("GET" | "HEAD"))
-        || request.version != Some(1)
-    {
-        return Err(ErrorCode::InvalidArgument);
-    }
-    let mut range = None;
-    let mut host = false;
     let authority = service.session.authority().to_string();
-    for h in request.headers {
-        if h.name.eq_ignore_ascii_case("host") {
-            if host || h.value != authority.as_bytes() {
-                return Err(ErrorCode::Denied);
-            }
-            host = true;
-        } else if h.name.eq_ignore_ascii_case("range") {
-            if range.is_some() {
-                return Err(ErrorCode::RangeInvalid);
-            }
-            range = Some(std::str::from_utf8(h.value).map_err(|_| ErrorCode::RangeInvalid)?);
-        } else if h.name.eq_ignore_ascii_case("origin")
-            || h.name.to_ascii_lowercase().starts_with("sec-fetch-")
-            || h.name.eq_ignore_ascii_case("transfer-encoding")
-            || h.name.eq_ignore_ascii_case("content-length") && h.value != b"0"
-        {
-            return Err(ErrorCode::Denied);
+    let parsed = match parse_http_request(&bytes, &authority) {
+        Ok(parsed) => parsed,
+        Err(err) => {
+            *committed = true;
+            let _ = socket.set_nonblocking(false);
+            let _ = socket.set_write_timeout(Some(Duration::from_millis(200)));
+            let _ = write!(
+                socket,
+                "HTTP/1.1 {} {}\r\nConnection: close\r\nCache-Control: no-store\r\nContent-Length: 0\r\n\r\n",
+                err.status_code(),
+                err.reason_phrase(),
+            );
+            return Err(match err {
+                HttpRequestError::Forbidden => ErrorCode::Denied,
+                HttpRequestError::RangeNotSatisfiable => ErrorCode::RangeInvalid,
+                HttpRequestError::BadRequest
+                | HttpRequestError::MethodNotAllowed
+                | HttpRequestError::PayloadTooLarge => ErrorCode::InvalidArgument,
+            });
         }
-    }
-    if !host {
-        return Err(ErrorCode::Denied);
-    }
+    };
+    let range = parsed.range;
     // Switch to nonblocking mode with NO SO_SNDTIMEO before registering with mio
     // or writing any response bytes: on Windows Winsock, SO_SNDTIMEO can leave
     // bytes queued on WSAETIMEDOUT and cause duplicate-chunk stream corruption.
@@ -309,9 +293,7 @@ fn serve(
     socket.set_read_timeout(None).map_err(io)?;
     socket.set_nonblocking(true).map_err(io)?;
     let mut watch = service.hub.watch(socket, cancel.clone()).map_err(io)?;
-    let access = service
-        .session
-        .open(request.path.ok_or(ErrorCode::InvalidArgument)?, cancel)?;
+    let access = service.session.open(parsed.path, cancel)?;
     let size = access.reader.size(&access.cancel)?;
     let mut range = match Range::parse(range, size) {
         Ok(range) => range,
@@ -330,12 +312,9 @@ fn serve(
             return Err(error);
         }
     };
-    let head = request.method == Some("HEAD");
+    let head = parsed.method == HttpMethod::Head;
     if !access.is_probed() && (head || range.offset > 0) {
-        let prefix = super::prepare::probe_prefix(&access.reader, 64, &access.cancel)?;
-        if super::prepare::adaptive(&prefix) {
-            return Err(ErrorCode::Unsupported);
-        }
+        super::prepare::ensure_non_adaptive_prefix(&access.reader, &access.cancel)?;
         access.mark_probed();
     }
     if !head
@@ -348,6 +327,11 @@ fn serve(
         if !access.is_probed() {
             if super::prepare::adaptive(&stream.first) {
                 return Err(ErrorCode::Unsupported);
+            }
+            let resource_eof = (stream.eof && range.len.is_none())
+                || size.or(stream.total) == Some(stream.first.len() as u64);
+            if !resource_eof && super::prepare::adaptive_undecided(&stream.first) {
+                super::prepare::ensure_non_adaptive_prefix(&access.reader, &access.cancel)?;
             }
             access.mark_probed();
         }
@@ -392,32 +376,24 @@ fn serve(
         let first = access.reader.read_at(range.offset, len, &access.cancel)?;
         validate(&first, len, range.offset, range.total)?;
         if !access.is_probed() {
-            if first.eof || first.blob.bytes.len() >= 64 {
-                if super::prepare::adaptive(&first.blob.bytes) {
-                    return Err(ErrorCode::Unsupported);
-                }
-            } else {
-                let prefix = super::prepare::probe_prefix(&access.reader, 64, &access.cancel)?;
-                if super::prepare::adaptive(&prefix) {
-                    return Err(ErrorCode::Unsupported);
-                }
+            if super::prepare::adaptive(&first.blob.bytes) {
+                return Err(ErrorCode::Unsupported);
+            }
+            if !first.eof && super::prepare::adaptive_undecided(&first.blob.bytes) {
+                super::prepare::ensure_non_adaptive_prefix(&access.reader, &access.cancel)?;
             }
             access.mark_probed();
         }
-        if size.is_none() {
-            if first.eof {
-                let total = range
-                    .offset
-                    .checked_add(first.blob.bytes.len() as u64)
-                    .ok_or(ErrorCode::RangeInvalid)?;
-                if range.partial && first.blob.bytes.is_empty() {
-                    return Err(ErrorCode::RangeInvalid);
-                }
-                range.total = Some(total);
-                range.len = Some(first.blob.bytes.len() as u64);
-            } else if range.partial {
-                range.len = Some(first.blob.bytes.len() as u64);
+        if size.is_none() && first.eof {
+            let total = range
+                .offset
+                .checked_add(first.blob.bytes.len() as u64)
+                .ok_or(ErrorCode::RangeInvalid)?;
+            if range.partial && first.blob.bytes.is_empty() {
+                return Err(ErrorCode::RangeInvalid);
             }
+            range.total = Some(total);
+            range.len = Some(first.blob.bytes.len() as u64);
         }
         Some(first)
     } else {

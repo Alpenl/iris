@@ -7,10 +7,7 @@ pub mod v2;
 pub mod workbench;
 pub use manifest::{CommandSpec, SourceProviderSpec, is_valid_id};
 pub use overlay::{OverlayNode, TextAlign};
-pub use source::{
-    MediaKind, PlaybackSnapshot, SourceDescriptor, SourceEntry, SourceEntryKind,
-    SourceManageAction, SourcePage, StreamSpec, StreamVariant, SubtitleAttachment,
-};
+pub use source::{MediaKind, SourceEntryKind, SourceManageAction, StreamVariant};
 pub use workbench::{
     ButtonSpec, ChromeLayoutSpec, Color, PluginModal, SelectOption, SidebarPanel, SidebarSection,
     StatusBadge, ToolbarButton, UiThemeSpec, ViewTimer, Widget, is_valid_hex_color,

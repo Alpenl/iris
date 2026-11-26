@@ -34,7 +34,7 @@ pub(in crate::ui) fn action_category_label(category: ActionCategory) -> &'static
     }
 }
 
-pub(in crate::ui) fn action_title(id: &str) -> &'static str {
+pub(crate) fn action_title(id: &str) -> &'static str {
     match id {
         "toggle_pause" => "播放 / 暂停",
         "seek_back" => "快退",
@@ -86,20 +86,20 @@ pub(in crate::ui) fn action_title(id: &str) -> &'static str {
         "toggle_fullscreen" => "切换全屏",
         "toggle_always_on_top" => "切换窗口置顶",
         "toggle_info" => MEDIA_INFO_LABEL,
-        "open_palette" => "打开命令面板",
-        "open_settings" => "打开设置",
-        "cycle_preset" => "切换工作区布局预设",
+        "open_palette" => "打开命令面板…",
+        "open_settings" => "打开设置…",
+        "cycle_preset" => "切换工作区预设",
         "quit" => "退出 Iris",
         _ => "快捷键操作",
     }
 }
 
-pub(in crate::ui) fn reserved_shortcut_label(action_id: &str) -> &'static str {
+fn reserved_shortcut_label(action_id: &str) -> &'static str {
     match action_id {
         "toggle_info" => "媒体详情（固定快捷键）",
         "open_palette" => "命令面板（固定快捷键）",
         "exit_fullscreen" => "退出全屏（固定快捷键）",
-        "reset_appearance" => "恢复外观（固定快捷键）",
+        "reset_appearance" => "恢复默认外观（固定快捷键）",
         _ => "固定快捷键",
     }
 }

@@ -3,7 +3,7 @@ use iris_api::v2::{Capability, ErrorCode, Generation, HostCommand, Reply, Role, 
 use iris_core::plugin_v2::{
     actor::{Actor, Executor, IoOutcome, Operation, Spawn, Status, TaskContext},
     engine::RuntimeEngine,
-    instance::{Blob, Instance, InstanceConfig, NoServices},
+    instance::{Blob, Instance, InstanceConfig},
     ledger::{Ledger, Resource},
     pool::IoPool,
 };
@@ -44,7 +44,6 @@ fn rust_and_c_share_decimal_and_ownership_vectors() {
             grants: BTreeSet::new(),
             ledger: Ledger::default(),
             cancel,
-            services: Box::new(NoServices),
         })
         .unwrap();
         for _ in 0..50 {

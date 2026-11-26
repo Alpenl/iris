@@ -29,10 +29,6 @@ pub enum RequestTarget {
     Url {
         url: String,
     },
-    Thumbnail {
-        view: Id,
-        entry: String,
-    },
 }
 pub struct RequestTicket {
     pub id: Id,
@@ -188,15 +184,6 @@ impl SourceRequests {
             RequestTarget::Url { url } => {
                 super::network::normalize_url(url, super::network::TransportKind::Http)?;
             }
-            RequestTarget::Thumbnail { view, entry } => {
-                let view = self.views.get(view).ok_or(ErrorCode::StaleHandle)?;
-                if view.owner != owner
-                    || view.generation != generation
-                    || !view.entries.contains(entry)
-                {
-                    return Err(ErrorCode::Denied);
-                }
-            }
             RequestTarget::Browse { .. } => {}
         }
         let lease = self.ledger.reserve(
@@ -268,10 +255,10 @@ impl SourceRequests {
         {
             return Err(ErrorCode::InvalidArgument);
         }
-        let bytes = crate::plugin_v2::json::encode(&page, iris_api::v2::MESSAGE_LIMIT)?;
+        let estimated = estimate_page_bytes(&page)?;
         let lease = self
             .ledger
-            .reserve(owner, &[(Resource::HostBytes, (bytes.len() * 32) as u64)])?;
+            .reserve(owner, &[(Resource::HostBytes, estimated * 32)])?;
         let cost: usize = page
             .entries
             .iter()
@@ -295,7 +282,7 @@ impl SourceRequests {
             _lease: lease,
         })
     }
-    /// The prepared playback/thumbnail job keeps the returned ticket through its
+    /// The prepared playback job keeps the returned ticket through its
     /// actual terminal state; removing an index does not release a worker's quota.
     pub fn take(
         &mut self,
@@ -345,12 +332,7 @@ impl SourceRequests {
             .iter()
             .filter_map(|(id, r)| r.upgrade().map(|r| (*id, r)))
             .filter_map(|(id, r)| match &r.target {
-                RequestTarget::Browse { view: v, .. }
-                | RequestTarget::Thumbnail { view: v, .. }
-                    if *v == view =>
-                {
-                    Some(id)
-                }
+                RequestTarget::Browse { view: v, .. } if *v == view => Some(id),
                 _ => None,
             })
             .collect();
@@ -393,6 +375,58 @@ impl SourceRequests {
         self.views.retain(|_, view| view.owner != owner);
         ids
     }
+}
+
+fn estimate_page_bytes(page: &SourcePage) -> Result<u64, ErrorCode> {
+    let mut total: usize = 128
+        + page.source_id.len()
+        + page.title.len()
+        + page.folder_id.as_ref().map_or(0, String::len)
+        + page.parent_id.as_ref().map_or(0, String::len)
+        + page.next_page.as_ref().map_or(0, String::len)
+        + page.auth_hint.as_ref().map_or(0, String::len);
+    for entry in &page.entries {
+        total = total
+            .saturating_add(160)
+            .saturating_add(entry.id.len())
+            .saturating_add(entry.name.len())
+            .saturating_add(entry.subtitle.as_ref().map_or(0, String::len));
+        for v in &entry.variants {
+            total = total
+                .saturating_add(32)
+                .saturating_add(v.id.len())
+                .saturating_add(v.label.len());
+        }
+        if let Some(thumb) = &entry.thumbnail {
+            total = total.saturating_add(64).saturating_add(thumb.url.len());
+            for (k, v) in &thumb.headers {
+                total = total
+                    .saturating_add(8)
+                    .saturating_add(k.len())
+                    .saturating_add(v.len());
+            }
+        }
+        if total > iris_api::v2::MESSAGE_LIMIT {
+            return Err(ErrorCode::QuotaExceeded);
+        }
+    }
+    for filter in &page.filters {
+        total = total
+            .saturating_add(64)
+            .saturating_add(filter.id.len())
+            .saturating_add(filter.label.len())
+            .saturating_add(filter.selected.as_ref().map_or(0, String::len));
+        for opt in &filter.options {
+            total = total
+                .saturating_add(32)
+                .saturating_add(opt.value.len())
+                .saturating_add(opt.label.len());
+        }
+        if total > iris_api::v2::MESSAGE_LIMIT {
+            return Err(ErrorCode::QuotaExceeded);
+        }
+    }
+    Ok(total as u64)
 }
 impl Drop for SourceRequests {
     fn drop(&mut self) {

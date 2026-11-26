@@ -2,10 +2,11 @@
 //! confirmation is supplied by trusted host interaction, never by a guest form.
 mod review;
 use super::{
+    json_error,
     ledger::{Ledger, Resource},
     package::{PACKAGE_LIMIT, Package, Provenance},
 };
-use crate::plugin_v2::json::decode;
+use crate::bounded_json::decode;
 use iris_api::v2::{Capability, ErrorCode, MESSAGE_LIMIT, Manifest, NetworkDeclaration};
 pub use review::Review;
 use ring::rand::{SecureRandom, SystemRandom};
@@ -98,6 +99,26 @@ impl Installer {
         .map(|(installed, _)| installed)
     }
 
+    pub(crate) fn bundled_pins(&self) -> &BTreeMap<String, [u8; 32]> {
+        &self.bundled
+    }
+
+    pub(crate) fn install_reviewed(
+        &self,
+        bytes: &[u8],
+        approval: Approval,
+        bundled: bool,
+        expected: Option<&Option<Installed>>,
+        expected_archived: Option<&Option<ArchivedIdentity>>,
+    ) -> Result<(Installed, Vec<String>), ErrorCode> {
+        let provenance = if bundled {
+            Provenance::Bundled(&self.bundled)
+        } else {
+            Provenance::User
+        };
+        self.install_from(bytes, approval, provenance, expected, expected_archived)
+    }
+
     pub fn is_bundled(&self, id: &str) -> bool {
         self.bundled.contains_key(id) || id.to_ascii_lowercase().starts_with("iris.")
     }
@@ -116,7 +137,7 @@ impl Installer {
         file.take(MESSAGE_LIMIT as u64 + 1)
             .read_to_end(&mut bytes)
             .map_err(|_| ErrorCode::IoError)?;
-        let record: ArchivedIdentity = decode(&bytes, MESSAGE_LIMIT)?;
+        let record: ArchivedIdentity = decode(&bytes, MESSAGE_LIMIT).map_err(json_error)?;
         if record.plugin_id != id || !valid_identity(&record.installation_id) {
             return Err(ErrorCode::InvalidArgument);
         }
@@ -181,7 +202,7 @@ impl Installer {
         provenance: Provenance<'_>,
         expected: Option<&Option<Installed>>,
         expected_archived: Option<&Option<ArchivedIdentity>>,
-    ) -> Result<(Installed, Option<String>), ErrorCode> {
+    ) -> Result<(Installed, Vec<String>), ErrorCode> {
         let _memory = self
             .ledger
             .reserve("package-installer", &[(Resource::HostBytes, 128 << 20)])?;
@@ -208,28 +229,36 @@ impl Installer {
         {
             return Err(ErrorCode::StaleHandle);
         }
-        let (installation_id, superseded_archived) = match (&approval.previous, &prior, &archived) {
-            (Some((identity, digest)), Some(prior), _)
+        let (installation_id, superseded) = match (&approval.previous, &prior, &archived) {
+            (Some((identity, digest)), Some(prior), arch)
                 if &prior.installation_id == identity && &prior.digest == digest =>
             {
-                (
-                    identity.clone(),
-                    archived
-                        .as_ref()
-                        .map(|a| a.installation_id.clone())
-                        .filter(|a| a != identity),
-                )
+                let superseded = arch
+                    .as_ref()
+                    .map(|a| a.installation_id.clone())
+                    .filter(|a| a != identity)
+                    .into_iter()
+                    .collect();
+                (identity.clone(), superseded)
             }
             (Some((identity, digest)), None, Some(arch))
                 if &arch.installation_id == identity && &arch.digest == digest =>
             {
-                (identity.clone(), None)
+                (identity.clone(), Vec::new())
             }
             (Some(_), _, _) => return Err(ErrorCode::StaleHandle),
-            (None, _, arch) => (
-                random_identity()?,
-                arch.as_ref().map(|a| a.installation_id.clone()),
-            ),
+            (None, prior_opt, arch_opt) => {
+                let mut superseded = Vec::new();
+                if let Some(p) = prior_opt {
+                    superseded.push(p.installation_id.clone());
+                }
+                if let Some(a) = arch_opt
+                    && !superseded.contains(&a.installation_id)
+                {
+                    superseded.push(a.installation_id.clone());
+                }
+                (random_identity()?, superseded)
+            }
         };
         let object = format!("{}-{}.irisplugin", installation_id, hex(&package.digest));
         let objects = self.root.join("objects");
@@ -282,12 +311,17 @@ impl Installer {
             &json,
         )
         .map_err(|_| ErrorCode::IoError)?;
+        if let Some(prior) = &prior
+            && prior.object != record.object
+        {
+            let _ = std::fs::remove_file(objects.join(&prior.object));
+        }
         let _ = std::fs::remove_file(
             self.root
                 .join("archived")
                 .join(format!("{}.json", record.plugin_id)),
         );
-        Ok((record, superseded_archived))
+        Ok((record, superseded))
     }
 
     pub fn record(&self, id: &str) -> Result<Option<Installed>, ErrorCode> {
@@ -304,7 +338,7 @@ impl Installer {
         file.take(MESSAGE_LIMIT as u64 + 1)
             .read_to_end(&mut bytes)
             .map_err(|_| ErrorCode::IoError)?;
-        let record: Installed = decode(&bytes, MESSAGE_LIMIT)?;
+        let record: Installed = decode(&bytes, MESSAGE_LIMIT).map_err(json_error)?;
         if record.plugin_id != id
             || !valid_identity(&record.installation_id)
             || record.object
@@ -426,7 +460,7 @@ fn validate_approval(manifest: &Manifest, approval: &Approval) -> Result<(), Err
     }
     Ok(())
 }
-fn random_identity() -> Result<String, ErrorCode> {
+pub(crate) fn random_identity() -> Result<String, ErrorCode> {
     let mut bytes = [0; 16];
     SystemRandom::new()
         .fill(&mut bytes)

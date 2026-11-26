@@ -239,25 +239,44 @@ impl IrisWindow {
         let actions = vstack(0.)
             .p(px(4.))
             .child(
-                act("more-rot", "顺时针旋转 90°", "rotate_cw", false)
-                    .on_click(cx.listener(|this, _, w, cx| this.rotate_cw(&RotateCw, w, cx))),
+                act(
+                    "more-rot",
+                    super::super::strings::actions::action_title("rotate_cw"),
+                    "rotate_cw",
+                    false,
+                )
+                .on_click(cx.listener(|this, _, w, cx| this.rotate_cw(&RotateCw, w, cx))),
             )
             .child(
-                act("more-hflip", "水平镜像翻转", "toggle_hflip", hflip)
-                    .on_click(cx.listener(|this, _, w, cx| this.toggle_hflip(&ToggleHFlip, w, cx))),
+                act(
+                    "more-hflip",
+                    super::super::strings::actions::action_title("toggle_hflip"),
+                    "toggle_hflip",
+                    hflip,
+                )
+                .on_click(cx.listener(|this, _, w, cx| this.toggle_hflip(&ToggleHFlip, w, cx))),
             )
             .child(
-                act("more-vflip", "垂直镜像翻转", "toggle_vflip", vflip)
-                    .on_click(cx.listener(|this, _, w, cx| this.toggle_vflip(&ToggleVFlip, w, cx))),
+                act(
+                    "more-vflip",
+                    super::super::strings::actions::action_title("toggle_vflip"),
+                    "toggle_vflip",
+                    vflip,
+                )
+                .on_click(cx.listener(|this, _, w, cx| this.toggle_vflip(&ToggleVFlip, w, cx))),
             )
             .when(is_video, |d| {
                 d.child(
-                    act("more-shot", "保存当前帧截图", "take_screenshot", false).on_click(
-                        cx.listener(|this, _, w, cx| {
-                            this.overlays.popover = None;
-                            this.take_screenshot(&TakeScreenshot, w, cx);
-                        }),
-                    ),
+                    act(
+                        "more-shot",
+                        super::super::strings::actions::action_title("take_screenshot"),
+                        "take_screenshot",
+                        false,
+                    )
+                    .on_click(cx.listener(|this, _, w, cx| {
+                        this.overlays.popover = None;
+                        this.take_screenshot(&TakeScreenshot, w, cx);
+                    })),
                 )
             })
             .child(

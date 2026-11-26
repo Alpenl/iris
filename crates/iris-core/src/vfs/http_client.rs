@@ -10,8 +10,8 @@ pub use address::{AddressKind, address_kind};
 pub(crate) use connection::doh;
 use connection::remaining_timeout;
 pub(crate) use connection::{
-    ConnectRegistration, ConnectionPolicy, HttpClientError, NetworkScope, SocketRegistration,
-    Transport, connect_transport,
+    ConnectionPolicy, HttpClientError, NetworkScope, SocketRegistration, Transport,
+    connect_transport,
 };
 pub use connection::{HttpCancel, validate_stream_url};
 use std::time::{Duration, Instant};
@@ -408,7 +408,6 @@ fn open_stream_with_credentials(
                 let name = h.name.to_ascii_lowercase();
                 if let Some(prev) = values.get_mut(&name) {
                     match name.as_str() {
-                        "content-length" if *prev == val => (),
                         "content-length" | "content-range" | "content-type" | "location" => {
                             bail!("duplicate HTTP {name} header");
                         }
@@ -425,7 +424,7 @@ fn open_stream_with_credentials(
         };
 
         if matches!(status, 301 | 302 | 303 | 307 | 308)
-            && let Some(loc) = header_ci(&resp_headers, "location").filter(|s| !s.is_empty())
+            && let Some(loc) = resp_headers.get("location").filter(|s| !s.is_empty())
         {
             if redirect == MAX_REDIRECTS {
                 bail!("exceeded maximum HTTP redirects ({MAX_REDIRECTS})");
@@ -460,7 +459,7 @@ fn open_stream_with_credentials(
         let mut prefix = Cursor::new(raw);
         prefix.set_position(header_end as u64);
         let chained = prefix.chain(transport);
-        let is_chunked = match header_ci(&resp_headers, "transfer-encoding") {
+        let is_chunked = match resp_headers.get("transfer-encoding").map(String::as_str) {
             Some(te) if te.eq_ignore_ascii_case("chunked") => {
                 resp_headers.remove("content-length");
                 true
@@ -557,41 +556,6 @@ pub(crate) fn fetch_subtitle_bytes(
     read_bounded(&mut response, 8 * 1024 * 1024, false, deadline)
 }
 
-pub fn fetch_head_bytes(
-    url: &str,
-    headers: &BTreeMap<String, String>,
-    max_bytes: usize,
-) -> Result<Vec<u8>> {
-    if max_bytes == 0 {
-        validate_stream_url(url)?;
-        return Ok(Vec::new());
-    }
-    let range = format!("bytes=0-{}", max_bytes - 1);
-    let url = validate_stream_url(url)?;
-    let scope = NetworkScope::new(url.clone());
-    let deadline = Instant::now() + CONNECT_TIMEOUT + IO_TIMEOUT;
-    let mut resp = open_stream(
-        Request {
-            method: "GET",
-            url,
-            headers,
-            body: None,
-            range: Some(&range),
-        },
-        &scope,
-        &HttpCancel::default(),
-        Some(deadline),
-    )?;
-    match resp.status {
-        200 | 206 => {
-            ensure_identity_headers(&resp.headers)?;
-            read_bounded(&mut resp, max_bytes, true, deadline)
-        }
-        416 => Ok(Vec::new()),
-        s => bail!("upstream HTTP status {s} while probing header bytes"),
-    }
-}
-
 pub(crate) fn fetch_range(
     url: &str,
     headers: &BTreeMap<String, String>,
@@ -652,13 +616,57 @@ pub(crate) fn fetch_range(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{
+        CONNECT_TIMEOUT, HttpCancel, IO_TIMEOUT, NetworkScope, Request, ensure_identity_headers,
+        fetch_range, open_stream, read_bounded, validate_stream_url,
+    };
+    use anyhow::{Result, bail};
+    use std::collections::BTreeMap;
+    use std::io::{BufRead, BufReader, Read, Write};
     use std::net::TcpListener;
+    use std::sync::{Arc, Mutex};
+    use std::thread;
+    use std::time::Instant;
+
+    fn test_fetch_head(
+        url: &str,
+        headers: &BTreeMap<String, String>,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>> {
+        if max_bytes == 0 {
+            validate_stream_url(url)?;
+            return Ok(Vec::new());
+        }
+        let range = format!("bytes=0-{}", max_bytes - 1);
+        let url = validate_stream_url(url)?;
+        let scope = NetworkScope::new(url.clone());
+        let deadline = Instant::now() + CONNECT_TIMEOUT + IO_TIMEOUT;
+        let mut resp = open_stream(
+            Request {
+                method: "GET",
+                url,
+                headers,
+                body: None,
+                range: Some(&range),
+            },
+            &scope,
+            &HttpCancel::default(),
+            Some(deadline),
+        )?;
+        match resp.status {
+            200 | 206 => {
+                ensure_identity_headers(&resp.headers)?;
+                read_bounded(&mut resp, max_bytes, true, deadline)
+            }
+            416 => Ok(Vec::new()),
+            s => bail!("upstream HTTP status {s}"),
+        }
+    }
 
     fn read_range(reply: &'static [u8], start: u64, len: usize) -> Result<(Vec<u8>, Option<u64>)> {
         let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))?;
         let url = format!("http://{}/photo", listener.local_addr()?);
-        let server = std::thread::spawn(move || {
+        let server = thread::spawn(move || {
             let (mut socket, _) = listener.accept().unwrap();
             let mut line = String::new();
             let mut reader = BufReader::new(&socket);
@@ -708,6 +716,138 @@ mod tests {
             b"HTTP/1.1 206 OK\r\nContent-Range: bytes +4-5/6\r\nContent-Length: 2\r\n\r\nab",
         ] {
             assert!(read_range(invalid, 4, 2).is_err());
+        }
+    }
+
+    #[test]
+    fn crlf_injection_is_stripped_on_wire_and_head_bytes_are_bounded() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let captured = Arc::new(Mutex::new(String::new()));
+        let captured_srv = Arc::clone(&captured);
+
+        let srv = thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let n = sock.read(&mut buf).unwrap();
+            *captured_srv.lock().unwrap() = String::from_utf8_lossy(&buf[..n]).into_owned();
+            let body = vec![b'Z'; 1000];
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = sock.write_all(head.as_bytes());
+            let _ = sock.write_all(&body);
+        });
+
+        let mut headers = BTreeMap::new();
+        headers.insert(
+            "Authorization".into(),
+            "Bearer good\r\nX-Injected: evil".into(),
+        );
+        headers.insert("X-Bad\r\nEvil: 1".into(), "val\0ue\r\n".into());
+
+        let head =
+            test_fetch_head(&format!("http://127.0.0.1:{port}/photo.jpg"), &headers, 64).unwrap();
+        assert_eq!(head.len(), 64);
+        assert!(head.iter().all(|&b| b == b'Z'));
+        srv.join().unwrap();
+
+        let raw_req = captured.lock().unwrap().clone();
+        for line in raw_req.split("\r\n") {
+            assert!(
+                !line.starts_with("X-Injected:") && !line.starts_with("Evil:"),
+                "header injection must never create a separate header line: {raw_req}"
+            );
+        }
+    }
+
+    #[test]
+    fn informational_headers_and_chunked_decoding_survive_same_origin_redirect() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut first, _) = listener.accept().unwrap();
+            let _ = first.read(&mut [0; 2048]).unwrap();
+            first
+                .write_all(b"HTTP/1.1 302 Found\r\nLocation: /audio\r\nContent-Length: 0\r\n\r\n")
+                .unwrap();
+            let (mut final_response, _) = listener.accept().unwrap();
+            let mut buf = [0; 2048];
+            let n = final_response.read(&mut buf).unwrap();
+            let forwarded = std::str::from_utf8(&buf[..n]).unwrap();
+            assert!(forwarded.contains("Authorization: Bearer fixture\r\n"));
+            assert!(forwarded.contains("Range: bytes=0-63\r\n"));
+            final_response
+                .write_all(
+                    concat!(
+                        "HTTP/1.1 103 Early Hints\r\nLink: </audio>; rel=preload\r\n\r\n",
+                        "HTTP/1.1 100 Continue\r\n\r\n",
+                        "HTTP/1.1 206 Partial Content\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+                        "5;ext=1\r\nhello\r\n6\r\n world\r\n0\r\nX-Trailer: done\r\n\r\n",
+                    )
+                    .as_bytes(),
+                )
+                .unwrap();
+        });
+        let headers = BTreeMap::from([("Authorization".into(), "Bearer fixture".into())]);
+        assert_eq!(
+            test_fetch_head(&format!("http://{addr}/start"), &headers, 64).unwrap(),
+            b"hello world"
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn redirects_revalidate_schemes_and_private_hosts_before_connecting() {
+        let second = TcpListener::bind("127.0.0.1:0").unwrap();
+        let other_host = format!(
+            "http://localhost:{}/other",
+            second.local_addr().unwrap().port()
+        );
+        let other_port = format!("http://{}/other", second.local_addr().unwrap());
+        second.set_nonblocking(true).unwrap();
+        for location in ["ftp://localhost/unsupported", &other_host, &other_port] {
+            let origin = TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}/media", origin.local_addr().unwrap());
+            thread::scope(|scope| {
+                scope.spawn(|| {
+                    let (mut socket, _) = origin.accept().unwrap();
+                    let _ = socket.read(&mut [0; 2048]);
+                    write!(
+                        socket,
+                        "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\n\r\n"
+                    )
+                    .unwrap();
+                });
+                assert!(test_fetch_head(&url, &BTreeMap::new(), 32).is_err());
+            });
+            assert!(
+                matches!(second.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock)
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_chunk_and_duplicate_content_length_headers_fail_closed() {
+        for response in [
+            &b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\ndata"[..],
+            &b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\ndata\r\n0\r\n"[..],
+            &b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nContent-Length: 3\r\n\r\ndata"[..],
+            &b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nContent-Length: 4\r\n\r\ndata"[..],
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            thread::scope(|scope| {
+                scope.spawn(move || {
+                    let (mut socket, _) = listener.accept().unwrap();
+                    let _ = socket.read(&mut [0; 2048]).unwrap();
+                    socket.write_all(response).unwrap();
+                });
+                assert!(
+                    test_fetch_head(&format!("http://{addr}/audio"), &BTreeMap::new(), 64).is_err()
+                );
+            });
         }
     }
 }

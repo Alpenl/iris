@@ -145,7 +145,8 @@ impl OverlayBank {
             .ledger
             .reserve(owner, &[(Resource::HostBytes, scratch_bytes)])?;
         let values: Vec<TimedCue> =
-            crate::plugin_v2::json::decode_exact(&blob.bytes, iris_api::v2::CHUNK_LIMIT)?;
+            crate::bounded_json::decode(&blob.bytes, iris_api::v2::CHUNK_LIMIT)
+                .map_err(super::json_error)?;
         if values.is_empty() {
             if !append {
                 self.tracks.remove(&(owner.into(), name.into()));
@@ -168,7 +169,7 @@ impl OverlayBank {
             if !ids.insert(value.id.clone()) {
                 return Err(ErrorCode::InvalidArgument);
             }
-            let size = crate::plugin_v2::json::encode(&value, 16_384)?.len() as u64;
+            let size = estimate_cue_bytes(&value)?;
             bytes += size;
             added.insert(
                 (value.start_ms.0, value.id.clone()),
@@ -333,6 +334,63 @@ fn window(revision: Id, position: u64) -> OverlayWindow {
         start_ms: Id(position.saturating_sub(30_000)),
         end_ms: Id(position.saturating_add(120_000)),
     }
+}
+fn estimate_overlay_node_bytes(node: &iris_api::OverlayNode) -> usize {
+    use iris_api::OverlayNode;
+    let color = |c: &iris_api::Color| match c {
+        iris_api::Color::Hex(s) => s.len() + 2,
+        _ => 10,
+    };
+    let opt_color = |c: &Option<iris_api::Color>| c.as_ref().map_or(4, color);
+    match node {
+        OverlayNode::Box { fill, border, .. } => 128 + opt_color(fill) + opt_color(border),
+        OverlayNode::Line { color: c, .. } => 112 + color(c),
+        OverlayNode::Grid { color: c, .. } => 72 + color(c),
+        OverlayNode::Crosshair { color: c, .. } => 96 + color(c),
+        OverlayNode::Text {
+            text, color: c, bg, ..
+        } => 128 + text.len() + color(c) + opt_color(bg),
+        OverlayNode::Bars {
+            values, color: c, ..
+        } => 96 + color(c) + values.len().saturating_mul(12),
+        OverlayNode::Button {
+            id,
+            label,
+            icon,
+            action_id,
+            ..
+        } => 112 + id.len() + label.len() + icon.as_ref().map_or(4, String::len) + action_id.len(),
+    }
+}
+fn estimate_cue_bytes(cue: &TimedCue) -> Result<u64, ErrorCode> {
+    let base: usize = 96 + cue.id.len();
+    let layout_bytes: usize = match cue.layout {
+        CueLayout::Scroll | CueLayout::Top | CueLayout::Bottom => 24,
+        CueLayout::Positioned { .. } => 56,
+    };
+    let content_bytes: usize = match &cue.content {
+        CueContent::Text { text, color, .. } => {
+            let color_len = match color {
+                iris_api::Color::Hex(s) => s.len() + 2,
+                _ => 10,
+            };
+            72 + text.len() + color_len
+        }
+        CueContent::Vector { nodes } => {
+            let mut sum = 32usize;
+            for node in nodes {
+                sum = sum.saturating_add(estimate_overlay_node_bytes(node));
+            }
+            sum
+        }
+    };
+    let total = base
+        .saturating_add(layout_bytes)
+        .saturating_add(content_bytes);
+    if total > 16_384 {
+        return Err(ErrorCode::QuotaExceeded);
+    }
+    Ok(total as u64)
 }
 fn charges(count: usize, bytes: u64) -> [(Resource, u64); 4] {
     [

@@ -104,14 +104,6 @@ impl PreparedQueue {
     pub fn entries(&self) -> &[Entry] {
         &self.entries
     }
-
-    pub fn len(&self) -> usize {
-        self.entries.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
-    }
 }
 
 /// Expands selected folders in place and preserves the first occurrence of each media file.
@@ -148,22 +140,23 @@ pub fn prepare_queue(paths: Vec<PathBuf>) -> Option<PreparedQueue> {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::path::{Path, PathBuf};
 
     use iris_mpv::Mpv;
 
-    use super::*;
+    use super::{prepare, prepare_queue};
+    use crate::library::{self, Kind, ScanResult};
     use crate::media_uri::MediaUri;
     use crate::player::{
         Command, RemoteMediaRequest, RemoteSubtitle, Session, SessionEvent, Track, TrackKind,
         step_speed,
     };
     use crate::settings::Settings;
+    use crate::test_util::TestDir;
 
     #[test]
     fn prepare_targets_file_or_first_entry_and_reuses_listing() {
-        let dir = std::env::temp_dir().join(format!("iris-prepare-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = TestDir::new("prepare");
         for name in ["ep10.mp4", "ep2.mp4", "notes.txt"] {
             std::fs::write(dir.join(name), b"").unwrap();
         }
@@ -191,17 +184,20 @@ mod tests {
         assert_eq!(other.entries().len(), 2);
 
         assert!(prepare(&dir.join("missing.mp4"), None).is_err());
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
     fn multi_open_expands_folders_in_place_without_repeating_files() {
-        let dir = std::env::temp_dir().join(format!("iris-queue-batch-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = TestDir::new("queue-batch");
         for name in ["b.mp4", "a.mkv", "title.srt"] {
             std::fs::write(dir.join(name), []).unwrap();
         }
-        let queue = prepare_queue(vec![dir.join("b.mp4"), dir.clone(), dir.join("a.mkv")]).unwrap();
+        let queue = prepare_queue(vec![
+            dir.join("b.mp4"),
+            dir.to_path_buf(),
+            dir.join("a.mkv"),
+        ])
+        .unwrap();
         assert_eq!(
             queue
                 .entries()
@@ -210,7 +206,6 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["b.mp4", "a.mkv"]
         );
-        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -242,9 +237,7 @@ mod tests {
 
     #[test]
     fn session_validates_local_uri_and_remote_subtitles() {
-        let dir = std::env::temp_dir().join(format!("iris-session-uri-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = TestDir::new("session-uri");
         let clip = dir.join("demo.mp4");
         std::fs::write(&clip, b"stub").unwrap();
 
@@ -360,7 +353,6 @@ mod tests {
         wait_hwdec(&session.mpv, "auto-safe");
 
         session.shutdown();
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

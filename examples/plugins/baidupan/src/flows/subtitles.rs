@@ -1,12 +1,19 @@
 //! Automatic sibling external subtitle (`.srt` / `.vtt` / `.ass`) discovery and attachment.
 
-use super::super::*;
 use crate::{
+    BaiduPanPlugin, HttpFlow, WindowState,
     auth::{AuthMode, OFFICIAL_DLINK_USER_AGENT},
-    playback::{OpenApiLinkKind, ResolveTarget},
-    sign::encode_query_component,
+    catalog, media,
+    playback::{self, OpenApiLinkKind, ResolveTarget},
+    sign::{self, encode_query_component},
 };
-use iris_plugin_sdk::api::v2::{enhance::EnhancementResource, stream::RemoteResource};
+use iris_plugin_sdk::{
+    api::v2::{
+        Generation, HostCommand, Id, LogLevel, enhance::EnhancementResource, stream::RemoteResource,
+    },
+    client::Host,
+    serde_json::{self, Value},
+};
 
 impl BaiduPanPlugin {
     pub(crate) fn pump_next_subtitle(
@@ -14,21 +21,28 @@ impl BaiduPanPlugin {
         state: &mut WindowState,
         host: &mut impl Host,
         now_secs: u64,
-    ) {
+    ) -> Vec<HostCommand> {
         if state.http_jobs.len() >= 6 {
-            return;
+            return Vec::new();
         }
         let Some((media, idx, sub)) = state.pending_subtitles.pop() else {
-            return;
+            return Vec::new();
         };
         if state.active_media != Some(media) {
             state.pending_subtitles.clear();
-            return;
+            return Vec::new();
         }
         match self.session.mode {
             AuthMode::Cookie => {
                 if self.session.uid == 0 {
-                    return;
+                    return Vec::new();
+                }
+                if now_secs == 0 {
+                    state.pending_subtitles.clear();
+                    return vec![HostCommand::Log {
+                        level: LogLevel::Warn,
+                        message: "baidupan: system wall clock unavailable (now_ms == 0); skipping Cookie subtitle signing".into(),
+                    }];
                 }
                 let url = playback::build_locate_download_url(
                     &sub.path,
@@ -65,7 +79,7 @@ impl BaiduPanPlugin {
                 let Ok(url) =
                     playback::build_openapi_meta_url(&dummy, &self.session.access_token, api_kind)
                 else {
-                    return;
+                    return Vec::new();
                 };
                 let _ = self.start_http(
                     state,
@@ -85,6 +99,7 @@ impl BaiduPanPlugin {
                 );
             }
         }
+        Vec::new()
     }
 
     pub(super) fn finish_subtitle_flow(
@@ -113,7 +128,7 @@ impl BaiduPanPlugin {
                         playback::user_agent_for_pcs_locate(),
                     ));
                 }
-                self.pump_next_subtitle(state, host, now_secs);
+                cmds.extend(self.pump_next_subtitle(state, host, now_secs));
                 cmds
             }
             HttpFlow::SubtitleOpenApiMeta {
@@ -126,7 +141,7 @@ impl BaiduPanPlugin {
                     && let Ok(json) = serde_json::from_slice::<Value>(body)
                     && let Ok(dlink) = playback::parse_openapi_dlink(&json, api_kind)
                 {
-                    if api_kind == OpenApiLinkKind::Official {
+                    let direct_url = if api_kind == OpenApiLinkKind::Official {
                         let with_token = format!(
                             "{dlink}&access_token={}",
                             encode_query_component(&self.session.access_token)
@@ -143,8 +158,8 @@ impl BaiduPanPlugin {
                                 HttpFlow::SubtitleOpenApiHead {
                                     media,
                                     idx,
-                                    sub,
-                                    fallback_dlink: with_token,
+                                    sub: sub.clone(),
+                                    fallback_dlink: with_token.clone(),
                                 },
                                 host,
                             )
@@ -152,21 +167,22 @@ impl BaiduPanPlugin {
                         {
                             return Vec::new();
                         }
+                        with_token
                     } else {
-                        let cmd = build_attach_subtitle_cmd(
-                            media,
-                            state.generation,
-                            idx,
-                            &sub,
-                            dlink,
-                            playback::user_agent_for_openapi(api_kind),
-                        );
-                        self.pump_next_subtitle(state, host, now_secs);
-                        return vec![cmd];
-                    }
+                        dlink
+                    };
+                    let mut cmds = vec![build_attach_subtitle_cmd(
+                        media,
+                        state.generation,
+                        idx,
+                        &sub,
+                        direct_url,
+                        playback::user_agent_for_openapi(api_kind),
+                    )];
+                    cmds.extend(self.pump_next_subtitle(state, host, now_secs));
+                    return cmds;
                 }
-                self.pump_next_subtitle(state, host, now_secs);
-                Vec::new()
+                self.pump_next_subtitle(state, host, now_secs)
             }
             HttpFlow::SubtitleOpenApiHead {
                 media,
@@ -191,7 +207,7 @@ impl BaiduPanPlugin {
                         OFFICIAL_DLINK_USER_AGENT,
                     ));
                 }
-                self.pump_next_subtitle(state, host, now_secs);
+                cmds.extend(self.pump_next_subtitle(state, host, now_secs));
                 cmds
             }
             _ => Vec::new(),

@@ -2,6 +2,8 @@
 //! referencing `komorebiCarry/BaiduPCS-Rust` (QR login, Cookie BDUSS/STOKEN, PCS Locate v4)
 //! and `OpenListTeam/OpenList` (Open Platform OAuth, `filemetas` / DLNA `dlink` / `streaming`).
 
+mod account_lifecycle;
+mod actions;
 pub mod auth;
 pub mod catalog;
 mod flows;
@@ -23,7 +25,36 @@ use iris_plugin_sdk::{
     serde_json::{self, Value},
 };
 use playback::{OpenApiLinkKind, ResolveTarget};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+
+#[derive(Default)]
+pub(crate) struct VideoCache {
+    pub(crate) entries: VecDeque<(String, (String, String))>,
+}
+
+impl VideoCache {
+    pub(crate) fn insert(&mut self, key: String, val: (String, String)) {
+        if key.is_empty() {
+            return;
+        }
+        self.entries.retain(|(k, _)| k != &key);
+        while self.entries.len() >= 128 {
+            self.entries.pop_front();
+        }
+        self.entries.push_back((key, val));
+    }
+
+    pub(crate) fn get(&self, key: &str) -> Option<&(String, String)> {
+        self.entries
+            .iter()
+            .rev()
+            .find_map(|(k, v)| (k == key).then_some(v))
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.entries.clear();
+    }
+}
 
 pub(crate) const SECRET_KEY: &str = "baidupan.session";
 
@@ -73,20 +104,26 @@ pub(crate) enum HttpFlow {
         manual: bool,
     },
     QrConfirmLogin {
+        account_epoch: u64,
         baiduid: String,
         open_modal: bool,
     },
     UserInfo {
+        account_epoch: u64,
         pending_session: Option<Box<StoredSession>>,
         close_modal: bool,
         notify_on_success: bool,
     },
-    Quota,
+    Quota {
+        account_epoch: u64,
+    },
     OAuthRefresh {
+        account_epoch: u64,
         base_session: Box<StoredSession>,
         retry: Box<OAuthRetry>,
     },
     Browse {
+        account_epoch: u64,
         request_id: Id,
         source_id: String,
         kind: BrowseKind,
@@ -106,6 +143,7 @@ pub(crate) enum HttpFlow {
         request_id: Id,
         target: Box<ResolveTarget>,
         preferred_line: usize,
+        original_variant: Option<String>,
         api_kind: OpenApiLinkKind,
         retried_oauth: bool,
     },
@@ -119,6 +157,7 @@ pub(crate) enum HttpFlow {
         request_id: Id,
         target: Box<ResolveTarget>,
         profile: String,
+        original_variant: Option<String>,
         retried_ad_token: bool,
         retried_oauth: bool,
     },
@@ -164,33 +203,30 @@ impl ActiveHttp {
 #[derive(Default)]
 pub(crate) struct WindowState {
     pub generation: Generation,
+    pub account_reset: bool,
     pub qr: Option<PendingQr>,
     pub http_jobs: BTreeMap<Id, ActiveHttp>,
     pub folder_caches: BTreeMap<String, FolderCache>,
     pub browse_seen: BTreeMap<String, BTreeSet<String>>,
     pub browse_cursors: BTreeMap<String, BTreeSet<String>>,
-    pub secret_write_op: Option<(Id, StoredSession, bool, bool)>,
+    pub browse_page: Option<catalog::PageCache>,
+    pub secret_write_op: Option<(Id, u64, StoredSession, Option<QuotaInfo>, bool, bool)>,
+    pub logout_secret_op: Option<(Id, u64)>,
+    pub background_secret_ops: BTreeSet<Id>,
+    pub background_secret_epoch: Option<u64>,
+    pub interrupted_secret: Option<account_lifecycle::InterruptedSecret>,
     pub active_media: Option<Id>,
     pub last_resolved_video: Option<(String, String)>,
     pub pending_subtitles: Vec<(Id, usize, CachedSubtitle)>,
 }
 
-impl WindowState {
-    fn clear_scoped(&mut self, host: &mut impl Host) {
-        for (_, job) in std::mem::take(&mut self.http_jobs) {
-            job.cancel(host);
-        }
-        self.pending_subtitles.clear();
-        self.secret_write_op = None;
-    }
-}
-
 #[derive(Default)]
 pub struct BaiduPanPlugin {
+    pub(crate) account_epoch: u64,
     pub(crate) session: StoredSession,
     pub(crate) quota: Option<QuotaInfo>,
     pub(crate) prefs: Preferences,
-    pub(crate) video_lookup: BTreeMap<String, (String, String)>,
+    pub(crate) video_lookup: VideoCache,
     synced_sources_auth: Option<bool>,
     init_secret_op: Option<Id>,
     init_prefs_op: Option<Id>,
@@ -254,10 +290,17 @@ impl BaiduPanPlugin {
                 }
                 let mut state = self.windows.remove(&window).unwrap_or_default();
                 if state.generation != generation {
-                    state.clear_scoped(host);
+                    // The host has already revoked old-generation handles; clear local
+                    // scoped tracking without calling host.close on stale IDs.
+                    state.discard_scoped();
+                    if state.generation.context != generation.context {
+                        state.browse_page = None;
+                    }
                     state.generation = generation;
                 }
-                let commands = self.handle_window(&mut state, *body, host, now_ms)?;
+                let mut commands = self.flush_account_reset(&mut state, Some(&body), host);
+                commands.extend(self.handle_window(&mut state, *body, host, now_ms)?);
+                self.resume_interrupted_secret(&mut state, host);
                 self.windows.insert(window, state);
                 Ok(commands)
             }
@@ -340,7 +383,7 @@ impl BaiduPanPlugin {
         host: &mut impl Host,
         now_ms: u64,
     ) -> Result<Vec<HostCommand>, ErrorCode> {
-        let now_secs = (now_ms / 1000).max(1_700_000_000);
+        let now_secs = now_ms / 1000;
         match event {
             HostEvent::WindowOpened { .. } => {
                 if self.session.is_authenticated() {
@@ -394,6 +437,7 @@ impl BaiduPanPlugin {
             HostEvent::MediaOpened { snapshot, .. } => {
                 state.active_media = snapshot.media;
                 state.pending_subtitles.clear();
+                let mut cmds = Vec::new();
                 if self.prefs.auto_subtitles
                     && let Some(media) = state.active_media
                     && let Some((path, name)) =
@@ -412,9 +456,9 @@ impl BaiduPanPlugin {
                     for (rev_i, sub) in matched.into_iter().enumerate() {
                         state.pending_subtitles.push((media, rev_i, sub));
                     }
-                    self.pump_next_subtitle(state, host, now_secs);
+                    cmds = self.pump_next_subtitle(state, host, now_secs);
                 }
-                Ok(Vec::new())
+                Ok(cmds)
             }
             HostEvent::Command { id, .. } => self.handle_action(state, &id, None, host, now_ms),
             HostEvent::Action { id, value, .. } => {
@@ -440,280 +484,25 @@ impl BaiduPanPlugin {
         uri: Option<&str>,
     ) -> Option<(String, String)> {
         let fallback = state.last_resolved_video.take();
-        if let Some(u) = uri
-            && let Some(rest) = u.strip_prefix("iris-plugin://community.baidupan/")
-            && let Some((_, entry_id)) = rest.split_once('/')
-        {
-            if let Some(found) = self.video_lookup.get(entry_id) {
-                return Some(found.clone());
-            }
-            if let Some((_, path)) = catalog::decode_entry_id(entry_id) {
-                let name = media::basename(&path).to_owned();
-                return Some((path, name));
-            }
-        }
-        fallback
-    }
-
-    fn handle_action(
-        &mut self,
-        state: &mut WindowState,
-        id: &str,
-        value: Option<String>,
-        host: &mut impl Host,
-        now_ms: u64,
-    ) -> Result<Vec<HostCommand>, ErrorCode> {
-        let mut cmds = Vec::new();
-        match id {
-            "login" => {
-                cmds.push(HostCommand::OpenModal {
-                    modal: Box::new(ui::build_login_modal(state.qr.as_ref())),
-                });
-            }
-            "start_qr" | "modal_start_qr" => {
-                let open_modal = id == "modal_start_qr";
-                let mut entropy = [0x5Au8; 16];
-                let _ = host.random(&mut entropy);
-                let gid = sign::generate_gid(&entropy);
-                let url = format!(
-                    "https://passport.baidu.com/v2/api/getqrcode?lp=pc&qrloginfrom=pc&gid={gid}&callback=tangram_guid_{now_ms}&apiver=v3&tt={now_ms}&tpl=netdisk&_={now_ms}"
-                );
-                match self.start_http(
-                    state,
-                    "GET",
-                    url,
-                    vec![("User-Agent".into(), auth::WEB_USER_AGENT.into())],
-                    true,
-                    Some(20_000),
-                    None,
-                    HttpFlow::QrGetSign { open_modal },
-                    host,
-                ) {
-                    Ok(()) => cmds.push(ui::toast("正在获取百度网盘登录二维码…")),
-                    Err(e) => cmds.push(ui::toast(format!("获取二维码失败：{e:?}"))),
-                }
-            }
-            "poll_qr" | "modal_poll_qr" | "auto_poll_qr" | "auto_modal_poll_qr" => {
-                let manual = matches!(id, "poll_qr" | "modal_poll_qr");
-                let open_modal = matches!(id, "modal_poll_qr" | "auto_modal_poll_qr");
-                let in_flight = state.http_jobs.values().any(|j| {
-                    matches!(
-                        j.flow,
-                        HttpFlow::QrPoll { .. } | HttpFlow::QrConfirmLogin { .. }
-                    )
-                });
-                if let Some(qr) = &state.qr {
-                    if !in_flight {
-                        let url = format!(
-                            "https://passport.baidu.com/channel/unicast?channel_id={}&tpl=netdisk&apiver=v3&tt={now_ms}",
-                            sign::encode_query_component(&qr.sign)
-                        );
-                        let mut headers = vec![("User-Agent".into(), auth::WEB_USER_AGENT.into())];
-                        if !qr.baiduid.is_empty() {
-                            headers.push(("Cookie".into(), format!("BAIDUID={}", qr.baiduid)));
-                        }
-                        let timeout = if manual { Some(10_000) } else { Some(15_000) };
-                        if let Err(e) = self.start_http(
-                            state,
-                            "GET",
-                            url,
-                            headers,
-                            true,
-                            timeout,
-                            None,
-                            HttpFlow::QrPoll { open_modal, manual },
-                            host,
-                        ) && manual
-                        {
-                            cmds.push(ui::toast(format!("检查扫码状态失败：{e:?}")));
-                        }
-                    }
-                } else if manual {
-                    cmds.push(ui::toast("请先生成百度网盘登录二维码"));
-                }
-            }
-            "refresh_account" => {
-                if !self.session.is_authenticated() {
-                    cmds.push(ui::toast("尚未登录百度网盘"));
-                } else if let Err(e) = self.request_user_info(state, None, false, true, host) {
-                    cmds.push(ui::toast(format!("刷新账号信息失败：{e:?}")));
-                } else {
-                    cmds.push(ui::toast("正在刷新百度网盘账号与空间配额…"));
-                }
-            }
-            "logout" => {
-                self.session = StoredSession::default();
-                self.quota = None;
-                state.qr = None;
-                state.folder_caches.clear();
-                let _ = host.submit(&Task::SecretWrite {
-                    bucket: CredentialBucket::Plugin,
-                    key: SECRET_KEY.into(),
-                    value: None,
-                });
-                cmds.extend(self.sync_ui(state));
-                cmds.extend(self.maybe_sync_sources());
-                cmds.extend(ui::refresh_all_sources());
-                cmds.push(ui::toast("已退出百度网盘账号"));
-            }
-            "set_playback_mode" => {
-                if let Some(mode) = value.filter(|m| {
-                    matches!(
-                        m.as_str(),
-                        "direct" | "transcode_1080" | "transcode_720" | "transcode_480"
-                    )
-                }) {
-                    self.prefs.playback_mode = mode;
-                    self.persist_prefs(host);
-                    cmds.extend(self.sync_ui(state));
-                    cmds.push(ui::toast("已更新视频默认播放线路"));
-                }
-            }
-            "set_openapi_link_api" => {
-                if let Some(api) =
-                    value.filter(|v| matches!(v.as_str(), "official" | "crack" | "crack_video"))
-                {
-                    self.prefs.openapi_link_api = api;
-                    self.persist_prefs(host);
-                    cmds.extend(self.sync_ui(state));
-                    cmds.push(ui::toast("已更新开放平台取链策略"));
-                }
-            }
-            "set_auto_subtitles" => {
-                self.prefs.auto_subtitles = match value.as_deref() {
-                    Some("true") => true,
-                    Some("false") => false,
-                    _ => !self.prefs.auto_subtitles,
-                };
-                self.persist_prefs(host);
-                cmds.extend(self.sync_ui(state));
-            }
-            "set_show_thumbnails" => {
-                self.prefs.show_thumbnails = match value.as_deref() {
-                    Some("true") => true,
-                    Some("false") => false,
-                    _ => !self.prefs.show_thumbnails,
-                };
-                self.persist_prefs(host);
-                cmds.extend(self.sync_ui(state));
-                cmds.extend(ui::refresh_all_sources());
-            }
-            "set_default_order" => {
-                if let Some(ord) = value.filter(|v| matches!(v.as_str(), "name" | "time" | "size"))
-                {
-                    self.prefs.default_order = ord;
-                    self.persist_prefs(host);
-                    cmds.extend(self.sync_ui(state));
-                    cmds.extend(ui::refresh_all_sources());
-                }
-            }
-            _ => {}
-        }
-        Ok(cmds)
-    }
-
-    fn handle_modal_submit(
-        &mut self,
-        state: &mut WindowState,
-        modal_id: &str,
-        values: &BTreeMap<String, String>,
-        host: &mut impl Host,
-    ) -> Result<Vec<HostCommand>, ErrorCode> {
-        if modal_id != "baidupan.login" {
-            return Ok(Vec::new());
-        }
-        let cookie_raw = values
-            .get("cookie")
-            .map(String::as_str)
-            .unwrap_or("")
-            .trim();
-        let at_raw = values
-            .get("access_token")
-            .map(String::as_str)
-            .unwrap_or("")
-            .trim();
-        let rt_raw = values
-            .get("refresh_token")
-            .map(String::as_str)
-            .unwrap_or("")
-            .trim();
-        let cid_raw = values
-            .get("client_id")
-            .map(String::as_str)
-            .unwrap_or("")
-            .trim();
-        let csec_raw = values
-            .get("client_secret")
-            .map(String::as_str)
-            .unwrap_or("")
-            .trim();
-
-        let candidate = if !cookie_raw.is_empty() {
-            match StoredSession::parse_cookie_input(cookie_raw) {
-                Ok(s) => s,
-                Err(msg) => return Ok(vec![ui::toast(msg)]),
-            }
-        } else if !at_raw.is_empty() || !rt_raw.is_empty() {
-            match StoredSession::parse_openapi_input(at_raw, rt_raw, cid_raw, csec_raw) {
-                Ok(s) => s,
-                Err(msg) => return Ok(vec![ui::toast(msg)]),
-            }
-        } else {
-            return Ok(vec![ui::toast(
-                "请先扫码登录，或在下方粘贴 Cookie (BDUSS) 或开放平台令牌",
-            )]);
+        let Some(u) = uri else {
+            return fallback;
         };
-
-        if candidate.mode == auth::AuthMode::OpenApi && candidate.access_token.is_empty() {
-            let retry = OAuthRetry::VerifyLogin {
-                close_modal: true,
-                notify_on_success: true,
-                save_after_verify: true,
-            };
-            return match self.start_oauth_refresh(state, &candidate, retry, host) {
-                Ok(()) => Ok(vec![ui::toast("正在通过 refresh_token 换取访问令牌…")]),
-                Err(e) => Ok(vec![ui::toast(format!("刷新 OAuth 令牌失败：{e:?}"))]),
-            };
+        let (_source_id, entry_id) = sign::parse_plugin_uri(u)?;
+        if let Some(found) = self.video_lookup.get(&entry_id) {
+            return Some(found.clone());
         }
-
-        match self.request_user_info(state, Some(candidate), true, true, host) {
-            Ok(()) => Ok(vec![ui::toast("正在校验百度网盘凭据…")]),
-            Err(e) => Ok(vec![ui::toast(format!("无法校验凭据：{e:?}"))]),
+        if let Some((_, path)) = catalog::decode_entry_id(&entry_id) {
+            let name = media::basename(&path).to_owned();
+            return Some((path, name));
         }
+        None
     }
 }
 
-#[cfg(target_arch = "wasm32")]
-mod wasm {
-    use super::*;
-    use iris_plugin_sdk::{
-        api::v2::{GuestError, Reply},
-        guest,
-    };
-    std::thread_local! {
-        static PLUGIN: std::cell::RefCell<BaiduPanPlugin> = std::cell::RefCell::new(BaiduPanPlugin::default());
-    }
-    fn dispatch(value: Value) -> Reply<HostCommand> {
-        let now_ms = guest::clock(false).map_or(0, |id| id.0);
-        let result = serde_json::from_value(value)
-            .map_err(|_| ErrorCode::InvalidArgument)
-            .and_then(|event| {
-                PLUGIN.with_borrow_mut(|plugin| {
-                    plugin.event(event, &mut iris_plugin_sdk::client::WasmHost, now_ms)
-                })
-            });
-        match result {
-            Ok(ok) => Reply::Ok { ok },
-            Err(code) => Reply::Error {
-                error: GuestError {
-                    code: code as i32,
-                    message: format!("{code:?}"),
-                },
-            },
-        }
-    }
-    iris_plugin_sdk::export_plugin!(dispatch);
-}
+iris_plugin_sdk::export_typed_plugin!(BaiduPanPlugin, |plugin, event| {
+    let now_ms = iris_plugin_sdk::guest::clock(false).map_or(0, |id| id.0);
+    plugin.event(event, &mut iris_plugin_sdk::client::WasmHost, now_ms)
+});
 
 #[cfg(test)]
 mod tests;

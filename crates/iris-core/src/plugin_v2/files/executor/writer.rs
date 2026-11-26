@@ -66,7 +66,10 @@ impl FileExecutor {
         Ok(Operation::blocking(move || {
             let _activity = activity;
             this.bind(&context)?;
-            let writer = this.0.root.writer(format.extension())?;
+            let writer = this
+                .temp_root()?
+                .writer(format.extension())?
+                .with_activity(this.0.activity.start());
             let id = Id(next_id()?);
             let cancel = this.0.cancel.child().map_err(|_| ErrorCode::Cancelled)?;
             let mut state = this.0.state.lock().unwrap_or_else(|e| e.into_inner());

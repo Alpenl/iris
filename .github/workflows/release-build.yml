@@ -214,6 +214,7 @@ jobs:
             ${{ runner.temp }}/iris-dist/*.tar.gz
             ${{ runner.temp }}/iris-dist/*.build-manifest.json
             ${{ runner.temp }}/iris-dist/media-runtime-verification.json
+            ${{ runner.temp }}/iris-dist/plugin-runtime-check.json
             ${{ runner.temp }}/iris-dist/notary-*-result.json
             ${{ runner.temp }}/iris-dist/notary-result.json
             ${{ runner.temp }}/iris-dist/SHA256SUMS

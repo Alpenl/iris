@@ -52,90 +52,98 @@ struct PaletteEntry {
     target: PaletteTarget,
 }
 
+fn palette_selected_index(palette_index: usize, entry_count: usize) -> Option<usize> {
+    (entry_count > 0).then(|| palette_index.min(entry_count - 1))
+}
+
 impl IrisWindow {
     fn palette_entries(&self) -> Vec<PaletteEntry> {
+        use super::strings::{actions::action_title, chrome};
         let live_key = |id: &str| self.key_hint(id).map(|s| s.to_string());
 
         let mut entries = vec![
             PaletteEntry {
-                title: "打开文件或文件夹…".into(),
+                title: action_title("open_file").into(),
                 subtitle: None,
                 badge: "内核".into(),
                 shortcut: live_key("open_file"),
                 target: PaletteTarget::Host("open"),
             },
             PaletteEntry {
-                title: super::strings::chrome::OPEN_STREAM_LABEL.into(),
+                title: chrome::OPEN_STREAM_LABEL.into(),
                 subtitle: Some("原生直连播放 HTTP / HTTPS 视频、HLS 或远程照片".into()),
                 badge: "网络".into(),
                 shortcut: live_key("open_url"),
                 target: PaletteTarget::OpenUrl,
             },
             PaletteEntry {
-                title: "恢复默认外观（清除无边框与插件主题覆盖）".into(),
+                title: format!(
+                    "{}（清除无边框与插件主题覆盖）",
+                    chrome::RESET_APPEARANCE_LABEL
+                ),
                 subtitle: Some("一键停用异常外观插件、恢复标题栏与默认石墨配色".into()),
                 badge: "安全".into(),
                 shortcut: None,
                 target: PaletteTarget::ResetAppearance,
             },
             PaletteEntry {
-                title: "播放 / 暂停".into(),
+                title: action_title("toggle_pause").into(),
                 subtitle: None,
                 badge: "内核".into(),
                 shortcut: live_key("toggle_pause"),
                 target: PaletteTarget::Host("toggle_pause"),
             },
             PaletteEntry {
-                title: "静音 / 取消静音".into(),
+                title: action_title("toggle_mute").into(),
                 subtitle: None,
                 badge: "内核".into(),
                 shortcut: live_key("toggle_mute"),
                 target: PaletteTarget::Host("toggle_mute"),
             },
             PaletteEntry {
-                title: "切换单曲循环".into(),
+                title: action_title("toggle_loop").into(),
                 subtitle: None,
                 badge: "内核".into(),
                 shortcut: live_key("toggle_loop"),
                 target: PaletteTarget::Host("toggle_loop"),
             },
             PaletteEntry {
-                title: "设置 A / B 点或清除区间".into(),
+                title: action_title("cycle_ab_loop").into(),
                 subtitle: None,
                 badge: "内核".into(),
                 shortcut: live_key("cycle_ab_loop"),
                 target: PaletteTarget::Host("cycle_ab_loop"),
             },
             PaletteEntry {
-                title: "清除 A-B 循环".into(),
+                title: action_title("clear_ab_loop").into(),
                 subtitle: None,
                 badge: "内核".into(),
                 shortcut: live_key("clear_ab_loop"),
                 target: PaletteTarget::Host("clear_ab_loop"),
             },
             PaletteEntry {
-                title: "切换画面比例 / 铺满裁剪".into(),
+                title: action_title("cycle_aspect").into(),
                 subtitle: None,
                 badge: "内核".into(),
                 shortcut: live_key("cycle_aspect"),
                 target: PaletteTarget::Host("cycle_aspect"),
             },
             PaletteEntry {
-                title: "顺时针旋转 90°".into(),
+                title: action_title("rotate_cw").into(),
                 subtitle: None,
                 badge: "内核".into(),
                 shortcut: live_key("rotate_cw"),
                 target: PaletteTarget::Host("rotate_cw"),
             },
             PaletteEntry {
-                title: "保存当前帧截图".into(),
+                title: action_title("take_screenshot").into(),
                 subtitle: None,
                 badge: "内核".into(),
                 shortcut: live_key("take_screenshot"),
                 target: PaletteTarget::Host("screenshot"),
             },
             PaletteEntry {
-                title: super::strings::chrome::MEDIA_INFO_LABEL.into(),
+                title: chrome::MEDIA_INFO_LABEL.into(),
                 subtitle: None,
                 badge: "内核".into(),
                 shortcut: live_key("toggle_info"),
@@ -152,28 +160,28 @@ impl IrisWindow {
                 target: PaletteTarget::Host("toggle_sidebar_mode"),
             },
             PaletteEntry {
-                title: "展开 / 收起侧栏面板".into(),
+                title: action_title("toggle_directory").into(),
                 subtitle: None,
                 badge: "工作区".into(),
                 shortcut: live_key("toggle_directory"),
                 target: PaletteTarget::Host("toggle_directory"),
             },
             PaletteEntry {
-                title: "搜索目录".into(),
+                title: action_title("toggle_search").into(),
                 subtitle: None,
                 badge: "内核".into(),
                 shortcut: live_key("toggle_search"),
                 target: PaletteTarget::Host("search"),
             },
             PaletteEntry {
-                title: "刷新目录".into(),
+                title: action_title("refresh_directory").into(),
                 subtitle: None,
                 badge: "内核".into(),
                 shortcut: live_key("refresh_directory"),
                 target: PaletteTarget::Host("refresh"),
             },
             PaletteEntry {
-                title: "循环切换下一个工作区预设".into(),
+                title: action_title("cycle_preset").into(),
                 subtitle: None,
                 badge: "预设".into(),
                 shortcut: live_key("cycle_preset"),
@@ -194,7 +202,7 @@ impl IrisWindow {
                 target: PaletteTarget::PinLocation,
             },
             PaletteEntry {
-                title: "打开设置…".into(),
+                title: action_title("open_settings").into(),
                 subtitle: None,
                 badge: "内核".into(),
                 shortcut: live_key("open_settings"),
@@ -318,10 +326,10 @@ impl IrisWindow {
 
     pub(in crate::ui) fn move_palette_selection(&mut self, delta: isize, cx: &mut Context<Self>) {
         let len = self.palette_entries().len();
-        if len == 0 {
+        let Some(cur) = palette_selected_index(self.overlays.palette_index, len) else {
             return;
-        }
-        let next = (self.overlays.palette_index as isize + delta).rem_euclid(len as isize) as usize;
+        };
+        let next = (cur as isize + delta).rem_euclid(len as isize) as usize;
         self.overlays.palette_index = next;
         self.overlays.palette_scroll.scroll_to_item(next);
         cx.notify();
@@ -333,7 +341,10 @@ impl IrisWindow {
         cx: &mut Context<Self>,
     ) {
         let entries = self.palette_entries();
-        if let Some(entry) = entries.get(self.overlays.palette_index).cloned() {
+        if let Some(entry) = palette_selected_index(self.overlays.palette_index, entries.len())
+            .and_then(|ix| entries.get(ix))
+            .cloned()
+        {
             self.run_palette_target(entry.target, window, cx);
         }
     }
@@ -429,10 +440,7 @@ impl IrisWindow {
     ) -> impl IntoElement {
         let t = ThemeTokens::of(cx);
         let entries = self.palette_entries();
-        let active_ix = self
-            .overlays
-            .palette_index
-            .min(entries.len().saturating_sub(1));
+        let active_ix = palette_selected_index(self.overlays.palette_index, entries.len());
         let viewport = window.viewport_size();
         let margin = 12.;
         let top = (f32::from(viewport.height) * 0.1).clamp(margin, 64.);
@@ -518,7 +526,7 @@ impl IrisWindow {
                                 )
                             })
                             .children(entries.into_iter().enumerate().map(|(ix, entry)| {
-                                let selected = ix == active_ix;
+                                let selected = Some(ix) == active_ix;
                                 let target = entry.target;
                                 div()
                                     .id(("pal-row", ix))
@@ -579,5 +587,19 @@ impl IrisWindow {
                             })),
                     ),
             )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::palette_selected_index;
+
+    #[test]
+    fn palette_executes_highlighted_clamped_entry_when_list_shrinks() {
+        assert_eq!(palette_selected_index(0, 0), None);
+        assert_eq!(palette_selected_index(5, 0), None);
+        assert_eq!(palette_selected_index(1, 4), Some(1));
+        assert_eq!(palette_selected_index(10, 3), Some(2));
+        assert_eq!(palette_selected_index(3, 3), Some(2));
     }
 }

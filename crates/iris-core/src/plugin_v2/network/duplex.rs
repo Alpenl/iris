@@ -1,7 +1,7 @@
 //! Convert an already authorized connection into an owned nonblocking transport.
 use super::{RequestGrant, raw};
 use crate::vfs::http_client::{
-    ConnectRegistration, HttpCancel, NetworkScope, SocketRegistration, Transport, connect_transport,
+    HttpCancel, NetworkScope, SocketRegistration, Transport, connect_transport,
 };
 use iris_api::v2::ErrorCode;
 use mio::{Interest, Registry, Token};
@@ -120,13 +120,4 @@ impl Write for Wire {
             State::Empty => Err(io::ErrorKind::NotConnected.into()),
         }
     }
-}
-
-pub(crate) fn cancellation_wake(
-    cancel: &HttpCancel,
-    wake: Arc<mio::Waker>,
-) -> Result<ConnectRegistration, ErrorCode> {
-    cancel
-        .register_shared_wake(wake)
-        .map_err(|_| ErrorCode::Cancelled)
 }

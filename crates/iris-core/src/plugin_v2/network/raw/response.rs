@@ -11,6 +11,10 @@ pub(super) fn receive(
     request: &RawRequest,
     deadline: Instant,
 ) -> Result<Response, ErrorCode> {
+    connection
+        .transport
+        .set_body_deadline(Some(deadline))
+        .map_err(|e| io_error(e, &connection.grant, &connection.cancel))?;
     let (status, headers, prefix) = head(&mut connection, deadline)?;
     if let Some(jar) = &request.cookies {
         jar.receive(&request.url, &headers)?;

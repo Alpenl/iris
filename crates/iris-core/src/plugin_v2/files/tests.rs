@@ -1,7 +1,8 @@
-use super::{FileExecutor, FileSetup, TempRoot, hash_media, identity::PinnedFile, random_name};
+use super::{FileExecutor, FileSetup, TempRoot, hash_media, identity::PinnedFile};
 use crate::{
     plugin_v2::{
         actor::{Executor, IoOutcome, Operation, TaskContext},
+        installation::random_identity,
         instance::Blob,
         ledger::{Ledger, Resource},
         network::NetworkGrant,
@@ -20,7 +21,7 @@ use std::{
 };
 
 fn directory() -> PathBuf {
-    let path = std::env::temp_dir().join(format!("iris-files-{}", random_name().unwrap()));
+    let path = std::env::temp_dir().join(format!("iris-files-{}", random_identity().unwrap()));
     std::fs::create_dir(&path).unwrap();
     path
 }
@@ -263,5 +264,36 @@ fn inert_artifacts_keep_writes_serial_and_cancellable() {
     assert_eq!(ledger.used(None, Resource::Handle), 0);
     drop(executor);
     assert_eq!(ledger.used(None, Resource::HostBytes), 0);
+    std::fs::remove_dir(dir).unwrap();
+}
+
+#[test]
+fn lazy_temp_root_creates_zero_directories_across_window_open_close_cycles() {
+    let ledger = Ledger::default();
+    let owner = "lazy-temp";
+    let dir = directory();
+    let capabilities = BTreeSet::from([Capability::MediaEnhance]);
+    let root = FileExecutor::new(FileSetup {
+        network: NetworkGrant::new(
+            owner.into(),
+            capabilities.clone(),
+            NetworkDeclaration::default(),
+            &ledger,
+        )
+        .unwrap(),
+        ledger: ledger.clone(),
+        capabilities,
+        temporary_directory: dir.clone(),
+    })
+    .unwrap();
+    for _ in 0..50 {
+        let window = root.for_window();
+        window.stop();
+        assert!(window.is_quiescent());
+    }
+    assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+    root.stop();
+    drop(root);
+    assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
     std::fs::remove_dir(dir).unwrap();
 }

@@ -86,7 +86,10 @@ impl RemoteFactory {
         )?;
         let reader = self.reader(resource, None)?;
         let deadline = Instant::now() + Duration::from_secs(30);
-        let mut response = reader.open("GET", None, cancel, deadline)?;
+        let mut response =
+            reader
+                .target
+                .open_range("GET", None, false, 2 << 20, cancel, deadline)?;
         let RawState::Response(raw) = &response.state else {
             return Err(ErrorCode::Internal);
         };

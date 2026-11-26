@@ -1,6 +1,6 @@
 //! Raw declarations from mpv/client.h, mpv/render.h and mpv/render_gl.h
 //! (client API 2.x, checked against mpv 0.42 headers).
-#![allow(non_camel_case_types, dead_code)]
+#![allow(non_camel_case_types)]
 
 use std::ffi::{c_char, c_int, c_void};
 
@@ -17,23 +17,21 @@ pub struct mpv_render_context {
 pub type mpv_format = c_int;
 pub const MPV_FORMAT_NONE: mpv_format = 0;
 pub const MPV_FORMAT_STRING: mpv_format = 1;
-pub const MPV_FORMAT_OSD_STRING: mpv_format = 2;
 pub const MPV_FORMAT_FLAG: mpv_format = 3;
 pub const MPV_FORMAT_INT64: mpv_format = 4;
 pub const MPV_FORMAT_DOUBLE: mpv_format = 5;
-pub const MPV_FORMAT_NODE: mpv_format = 6;
-pub const MPV_FORMAT_NODE_ARRAY: mpv_format = 7;
 pub const MPV_FORMAT_NODE_MAP: mpv_format = 8;
 
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub union mpv_node_u {
     pub string: *mut c_char,
+    #[allow(dead_code)]
     pub flag: c_int,
     pub int64: i64,
+    #[allow(dead_code)]
     pub double_: f64,
     pub list: *mut mpv_node_list,
-    pub ba: *mut c_void,
 }
 
 #[repr(C)]
@@ -98,6 +96,7 @@ pub struct mpv_event_log_message {
     pub prefix: *const c_char,
     pub level: *const c_char,
     pub text: *const c_char,
+    #[allow(dead_code)]
     pub log_level: c_int,
 }
 
@@ -111,12 +110,15 @@ pub struct mpv_event_end_file {
     pub reason: c_int,
     pub error: c_int,
     pub playlist_entry_id: i64,
+    #[allow(dead_code)]
     pub playlist_insert_id: i64,
+    #[allow(dead_code)]
     pub playlist_insert_num_entries: c_int,
 }
 
 #[repr(C)]
 pub struct mpv_event_hook {
+    #[allow(dead_code)]
     pub name: *const c_char,
     pub id: u64,
 }

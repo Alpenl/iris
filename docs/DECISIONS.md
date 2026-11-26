@@ -13,7 +13,7 @@
 | 1.3 | 插件只在控制面、虚拟数据源与参数化工作台工作，**不经手实时像素数据**；像素管线由内核独占。 | 已落实 |
 | 1.4 | 界面的渲染管线与焦点纪律由内核掌握，插件通过统一的 `Widget` 控件树（侧栏面板与异步校验弹窗共用）、`StatusBadge`、`ToolbarButton`、`OverlayNode` 视口叠层、`UiThemeSpec`/`ChromeLayoutSpec`（允许自由定制配色、圆角/栏高与 `hide_titlebar` 无边框影院窗，宿主提供顶缘悬浮唤醒、视口拖拽与对比度逃生护栏）及支持动态多实例管理的 `MediaSource`（`SetSources` / `SourceManage`）契约与宿主通信。 | 已落实 |
 | 1.5 | 不做多轨合成的非线性剪辑；mpv 是单管线前向播放，做不了。 | 方向已定 |
-| 1.6 | UI 发语义化命令 → 会话改状态 → 语义事件 → UI 重绘；UI 不直接使用 mpv 属性（渲染层仅持窄能力 `RenderHandle`）；坐标换算显式建模；机制和策略分开。 | 已收口到 `Session` / `RenderHandle` / `geometry.rs` / `input.rs` / `plugin/` |
+| 1.6 | UI 发语义化命令 → 会话改状态 → 语义事件 → UI 重绘；UI 不直接使用 mpv 属性（渲染层仅持窄能力 `RenderHandle`）；坐标换算显式建模；机制和策略分开。 | 已收口到 `Session` / `RenderHandle` / `geometry.rs` / `input.rs` / `plugin_v2/` |
 | 1.7 | 当前不做：Lua/JS 脚本引擎、SQLite 媒体库、Linux 移植。外部扩展已演进为受控 Wasmtime 沙箱（详见 [PLUGIN_V2_DECISIONS.md](PLUGIN_V2_DECISIONS.md)），取消旧版无沙箱 Python/stdio 子进程模型。 | 已更新（见 `PLUGIN_V2_DECISIONS.md`） |
 | 1.8 | 本体默认界面保持方向 C 的配色和整体风格（细节参照 Zed 和 Sooty：默认直角、36px 标题栏、44px 单行工具栏、60fps 跟手拖拽时间轴、16px SVG、可调宽虚拟滚动侧栏），但**不以此限制插件的定制自由度**；圆角与栏高经 `ThemeTokens` 统一封装进 `ui/kit/` 原语。照片的缩放比例按原始像素算，1:1 即 100%。 | 已完成（2026-11-23 Windows 11 双屏实机核验通过；macOS 本轮新界面人工走查待补） |
 
@@ -38,7 +38,7 @@
 
 | # | 结论 | 状态 |
 |---|---|---|
-| 3.1 | **会话挂在视口上，不挂在窗口上**：窗口持有 `Vec<Viewport>`，当前长度 1；每个视口持有独立会话、画面层、矩形和照片变换。 | 已完成；不提前实现同屏对比 |
+| 3.1 | **会话挂在视口上，不挂在窗口上**：窗口持有独立的 `viewport: Viewport` 结构体（封装独立会话、画面层、矩形和照片变换，待真正实现同屏对比时再扩为多视口集合）。 | 已完成；不提前实现同屏对比 |
 | 3.2 | **上下文驱动的输入**：键盘按 `Workspace` / `Viewport` / `SearchInput` / `CommandPalette` 与 `media` 匹配；指针与捏合手势经同样的状态策略解析。 | 已完成（`input.rs` + `platform/`） |
 | 3.3 | **许可走路线 B**：主程序 `MIT OR Apache-2.0`，保留商业 / 闭源扩展可能；媒体动态库独立遵守 LGPL。 | 已落实，见第 5 节 |
 | 3.4 | **媒体只读 + 路径做主键**：内核对媒体文件和目录永远只读，个人数据（设置、收藏、进度、最近打开、插件）全放应用数据目录，照片缩略图仅驻留内存。内容指纹重新匹配尚未做。 | 只读已遵守；收藏、进度与最近打开已实现（`store.rs`） |
@@ -132,7 +132,7 @@
 
 - **v0.1 基础内核验收**（2026-11-21）：打开方式、视频精确跳转与重播、照片缩放平移与色彩/方向/超大图修补、音轨字幕、自然排序目录、全屏字幕避让、设置落盘、Windows D3D11 原生合成、LGPL 源码自建 SDK 与未签名本地包。
 - **成熟播放器体验完善**（2026-11-22）：可调宽虚拟化目录、搜索/排序/子目录导航、窗内设置中心、60fps 跟手时间轴与章节刻度、连续音量条、音频播放卡片、外挂字幕模糊自动加载与延迟调节、画面比例/旋转/镜像/截图、防休眠、窗口置顶、独立轻量 OSD、右键上下文菜单、媒体详情与 EXIF、照片内存缩略图底条、macOS 原生捏合缩放与媒体键。
-- **模块化工作台、全插件化远程数据源与中期工程收敛**（2026-11-22）：`PresetManager` + `PresetRuntime`（`1B+` 稀疏补丁与个人基线自动回正）、`Keymap` 多方案与 `!TextInput` 打字安全防火墙、`ThemeTokens` GPUI 全局令牌与无标题栏三重安全护栏、三元 `MediaUri`（`Local | HttpUrl | Plugin`）+ 统一 `CatalogItem` + 独立 `PlayQueue` + 单表 `Store`、慢速共享盘免 `stat` 扫描、`mpv_command_node_async` 零注入远程流直通、`CredentialVault` 系统凭据分桶托管、`photo::probe_bytes` 远程照片色彩与方向探测、音频输出设备切换、画面均衡器、缓冲条/直播状态 UI，以及支持动态多实例 `SetSources` 与异步弹窗校验的 `iris-api` 插件协议（`protocol: 1`）与内置/外部插件（`iris.guides`、`iris.ab-loop`、`iris.webdav`、`examples/plugins/{cloud-media-demo,cinema-ui,watch-stats}`）。
+- **模块化工作台、全插件化远程数据源与中期工程收敛**（2026-11-22，后于 `0.0.2` 统一演进为 `protocol: 2`）：`PresetManager` + `PresetRuntime`（`1B+` 稀疏补丁与个人基线自动回正）、`Keymap` 多方案与 `!TextInput` 打字安全防火墙、`ThemeTokens` GPUI 全局令牌与无标题栏三重安全护栏、三元 `MediaUri`（`Local | HttpUrl | Plugin`）+ 统一 `CatalogItem` + 独立 `PlayQueue` + 单表 `Store`、慢速共享盘免 `stat` 扫描、`mpv_command_node_async` 零注入远程流直通、`CredentialVault` 系统凭据分桶托管、`photo::probe_bytes` 远程照片色彩与方向探测、音频输出设备切换、画面均衡器、缓冲条/直播状态 UI；原 v1 插件底座与示例已于 `0.0.2` 统一切换为 Wasm `protocol: 2`（官方包 `iris.guides`、`iris.webdav`，原生 `Session` A-B 循环，以及 `examples/plugins/{cinema-ui,watch-stats,virtual-audio,bilibili,baidupan}`）。
 
 ## 10. 待决问题
 

@@ -108,9 +108,8 @@ impl IrisWindow {
 
         let mut source_items: Vec<_> = match &self.catalog.active_source {
             ActiveSource::Local => self.catalog.local_dir.to_catalog_items(),
-            ActiveSource::Plugin(view) => view
-                .entries
-                .iter()
+            ActiveSource::Plugin(view) => self
+                .plugin_source_entries(&view.source_id)
                 .map(|entry| {
                     iris_core::plugin_v2::catalog_item_from_source_entry(
                         &view.plugin_id,

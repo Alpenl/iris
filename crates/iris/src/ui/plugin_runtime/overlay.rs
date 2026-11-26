@@ -6,7 +6,7 @@ use gpui::{
 };
 use iris_api::v2::{
     Capability, HostEvent,
-    enhance::{CueContent, CueLayout},
+    enhance::{CueContent, CueLayout, OverlayWindow},
 };
 use iris_core::plugin_v2::{
     ledger::{Ledger, Reservation, Resource},
@@ -141,27 +141,12 @@ impl IrisWindow {
         }
         self.update_overlay_window(cx);
     }
-    pub(in crate::ui) fn update_overlay_window(&mut self, cx: &mut Context<Self>) {
-        if !self.active().session.state().loaded {
-            return;
-        }
-        let Some(bank) = self.plugin_view.enhance.bank.as_ref() else {
-            return;
-        };
-        let position = self.plugin_view.enhance.clock.position_ms(Instant::now());
-        let (changed, window) = {
-            let Ok(mut bank) = bank.try_lock() else {
-                return;
-            };
-            let changed = bank
-                .advance(
-                    self.plugin_media_id(),
-                    self.plugin_view.enhance.overlay_generation,
-                    position,
-                )
-                .unwrap_or(false);
-            (changed, bank.window().clone())
-        };
+    fn notify_overlay_window_changed(
+        &mut self,
+        changed: bool,
+        window: OverlayWindow,
+        cx: &mut Context<Self>,
+    ) {
         let generation = self.plugin_view.enhance.overlay_generation;
         let recipients: Vec<_> = self
             .plugin_view
@@ -200,6 +185,29 @@ impl IrisWindow {
             }
             self.apply_poll_report(report, None, cx);
         }
+    }
+    pub(in crate::ui) fn update_overlay_window(&mut self, cx: &mut Context<Self>) {
+        if !self.active().session.state().loaded {
+            return;
+        }
+        let Some(bank) = self.plugin_view.enhance.bank.as_ref() else {
+            return;
+        };
+        let position = self.plugin_view.enhance.clock.position_ms(Instant::now());
+        let (changed, window) = {
+            let Ok(mut bank) = bank.try_lock() else {
+                return;
+            };
+            let changed = bank
+                .advance(
+                    self.plugin_media_id(),
+                    self.plugin_view.enhance.overlay_generation,
+                    position,
+                )
+                .unwrap_or(false);
+            (changed, bank.window().clone())
+        };
+        self.notify_overlay_window_changed(changed, window, cx);
     }
     pub(in crate::ui) fn prepare_timed_overlay_frame(
         &mut self,
@@ -247,43 +255,7 @@ impl IrisWindow {
             (frame, window_changed)
         };
         if let Some((changed, next_window)) = window_changed {
-            let recipients: Vec<_> = self
-                .plugin_view
-                .enhance
-                .bindings
-                .values()
-                .filter(|b| {
-                    b.is_live()
-                        && b.installed.grants.contains(&Capability::UiOverlay)
-                        && (changed
-                            || self
-                                .plugin_view
-                                .enhance
-                                .announced
-                                .get(&b.installed.installation_id)
-                                != Some(&generation))
-                })
-                .map(|b| {
-                    (
-                        b.installed.plugin_id.clone(),
-                        b.installed.installation_id.clone(),
-                    )
-                })
-                .collect();
-            for (plugin, owner) in recipients {
-                let report = self.plugins.send_to(
-                    &plugin,
-                    HostEvent::OverlayWindowChanged {
-                        media: self.plugin_media_id(),
-                        generation,
-                        window: next_window.clone(),
-                    },
-                );
-                if report.notices.is_empty() {
-                    self.plugin_view.enhance.announced.insert(owner, generation);
-                }
-                self.apply_poll_report(report, None, cx);
-            }
+            self.notify_overlay_window_changed(changed, next_window, cx);
         }
         let Some(Ok(mut frame)) = frame else {
             self.plugin_view.enhance.frame = None;

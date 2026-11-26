@@ -32,6 +32,22 @@ pub(super) struct EnhancementView {
     pub ledger: Option<iris_core::plugin_v2::ledger::Ledger>,
     pub annotations: super::annotations::AnnotationView,
 }
+impl EnhancementView {
+    fn cancel_lut(&mut self, owner: &str) -> bool {
+        // A clear also supersedes preparation of a first LUT, or a replacement
+        // while another plugin still owns the currently applied filter.
+        self.pending.remove(&(owner.into(), "lut".into()));
+        self.lut_owner.as_deref() == Some(owner)
+    }
+
+    fn finish_job(&mut self, key: &(String, String), id: Id) -> bool {
+        if self.pending.get(key) != Some(&id) {
+            return false;
+        }
+        self.pending.remove(key);
+        true
+    }
+}
 pub(super) enum Effect {
     Track(Arc<Attachment>),
     Lut(Arc<MonitorLut>),
@@ -128,16 +144,12 @@ impl IrisWindow {
                         },
                         cx,
                     )?;
-                } else if self.plugin_view.enhance.lut_owner.as_deref() == Some(&owner) {
+                } else if self.plugin_view.enhance.cancel_lut(&owner) {
                     self.active_mut()
                         .session
                         .set_monitor_lut(None)
                         .map_err(|_| ErrorCode::IoError)?;
                     self.plugin_view.enhance.lut_owner = None;
-                    self.plugin_view
-                        .enhance
-                        .pending
-                        .remove(&(owner, "lut".into()));
                 }
             }
             HostCommand::AttachSubtitle {
@@ -219,21 +231,12 @@ impl IrisWindow {
                     .ok_or(ErrorCode::StaleHandle)?
                     .data
                     .clone();
-                // Append order is preserved: an outstanding mutation of this
-                // track produces backpressure instead of racing another append.
-                let key = format!("overlay:{track}");
-                if self
-                    .plugin_view
-                    .enhance
-                    .pending
-                    .contains_key(&(owner, key.clone()))
-                {
-                    return Err(ErrorCode::Backpressure);
-                }
+                // Append order is preserved in `enhancement_job`: an outstanding mutation
+                // of this track produces backpressure instead of racing another append.
                 self.enhancement_job(
                     action,
                     access,
-                    key,
+                    format!("overlay:{track}"),
                     move |access| {
                         bank.lock().unwrap_or_else(|e| e.into_inner()).submit(
                             &access.owner,
@@ -419,6 +422,11 @@ impl IrisWindow {
         {
             return Err(ErrorCode::Backpressure);
         }
+        if (key.1.starts_with("overlay:") || key.1.starts_with("stream-") || key.1 == "annotations")
+            && self.plugin_view.enhance.pending.contains_key(&key)
+        {
+            return Err(ErrorCode::Backpressure);
+        }
         let serial = self
             .plugin_view
             .enhance
@@ -427,11 +435,6 @@ impl IrisWindow {
             .ok_or(ErrorCode::QuotaExceeded)?;
         self.plugin_view.enhance.sequence = serial;
         let id = Id(serial);
-        if (key.1.starts_with("overlay:") || key.1.starts_with("stream-") || key.1 == "annotations")
-            && self.plugin_view.enhance.pending.contains_key(&key)
-        {
-            return Err(ErrorCode::Backpressure);
-        }
         let binding = action.binding.clone();
         let generation = action.update.generation;
         let receipt = access.background(work)?;
@@ -439,10 +442,9 @@ impl IrisWindow {
         cx.spawn(async move |this, cx| {
             let result = receipt.await.unwrap_or(Err(ErrorCode::Cancelled));
             let _ = this.update(cx, |this, cx| {
-                if this.plugin_view.enhance.pending.get(&key) != Some(&id) {
+                if !this.plugin_view.enhance.finish_job(&key, id) {
                     return;
                 }
-                this.plugin_view.enhance.pending.remove(&key);
                 if !binding.is_live() || generation != this.plugins.generation() {
                     return;
                 }
@@ -518,3 +520,6 @@ impl IrisWindow {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

@@ -19,7 +19,7 @@ fn blob(ledger: &Ledger, owner: &str, cues: &[TimedCue]) -> Arc<Blob> {
         Blob::new(
             ledger,
             owner,
-            crate::plugin_v2::json::encode(&cues, iris_api::v2::CHUNK_LIMIT).unwrap(),
+            crate::bounded_json::encode(&cues, iris_api::v2::CHUNK_LIMIT).unwrap(),
         )
         .unwrap(),
     )
@@ -145,4 +145,32 @@ fn host_clock_interpolates_without_guest_ticks_and_freezes_when_paused_or_buffer
     assert_eq!(clock.position_ms(now + Duration::from_secs(5)), 11_000);
     clock.update(19., 2., false, false, 20., now);
     assert_eq!(clock.position_ms(now + Duration::from_secs(5)), 20_000);
+}
+
+#[test]
+fn submit_rejects_unknown_fields_and_charges_bounded_overlay_bytes() {
+    let ledger = Ledger::default();
+    let generation = Generation::default();
+    let mut bank = OverlayBank::new(ledger.clone(), Id(1), generation, 0);
+    let bad_blob = Arc::new(
+        Blob::new(
+            &ledger,
+            "a",
+            br#"[{"id":"1","start_ms":"0","duration_ms":"1000","layout":{"kind":"scroll"},"content":{"kind":"text","text":"hi","size":20,"color":[1,1,1,1],"bold":false},"rogue":1}]"#
+                .to_vec(),
+        )
+        .unwrap(),
+    );
+    assert_eq!(
+        bank.submit("a", Id(1), generation, "track", Id(1), &bad_blob, false),
+        Err(ErrorCode::InvalidArgument)
+    );
+    let good = blob(&ledger, "a", &[cue(1, 500), cue(2, 1500)]);
+    bank.submit("a", Id(1), generation, "track", Id(1), &good, false)
+        .unwrap();
+    assert!(ledger.used(Some("a"), Resource::OverlayBytes) > 0);
+    bank.revoke("a");
+    assert_eq!(ledger.used(Some("a"), Resource::OverlayBytes), 0);
+    drop((bad_blob, good, bank));
+    assert_eq!(ledger.used(None, Resource::HostBytes), 0);
 }

@@ -4,7 +4,7 @@ use super::super::{
 };
 use super::NetworkExecutor;
 use crate::plugin_v2::{
-    actor::{IoOutcome, Operation, TaskContext},
+    actor::{Operation, TaskContext},
     instance::{Blob, next_id},
     ledger::Resource,
 };
@@ -126,11 +126,10 @@ impl NetworkExecutor {
         {
             return Err(ErrorCode::Denied);
         }
-        let grant =
+        let (grant, url) =
             self.0
                 .grant
-                .request_tracked(&url, kind, origin_grant, self.0.activity.clone())?;
-        let url = normalize_url(&url, kind)?;
+                .request_normalized(&url, kind, origin_grant, self.0.activity.clone())?;
         grant.check_credentials(&url, &headers)?;
         let ws = kind == TransportKind::WebSocket;
         let reservation = self.0.ledger.reserve(
@@ -177,10 +176,8 @@ impl NetworkExecutor {
                     socket,
                 },
             );
-            Ok(IoOutcome::new(
-                serde_json::json!({"stream_handle":Id(id)}),
-                None,
-            ))
+            drop(handles);
+            Ok(this.opened(id, serde_json::json!({"stream_handle":Id(id)})))
         }))
     }
 }

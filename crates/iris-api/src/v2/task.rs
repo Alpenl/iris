@@ -126,6 +126,10 @@ impl Task {
     pub fn authorized(&self, grants: &std::collections::BTreeSet<Capability>) -> bool {
         if matches!(self, Self::SecretRead { .. } | Self::SecretWrite { .. }) {
             grants.contains(&Capability::Secrets) || grants.contains(&Capability::MediaSource)
+        } else if matches!(self, Self::OriginLookup { .. }) {
+            grants.contains(&Capability::NetHttp)
+                || grants.contains(&Capability::NetWs)
+                || grants.contains(&Capability::NetTcp)
         } else {
             self.capability().is_none_or(|cap| grants.contains(&cap))
         }
@@ -188,4 +192,23 @@ pub enum FileHash {
     FullMd5,
     FullSha256,
     SparseSha256V1,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Task;
+    use crate::v2::Capability;
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn origin_lookup_accepts_net_http_net_ws_or_net_tcp() {
+        let task = Task::OriginLookup {
+            origin: "wss://chat.example".into(),
+        };
+        assert!(task.authorized(&BTreeSet::from([Capability::NetHttp])));
+        assert!(task.authorized(&BTreeSet::from([Capability::NetWs])));
+        assert!(task.authorized(&BTreeSet::from([Capability::NetTcp])));
+        assert!(!task.authorized(&BTreeSet::from([Capability::UiModal])));
+        assert!(!task.allowed_in_stream());
+    }
 }

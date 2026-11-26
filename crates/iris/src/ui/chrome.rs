@@ -183,6 +183,7 @@ impl IrisWindow {
 
     pub(super) fn close_overlays(&mut self, cx: &mut Context<Self>) {
         self.overlays.close_all();
+        self.sync_view_timer(cx);
         self.bump_activity(cx);
         cx.notify();
     }
@@ -202,6 +203,7 @@ impl IrisWindow {
         }
         self.chrome.fullscreen = fs;
         self.overlays.dir_popup = DirectoryPopup::Hidden;
+        self.sync_view_timer(cx);
         let pos = window.mouse_position();
         self.chrome.mouse_pos = Some(pos);
         self.chrome.last_pointer_pos = Some(pos);
@@ -530,6 +532,7 @@ impl IrisWindow {
         if self.overlays.dir_popup == DirectoryPopup::Hover && self.directory_hover_allowed(window)
         {
             self.overlays.dir_popup = DirectoryPopup::Hidden;
+            self.sync_view_timer(cx);
             self.bump_activity(cx);
             cx.notify();
         } else if self.chrome.fullscreen && self.chrome.chrome_visible {
@@ -573,6 +576,7 @@ impl IrisWindow {
             );
             if next != self.overlays.dir_popup {
                 self.overlays.dir_popup = next;
+                self.sync_view_timer(cx);
                 cx.notify();
             }
         }

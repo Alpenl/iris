@@ -213,7 +213,7 @@ pub fn classify_nclx(primaries: u16, transfer: u16) -> Option<Colour> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{Colour, classify_icc, classify_nclx};
     use std::path::Path;
 
     const PROFILES: &str = "/System/Library/ColorSync/Profiles";

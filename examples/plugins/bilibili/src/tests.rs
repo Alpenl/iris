@@ -3,6 +3,19 @@ use iris_plugin_sdk::api::v2::{Role, stream::StreamSource};
 use serde_json::json;
 use std::collections::VecDeque;
 
+mod account_lifecycle;
+mod regressions;
+
+impl crate::enhance::CidCache {
+    pub(crate) fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
 #[derive(Default)]
 struct MockHost {
     next: u64,

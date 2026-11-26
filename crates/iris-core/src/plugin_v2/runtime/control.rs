@@ -3,27 +3,14 @@ use crate::{
     logging::{self, EventLevel},
     plugin_v2::{
         actor::{Actor, Executor, Status, Update},
-        auth::BrowserOpen,
         enhancement::AttachmentRegistry,
+        json_error,
     },
     vfs::HttpCancel,
 };
-use iris_api::v2::{
-    ErrorCode, Generation, HostCommand, HostEvent, Id, LogLevel, source::PlaybackSnapshot,
-};
+use iris_api::v2::{ErrorCode, Generation, HostCommand, HostEvent, Id, LogLevel};
 use std::sync::Arc;
 impl Control {
-    /// Directory setup is background-only. The browser hook only queues UI work.
-    pub fn open_window(
-        &mut self,
-        window: Id,
-        generation: Generation,
-        snapshot: Option<PlaybackSnapshot>,
-        browser: BrowserOpen,
-    ) -> Result<(), ErrorCode> {
-        let plan = self.window_preparation(window, generation, snapshot, browser)?;
-        self.attach_window(plan.prepare()?)
-    }
     pub fn advance_window(&mut self, window: Id, generation: Generation) -> Result<(), ErrorCode> {
         self.live()?;
         let state = self
@@ -90,7 +77,8 @@ impl Control {
             return Ok(());
         };
         let actor = self.actor.as_ref().ok_or(ErrorCode::Unsupported)?;
-        let bytes = crate::plugin_v2::json::encode(&event, iris_api::v2::MESSAGE_LIMIT - 512)?;
+        let bytes = crate::bounded_json::encode(&event, iris_api::v2::MESSAGE_LIMIT - 512)
+            .map_err(json_error)?;
         if let Some(cancel) = cancel {
             actor.send_cancellable(window, state.generation, bytes, cancel)
         } else {

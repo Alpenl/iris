@@ -39,20 +39,32 @@ run = _media.run
 SIGNING_ENV = ("IRIS_WINDOWS_PFX", "IRIS_WINDOWS_PFX_PASSWORD", "IRIS_TIMESTAMP_URL",
                "IRIS_MAC_SIGN_IDENTITY", "IRIS_NOTARY_PROFILE", "IRIS_NOTARY_KEYCHAIN")
 
-# Versions verified to ship an SPDX declaration without a standalone notice file.
-# Keep the corresponding checked Cargo.toml in their notice directory.
-METADATA_LICENSES = frozenset("""
-block@0.1.6 convert_case@0.4.0 cranelift-assembler-x64@0.138.0 cranelift-assembler-x64-meta@0.138.0
-cranelift-bitset@0.138.0 cranelift-isle@0.138.0 cranelift-srcgen@0.138.0 dtor@0.0.6 dtor-proc-macro@0.0.5
-dwrote@0.11.5 gloo-timers@0.3.0 hexf-parse@0.2.1 leak@0.1.2 leaky-cow@0.1.1 lyon@1.0.19
-lyon_algorithms@1.0.22 lyon_geom@1.0.20 lyon_path@1.0.19 lyon_tessellation@1.0.23 mac@0.1.1 malloc_buf@0.0.6
-naga@25.0.1 pathfinder_geometry@0.5.1 pathfinder_simd@0.5.6 profiling@1.0.18 profiling-procmacros@1.0.18
-pulley-interpreter@51.0.0 pulley-macros@51.0.0 r-efi@5.3.0 r-efi@6.0.0 seahash@4.1.0 simd_helpers@0.1.0
-stacksafe@0.1.4 stacksafe-macro@0.1.4 svg_fmt@0.4.5 taffy@0.9.0 wasmtime-internal-component-util@51.0.0
-wasmtime-internal-core@51.0.0 wasmtime-internal-jit-debug@51.0.0 wasmtime-internal-jit-icache-coherence@51.0.0
-wasmtime-internal-versioned-export-macros@51.0.0 winapi-i686-pc-windows-gnu@0.4.0 winapi-x86_64-pc-windows-gnu@0.4.0
-zune-inflate@0.2.54
+# Crates verified to ship an SPDX declaration in Cargo.toml without a standalone
+# notice file. Match by crate name and resolve locked versions from Cargo.lock
+# rather than hardcoding brittle crate versions.
+METADATA_LICENSE_CRATES = frozenset("""
+block convert_case cranelift-assembler-x64 cranelift-assembler-x64-meta
+cranelift-bitset cranelift-isle cranelift-srcgen dtor dtor-proc-macro
+dwrote gloo-timers hexf-parse leak leaky-cow lyon
+lyon_algorithms lyon_geom lyon_path lyon_tessellation mac malloc_buf
+naga pathfinder_geometry pathfinder_simd profiling profiling-procmacros
+pulley-interpreter pulley-macros r-efi seahash simd_helpers
+stacksafe stacksafe-macro svg_fmt taffy wasmtime-internal-component-util
+wasmtime-internal-core wasmtime-internal-jit-debug wasmtime-internal-jit-icache-coherence
+wasmtime-internal-versioned-export-macros winapi-i686-pc-windows-gnu winapi-x86_64-pc-windows-gnu
+zune-inflate
 """.split())
+
+
+def resolve_metadata_licenses(lock_path=None):
+    lock = ROOT / "Cargo.lock" if lock_path is None else Path(lock_path)
+    with lock.open("rb") as file:
+        packages = tomllib.load(file).get("package", [])
+    return frozenset(
+        f"{pkg['name']}@{pkg['version']}"
+        for pkg in packages
+        if pkg.get("name") in METADATA_LICENSE_CRATES and pkg.get("version")
+    )
 
 
 def sha(path):
@@ -77,14 +89,18 @@ def application_inputs():
         p
         for directory in ("crates", "Resources", "scripts/release")
         for p in (ROOT / directory).rglob("*")
-        if p.is_file() and p.name != ".DS_Store" and "__pycache__" not in p.parts and p.suffix != ".pyc"
+        if p.is_file()
+        and p.name != ".DS_Store"
+        and "__pycache__" not in p.parts
+        and "IconConcepts" not in p.parts
+        and p.suffix != ".pyc"
     ]
     return {p.relative_to(ROOT).as_posix(): sha(p) for p in sorted(files)}
 
 
 def save_checkpoint(path, state):
     temporary = path.with_suffix(".tmp")
-    temporary.write_text(json.dumps(state, indent=2) + "\n")
+    temporary.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8", newline="\n")
     temporary.replace(path)
 
 
@@ -319,7 +335,7 @@ def rust_notices(destination, env, checkpoint, state):
         vendored = subprocess.run(["cargo", "vendor", "--locked", "--versioned-dirs", str(vendor)],
                                   cwd=ROOT, env=env, check=True, stdout=subprocess.PIPE, text=True)
         config = vendored.stdout.replace(str(vendor).replace("\\", "\\\\"), "rust-vendor")
-        (destination / "cargo-vendor-config.toml").write_text(config)
+        (destination / "cargo-vendor-config.toml").write_text(config, encoding="utf-8", newline="\n")
         state["vendor"] = True
         save_checkpoint(checkpoint, state)
     if not vendor.is_dir() or not (destination / "cargo-vendor-config.toml").is_file():
@@ -330,6 +346,7 @@ def rust_notices(destination, env, checkpoint, state):
     metadata = json.loads(metadata_result.stdout)
     notices = destination / "rust-licenses"
     notices.mkdir(exist_ok=True)
+    allowed_metadata_licenses = resolve_metadata_licenses()
     entries = []
     for package in metadata["packages"]:
         if package["source"] is None:
@@ -340,7 +357,7 @@ def rust_notices(destination, env, checkpoint, state):
         checksum_path = directory / ".cargo-checksum.json"
         if not checksum_path.is_file():
             raise RuntimeError("Vendored crate checksum manifest missing: " + str(directory))
-        checksums = json.loads(checksum_path.read_text())
+        checksums = json.loads(checksum_path.read_text(encoding="utf-8"))
         for relative, digest in checksums["files"].items():
             file = directory / relative
             if not file.is_file() or sha(file) != digest:
@@ -369,7 +386,12 @@ def rust_notices(destination, env, checkpoint, state):
         upstream_notice = bool(files)
         if not files:
             crate = f"{package['name']}@{package['version']}"
-            if crate not in METADATA_LICENSES or not package["license"]:
+            if (
+                crate not in allowed_metadata_licenses
+                or not package["license"]
+                or "Cargo.toml" not in checksums["files"]
+                or not (directory / "Cargo.toml").is_file()
+            ):
                 raise RuntimeError(f"No upstream license notice in vendored crate: {crate}")
             # Preserve the actual published declaration when this version contains no notice file.
             target = notices / directory.name / "Cargo.toml"
@@ -379,7 +401,9 @@ def rust_notices(destination, env, checkpoint, state):
         entries.append({"name": package["name"], "version": package["version"], "license": package["license"],
                         "license_file": package["license_file"], "notices": sorted(files),
                         "notice_basis": "upstream-files" if upstream_notice else "published-SPDX-declaration"})
-    (destination / "rust-license-manifest.json").write_text(json.dumps(entries, indent=2) + "\n")
+    (destination / "rust-license-manifest.json").write_text(
+        json.dumps(entries, indent=2) + "\n", encoding="utf-8", newline="\n"
+    )
     for name in ("LICENSE-MIT", "LICENSE-APACHE"):
         shutil.copy2(ROOT / name, destination / name)
     state["rust_notices"] = True
@@ -416,7 +440,7 @@ def record_file(state, checkpoint, file):
 
 
 def reuse_rust(prior, state, notices, archive_dir):
-    previous = json.loads((prior / "package-checkpoint.json").read_text())
+    previous = json.loads((prior / "package-checkpoint.json").read_text(encoding="utf-8"))
     for name, digest in state["identity"]["application"].items():
         if name.endswith("Cargo.toml") or name in ("Cargo.lock", "deny.toml", "scripts/release/package.py"):
             if previous["identity"]["application"].get(name) != digest:
@@ -487,7 +511,7 @@ def notarize(submission, target, evidence):
                 result["notary_log"] = log_result.stdout
         if log_result.stderr.strip():
             result["notary_log_stderr"] = log_result.stderr.strip()
-    evidence.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
+    evidence.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8", newline="\n")
     if not accepted:
         raise RuntimeError(f"Apple notarization did not accept {target} (status={result.get('status')!r})")
     run(["xcrun", "stapler", "staple", target])
@@ -519,6 +543,76 @@ def _which_trusted(name):
     return candidate.resolve()
 
 
+def _sdk_version_key(path):
+    return tuple(int(part) if part.isdigit() else -1 for part in path.name.split("."))
+
+
+def _windows_signtool():
+    override = os.environ.get("IRIS_SIGNTOOL", "").strip()
+    if override:
+        candidate = Path(override)
+        if not candidate.is_absolute() or not candidate.is_file():
+            raise RuntimeError(f"IRIS_SIGNTOOL must be an absolute path to signtool.exe: {override!r}")
+        return candidate.resolve()
+
+    archs = ("x64", "arm64", "x86")
+    ver_bin = os.environ.get("WindowsSdkVerBinPath", "").strip()
+    if ver_bin:
+        base = Path(ver_bin)
+        if base.is_absolute():
+            for arch in archs:
+                candidate = base / arch / "signtool.exe"
+                if candidate.is_file():
+                    return candidate.resolve()
+
+    sdk_roots = []
+    sdk_dir = os.environ.get("WindowsSdkDir", "").strip()
+    if sdk_dir and Path(sdk_dir).is_absolute():
+        sdk_roots.append(Path(sdk_dir))
+    for env_key in ("ProgramFiles(x86)", "ProgramFiles"):
+        root = os.environ.get(env_key, "").strip()
+        if root and Path(root).is_absolute():
+            sdk_roots.append(Path(root) / "Windows Kits/10")
+
+    sdk_ver = os.environ.get("WindowsSDKVersion", "").strip().rstrip("\\/")
+    for sdk_root in sdk_roots:
+        bin_root = sdk_root / "bin"
+        if not bin_root.is_dir():
+            continue
+        if sdk_ver:
+            for arch in archs:
+                candidate = bin_root / sdk_ver / arch / "signtool.exe"
+                if candidate.is_file():
+                    return candidate.resolve()
+        version_dirs = sorted(
+            (entry for entry in bin_root.iterdir() if entry.is_dir() and entry.name[0].isdigit()),
+            key=_sdk_version_key,
+            reverse=True,
+        )
+        for ver_dir in version_dirs:
+            for arch in archs:
+                candidate = ver_dir / arch / "signtool.exe"
+                if candidate.is_file():
+                    return candidate.resolve()
+        for arch in archs:
+            candidate = bin_root / arch / "signtool.exe"
+            if candidate.is_file():
+                return candidate.resolve()
+
+    for env_key in ("ProgramFiles(x86)", "ProgramFiles"):
+        root = os.environ.get(env_key, "").strip()
+        if root and Path(root).is_absolute():
+            for arch in ("x64", "x86"):
+                candidate = Path(root) / "Windows Kits/8.1/bin" / arch / "signtool.exe"
+                if candidate.is_file():
+                    return candidate.resolve()
+
+    trusted = _which_trusted("signtool.exe") or _which_trusted("signtool")
+    if trusted:
+        return trusted
+    raise RuntimeError("Windows signing verification requires signtool.exe from the Windows SDK or IRIS_SIGNTOOL")
+
+
 def _windows_signer():
     host = _which_trusted("pwsh.exe")
     if not host:
@@ -526,8 +620,30 @@ def _windows_signer():
         host = Path(system_root) / "System32/WindowsPowerShell/v1.0/powershell.exe" if system_root else None
         if host is None or not host.is_file():
             raise RuntimeError("Windows signing requires pwsh.exe or inbox Windows PowerShell")
+        host = host.resolve()
+    signtool = _windows_signtool()
     script = Path(__file__).resolve().with_name("sign-windows.ps1")
-    return [host, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script, "-File"]
+    return [host, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script, "-SignTool", signtool, "-File"]
+
+
+def verify_official_plugins(env, output=None):
+    verify_dir = (
+        (ROOT / "target/plugin-v2/official")
+        if output is None
+        else (Path(output) / "official-plugin-verify")
+    )
+    run(
+        [
+            sys.executable,
+            "-B",
+            ROOT / "scripts/build-official-plugins.py",
+            "--verify-embedded",
+            "--output",
+            str(verify_dir),
+        ],
+        ROOT,
+        env,
+    )
 
 
 def check_plugin_runtime(payload, windows, output):
@@ -539,7 +655,9 @@ def check_plugin_runtime(payload, windows, output):
     identities = [row.get("plugin") for row in receipt.get("plugins", [])]
     if receipt.get("status") != "ok" or receipt.get("protocol") != 2 or receipt.get("abi") != 2 or sorted(identities) != ["iris.guides", "iris.webdav"]:
         raise RuntimeError("Packaged plugin runtime smoke test failed")
-    (output / "plugin-runtime-check.json").write_text(json.dumps(receipt, indent=2) + "\n", encoding="utf-8")
+    (output / "plugin-runtime-check.json").write_text(
+        json.dumps(receipt, indent=2) + "\n", encoding="utf-8", newline="\n"
+    )
 
 
 def sign_payload(payload, executable, frameworks, notices, graph, target, mode, version, windows, output):
@@ -561,7 +679,9 @@ def sign_payload(payload, executable, frameworks, notices, graph, target, mode, 
         if release:
             # The sealed resource records the release requirement. The external manifest records the outcome.
             record["notarization"] = "required; see accompanying build manifest for result"
-    (notices / "package-manifest.json").write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
+    (notices / "package-manifest.json").write_text(
+        json.dumps(record, indent=2) + "\n", encoding="utf-8", newline="\n"
+    )
     if not windows:
         # Locked Wasmtime 51 uses mmap + mprotect for code, not MAP_JIT.
         # Do not disable library validation or general executable page protection.
@@ -611,7 +731,31 @@ def build_installer(payload, output, artifact, version, release):
                  f"/Siris={signer} $f"]
     run([*args, Path(__file__).with_name("windows-installer.iss")])
     if release:
-        run(["signtool", "verify", "/pa", "/all", output / (artifact + "-setup.exe")])
+        run([_windows_signtool(), "verify", "/pa", "/all", output / (artifact + "-setup.exe")])
+
+
+def verify_sdk_files(prefix, files):
+    resolved_prefix = prefix.resolve()
+    for relative, digest in files.items():
+        posix = PurePosixPath(relative)
+        path = Path(relative)
+        if (
+            not relative
+            or "\\" in relative
+            or posix.is_absolute()
+            or path.is_absolute()
+            or path.drive
+            or path.anchor
+            or ".." in posix.parts
+            or ".." in path.parts
+        ):
+            raise RuntimeError("SDK path outside pinned prefix: " + relative)
+        file = resolved_prefix / path
+        resolved = file.resolve()
+        if not resolved.is_relative_to(resolved_prefix):
+            raise RuntimeError("SDK path outside pinned prefix: " + relative)
+        if not resolved.is_file() or sha(resolved) != digest:
+            raise RuntimeError("SDK checksum mismatch: " + relative)
 
 
 def media_source(compliance, manifest):
@@ -651,7 +795,7 @@ def main():
         parser.error(f"only the current 0.0.x workspace version ({workspace_version}) is authorized")
     sdk, output = args.sdk.resolve(), args.output.resolve()
     compliance = sdk / "compliance"
-    manifest = json.loads((compliance / "build-manifest.json").read_text())
+    manifest = json.loads((compliance / "build-manifest.json").read_text(encoding="utf-8"))
     media_archive = media_source(compliance, manifest)
     media_digest = sha(media_archive)
     prefix = sdk / "prefix"
@@ -667,7 +811,7 @@ def main():
     identity["media_source"] = media_digest
     state = {"identity": identity}
     if checkpoint.exists():
-        state = json.loads(checkpoint.read_text())
+        state = json.loads(checkpoint.read_text(encoding="utf-8"))
         if state["identity"] != identity:
             parser.error("Application, SDK, mode or version changed; refusing stale package resume")
     elif args.resume:
@@ -675,13 +819,7 @@ def main():
     if args.package_only and not (state.get("prepared") and state.get("build") and state.get("license_gate")):
         parser.error("--package-only requires --resume and completed preparation")
     # Verify the entire SDK before compiling, including import libraries and headers.
-    for relative, digest in manifest["files"].items():
-        path = Path(relative)
-        file = prefix / path
-        if not windows and (path.is_absolute() or ".." in path.parts or not file.resolve().is_relative_to(prefix)):
-            raise RuntimeError("SDK path outside pinned prefix: " + relative)
-        if not file.is_file() or sha(file) != digest:
-            raise RuntimeError("SDK checksum mismatch: " + relative)
+    verify_sdk_files(prefix, manifest["files"])
     if manifest["ffmpeg"] != {"gpl": False, "version3": False, "nonfree": False, "chromaprint": False, "shared": True}:
         raise RuntimeError("Media manifest license gate rejected")
     for key, value in (("gpl", False), ("libmpv", True), ("cplayer", False)):
@@ -696,7 +834,7 @@ def main():
         if not windows:
             verification_env["DYLD_LIBRARY_PATH"] = str(prefix / "lib")
         verification = run([sys.executable, Path(__file__).with_name("verify-media.py"), "--sdk", sdk], env=verification_env)
-        runtime_evidence.write_text(verification, encoding="utf-8")
+        runtime_evidence.write_text(verification, encoding="utf-8", newline="\n")
         state["runtime_verification"] = sha(runtime_evidence)
         save_checkpoint(checkpoint, state)
     elif not runtime_evidence.is_file() or sha(runtime_evidence) != state.get("runtime_verification"):
@@ -715,7 +853,7 @@ def main():
     env["CARGO_TARGET_DIR"] = str(cargo_target)
     built = output / "unsigned" / ("iris.exe" if windows else "iris")
     if not state.get("build"):
-        run([sys.executable, "-B", ROOT / "scripts/build-official-plugins.py", "--verify-embedded", "--output", ROOT / "Resources/Plugins"], ROOT, env)
+        verify_official_plugins(env, output)
         run(["cargo", "build", "--locked", "--release", "--target", target, "-p", "iris"], ROOT, env)
         built.parent.mkdir(exist_ok=True)
         shutil.copy2(cargo_target / target / "release" / built.name, built)
@@ -797,6 +935,7 @@ def main():
                 "Download these exact source archives alongside the Iris distribution:\n"
                 + "".join(f"{sha(sources[name])}  {filename}\n" for name, filename in sorted(source_names.items())),
                 encoding="utf-8",
+                newline="\n",
             )
         graph = windows_dependencies(executable, prefix, manifest, frameworks) if windows else mac_dependencies(
             executable, prefix, manifest, frameworks, manifest["target"].removeprefix("macos-"))
@@ -836,7 +975,7 @@ def main():
         record_file(state, checkpoint, setup)
     elif release:
         if windows:
-            run(["signtool", "verify", "/pa", "/all", setup])
+            run([_windows_signtool(), "verify", "/pa", "/all", setup])
         else:
             run(["codesign", "--verify", "--strict", setup])
             run(["xcrun", "stapler", "validate", setup])
@@ -855,9 +994,13 @@ def main():
                   "corresponding_source": source_names if args.source_mode == "sidecar" else "embedded"}
         if release and not windows and binary == setup:
             bundle["disk_image_notarization"] = "accepted-and-stapled"
-        (output / (binary.name + ".build-manifest.json")).write_text(json.dumps(bundle, indent=2) + "\n")
+        (output / (binary.name + ".build-manifest.json")).write_text(
+            json.dumps(bundle, indent=2) + "\n", encoding="utf-8", newline="\n"
+        )
     distributed = sorted(p for p in output.glob(artifact + "*") if p.is_file())
-    (output / "SHA256SUMS").write_text("".join(f"{sha(p)}  {p.name}\n" for p in distributed))
+    (output / "SHA256SUMS").write_text(
+        "".join(f"{sha(p)}  {p.name}\n" for p in distributed), encoding="utf-8", newline="\n"
+    )
     print("Packaged:", output, "signing:", package["signing"], "notarization:", package["notarization"])
 
 

@@ -125,9 +125,10 @@ fn controls_share_global_budget_and_window_media_lifetimes_are_independent() {
         ..Generation::default()
     };
     for id in [a, b] {
-        control
-            .open_window(id, gen_a, None, Arc::new(|_, _, _| Err(ErrorCode::Denied)))
+        let plan = control
+            .window_preparation(id, gen_a, None, Arc::new(|_, _, _| Err(ErrorCode::Denied)))
             .unwrap();
+        control.attach_window(plan.prepare().unwrap()).unwrap();
     }
     let media_a = control.windows[&a].media.clone();
     let media_b = control.windows[&b].media.clone();
@@ -256,4 +257,88 @@ fn altered_approval_cannot_be_loaded_against_an_existing_record() {
     let record = f.root.join("packages/installed/fixture.runtime.json");
     std::fs::write(&record, serde_json::to_vec(&changed).unwrap()).unwrap();
     assert!(matches!(f.installer.load(&changed), Err(ErrorCode::Denied)));
+}
+
+#[test]
+fn origin_granted_filter_accepts_net_tcp_only_with_ui_modal() {
+    let event = || HostEvent::OriginGranted {
+        request_id: Id(1),
+        origin: "http://192.168.1.61:9000".into(),
+        grant: Some(Id(7)),
+        insecure_auth: false,
+    };
+    assert!(
+        events::filter(
+            event(),
+            &BTreeSet::from([Capability::UiModal, Capability::NetTcp]),
+            &[],
+        )
+        .unwrap()
+        .is_some()
+    );
+    assert_eq!(
+        events::filter(event(), &BTreeSet::from([Capability::NetTcp]), &[]).err(),
+        Some(ErrorCode::Denied)
+    );
+    assert_eq!(
+        events::filter(event(), &BTreeSet::from([Capability::UiModal]), &[]).err(),
+        Some(ErrorCode::Denied)
+    );
+}
+
+#[test]
+fn attach_window_rollback_on_saturated_actor_allows_clean_retry_with_same_window_id() {
+    let f = Fixture::new(r#"{"ok":[]}"#, vec![Capability::Notifications]);
+    let mut control = f.load();
+    wait(|| control.status() == Status::Ready);
+
+    let first = Control::new_window_id().unwrap();
+    let gen0 = Generation::default();
+    let browser: crate::plugin_v2::auth::BrowserOpen = Arc::new(|_, _, _| Err(ErrorCode::Denied));
+    let plan1 = control
+        .window_preparation(first, gen0, None, browser.clone())
+        .unwrap();
+    control.attach_window(plan1.prepare().unwrap()).unwrap();
+
+    // Exhaust all but 1 Handle for this owner so `services.open_window` succeeds on
+    // attempt 1 while `actor.open_window_with_event` fails inside `attach_window`,
+    // then verify retrying the exact same `second` window Id succeeds cleanly.
+    let used = f
+        .setup
+        .resources
+        .ledger
+        .used(Some(&f.installed.installation_id), Resource::Handle);
+    let hold = f
+        .setup
+        .resources
+        .ledger
+        .reserve(
+            &f.installed.installation_id,
+            &[(Resource::Handle, 128 - used - 1)],
+        )
+        .unwrap();
+
+    let second = Control::new_window_id().unwrap();
+    for _ in 0..9 {
+        let plan = control
+            .window_preparation(second, gen0, None, browser.clone())
+            .unwrap();
+        assert_eq!(
+            control.attach_window(plan.prepare().unwrap()),
+            Err(ErrorCode::QuotaExceeded)
+        );
+    }
+    drop(hold);
+
+    let retry_plan = control
+        .window_preparation(second, gen0, None, browser)
+        .unwrap();
+    control
+        .attach_window(retry_plan.prepare().unwrap())
+        .unwrap();
+
+    control.stop();
+    wait(|| control.is_quiescent());
+    drop(control);
+    wait(|| f.setup.resources.ledger.used(None, Resource::HostBytes) == 0);
 }

@@ -19,10 +19,11 @@ OUTDIR/<test>-<file>.png and Iris's stderr in OUTDIR/iris-stderr.log.
 Latency is measured until mpv reports video-params for the new file; texture
 upload and presentation are not included.
 """
-import argparse, ctypes, json, os, queue, re, runpy, subprocess, sys, tempfile, threading, time
+import argparse, json, os, queue, re, runpy, subprocess, sys, tempfile, threading, time
 
-ControlClient = runpy.run_path(os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                          "control-client.py"))["ControlClient"]
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+ControlClient = runpy.run_path(os.path.join(_SCRIPT_DIR, "control-client.py"))["ControlClient"]
+_sample_process_metrics = runpy.run_path(os.path.join(_SCRIPT_DIR, "benchmark-plugin-v2.py"))["sample_process_metrics"]
 
 _ap = argparse.ArgumentParser(description="Photo edge-case checks for Iris.")
 _ap.add_argument("--repo", default=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
@@ -67,14 +68,21 @@ class Iris:
         self.mpv_msgs = []
         self.log = None
         try:
-            self.log = open(os.path.join(OUT, "iris-stderr.log"), "a", encoding="utf-8")
+            self.log = open(os.path.join(OUT, "iris-stderr.log"), "a", encoding="utf-8", newline="\n")
             env = dict(os.environ, IRIS_CONTROL=self.endpoint,
                        IRIS_SETTINGS=os.path.join(self.private.name, "settings.conf"))
             env.update(IRIS_LOG_DIR=os.path.join(self.private.name, "logs"),
-                       IRIS_PLUGINS=os.path.join(self.private.name, "plugins"),
+                       IRIS_PLUGINS_V2=os.path.join(self.private.name, "plugins-v2"),
                        IRIS_TEST_VAULT=os.path.join(self.private.name, "vault.json"))
-            env.pop("IRIS_LOG", None)
-            env.pop("GPUI_DISABLE_DIRECT_COMPOSITION", None)
+            for stale_var in (
+                "IRIS_LOG",
+                "IRIS_PLUGINS",
+                "IRIS_KEYMAP",
+                "IRIS_PRESETS",
+                "IRIS_EVENTS_LOG",
+                "GPUI_DISABLE_DIRECT_COMPOSITION",
+            ):
+                env.pop(stale_var, None)
             self.proc = subprocess.Popen([BIN], env=env, stderr=subprocess.PIPE,
                                          text=True, encoding="utf-8", errors="replace", bufsize=1)
             self.reader = threading.Thread(target=self._read, daemon=True)
@@ -144,38 +152,8 @@ class Iris:
         return None
 
     def rss_mb(self):
-        if os.name == "nt":
-            from ctypes import wintypes
-
-            class MemoryCounters(ctypes.Structure):
-                _fields_ = [("cb", wintypes.DWORD), ("PageFaultCount", wintypes.DWORD),
-                            ("PeakWorkingSetSize", ctypes.c_size_t), ("WorkingSetSize", ctypes.c_size_t),
-                            ("QuotaPeakPagedPoolUsage", ctypes.c_size_t), ("QuotaPagedPoolUsage", ctypes.c_size_t),
-                            ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t), ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
-                            ("PagefileUsage", ctypes.c_size_t), ("PeakPagefileUsage", ctypes.c_size_t)]
-
-            kernel = ctypes.WinDLL("kernel32", use_last_error=True)
-            psapi = ctypes.WinDLL("psapi", use_last_error=True)
-            kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
-            kernel.OpenProcess.restype = wintypes.HANDLE
-            kernel.CloseHandle.argtypes = [wintypes.HANDLE]
-            kernel.CloseHandle.restype = wintypes.BOOL
-            psapi.GetProcessMemoryInfo.argtypes = [wintypes.HANDLE, ctypes.POINTER(MemoryCounters), wintypes.DWORD]
-            psapi.GetProcessMemoryInfo.restype = wintypes.BOOL
-            handle = kernel.OpenProcess(0x0400 | 0x0010, False, self.proc.pid)
-            if not handle:
-                raise ctypes.WinError(ctypes.get_last_error())
-            try:
-                counters = MemoryCounters()
-                counters.cb = ctypes.sizeof(counters)
-                if not psapi.GetProcessMemoryInfo(handle, ctypes.byref(counters), counters.cb):
-                    raise ctypes.WinError(ctypes.get_last_error())
-                return counters.WorkingSetSize / (1024 * 1024)
-            finally:
-                kernel.CloseHandle(handle)
-        out = subprocess.run(["ps", "-o", "rss=", "-p", str(self.proc.pid)],
-                             capture_output=True, text=True, check=True).stdout.strip()
-        return int(out) / 1024 if out else None
+        ws, _, _ = _sample_process_metrics(self.proc)
+        return ws / (1024 * 1024) if ws is not None else None
 
     def quit(self):
         try:
@@ -353,6 +331,6 @@ try:
 finally:
     iris.quit()
 
-with open(os.path.join(OUT, "results.json"), "a") as fh:
+with open(os.path.join(OUT, "results.json"), "a", encoding="utf-8", newline="\n") as fh:
     fh.write(json.dumps(results, ensure_ascii=False) + "\n")
 print(json.dumps(results, ensure_ascii=False, indent=1))

@@ -18,6 +18,29 @@ const SEAM_HIT: f32 = 14.;
 /// How much of that hit area lies above the bar, over the picture.
 const SEAM_ABOVE: f32 = 6.;
 
+fn timeline_ratios(
+    preview_ratio: Option<f32>,
+    time_pos: f64,
+    cache_duration: f64,
+    duration: f64,
+) -> (f32, f32) {
+    let valid_dur = duration.is_finite() && duration > 0.;
+    let pct = if let Some(r) = preview_ratio.filter(|r| r.is_finite()) {
+        r.clamp(0., 1.)
+    } else if valid_dur && time_pos.is_finite() {
+        (time_pos / duration).clamp(0., 1.) as f32
+    } else {
+        0.
+    };
+    let buf_pct =
+        if valid_dur && time_pos.is_finite() && cache_duration.is_finite() && cache_duration > 0. {
+            ((time_pos + cache_duration) / duration).clamp(0., 1.) as f32
+        } else {
+            0.
+        };
+    (pct, buf_pct)
+}
+
 impl IrisWindow {
     pub(super) fn render_timeline(
         &self,
@@ -74,25 +97,20 @@ impl IrisWindow {
         }
 
         let duration = state.duration;
-        let pct = if let Some(r) = self.chrome.scrub.seek_preview_ratio {
-            r.clamp(0., 1.)
-        } else if duration > 0. {
-            (state.time_pos / duration).clamp(0., 1.) as f32
-        } else {
-            0.
-        };
-        let buf_pct = if duration > 0. && state.cache_duration > 0. {
-            ((state.time_pos + state.cache_duration) / duration).clamp(0., 1.) as f32
-        } else {
-            0.
-        };
+        let valid_dur = duration.is_finite() && duration > 0.;
+        let (pct, buf_pct) = timeline_ratios(
+            self.chrome.scrub.seek_preview_ratio,
+            state.time_pos,
+            state.cache_duration,
+            duration,
+        );
         let active = self.chrome.scrub.timeline_hover || self.chrome.scrub.seeking;
         let track = if active { 4. } else { 2. };
 
         let ab_marks: Vec<AnyElement> = [state.ab_start, state.ab_end]
             .into_iter()
             .flatten()
-            .filter(|time| duration > 0. && *time <= duration)
+            .filter(|time| valid_dur && time.is_finite() && *time >= 0. && *time <= duration)
             .map(|time| {
                 div()
                     .absolute()
@@ -104,11 +122,11 @@ impl IrisWindow {
                     .into_any_element()
             })
             .collect();
-        let chapter_marks: Vec<AnyElement> = if duration > 0. {
+        let chapter_marks: Vec<AnyElement> = if valid_dur {
             state
                 .chapters
                 .iter()
-                .filter(|c| c.time > 0.5 && c.time < duration - 0.5)
+                .filter(|c| c.time.is_finite() && c.time > 0.5 && c.time < duration - 0.5)
                 .map(|c| {
                     let ratio = (c.time / duration).clamp(0., 1.) as f32;
                     div()
@@ -127,7 +145,7 @@ impl IrisWindow {
 
         let annotation_marks: Vec<AnyElement> = session
             .current_media_uri()
-            .filter(|_| session.may_share_current_identity() && duration > 0.)
+            .filter(|_| session.may_share_current_identity() && valid_dur)
             .and_then(|uri| self.store.annotations(&uri))
             .into_iter()
             .flat_map(|a| a.markers.values())
@@ -150,7 +168,7 @@ impl IrisWindow {
                 let b = self.chrome.probes.progress_bounds.get()?;
                 let p = self.chrome.mouse_pos?;
                 let width = f32::from(b.size.width);
-                if width <= 0. || duration <= 0. {
+                if !width.is_finite() || width <= 0. || !valid_dur {
                     return None;
                 }
                 let x = f32::from(p.x - b.origin.x).clamp(0., width);
@@ -216,7 +234,8 @@ impl IrisWindow {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, ev: &MouseDownEvent, _, cx| {
-                    if this.active().session.state().duration <= 0. {
+                    let duration = this.active().session.state().duration;
+                    if !duration.is_finite() || duration <= 0. {
                         return;
                     }
                     this.chrome.scrub.seek_preview_timeout = None;
@@ -279,5 +298,20 @@ impl IrisWindow {
             )
             .children(label)
             .into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::timeline_ratios;
+
+    #[test]
+    fn timeline_ratios_guard_non_finite_inputs_before_clamping() {
+        assert_eq!(timeline_ratios(Some(f32::NAN), 10., 5., 100.), (0.1, 0.15));
+        assert_eq!(timeline_ratios(None, f64::NAN, 5., 100.), (0., 0.));
+        assert_eq!(timeline_ratios(None, 10., f64::INFINITY, 100.), (0.1, 0.));
+        assert_eq!(timeline_ratios(None, 10., 5., f64::INFINITY), (0., 0.));
+        assert_eq!(timeline_ratios(None, 10., 5., f64::NAN), (0., 0.));
+        assert_eq!(timeline_ratios(Some(1.5), 10., 5., 100.), (1., 0.15));
     }
 }

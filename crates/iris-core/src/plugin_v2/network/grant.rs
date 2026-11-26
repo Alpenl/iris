@@ -79,7 +79,6 @@ impl Origin {
 struct ConfirmedOrigin {
     origin: Origin,
     ips: BTreeSet<IpAddr>,
-    private: bool,
     active: AtomicBool,
     cancel: HttpCancel,
     insecure_auth: AtomicBool,
@@ -169,6 +168,24 @@ impl NetworkGrant {
         }
     }
 
+    pub(super) fn has_capability(&self, capability: Capability) -> bool {
+        self.0.capabilities.contains(&capability)
+    }
+    fn allows_origin(&self, kind: TransportKind) -> bool {
+        match kind {
+            TransportKind::Http => self.0.capabilities.iter().any(|c| {
+                matches!(
+                    c,
+                    Capability::NetHttp | Capability::NetWs | Capability::NetTcp
+                )
+            }),
+            TransportKind::WebSocket => {
+                self.has_capability(Capability::NetWs) || self.has_capability(Capability::NetHttp)
+            }
+            TransportKind::Tcp { .. } => self.has_capability(Capability::NetTcp),
+        }
+    }
+
     /// The UI supplies the exact displayed Origin and resolved address set after
     /// confirmation. No discovery/redirect/plugin-form code may call this.
     pub fn confirm_origin(
@@ -178,17 +195,10 @@ impl NetworkGrant {
         ips: &[IpAddr],
     ) -> Result<Id, ErrorCode> {
         self.check_live()?;
-        let allowed = self.0.capabilities.contains(&kind.capability())
-            || (kind == TransportKind::Http
-                && self
-                    .0
-                    .capabilities
-                    .iter()
-                    .any(|c| matches!(c, Capability::NetHttp | Capability::NetWs)));
-        if !allowed {
+        if !self.allows_origin(kind) {
             return Err(ErrorCode::Denied);
         }
-        let (origin, ips, private) = validate_pins(raw, kind, ips)?;
+        let (origin, ips) = validate_pins(raw, kind, ips)?;
         let origin = origin.http_equivalent();
         let cookies = Arc::new(super::cookies::CookieJar::new(
             &self.0.owner,
@@ -216,7 +226,6 @@ impl NetworkGrant {
             Arc::new(ConfirmedOrigin {
                 origin,
                 ips,
-                private,
                 active: AtomicBool::new(true),
                 cancel: HttpCancel::default(),
                 insecure_auth: AtomicBool::new(false),
@@ -249,15 +258,16 @@ impl NetworkGrant {
         kind: TransportKind,
         origin: Option<Id>,
     ) -> Result<Arc<RequestGrant>, ErrorCode> {
-        self.request_tracked(raw, kind, origin, Activity::default())
+        self.request_normalized(raw, kind, origin, Activity::default())
+            .map(|(grant, _)| grant)
     }
-    pub(crate) fn request_tracked(
+    pub(crate) fn request_normalized(
         &self,
         raw: &str,
         kind: TransportKind,
         origin: Option<Id>,
         activity: Activity,
-    ) -> Result<Arc<RequestGrant>, ErrorCode> {
+    ) -> Result<(Arc<RequestGrant>, Url), ErrorCode> {
         self.check_live()?;
         if !self.0.capabilities.contains(&kind.capability()) {
             return Err(ErrorCode::Denied);
@@ -294,7 +304,7 @@ impl NetworkGrant {
             activity,
         });
         request.check_url(&url)?;
-        Ok(request)
+        Ok((request, url))
     }
     pub(crate) fn check_live(&self) -> Result<(), ErrorCode> {
         if self.0.active.load(Ordering::Acquire) {
@@ -312,14 +322,7 @@ impl NetworkGrant {
         kind: TransportKind,
     ) -> Result<iris_api::v2::task_result::OriginResult, ErrorCode> {
         self.check_live()?;
-        let allowed = self.0.capabilities.contains(&kind.capability())
-            || (kind == TransportKind::Http
-                && self
-                    .0
-                    .capabilities
-                    .iter()
-                    .any(|c| matches!(c, Capability::NetHttp | Capability::NetWs)));
-        if !allowed {
+        if !self.allows_origin(kind) {
             return Err(ErrorCode::Denied);
         }
         let origin = Origin::of(&normalize_url(raw, kind)?)?;
@@ -428,6 +431,9 @@ impl RequestGrant {
             return Err(ErrorCode::Denied);
         }
         if let TransportKind::Tcp { tls } = self.kind {
+            if confirmed && http_origin.scheme == if tls { "https" } else { "http" } {
+                return Ok(());
+            }
             let scheme = if tls { "tls" } else { "tcp" };
             return if declaration.tcp_targets.iter().any(|r| {
                 r.host == origin.host
@@ -463,19 +469,16 @@ impl RequestGrant {
             return Err(ErrorCode::Denied);
         }
         let ip = address.ip().to_canonical();
-        if let Some(grant) = &self.origin {
-            if grant.origin == http_origin {
-                if grant.ips.contains(&ip) {
-                    return Ok(());
-                }
-                return Err(ErrorCode::Denied);
+        if let Some(grant) = &self.origin
+            && grant.origin == http_origin
+        {
+            if grant.ips.contains(&ip) {
+                return Ok(());
             }
-            // A private-service redirect may use separately allowed public CDNs;
-            // it never expands its private IP/origin set.
-            if grant.private && address_kind(ip) != AddressKind::Public {
-                return Err(ErrorCode::Denied);
-            }
+            return Err(ErrorCode::Denied);
         }
+        // Redirects off a confirmed origin may only reach separately allowed
+        // public addresses; they never expand a private IP/origin set.
         if address_kind(ip) == AddressKind::Public {
             Ok(())
         } else {
@@ -514,7 +517,33 @@ pub fn normalize_url(raw: &str, kind: TransportKind) -> Result<Url, ErrorCode> {
     {
         return Err(ErrorCode::InvalidArgument);
     }
-    let mut url = Url::parse(raw).map_err(|_| ErrorCode::InvalidArgument)?;
+    let rewritten;
+    let effective = match kind {
+        TransportKind::Tcp { tls: false } if raw.starts_with("tcp://") => {
+            if Url::parse(raw)
+                .map_err(|_| ErrorCode::InvalidArgument)?
+                .port()
+                .is_none()
+            {
+                return Err(ErrorCode::InvalidArgument);
+            }
+            rewritten = format!("http://{}", &raw["tcp://".len()..]);
+            rewritten.as_str()
+        }
+        TransportKind::Tcp { tls: true } if raw.starts_with("tls://") => {
+            if Url::parse(raw)
+                .map_err(|_| ErrorCode::InvalidArgument)?
+                .port()
+                .is_none()
+            {
+                return Err(ErrorCode::InvalidArgument);
+            }
+            rewritten = format!("https://{}", &raw["tls://".len()..]);
+            rewritten.as_str()
+        }
+        _ => raw,
+    };
+    let mut url = Url::parse(effective).map_err(|_| ErrorCode::InvalidArgument)?;
     if !kind.scheme(url.scheme())
         || !url.username().is_empty()
         || url.password().is_some()
@@ -539,7 +568,7 @@ pub(super) fn validate_pins(
     raw: &str,
     kind: TransportKind,
     ips: &[IpAddr],
-) -> Result<(Origin, BTreeSet<IpAddr>, bool), ErrorCode> {
+) -> Result<(Origin, BTreeSet<IpAddr>), ErrorCode> {
     let url = normalize_url(raw, kind)?;
     if ips.is_empty() || ips.len() > 32 {
         return Err(ErrorCode::InvalidArgument);
@@ -569,7 +598,7 @@ pub(super) fn validate_pins(
     {
         return Err(ErrorCode::Denied);
     }
-    Ok((Origin::of(&url)?, ips, private))
+    Ok((Origin::of(&url)?, ips))
 }
 
 fn normalize_host(raw: &str) -> Result<String, ErrorCode> {

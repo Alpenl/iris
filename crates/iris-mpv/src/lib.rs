@@ -9,10 +9,12 @@ use std::fmt;
 use std::ptr;
 use std::sync::Mutex;
 
+mod event;
 pub mod render;
 mod reply;
 pub(crate) mod sys;
 
+pub use event::{EndReason, Event, Format, Value};
 pub use render::RenderHandle;
 
 #[derive(Debug, Clone)]
@@ -71,81 +73,6 @@ fn with_cstr<R>(s: &str, f: impl FnOnce(*const c_char) -> R) -> R {
         let owned = cstr(s);
         f(owned.as_ptr())
     }
-}
-
-/// Value of an observed property.
-#[derive(Debug, Clone, PartialEq)]
-pub enum Value {
-    None,
-    Flag(bool),
-    Int(i64),
-    Double(f64),
-    Str(String),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Format {
-    Flag,
-    Int,
-    Double,
-    Str,
-}
-
-impl Format {
-    fn raw(self) -> sys::mpv_format {
-        match self {
-            Format::Flag => sys::MPV_FORMAT_FLAG,
-            Format::Int => sys::MPV_FORMAT_INT64,
-            Format::Double => sys::MPV_FORMAT_DOUBLE,
-            Format::Str => sys::MPV_FORMAT_STRING,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EndReason {
-    Eof,
-    Stop,
-    Quit,
-    Error,
-    Redirect,
-    Other(i32),
-}
-
-#[derive(Debug, Clone)]
-pub enum Event {
-    Shutdown,
-    CommandReply {
-        id: u64,
-        error: i32,
-    },
-    Log {
-        prefix: String,
-        level: String,
-        text: String,
-    },
-    StartFile(i64),
-    EndFile {
-        reason: EndReason,
-        error: i32,
-        playlist_entry_id: i64,
-    },
-    FileLoaded,
-    VideoReconfig,
-    AudioReconfig,
-    Seek,
-    PlaybackRestart,
-    PropertyChange {
-        id: u64,
-        name: String,
-        value: Value,
-    },
-    QueueOverflow,
-    Hook {
-        userdata: u64,
-        id: u64,
-    },
-    Other(i32),
 }
 
 /// An mpv client handle. The client API is thread-safe. [`Mpv::wait_event`]
@@ -344,7 +271,7 @@ impl Mpv {
             || "loadfile_with_options".into(),
         )?;
         // SAFETY: A successful command returned a valid result node.
-        let id = unsafe { load_entry_id(&result) };
+        let id = unsafe { event::load_entry_id(&result) };
         // SAFETY: The result and its contents are freed exactly once here.
         unsafe { sys::mpv_free_node_contents(&raw mut result) };
         id.ok_or_else(|| Error {
@@ -483,8 +410,8 @@ impl Mpv {
     }
 
     /// Unblocks any pending device-recovery video track query if shutdown skips normal events.
+    #[cfg(target_os = "windows")]
     pub fn abort_video_recovery(&self) {
-        #[cfg(target_os = "windows")]
         self.video_recovery
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -492,26 +419,26 @@ impl Mpv {
     }
 
     /// Restores the active playlist entry ID in `VideoRecovery` after `Event::QueueOverflow`.
+    #[cfg(target_os = "windows")]
     pub fn reseed_video_recovery(&self, entry: Option<i64>) {
-        #[cfg(target_os = "windows")]
         self.video_recovery
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .set_entry(entry);
-        #[cfg(not(target_os = "windows"))]
-        let _ = entry;
     }
 
     /// Waits for the next event. `timeout < 0` waits forever. Returns `None` on timeout.
     pub fn wait_event(&self, timeout: f64) -> Option<Event> {
         let _wait = self.wait_lock.lock().unwrap_or_else(|e| e.into_inner());
-        // SAFETY: `mpv_wait_event` always returns a non-null `mpv_event` pointer valid
-        // until the next `mpv_wait_event` call on this handle.
-        let ev = unsafe { &*sys::mpv_wait_event(self.handle, timeout) };
+        // SAFETY: `mpv_wait_event` returns an `mpv_event` pointer valid until the next
+        // `mpv_wait_event` call on this handle; guard against unexpected null defensively.
+        let raw = unsafe { sys::mpv_wait_event(self.handle, timeout) };
+        if raw.is_null() {
+            return None;
+        }
+        let ev = unsafe { &*raw };
         #[cfg(target_os = "windows")]
-        if ev.event_id == sys::MPV_EVENT_GET_PROPERTY_REPLY
-            && ev.reply_userdata == render::VideoRecovery::QUERY_VID
-        {
+        if ev.event_id == sys::MPV_EVENT_GET_PROPERTY_REPLY && ev.reply_userdata != 0 {
             let vid = if ev.error >= 0 && !ev.data.is_null() {
                 // SAFETY: A successful GET_PROPERTY_REPLY contains mpv_event_property.
                 let prop = unsafe { &*ev.data.cast::<sys::mpv_event_property>() };
@@ -537,92 +464,10 @@ impl Mpv {
             self.video_recovery
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .reply(vid);
+                .reply(ev.reply_userdata, vid);
         }
-        let event = match ev.event_id {
-            sys::MPV_EVENT_NONE => return None,
-            sys::MPV_EVENT_SHUTDOWN => Event::Shutdown,
-            sys::MPV_EVENT_COMMAND_REPLY if ev.reply_userdata != 0 => Event::CommandReply {
-                id: ev.reply_userdata,
-                error: ev.error,
-            },
-            sys::MPV_EVENT_LOG_MESSAGE => {
-                // SAFETY: For `MPV_EVENT_LOG_MESSAGE`, `ev.data` points to `mpv_event_log_message`
-                // whose string fields are valid NUL-terminated C strings.
-                unsafe {
-                    let m = &*(ev.data as *const sys::mpv_event_log_message);
-                    Event::Log {
-                        prefix: lossy(m.prefix),
-                        level: lossy(m.level),
-                        text: lossy(m.text),
-                    }
-                }
-            }
-            sys::MPV_EVENT_START_FILE => {
-                // SAFETY: START_FILE carries an mpv_event_start_file.
-                let data = unsafe { &*ev.data.cast::<sys::mpv_event_start_file>() };
-                Event::StartFile(data.playlist_entry_id)
-            }
-            sys::MPV_EVENT_END_FILE => {
-                // SAFETY: For `MPV_EVENT_END_FILE`, `ev.data` points to `mpv_event_end_file`.
-                let e = unsafe { &*(ev.data as *const sys::mpv_event_end_file) };
-                let reason = match e.reason {
-                    sys::MPV_END_FILE_REASON_EOF => EndReason::Eof,
-                    sys::MPV_END_FILE_REASON_STOP => EndReason::Stop,
-                    sys::MPV_END_FILE_REASON_QUIT => EndReason::Quit,
-                    sys::MPV_END_FILE_REASON_ERROR => EndReason::Error,
-                    sys::MPV_END_FILE_REASON_REDIRECT => EndReason::Redirect,
-                    other => EndReason::Other(other),
-                };
-                Event::EndFile {
-                    reason,
-                    error: e.error,
-                    playlist_entry_id: e.playlist_entry_id,
-                }
-            }
-            sys::MPV_EVENT_FILE_LOADED => Event::FileLoaded,
-            sys::MPV_EVENT_VIDEO_RECONFIG => Event::VideoReconfig,
-            sys::MPV_EVENT_AUDIO_RECONFIG => Event::AudioReconfig,
-            sys::MPV_EVENT_SEEK => Event::Seek,
-            sys::MPV_EVENT_PLAYBACK_RESTART => Event::PlaybackRestart,
-            sys::MPV_EVENT_PROPERTY_CHANGE => {
-                // SAFETY: For `MPV_EVENT_PROPERTY_CHANGE`, `ev.data` points to `mpv_event_property`.
-                let p = unsafe { &*(ev.data as *const sys::mpv_event_property) };
-                let value = if p.data.is_null() {
-                    Value::None
-                } else {
-                    // SAFETY: `p.data` is non-null and its layout is determined by `p.format` per `client.h`.
-                    unsafe {
-                        match p.format {
-                            sys::MPV_FORMAT_FLAG => Value::Flag(*(p.data as *const c_int) != 0),
-                            sys::MPV_FORMAT_INT64 => Value::Int(*(p.data as *const i64)),
-                            sys::MPV_FORMAT_DOUBLE => Value::Double(*(p.data as *const f64)),
-                            sys::MPV_FORMAT_STRING => {
-                                Value::Str(lossy(*(p.data as *const *const c_char)))
-                            }
-                            _ => Value::None,
-                        }
-                    }
-                };
-                // SAFETY: `p.name` is either null or a valid NUL-terminated C string from mpv.
-                let name = unsafe { lossy(p.name) };
-                Event::PropertyChange {
-                    id: ev.reply_userdata,
-                    name,
-                    value,
-                }
-            }
-            sys::MPV_EVENT_QUEUE_OVERFLOW => Event::QueueOverflow,
-            sys::MPV_EVENT_HOOK => {
-                // SAFETY: HOOK carries an mpv_event_hook.
-                let data = unsafe { &*ev.data.cast::<sys::mpv_event_hook>() };
-                Event::Hook {
-                    userdata: ev.reply_userdata,
-                    id: data.id,
-                }
-            }
-            other => Event::Other(other),
-        };
+        // SAFETY: `ev` is valid for the duration of this `wait_lock` guard.
+        let event = unsafe { event::decode_event(ev) }?;
         #[cfg(target_os = "windows")]
         match event {
             Event::StartFile(_)
@@ -640,39 +485,6 @@ impl Mpv {
     }
 }
 
-/// # Safety
-/// `result` must be a valid mpv node returned by a successful command.
-unsafe fn load_entry_id(result: &sys::mpv_node) -> Option<i64> {
-    if result.format != sys::MPV_FORMAT_NODE_MAP {
-        return None;
-    }
-    // SAFETY: A node map owns a valid list, arrays of `num` keys/values, and C strings.
-    unsafe {
-        let list = &*result.u.list;
-        for i in 0..list.num as usize {
-            let key = CStr::from_ptr(*list.keys.add(i));
-            let value = &*list.values.add(i);
-            if key.to_bytes() == b"playlist_entry_id" && value.format == sys::MPV_FORMAT_INT64 {
-                return Some(value.u.int64);
-            }
-        }
-    }
-    None
-}
-
-/// Converts a nullable C string pointer from an mpv event into an owned `String`.
-///
-/// # Safety
-/// `p` must be either null or a valid pointer to a NUL-terminated C string.
-unsafe fn lossy(p: *const c_char) -> String {
-    if p.is_null() {
-        String::new()
-    } else {
-        // SAFETY: Caller guarantees `p` points to a valid NUL-terminated C string when non-null.
-        unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned()
-    }
-}
-
 impl Drop for Mpv {
     fn drop(&mut self) {
         // SAFETY: `self.handle` was created by `mpv_create` and is destroyed once on drop.
@@ -682,9 +494,10 @@ impl Drop for Mpv {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::CStr;
     use std::sync::Arc;
 
-    use super::*;
+    use super::{Error, Mpv, RenderHandle, Result, with_cstr};
 
     fn roundtrip_with_cstr(input: &str) -> String {
         with_cstr(input, |ptr| {

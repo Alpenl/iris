@@ -1,11 +1,21 @@
 //! QR code login, user profile verification, storage quota, and OAuth refresh flows.
 
-use super::super::*;
 use crate::{
-    auth::{AuthMode, BAIDU_APP_ID, QrPollOutcome, StoredSession},
+    BaiduPanPlugin, HttpFlow, OAuthRetry, SECRET_KEY, WindowState,
+    auth::{self, AuthMode, BAIDU_APP_ID, QrPollOutcome, QuotaInfo, StoredSession},
+    qr_png,
     sign::{build_query, encode_query_component},
+    ui,
 };
-use iris_plugin_sdk::api::v2::task::{CredentialBucket, Task};
+use iris_plugin_sdk::{
+    api::v2::{
+        ErrorCode, HostCommand,
+        task::{CredentialBucket, Task},
+    },
+    client::Host,
+    error_message,
+    serde_json::{self, Value},
+};
 
 impl BaiduPanPlugin {
     pub(crate) fn request_user_info(
@@ -41,6 +51,7 @@ impl BaiduPanPlugin {
             Some(20_000),
             None,
             HttpFlow::UserInfo {
+                account_epoch: self.account_epoch,
                 pending_session: session_override.map(Box::new),
                 close_modal,
                 notify_on_success,
@@ -70,7 +81,9 @@ impl BaiduPanPlugin {
             true,
             Some(20_000),
             None,
-            HttpFlow::Quota,
+            HttpFlow::Quota {
+                account_epoch: self.account_epoch,
+            },
             host,
         );
     }
@@ -101,6 +114,7 @@ impl BaiduPanPlugin {
             Some(20_000),
             retry.request_id(),
             HttpFlow::OAuthRefresh {
+                account_epoch: self.account_epoch,
                 base_session: Box::new(source_session.clone()),
                 retry: Box::new(retry),
             },
@@ -121,6 +135,7 @@ impl BaiduPanPlugin {
         &self,
         state: &mut WindowState,
         next_session: StoredSession,
+        next_quota: Option<QuotaInfo>,
         close_modal: bool,
         notify_login: bool,
         host: &mut impl Host,
@@ -134,10 +149,18 @@ impl BaiduPanPlugin {
             value: Some(encoded),
         }) {
             Ok(op) => {
-                state.secret_write_op = Some((op, next_session, close_modal, notify_login));
+                state.set_secret_write(
+                    op,
+                    self.account_epoch,
+                    next_session,
+                    next_quota,
+                    close_modal,
+                    notify_login,
+                    host,
+                );
                 Vec::new()
             }
-            Err(e) => vec![ui::toast(format!("保存凭据失败：{e:?}"))],
+            Err(e) => vec![ui::toast(format!("保存凭据失败：{}", error_message(e)))],
         }
     }
 
@@ -177,7 +200,10 @@ impl BaiduPanPlugin {
                             },
                             host,
                         ) {
-                            vec![ui::toast(format!("下载二维码图片失败：{e:?}"))]
+                            vec![ui::toast(format!(
+                                "下载二维码图片失败：{}",
+                                error_message(e)
+                            ))]
                         } else {
                             Vec::new()
                         }
@@ -267,12 +293,13 @@ impl BaiduPanPlugin {
                             Some(20_000),
                             None,
                             HttpFlow::QrConfirmLogin {
+                                account_epoch: self.account_epoch,
                                 baiduid,
                                 open_modal,
                             },
                             host,
                         ) {
-                            vec![ui::toast(format!("确认扫码登录失败：{e:?}"))]
+                            vec![ui::toast(format!("确认扫码登录失败：{}", error_message(e)))]
                         } else {
                             Vec::new()
                         }
@@ -287,40 +314,55 @@ impl BaiduPanPlugin {
                 }
             }
             HttpFlow::QrConfirmLogin {
+                account_epoch,
                 baiduid,
                 open_modal,
-            } => match auth::extract_qrbdusslogin_session(headers, &baiduid) {
-                Ok(next_session) => {
-                    if self
-                        .request_user_info(
-                            state,
-                            Some(next_session.clone()),
-                            open_modal,
-                            true,
-                            host,
-                        )
-                        .is_err()
-                    {
-                        self.save_session(state, next_session, open_modal, true, host)
-                    } else {
-                        Vec::new()
-                    }
+            } => {
+                if account_epoch != self.account_epoch {
+                    return Vec::new();
                 }
-                Err(msg) => vec![ui::toast(msg)],
-            },
+                match auth::extract_qrbdusslogin_session(headers, &baiduid) {
+                    Ok(next_session) => {
+                        if self
+                            .request_user_info(
+                                state,
+                                Some(next_session.clone()),
+                                open_modal,
+                                true,
+                                host,
+                            )
+                            .is_err()
+                        {
+                            self.save_session(state, next_session, None, open_modal, true, host)
+                        } else {
+                            Vec::new()
+                        }
+                    }
+                    Err(msg) => vec![ui::toast(msg)],
+                }
+            }
             HttpFlow::UserInfo {
+                account_epoch,
                 pending_session,
                 close_modal,
                 notify_on_success,
-            } => self.finish_user_info(
-                state,
-                pending_session,
-                close_modal,
-                notify_on_success,
-                body,
-                host,
-            ),
-            HttpFlow::Quota => {
+            } => {
+                if account_epoch != self.account_epoch {
+                    return Vec::new();
+                }
+                self.finish_user_info(
+                    state,
+                    pending_session,
+                    close_modal,
+                    notify_on_success,
+                    body,
+                    host,
+                )
+            }
+            HttpFlow::Quota { account_epoch } => {
+                if account_epoch != self.account_epoch {
+                    return Vec::new();
+                }
                 if let Ok(json) = serde_json::from_slice::<Value>(body)
                     && let Some(q) = auth::parse_quota(&json)
                 {
@@ -330,17 +372,23 @@ impl BaiduPanPlugin {
                 Vec::new()
             }
             HttpFlow::OAuthRefresh {
+                account_epoch,
                 base_session,
                 retry,
-            } => self.finish_oauth_refresh(
-                state,
-                *base_session,
-                *retry,
-                body,
-                host,
-                now_ms,
-                now_secs,
-            ),
+            } => {
+                if account_epoch != self.account_epoch {
+                    return fail_oauth_retry(&retry, "账号状态已变更，请重新加载");
+                }
+                self.finish_oauth_refresh(
+                    state,
+                    *base_session,
+                    *retry,
+                    body,
+                    host,
+                    now_ms,
+                    now_secs,
+                )
+            }
             _ => Vec::new(),
         }
     }
@@ -365,29 +413,34 @@ impl BaiduPanPlugin {
             .as_deref()
             .cloned()
             .unwrap_or_else(|| self.session.clone());
+        let mut parsed_quota = None;
         let res = match target.mode {
             AuthMode::Cookie => auth::apply_membership_uinfo(&json, &mut target).map(|q| {
-                if let Some(quota) = q {
-                    self.quota = Some(quota);
-                }
+                parsed_quota = q;
             }),
             AuthMode::OpenApi => auth::apply_openapi_uinfo(&json, &mut target),
         };
         match res {
             Ok(()) => {
                 if pending_session.is_some() {
-                    self.save_session(state, target, close_modal, notify_on_success, host)
+                    self.save_session(
+                        state,
+                        target,
+                        parsed_quota,
+                        close_modal,
+                        notify_on_success,
+                        host,
+                    )
                 } else {
+                    if let Some(quota) = parsed_quota {
+                        self.quota = Some(quota);
+                    }
                     let changed = self.session.uid != target.uid
                         || self.session.username != target.username
                         || self.session.vip_type != target.vip_type;
                     self.session = target;
-                    if changed && let Ok(raw) = serde_json::to_string(&self.session) {
-                        let _ = host.submit(&Task::SecretWrite {
-                            bucket: CredentialBucket::Plugin,
-                            key: SECRET_KEY.into(),
-                            value: Some(raw),
-                        });
+                    if changed {
+                        state.submit_background_secret(&self.session, self.account_epoch, host);
                     }
                     self.request_quota(state, host);
                     let mut cmds = self.sync_ui(state);
@@ -450,7 +503,7 @@ impl BaiduPanPlugin {
                         let override_sess = save_after_verify.then(|| base_session.clone());
                         if !save_after_verify {
                             self.session = base_session;
-                            persist_secret(&self.session, host);
+                            state.submit_background_secret(&self.session, self.account_epoch, host);
                         }
                         if let Err(e) = self.request_user_info(
                             state,
@@ -459,7 +512,10 @@ impl BaiduPanPlugin {
                             notify_on_success,
                             host,
                         ) {
-                            vec![ui::toast(format!("校验刷新后的令牌失败：{e:?}"))]
+                            vec![ui::toast(format!(
+                                "校验刷新后的令牌失败：{}",
+                                error_message(e)
+                            ))]
                         } else {
                             Vec::new()
                         }
@@ -473,7 +529,7 @@ impl BaiduPanPlugin {
                         filters,
                     } => {
                         self.session = base_session;
-                        persist_secret(&self.session, host);
+                        state.submit_background_secret(&self.session, self.account_epoch, host);
                         self.begin_browse(
                             state, request_id, source_id, folder_id, cursor, query, filters, true,
                             host, now_ms,
@@ -486,7 +542,7 @@ impl BaiduPanPlugin {
                         variant,
                     } => {
                         self.session = base_session;
-                        persist_secret(&self.session, host);
+                        state.submit_background_secret(&self.session, self.account_epoch, host);
                         self.begin_resolve(
                             state, request_id, &source_id, &entry_id, variant, true, host, now_secs,
                         )
@@ -495,16 +551,6 @@ impl BaiduPanPlugin {
             }
             Err(msg) => fail_oauth_retry(&retry, &msg),
         }
-    }
-}
-
-fn persist_secret(session: &StoredSession, host: &mut impl Host) {
-    if let Ok(raw) = serde_json::to_string(session) {
-        let _ = host.submit(&Task::SecretWrite {
-            bucket: CredentialBucket::Plugin,
-            key: SECRET_KEY.into(),
-            value: Some(raw),
-        });
     }
 }
 

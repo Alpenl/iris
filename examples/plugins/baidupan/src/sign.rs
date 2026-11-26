@@ -2,7 +2,7 @@
 //! (`devuid` + `rand`, aligned with `BaiduPCS-Rust` / `BaiduPCS-Go`), query encoding,
 //! text sanitization, and HTTP body decompression.
 
-use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
+use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, percent_decode_str, utf8_percent_encode};
 
 const LOCATE_MAGIC: &[u8] = b"ebrcUYiuxaZv2XGu7KIYKxUrqfnOfpDF";
 
@@ -48,6 +48,41 @@ pub fn sanitize_text(raw: &str, max_bytes: usize) -> String {
 
 pub fn encode_query_component(raw: &str) -> String {
     utf8_percent_encode(raw, QUERY_ENCODE_SET).to_string()
+}
+
+pub fn percent_decode_utf8(raw: &str) -> Option<String> {
+    percent_decode_str(raw)
+        .decode_utf8()
+        .ok()
+        .map(|s| s.into_owned())
+}
+
+/// Parses `iris-plugin://community.baidupan/<source>/<entry>` (or `plugin://`),
+/// UTF-8 percent-decoding `<source>` and `<entry>` to match `MediaUri::Plugin`.
+pub fn parse_plugin_uri(uri: &str) -> Option<(String, String)> {
+    let rest =
+        strip_prefix_ci(uri, "iris-plugin://").or_else(|| strip_prefix_ci(uri, "plugin://"))?;
+    let mut parts = rest.splitn(3, '/');
+    let plugin_id = percent_decode_utf8(parts.next()?)?;
+    if plugin_id != "community.baidupan" {
+        return None;
+    }
+    let source_id = percent_decode_utf8(parts.next()?)?;
+    let entry_id = percent_decode_utf8(parts.next()?)?;
+    if source_id.is_empty() || entry_id.is_empty() {
+        return None;
+    }
+    Some((source_id, entry_id))
+}
+
+fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
+    if s.len() >= prefix.len()
+        && s.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
+    {
+        Some(&s[prefix.len()..])
+    } else {
+        None
+    }
 }
 
 pub fn build_query(params: &[(&str, String)]) -> String {

@@ -198,7 +198,7 @@ fn rewrite_attributes(
                 | "#EXT-X-I-FRAME-STREAM-INF"
                 | "#EXT-X-IMAGE-STREAM-INF"
                 | "#EXT-X-RENDITION-REPORT" => (RouteKind::Playlist, "m3u8"),
-                "#EXT-X-KEY" | "#EXT-X-SESSION-KEY" => (RouteKind::Media, "key"),
+                "#EXT-X-KEY" | "#EXT-X-SESSION-KEY" => (RouteKind::Key, "key"),
                 "#EXT-X-MAP" => (RouteKind::Media, "mp4"),
                 _ => (RouteKind::Media, "ts"),
             };

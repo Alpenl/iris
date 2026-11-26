@@ -1,10 +1,14 @@
 //! Seeded mutation regression for host-facing parsers. This is bounded mutation
 //! fuzzing, not coverage-guided fuzzing or a substitute for sanitizer campaigns.
-use iris_api::v2::{HostCommand, MESSAGE_LIMIT, Manifest, stream::ManifestFormat, task::Task};
-use iris_core::plugin_v2::json::decode_exact;
+use iris_api::v2::{
+    HostCommand, MESSAGE_LIMIT, Manifest,
+    stream::{ManifestFormat, TrackKind},
+    task::Task,
+};
+use iris_core::bounded_json::decode_exact;
 use iris_core::plugin_v2::{
     package::{Package, Provenance},
-    stream::manifest,
+    stream::{manifest, prepare, remote_manifest},
     validation,
 };
 use std::{path::PathBuf, time::Instant};
@@ -15,6 +19,7 @@ fn exercise(input: &[u8]) {
             text,
             iris_core::plugin_v2::network::TransportKind::Http,
         );
+        let _ = iris_core::plugin_v2::network::parse_consent_origin_url(text);
         let _ = iris_core::plugin_v2::package::validate_path(text);
         for size in [None, Some(0), Some(1024), Some(u64::MAX)] {
             if let Ok(range) =
@@ -30,7 +35,14 @@ fn exercise(input: &[u8]) {
                 let _ = range.content_range();
             }
         }
+        let _ = remote_manifest::parse_hls_attributes(text);
+        let mut bound = 0usize;
+        let _ = remote_manifest::parse_hls_media(text, TrackKind::Video, |_, _, _| {
+            bound += 1;
+            Ok(format!("seg_{bound}"))
+        });
     }
+    let _ = prepare::subtitle_format(input);
     if let Ok(command) = decode_exact::<HostCommand>(input, MESSAGE_LIMIT) {
         let _ = validation::command(&command);
     }
@@ -39,14 +51,12 @@ fn exercise(input: &[u8]) {
         let _ = manifest.validate();
     }
     let _ = Package::from_zip(input, Provenance::User);
-    for format in [ManifestFormat::VirtualHls] {
-        if let Ok(value) = manifest::compile(format, input, &|id, _| {
-            Ok(format!("http://127.0.0.1:1234/{id}"))
-        }) {
-            for document in value.documents {
-                assert!(document.bytes.len() <= manifest::OUTPUT_LIMIT);
-                std::str::from_utf8(&document.bytes).unwrap();
-            }
+    if let Ok(value) = manifest::compile(ManifestFormat::VirtualHls, input, &|id, _| {
+        Ok(format!("http://127.0.0.1:1234/{id}"))
+    }) {
+        for document in value.documents {
+            assert!(document.bytes.len() <= manifest::OUTPUT_LIMIT);
+            std::str::from_utf8(&document.bytes).unwrap();
         }
     }
 }
@@ -54,7 +64,7 @@ fn exercise(input: &[u8]) {
 #[test]
 fn seeded_plugin_parser_mutations() {
     let corpus = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/corpus/plugin-v2");
-    // Valid seeds must actually reach the renderers; malformed-input-only
+    // Valid seeds must actually reach the renderers and parsers; malformed-input-only
     // mutation campaigns would miss most conversion logic.
     manifest::compile(
         ManifestFormat::VirtualHls,
@@ -67,12 +77,37 @@ fn seeded_plugin_parser_mutations() {
         Provenance::User,
     )
     .expect("valid package seed");
+    let hls_media_seed = concat!(
+        "#EXTM3U\n",
+        "#EXT-X-VERSION:7\n",
+        "#EXT-X-TARGETDURATION:4\n",
+        "#EXT-X-MEDIA-SEQUENCE:1\n",
+        "#EXT-X-MAP:URI=\"init.mp4\",BYTERANGE=\"512@0\"\n",
+        "#EXT-X-KEY:METHOD=AES-128,URI=\"key.bin\",IV=0x00000000000000000000000000000001\n",
+        "#EXTINF:3.500,\n",
+        "seg0.m4s\n",
+        "#EXT-X-ENDLIST\n"
+    );
+    remote_manifest::parse_hls_media(hls_media_seed, TrackKind::Video, |_, _, _| {
+        Ok("bound_res".into())
+    })
+    .expect("valid hls media seed");
+    let vtt_seed = b"WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nhello\n";
+    let srt_seed = b"1\n00:00:00,000 --> 00:00:01,500\nhello\n";
+    let ass_seed = b"[Script Info]\nTitle: test\n[Events]\nDialogue: 0,0:00:00.00,0:00:01.00,Default,,0,0,0,,hi\n";
+    assert_eq!(prepare::subtitle_format(vtt_seed), Ok("vtt"));
+    assert_eq!(prepare::subtitle_format(srt_seed), Ok("srt"));
+    assert_eq!(prepare::subtitle_format(ass_seed), Ok("ass"));
     let mut files: Vec<_> = std::fs::read_dir(corpus)
         .unwrap()
         .map(|p| p.unwrap().path())
         .collect();
     files.sort();
-    let seeds: Vec<Vec<u8>> = files.iter().map(|p| std::fs::read(p).unwrap()).collect();
+    let mut seeds: Vec<Vec<u8>> = files.iter().map(|p| std::fs::read(p).unwrap()).collect();
+    seeds.push(hls_media_seed.as_bytes().to_vec());
+    seeds.push(vtt_seed.to_vec());
+    seeds.push(srt_seed.to_vec());
+    seeds.push(ass_seed.to_vec());
     for seed in &seeds {
         exercise(seed);
     }

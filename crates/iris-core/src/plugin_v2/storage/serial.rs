@@ -33,6 +33,16 @@ impl Serial {
 }
 impl Ticket {
     pub fn wait(&self, cancel: &HttpCancel) -> Result<(), ErrorCode> {
+        if cancel.is_cancelled() {
+            return Err(ErrorCode::Cancelled);
+        }
+        let wake_serial = self.serial.clone();
+        let _reg = cancel
+            .register_callback(Arc::new(move || {
+                let _guard = wake_serial.queue.lock().unwrap_or_else(|e| e.into_inner());
+                wake_serial.changed.notify_all();
+            }))
+            .map_err(|_| ErrorCode::Cancelled)?;
         let deadline = Instant::now() + Duration::from_secs(30);
         let mut queue = self.serial.queue.lock().unwrap_or_else(|e| e.into_inner());
         loop {
@@ -42,13 +52,13 @@ impl Ticket {
             if queue.front() == Some(&self.id) {
                 return Ok(());
             }
-            if Instant::now() >= deadline {
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
                 return Err(ErrorCode::Timeout);
-            }
+            };
             queue = self
                 .serial
                 .changed
-                .wait_timeout(queue, Duration::from_millis(20))
+                .wait_timeout(queue, remaining)
                 .unwrap_or_else(|e| e.into_inner())
                 .0;
         }

@@ -10,7 +10,7 @@ use iris_api::v2::{Capability, ErrorCode, Generation, Id, Role, stream::StreamCo
 use std::{
     collections::BTreeSet,
     sync::{Arc, Mutex},
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 struct State {
@@ -40,11 +40,17 @@ impl StreamStore {
         spawn.generation.context = context.version;
         let generation = spawn.generation;
         let actor = Actor::spawn(spawn)?;
-        actor.send(crate::plugin_v2::json::encode(&serde_json::json!({
-            "event":"init", "protocol":2, "abi":2, "host_version":env!("CARGO_PKG_VERSION"),
-            "role":"stream", "generation":generation, "capabilities":transports, "features":["stream_read","stream_context_changed"],
-            "snapshot":null
-        }),iris_api::v2::MESSAGE_LIMIT)?)?;
+        actor.send(
+            crate::bounded_json::encode(
+                &serde_json::json!({
+                    "event":"init", "protocol":2, "abi":2, "host_version":env!("CARGO_PKG_VERSION"),
+                    "role":"stream", "generation":generation, "capabilities":transports, "features":["stream_read","stream_context_changed"],
+                    "snapshot":null
+                }),
+                iris_api::v2::MESSAGE_LIMIT,
+            )
+            .map_err(crate::plugin_v2::json_error)?,
+        )?;
         actor.send_context(
             serde_json::json!({"event":"stream_init","session":session,"generation":generation}),
             blob,
@@ -171,25 +177,12 @@ impl Reader for GuestReader {
                 .read(self.resource.clone(), offset, len, self.size)?;
             (ticket, state.expires)
         };
-        let deadline = Instant::now() + Duration::from_secs(30);
-        loop {
-            if cancel.is_cancelled() {
-                return Err(ErrorCode::Cancelled);
-            }
-            if Instant::now() >= deadline {
-                return Err(ErrorCode::Timeout);
-            }
-            match ticket.receive(Duration::from_millis(20)) {
-                Err(ErrorCode::Timeout) => (),
-                result => {
-                    check_expiry(expires)?;
-                    if cancel.is_cancelled() {
-                        return Err(ErrorCode::Cancelled);
-                    }
-                    return result;
-                }
-            }
+        let result = ticket.receive_cancellable(cancel, Duration::from_secs(30))?;
+        check_expiry(expires)?;
+        if cancel.is_cancelled() {
+            return Err(ErrorCode::Cancelled);
         }
+        Ok(result)
     }
 }
 fn check_expiry(expires: Option<Id>) -> Result<(), ErrorCode> {

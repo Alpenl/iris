@@ -189,6 +189,148 @@ impl Drop for ClientWatch {
     }
 }
 
+/// Parsed and security-validated HTTP/1.1 loopback relay request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HttpMethod {
+    Get,
+    Head,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ParsedHttpRequest<'a> {
+    pub(crate) method: HttpMethod,
+    pub(crate) path: &'a str,
+    pub(crate) range: Option<&'a str>,
+}
+
+/// Strict loopback HTTP/1.1 request validation failure with canonical HTTP status mapping.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HttpRequestError {
+    BadRequest,
+    Forbidden,
+    MethodNotAllowed,
+    PayloadTooLarge,
+    RangeNotSatisfiable,
+}
+
+impl HttpRequestError {
+    pub(crate) const fn status_code(self) -> u16 {
+        match self {
+            Self::BadRequest => 400,
+            Self::Forbidden => 403,
+            Self::MethodNotAllowed => 405,
+            Self::PayloadTooLarge => 413,
+            Self::RangeNotSatisfiable => 416,
+        }
+    }
+
+    pub(crate) const fn reason_phrase(self) -> &'static str {
+        match self {
+            Self::BadRequest => "Bad Request",
+            Self::Forbidden => "Forbidden",
+            Self::MethodNotAllowed => "Method Not Allowed",
+            Self::PayloadTooLarge => "Payload Too Large",
+            Self::RangeNotSatisfiable => "Range Not Satisfiable",
+        }
+    }
+}
+
+/// Strictly parses and validates an HTTP/1.1 `GET`/`HEAD` request targeted at a loopback relay.
+///
+/// Enforces:
+/// - HTTP/1.1 complete header block with no trailing bytes (`400`)
+/// - Single exact `Host == expected_host` and no browser `Origin`/`Sec-Fetch-*` headers (`403`)
+/// - `GET` or `HEAD` method only (`405`)
+/// - No `Transfer-Encoding` and no non-zero/duplicate/invalid `Content-Length` (`400`/`413`)
+///   so unread request body bytes cannot trigger `ClientHub::dispatch_event` self-cancellation
+/// - At most one valid UTF-8 `Range` header (`416`)
+pub(crate) fn parse_http_request<'a>(
+    raw: &'a [u8],
+    expected_host: &str,
+) -> Result<ParsedHttpRequest<'a>, HttpRequestError> {
+    let mut slots = [httparse::EMPTY_HEADER; 64];
+    let mut request = httparse::Request::new(&mut slots);
+    let used = match request.parse(raw) {
+        Ok(httparse::Status::Complete(n)) => n,
+        _ => return Err(HttpRequestError::BadRequest),
+    };
+    if request.version != Some(1) {
+        return Err(HttpRequestError::BadRequest);
+    }
+    let method_str = request.method.ok_or(HttpRequestError::BadRequest)?;
+    let path = request
+        .path
+        .filter(|p| !p.is_empty())
+        .ok_or(HttpRequestError::BadRequest)?;
+
+    let mut host_seen = false;
+    let mut transfer_encoding = false;
+    let mut content_length_seen = false;
+    let mut content_length_err = None;
+    let mut range: Option<&'a str> = None;
+    let mut range_err = false;
+
+    for h in request.headers {
+        if h.name.eq_ignore_ascii_case("origin")
+            || (h.name.len() >= 10 && h.name.as_bytes()[..10].eq_ignore_ascii_case(b"sec-fetch-"))
+        {
+            return Err(HttpRequestError::Forbidden);
+        }
+        if h.name.eq_ignore_ascii_case("host") {
+            if host_seen || h.value != expected_host.as_bytes() {
+                return Err(HttpRequestError::Forbidden);
+            }
+            host_seen = true;
+        } else if h.name.eq_ignore_ascii_case("transfer-encoding") {
+            transfer_encoding = true;
+        } else if h.name.eq_ignore_ascii_case("content-length") {
+            let value = h.value.trim_ascii();
+            if content_length_seen || value.is_empty() || !value.iter().all(u8::is_ascii_digit) {
+                content_length_err = Some(HttpRequestError::BadRequest);
+            } else if value.iter().any(|&b| b != b'0') {
+                content_length_err.get_or_insert(HttpRequestError::PayloadTooLarge);
+            } else if value != b"0" {
+                content_length_err = Some(HttpRequestError::BadRequest);
+            }
+            content_length_seen = true;
+        } else if h.name.eq_ignore_ascii_case("range") {
+            if range.is_some() {
+                range_err = true;
+            } else if let Ok(value) = std::str::from_utf8(h.value) {
+                range = Some(value);
+            } else {
+                range_err = true;
+            }
+        }
+    }
+
+    if !host_seen {
+        return Err(HttpRequestError::Forbidden);
+    }
+    let method = match method_str {
+        "GET" => HttpMethod::Get,
+        "HEAD" => HttpMethod::Head,
+        _ => return Err(HttpRequestError::MethodNotAllowed),
+    };
+    if transfer_encoding {
+        return Err(HttpRequestError::BadRequest);
+    }
+    if let Some(err) = content_length_err {
+        return Err(err);
+    }
+    if used != raw.len() {
+        return Err(HttpRequestError::BadRequest);
+    }
+    if range_err {
+        return Err(HttpRequestError::RangeNotSatisfiable);
+    }
+    Ok(ParsedHttpRequest {
+        method,
+        path,
+        range,
+    })
+}
+
 /// Reads an HTTP/1.1 request header block terminated by `\r\n\r\n` within `timeout` and `max_bytes`.
 pub(crate) fn read_request(
     socket: &mut TcpStream,
@@ -285,7 +427,9 @@ pub(crate) fn write_chunk_cancellable(
 pub(crate) fn is_adaptive_manifest(bytes: &[u8]) -> bool {
     let bytes = bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(bytes);
     let trimmed = bytes.trim_ascii_start();
-    trimmed.starts_with(b"#EXTM3U")
+    trimmed
+        .get(..7)
+        .is_some_and(|p| p.eq_ignore_ascii_case(b"#EXTM3U"))
         || trimmed == b"<"
         || (trimmed.len() >= 2
             && trimmed[0] == b'<'
@@ -303,6 +447,135 @@ pub(crate) fn is_adaptive_prefix_undecided(bytes: &[u8]) -> bool {
         .unwrap_or(bytes)
         .trim_ascii_start();
     trimmed.is_empty()
-        || (trimmed.len() < 7 && b"#EXTM3U".starts_with(trimmed))
+        || (trimmed.len() < 7 && b"#EXTM3U"[..trimmed.len()].eq_ignore_ascii_case(trimmed))
         || (trimmed.len() < 2 && trimmed[0] == b'<')
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        HttpMethod, HttpRequestError, ParsedHttpRequest, is_adaptive_manifest,
+        is_adaptive_prefix_undecided, parse_http_request,
+    };
+
+    const HOST: &str = "127.0.0.1:43210";
+
+    #[test]
+    fn parse_http_request_accepts_valid_get_head_and_zero_content_length() {
+        let req = b"GET /stream/item.m3u8 HTTP/1.1\r\nHost: 127.0.0.1:43210\r\nRange: bytes=0-1023\r\nContent-Length: 0\r\n\r\n";
+        assert_eq!(
+            parse_http_request(req, HOST),
+            Ok(ParsedHttpRequest {
+                method: HttpMethod::Get,
+                path: "/stream/item.m3u8",
+                range: Some("bytes=0-1023"),
+            })
+        );
+        let head = b"HEAD /seg.ts HTTP/1.1\r\nHost: 127.0.0.1:43210\r\n\r\n";
+        assert_eq!(
+            parse_http_request(head, HOST),
+            Ok(ParsedHttpRequest {
+                method: HttpMethod::Head,
+                path: "/seg.ts",
+                range: None,
+            })
+        );
+    }
+
+    #[test]
+    fn parse_http_request_distinguishes_status_codes_and_rejects_bodies() {
+        assert_eq!(
+            parse_http_request(b"GET /a HTTP/1.0\r\nHost: 127.0.0.1:43210\r\n\r\n", HOST),
+            Err(HttpRequestError::BadRequest)
+        );
+        assert_eq!(
+            parse_http_request(b"GET /a HTTP/1.1\r\n\r\n", HOST),
+            Err(HttpRequestError::Forbidden)
+        );
+        assert_eq!(
+            parse_http_request(b"GET /a HTTP/1.1\r\nHost: evil.example\r\n\r\n", HOST),
+            Err(HttpRequestError::Forbidden)
+        );
+        assert_eq!(
+            parse_http_request(
+                b"GET /a HTTP/1.1\r\nHost: 127.0.0.1:43210\r\nOrigin: https://evil.example\r\n\r\n",
+                HOST
+            ),
+            Err(HttpRequestError::Forbidden)
+        );
+        assert_eq!(
+            parse_http_request(
+                b"GET /a HTTP/1.1\r\nHost: 127.0.0.1:43210\r\nSec-Fetch-Site: cross-site\r\n\r\n",
+                HOST
+            ),
+            Err(HttpRequestError::Forbidden)
+        );
+        assert_eq!(
+            parse_http_request(
+                b"POST /a HTTP/1.1\r\nHost: 127.0.0.1:43210\r\nContent-Length: 5\r\n\r\nhello",
+                HOST
+            ),
+            Err(HttpRequestError::MethodNotAllowed)
+        );
+        assert_eq!(
+            parse_http_request(
+                b"GET /a HTTP/1.1\r\nHost: 127.0.0.1:43210\r\nTransfer-Encoding: chunked\r\n\r\n",
+                HOST
+            ),
+            Err(HttpRequestError::BadRequest)
+        );
+        assert_eq!(
+            parse_http_request(
+                b"GET /a HTTP/1.1\r\nHost: 127.0.0.1:43210\r\nContent-Length: 5\r\n\r\nhello",
+                HOST
+            ),
+            Err(HttpRequestError::PayloadTooLarge)
+        );
+        assert_eq!(
+            parse_http_request(
+                b"GET /a HTTP/1.1\r\nHost: 127.0.0.1:43210\r\nContent-Length: 0\r\nContent-Length: 0\r\n\r\n",
+                HOST
+            ),
+            Err(HttpRequestError::BadRequest)
+        );
+        assert_eq!(
+            parse_http_request(
+                b"GET /a HTTP/1.1\r\nHost: 127.0.0.1:43210\r\n\r\nextra",
+                HOST
+            ),
+            Err(HttpRequestError::BadRequest)
+        );
+        assert_eq!(
+            parse_http_request(
+                b"GET /a HTTP/1.1\r\nHost: 127.0.0.1:43210\r\nRange: bytes=0-1\r\nRange: bytes=2-3\r\n\r\n",
+                HOST
+            ),
+            Err(HttpRequestError::RangeNotSatisfiable)
+        );
+        assert_eq!(HttpRequestError::BadRequest.status_code(), 400);
+        assert_eq!(HttpRequestError::Forbidden.status_code(), 403);
+        assert_eq!(HttpRequestError::MethodNotAllowed.status_code(), 405);
+        assert_eq!(HttpRequestError::PayloadTooLarge.status_code(), 413);
+        assert_eq!(HttpRequestError::RangeNotSatisfiable.status_code(), 416);
+    }
+
+    #[test]
+    fn adaptive_prefix_helpers_track_leading_whitespace_bom_and_partial_headers() {
+        let mut padded_hls = vec![b' '; 128];
+        padded_hls.extend_from_slice(b"#EXTM3U\n");
+        assert!(is_adaptive_prefix_undecided(&padded_hls[..64]));
+        assert!(!is_adaptive_manifest(&padded_hls[..64]));
+        assert!(is_adaptive_prefix_undecided(&padded_hls[..131])); // 128 spaces + "#EX"
+        assert!(is_adaptive_manifest(&padded_hls));
+        assert!(!is_adaptive_prefix_undecided(&padded_hls));
+
+        let bom_xml = b"\xef\xbb\xbf  \n\t<?xml version=\"1.0\"?><MPD/>";
+        assert!(is_adaptive_prefix_undecided(&bom_xml[..2]));
+        assert!(is_adaptive_prefix_undecided(&bom_xml[..6]));
+        assert!(is_adaptive_manifest(bom_xml));
+
+        let mp4 = b"\x00\x00\x00\x18ftypisom";
+        assert!(!is_adaptive_prefix_undecided(&mp4[..1]));
+        assert!(!is_adaptive_manifest(mp4));
+    }
 }

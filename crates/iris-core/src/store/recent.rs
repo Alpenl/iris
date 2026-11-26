@@ -345,7 +345,7 @@ impl Store {
     }
 
     pub fn push_recent_path(&mut self, path: &Path) {
-        self.push_recent(&MediaUri::Local(path.to_path_buf()));
+        self.push_recent(&MediaUri::from(path));
     }
 
     /// Backfills display titles for existing recent plugin entries when a catalog page loads

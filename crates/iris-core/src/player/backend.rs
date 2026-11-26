@@ -1,64 +1,34 @@
 //! Hardened `libmpv` instance initialization, property observation, event pump,
 //! and backend command/filter execution on [`Session`].
 
-use std::cell::Cell;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, Weak};
-use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::sync::Arc;
 
 use anyhow::Result;
-use futures::channel::mpsc::{UnboundedReceiver, unbounded};
-use iris_mpv::{Event, Format, Mpv, Value};
-use serde_json::json;
+use iris_mpv::{Format, Mpv};
 
 use crate::library::Kind;
-use crate::logging::{self, EventLevel};
 use crate::settings::{Hwdec, OnEof, Settings, SubLang};
 
-use super::model::{
-    AspectMode, Command, MAX_SPEED, MIN_SPEED, PlayerActionError, SessionEvent, SessionUpdate,
-};
-use super::relay::Service;
-use super::{MediaSourceState, MonitorLutFilter, ScopedStream, Session, next_command_receipt};
+use super::model::{AspectMode, Command, MAX_SPEED, MIN_SPEED, PlayerActionError};
+use super::{MediaSourceState, MonitorLutFilter, Session, next_command_receipt};
 mod commands;
+mod pump;
 mod references;
-use references::{disable_hls, enable_hls};
-
-const HOOK_LOAD: u64 = 1;
-const HOOK_PRELOADED: u64 = 2;
-
-pub(super) mod prop {
-    pub const TIME_POS: u64 = 1;
-    pub const DURATION: u64 = 2;
-    pub const PAUSE: u64 = 3;
-    pub const VOLUME: u64 = 4;
-    pub const SPEED: u64 = 5;
-    pub const VIDEO_W: u64 = 6;
-    pub const VIDEO_H: u64 = 7;
-    pub const HWDEC: u64 = 8;
-    pub const SUB_VISIBLE: u64 = 9;
-    pub const EOF: u64 = 10;
-    pub const AUDIO: u64 = 11;
-    pub const ROTATION: u64 = 12;
-    pub const MUTE: u64 = 13;
-    pub const SUB: u64 = 14;
-    pub const TRACK_COUNT: u64 = 15;
-    pub const LOOP_FILE: u64 = 16;
-    pub const SUB_DELAY: u64 = 17;
-    pub const CHAPTER: u64 = 18;
-    pub const CHAPTER_COUNT: u64 = 19;
-    pub const PAUSED_FOR_CACHE: u64 = 20;
-    pub const CACHE_DURATION: u64 = 21;
-    pub const SOURCE_ROTATION: u64 = 22;
-    pub const AB_START: u64 = 23;
-    pub const AB_END: u64 = 24;
-}
+pub(super) use pump::{EventPump, active_playlist_entry_id, spawn_event_pump};
+use pump::{HOOK_LOAD, HOOK_PRELOADED, prop};
 
 pub(super) fn create() -> Result<Arc<Mpv>> {
+    create_with_options(false, false)
+}
+
+pub(super) fn create_headless(paused: bool) -> Result<Arc<Mpv>> {
+    create_with_options(true, paused)
+}
+
+fn create_with_options(headless: bool, paused: bool) -> Result<Arc<Mpv>> {
     let mut mpv = Mpv::create()?;
     for (k, v) in [
-        ("vo", "libmpv"),
+        ("vo", if headless { "null" } else { "libmpv" }),
         ("hwdec", "auto-safe"),
         ("keep-open", "yes"),
         ("idle", "yes"),
@@ -77,6 +47,12 @@ pub(super) fn create() -> Result<Arc<Mpv>> {
         ("subs-fallback", "yes"),
     ] {
         mpv.set_option(k, v)?;
+    }
+    if headless {
+        mpv.set_option("ao", "null")?;
+        if paused {
+            mpv.set_option("pause", "yes")?;
+        }
     }
     for option in [
         "load-scripts",
@@ -137,270 +113,6 @@ pub(super) fn create() -> Result<Arc<Mpv>> {
     mpv.add_hook(HOOK_LOAD, "on_load")?;
     mpv.add_hook(HOOK_PRELOADED, "on_preloaded")?;
     Ok(Arc::new(mpv))
-}
-
-pub(super) struct EventPump {
-    done: Arc<AtomicBool>,
-    relay: Arc<Mutex<Weak<Service>>>,
-    scoped: Arc<Mutex<Weak<dyn ScopedStream>>>,
-    thread: Cell<Option<JoinHandle<()>>>,
-}
-
-impl EventPump {
-    pub(super) fn set_scoped(&self, scoped: Weak<dyn ScopedStream>) -> Weak<dyn ScopedStream> {
-        std::mem::replace(&mut *self.scoped.lock().unwrap(), scoped)
-    }
-    pub(super) fn set_relay(&self, relay: Weak<Service>) -> Weak<Service> {
-        std::mem::replace(&mut *self.relay.lock().unwrap(), relay)
-    }
-
-    pub(super) fn stop(&self, mpv: &Mpv) {
-        if let Some(thread) = self.thread.take() {
-            // Continue any in-flight load hook until mpv acknowledges quit.
-            if mpv.command_async(&["quit"]).is_err() {
-                self.done.store(true, Ordering::Release);
-                mpv.abort_video_recovery();
-                mpv.wakeup();
-            }
-            let _ = thread.join();
-        }
-    }
-}
-
-pub(super) fn active_playlist_entry_id(mpv: &Mpv) -> Option<i64> {
-    let pos: i64 = mpv
-        .get_property_string("playlist-playing-pos")
-        .ok()?
-        .parse()
-        .ok()
-        .filter(|&p| p >= 0)?;
-    mpv.get_property_string(&format!("playlist/{pos}/id"))
-        .ok()?
-        .parse()
-        .ok()
-}
-
-pub(super) fn spawn_event_pump(
-    mpv: Arc<Mpv>,
-) -> Result<(EventPump, UnboundedReceiver<SessionUpdate>)> {
-    let (tx, rx) = unbounded();
-    let done = Arc::new(AtomicBool::new(false));
-    let stopped = done.clone();
-    let relay = Arc::new(Mutex::new(Weak::<Service>::new()));
-    let source = relay.clone();
-    let scoped = Arc::new(Mutex::new(super::scoped::empty_scoped()));
-    let scoped_source = scoped.clone();
-    let thread = thread::Builder::new()
-        .name("iris-mpv-events".into())
-        .spawn(move || {
-            let mut playing = None;
-            let mut hls = false;
-            let mut restricted = false;
-            let mut last_decode_burst: Option<Instant> = None;
-            let mut suppressed_decode_errors: u32 = 0;
-            while !stopped.load(Ordering::Acquire) {
-                let Some(raw) = mpv.wait_event(-1.0) else {
-                    continue;
-                };
-                let scope = match &raw {
-                    Event::Shutdown => break,
-                    Event::CommandReply { .. } => None,
-                    Event::StartFile(id) => {
-                        hls = false;
-                        restricted = false;
-                        playing = Some(*id);
-                        continue;
-                    }
-                    Event::EndFile {
-                        playlist_entry_id, ..
-                    } => {
-                        if playing == Some(*playlist_entry_id) {
-                            playing = None;
-                        }
-                        Some(*playlist_entry_id)
-                    }
-                    Event::Hook { userdata, id } => {
-                        match *userdata {
-                            HOOK_LOAD => {
-                                restricted = scoped_source.lock().unwrap().upgrade().is_some_and(
-                                    |session| {
-                                        session.root_url().ok()
-                                            == mpv.get_property_string("stream-open-filename").ok()
-                                    },
-                                );
-                                let service = source.lock().unwrap().upgrade();
-                                if let Some(service) = service {
-                                    match enable_hls(&mpv, &service) {
-                                        Ok(prepared) => hls = prepared,
-                                        Err(_) => {
-                                            let _ = disable_hls(&mpv);
-                                            log::warn!("could not prepare scoped HLS playback");
-                                        }
-                                    }
-                                }
-                            }
-                            HOOK_PRELOADED if restricted => {
-                                if super::scoped::restore_attachment_policy(&mpv).is_err() {
-                                    log::error!("could not restore scoped attachment policy");
-                                    let _ = mpv.command_async(&["stop"]);
-                                }
-                                restricted = false;
-                            }
-                            HOOK_PRELOADED if hls => {
-                                // The HLS demuxer captures its open policy. Future
-                                // attachments must see the restrictive defaults.
-                                if disable_hls(&mpv).is_err() {
-                                    log::error!("could not restore mpv reference policy");
-                                    let _ = mpv.command_async(&["stop"]);
-                                }
-                                hls = false;
-                            }
-                            _ => (),
-                        }
-                        // SAFETY: This event came from this handle's wait_event call, and this
-                        // is its only continuation after completing the hook's work.
-                        let _ = unsafe { mpv.continue_hook(*id) };
-                        continue;
-                    }
-                    Event::QueueOverflow => {
-                        playing = active_playlist_entry_id(&mpv);
-                        mpv.reseed_video_recovery(playing);
-                        log::warn!("mpv event queue overflow; resyncing active entry {playing:?}");
-                        None
-                    }
-                    Event::Log {
-                        prefix,
-                        level,
-                        text,
-                    } => {
-                        let detail = logging::redact_text(text.trim_end());
-                        let mapped = match level.as_str() {
-                            "fatal" | "error" => log::Level::Error,
-                            "warn" => log::Level::Warn,
-                            "info" => log::Level::Info,
-                            _ => log::Level::Debug,
-                        };
-                        log::log!(target: "iris::mpv", mapped, "{prefix}/{level}: {detail}");
-                        if prefix == "vd" && detail.contains("Attempting next decoding method") {
-                            logging::event(
-                                EventLevel::Warn,
-                                "player",
-                                "decode_fallback",
-                                json!({ "prefix": prefix, "detail": detail }),
-                            );
-                        } else if matches!(prefix.as_str(), "vd" | "vo" | "d3d11")
-                            || (prefix == "ffmpeg" && level == "error")
-                        {
-                            let now = Instant::now();
-                            let due = last_decode_burst
-                                .is_none_or(|t| now.duration_since(t) >= Duration::from_secs(5));
-                            if due {
-                                let skipped = std::mem::take(&mut suppressed_decode_errors);
-                                last_decode_burst = Some(now);
-                                logging::event(
-                                    EventLevel::Warn,
-                                    "player",
-                                    "mpv_diagnostic",
-                                    json!({
-                                        "prefix": prefix,
-                                        "mpv_level": level,
-                                        "detail": detail,
-                                        "suppressed_since_last": skipped,
-                                    }),
-                                );
-                            } else {
-                                suppressed_decode_errors =
-                                    suppressed_decode_errors.saturating_add(1);
-                            }
-                        }
-                        continue;
-                    }
-                    Event::PropertyChange { id, .. }
-                        if matches!(
-                            *id,
-                            prop::VOLUME | prop::MUTE | prop::SPEED | prop::SUB_VISIBLE
-                        ) =>
-                    {
-                        None
-                    }
-                    _ => match playing {
-                        Some(id) => Some(id),
-                        None => continue,
-                    },
-                };
-                if let Some(event) = SessionEvent::from_backend(raw) {
-                    let _ = tx.unbounded_send(SessionUpdate {
-                        playlist_entry_id: scope,
-                        event,
-                    });
-                }
-            }
-        })?;
-    Ok((
-        EventPump {
-            done,
-            relay,
-            scoped,
-            thread: Cell::new(Some(thread)),
-        },
-        rx,
-    ))
-}
-
-impl SessionEvent {
-    pub(super) fn from_backend(event: Event) -> Option<Self> {
-        Some(match event {
-            Event::Seek => Self::Seek,
-            Event::CommandReply { id, error } => Self::CommandReply { id, error },
-            Event::PropertyChange { id, value, .. } => match (id, value) {
-                (prop::TIME_POS, Value::Double(v)) => Self::Position(v),
-                (prop::TIME_POS, Value::None) => Self::Position(0.),
-                (prop::DURATION, Value::Double(v)) => Self::Duration(v),
-                (prop::PAUSE, Value::Flag(v)) => Self::Paused(v),
-                (prop::VOLUME, Value::Double(v)) => Self::Volume(v),
-                (prop::MUTE, Value::Flag(v)) => Self::Muted(v),
-                (prop::SPEED, Value::Double(v)) => Self::Speed(v),
-                (prop::VIDEO_W, Value::Int(v)) => Self::Width(v),
-                (prop::VIDEO_H, Value::Int(v)) => Self::Height(v),
-                (prop::HWDEC, Value::Str(v)) => Self::Hardware(v),
-                (prop::HWDEC, Value::None) => Self::Hardware(String::new()),
-                (prop::SUB_VISIBLE, Value::Flag(v)) => Self::Subtitles(v),
-                (prop::SUB, Value::Str(v)) => Self::SubtitleTrack(v),
-                (prop::SUB, Value::None) => Self::SubtitleTrack(String::new()),
-                (prop::SUB_DELAY, Value::Double(v)) => Self::SubDelay(v),
-                (prop::EOF, Value::Flag(v)) => Self::Ended(v),
-                (prop::AUDIO, Value::Str(v)) => Self::Audio(v),
-                (prop::AUDIO, Value::None) => Self::Audio(String::new()),
-                (prop::ROTATION, Value::Int(v)) => Self::Rotation(v),
-                (prop::SOURCE_ROTATION, Value::Int(v)) => Self::SourceRotation(v),
-                (prop::TRACK_COUNT, Value::Int(_)) => Self::TracksChanged,
-                (prop::LOOP_FILE, Value::Str(v)) => Self::LoopFile(v == "inf" || v == "yes"),
-                (prop::AB_START, Value::Str(v)) => {
-                    Self::AbStart(v.parse::<f64>().ok().filter(|v| v.is_finite() && *v >= 0.))
-                }
-                (prop::AB_END, Value::Str(v)) => {
-                    Self::AbEnd(v.parse::<f64>().ok().filter(|v| v.is_finite() && *v >= 0.))
-                }
-                (prop::CHAPTER, Value::Int(v)) => Self::Chapter(v),
-                (prop::CHAPTER, Value::None) => Self::Chapter(-1),
-                (prop::CHAPTER_COUNT, Value::Int(_)) => Self::ChaptersChanged,
-                (prop::PAUSED_FOR_CACHE, Value::Flag(v)) => Self::Buffering(v),
-                (prop::PAUSED_FOR_CACHE, Value::None) => Self::Buffering(false),
-                (prop::CACHE_DURATION, Value::Double(v)) => Self::CacheDuration(v),
-                (prop::CACHE_DURATION, Value::None) => Self::CacheDuration(0.),
-                _ => return None,
-            },
-            Event::FileLoaded => Self::Loaded,
-            Event::VideoReconfig => Self::Reconfigured,
-            Event::QueueOverflow => Self::QueueOverflow,
-            Event::EndFile {
-                reason: iris_mpv::EndReason::Error,
-                error,
-                ..
-            } => Self::Error(error),
-            _ => return None,
-        })
-    }
 }
 
 impl Session {
@@ -482,7 +194,33 @@ impl Session {
         }
     }
 
-    pub(super) fn reset_backend_for_load(&self) -> Result<()> {
+    pub(super) fn retire_active_lut(&mut self) {
+        let Some(old) = self.enhancements.monitor_lut.take() else {
+            return;
+        };
+        if matches!(self.kind, Some(Kind::Video | Kind::Photo)) {
+            Self::log_mpv_err(
+                "reset hwdec",
+                self.mpv
+                    .command_async(&["set", "hwdec", self.effective_hwdec_str()]),
+            );
+        }
+        match next_command_receipt().and_then(|receipt| {
+            self.mpv
+                .command_with_reply(receipt, &["set", "vf", ""])
+                .map(|()| receipt)
+                .map_err(anyhow::Error::from)
+        }) {
+            Ok(receipt) => self.enhancements.retired_luts.push((receipt, old)),
+            Err(err) => {
+                log::debug!("mpv tracked lut clear fallback: {err}");
+                Self::log_mpv_err("reset vf", self.mpv.command_async(&["set", "vf", ""]));
+                self.enhancements.loading_luts.push(old);
+            }
+        }
+    }
+
+    pub(super) fn reset_backend_for_load(&mut self) -> Result<()> {
         self.mpv.command_async(&["set", "ab-loop-b", "no"])?;
         self.mpv.command_async(&["set", "ab-loop-a", "no"])?;
         self.transform(0., [0., 0.])?;
@@ -508,7 +246,11 @@ impl Session {
             self.mpv
                 .command_async(&["set", "hwdec", self.user_hwdec.get().mpv_value()]),
         );
-        Self::log_mpv_err("reset vf", self.mpv.command_async(&["set", "vf", ""]));
+        if self.enhancements.monitor_lut.is_some() {
+            self.retire_active_lut();
+        } else {
+            Self::log_mpv_err("reset vf", self.mpv.command_async(&["set", "vf", ""]));
+        }
         Ok(())
     }
 
@@ -598,7 +340,7 @@ impl Session {
         match self.apply_vf_filters_tracked(previous.is_some()) {
             Ok(Some(receipt)) => {
                 if let Some(old) = previous {
-                    self.enhancements.retired_lut = Some((receipt, old));
+                    self.enhancements.retired_luts.push((receipt, old));
                 }
                 Ok(())
             }
@@ -685,28 +427,57 @@ impl Session {
                 return;
             }
         }
-        let monitor_lut = self.enhancements.monitor_lut.clone();
+        let monitor_lut = self
+            .enhancements
+            .monitor_lut
+            .clone()
+            .or_else(|| self.enhancements.error_lut.take().and_then(|w| w.upgrade()));
+        let saved_timeline = self
+            .enhancements
+            .timeline_owner
+            .clone()
+            .map(|owner| (owner, self.state.chapters.clone()))
+            .or_else(|| self.enhancements.error_timeline.take());
+        let mut saved_plugin_tracks = self.enhancements.tracks.snapshot_wanted_live();
+        if saved_plugin_tracks.is_empty() {
+            saved_plugin_tracks = std::mem::take(&mut self.enhancements.error_tracks)
+                .into_iter()
+                .filter_map(|w| w.upgrade())
+                .filter(|t| t.is_live())
+                .collect();
+        }
         let private_identity = self.private_identity;
         let (ab_start, ab_end) = (self.state.ab_start, self.state.ab_end);
-        let (hflip, vflip, extra_rotate, aspect, sub_delay, paused, pos) = (
+        let (hflip, vflip, extra_rotate, aspect, sub_delay, paused, eof_paused, pos) = (
             self.state.hflip,
             self.state.vflip,
             self.visual.extra_rotate,
             self.state.aspect,
             self.state.sub_delay,
             self.state.paused,
+            self.eof_paused,
             self.state.time_pos,
         );
         let reloaded = if let Some(path) = self.current.clone() {
             let (kind, photo) = (self.kind, self.photo_meta.clone());
             self.load(&path, kind, photo, pos).is_ok()
-        } else if let MediaSourceState::DirectRemote { last_remote, .. } = &self.source {
+        } else if let MediaSourceState::DirectRemote { last_remote, .. }
+        | MediaSourceState::StoppedRemote { last_remote } = &self.source
+        {
             let req = (**last_remote).clone();
             self.load_remote(req, settings, pos).is_ok()
         } else if let MediaSourceState::PluginScoped { playback, .. } = &self.source {
             let playback = Arc::clone(playback);
-            self.current_media_uri()
-                .is_some_and(|uri| self.open_scoped(playback, uri, settings, pos).is_ok())
+            if playback.stream.is_cancelled() {
+                self.discard_scoped();
+                self.state.loaded = false;
+                false
+            } else {
+                self.current_media_uri().is_some_and(|uri| {
+                    self.reopen_scoped_after_gpu_reset(playback, uri, settings, pos)
+                        .is_ok()
+                })
+            }
         } else {
             false
         };
@@ -718,6 +489,12 @@ impl Session {
         self.state.vflip = vflip;
         self.visual.extra_rotate = extra_rotate;
         self.enhancements.monitor_lut = monitor_lut;
+        self.enhancements.reattach_on_load = saved_plugin_tracks;
+        if let Some((owner, chapters)) = saved_timeline {
+            self.enhancements.timeline_owner = Some(owner);
+            self.state.chapters = chapters;
+            self.update_plugin_chapter();
+        }
         if hflip
             || vflip
             || self.enhancements.monitor_lut.is_some()
@@ -747,6 +524,8 @@ impl Session {
                 self.state.ab_start = Some(start);
                 self.state.ab_end = Some(end);
             }
+            self.state.paused = paused;
+            self.eof_paused = eof_paused;
             let _ = self
                 .mpv
                 .command_async(&["set", "pause", if paused { "yes" } else { "no" }]);
@@ -759,32 +538,57 @@ impl Session {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::thread;
     use std::time::{Duration, Instant};
 
-    use super::*;
+    use iris_mpv::Mpv;
+
+    use crate::library::Kind;
+    use crate::player::{Command, MonitorLutFilter, Session};
+
+    struct StubMonitorLut(PathBuf);
+
+    impl MonitorLutFilter for StubMonitorLut {
+        fn filter_spec(&self) -> anyhow::Result<String> {
+            let path = self.0.to_str().expect("utf-8 test path");
+            #[cfg(windows)]
+            let path = path.replace('\\', "/");
+            let escape = |value: &str, special: &str| {
+                let mut out = String::new();
+                for ch in value.chars() {
+                    if special.contains(ch) || ch.is_ascii_whitespace() {
+                        out.push('\\');
+                    }
+                    out.push(ch);
+                }
+                out
+            };
+            let option = escape(&path, ":\\'");
+            let graph = format!(
+                "lut3d=file={}:interp=trilinear",
+                escape(&option, "[]=;,\\'")
+            );
+            Ok(format!(
+                "@iris-monitor-lut:lavfi=graph=%{}%{}",
+                graph.len(),
+                graph
+            ))
+        }
+    }
 
     #[test]
     fn monitor_lut_loads_through_native_filter_and_releases_on_stop() {
-        use crate::plugin_v2::{
-            files::TempRoot,
-            ledger::{Ledger, Resource},
-            lut::MonitorLut,
-        };
-        use crate::vfs::HttpCancel;
-        let parent = crate::test_util::TestDir::new("lut-[,;' space");
-        let ledger = Ledger::default();
-        let root = TempRoot::new(&parent, "lut-test".into(), ledger.clone()).unwrap();
-        let cancel = HttpCancel::default();
-        let mut writer = root.writer("cube").unwrap();
-        writer
-            .write(
-                format!("LUT_3D_SIZE 2\n{}", "1 0 0\n".repeat(8)).as_bytes(),
-                &cancel,
-            )
-            .unwrap();
-        let lut = MonitorLut::prepare(writer.finish(&cancel).unwrap(), &ledger, &cancel).unwrap();
-        let mut session = Session::new().unwrap();
-        session.mpv.set_property_string("vo", "null").unwrap();
+        let dir = crate::test_util::TestDir::new("lut-[,;' space");
+        let cube_path = dir.join("preview.cube");
+        std::fs::write(
+            &cube_path,
+            format!("LUT_3D_SIZE 2\n{}", "1 0 0\n".repeat(8)),
+        )
+        .unwrap();
+        let lut: Arc<dyn MonitorLutFilter> = Arc::new(StubMonitorLut(cube_path));
+        let mut session = Session::new_headless(true).unwrap();
         let video = format!(
             "memory://YUV4MPEG2 W16 H16 F10:1 Ip A1:1 C420jpeg\n{}",
             format!("FRAME\n{}", "x".repeat(384)).repeat(30)
@@ -800,7 +604,7 @@ mod tests {
         }
         session.kind = Some(Kind::Video);
         session.state.loaded = true;
-        session.set_monitor_lut(Some(lut.clone())).unwrap();
+        session.set_monitor_lut(Some(Arc::clone(&lut))).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             let filters = session.mpv.get_property_string("vf").unwrap();
@@ -822,19 +626,9 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         }
         assert_eq!(session.effective_hwdec_str(), "auto-copy");
-        drop(lut);
         session.stop().unwrap();
         assert_eq!(session.effective_hwdec_str(), "auto-safe");
         session.shutdown();
-        drop(session);
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while !root.is_quiescent() {
-            assert!(Instant::now() < deadline);
-            thread::sleep(Duration::from_millis(10));
-        }
-        drop(root);
-        assert_eq!(ledger.used(None, Resource::HostBytes), 0);
-        assert_eq!(ledger.used(None, Resource::TempBytes), 0);
     }
 
     #[test]

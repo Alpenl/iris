@@ -1,7 +1,7 @@
 use super::{
     NetworkGrant, TransportKind,
     cookies::CookieJar,
-    normalize_url,
+    parse_consent_origin_url,
     raw::{self, RawRequest, RawState},
 };
 mod socket_tasks;
@@ -130,6 +130,17 @@ impl NetworkExecutor {
             .map_err(|_| ErrorCode::Cancelled)?;
         Ok((handle, busy))
     }
+
+    fn opened(&self, id: u64, value: serde_json::Value) -> IoOutcome {
+        let weak = Arc::downgrade(&self.0);
+        IoOutcome::new(value, None).on_discard(move || {
+            if let Some(inner) = weak.upgrade() {
+                // Until delivery is acknowledged, the guest cannot close this
+                // handle. Cancellation or a dropped mailbox must reclaim it.
+                let _ = Self(inner).close(id);
+            }
+        })
+    }
 }
 
 impl Executor for NetworkExecutor {
@@ -148,12 +159,7 @@ impl Executor for NetworkExecutor {
                 if context.role != Role::Control {
                     return Err(ErrorCode::Denied);
                 }
-                let kind = if normalize_url(&origin, TransportKind::WebSocket).is_ok() {
-                    TransportKind::WebSocket
-                } else {
-                    normalize_url(&origin, TransportKind::Http)?;
-                    TransportKind::Http
-                };
+                let (_, kind) = parse_consent_origin_url(&origin)?;
                 let grant = self.0.grant.clone();
                 let activity = self.0.activity.start();
                 Ok(Operation::blocking(move || {
@@ -196,13 +202,12 @@ impl Executor for NetworkExecutor {
                     return Err(ErrorCode::InvalidArgument);
                 }
                 raw::validate_headers(&headers)?;
-                let grant = self.0.grant.request_tracked(
+                let (grant, url) = self.0.grant.request_normalized(
                     &url,
                     TransportKind::Http,
                     origin_grant,
                     self.0.activity.clone(),
                 )?;
-                let url = normalize_url(&url, TransportKind::Http)?;
                 grant.check_credentials(&url, &headers)?;
                 let body = body_handle
                     .map(|id| blobs.get(&id.0).cloned().ok_or(ErrorCode::StaleHandle))
@@ -269,7 +274,8 @@ impl Executor for NetworkExecutor {
                         return Err(ErrorCode::Cancelled);
                     }
                     handles.http.insert(id, handle);
-                    Ok(IoOutcome::new(result, None))
+                    drop(handles);
+                    Ok(this.opened(id, result))
                 }))
             }
             Task::HttpRead { handle, len } => {
@@ -410,6 +416,7 @@ fn metadata(id: u64, state: &RawState) -> Result<serde_json::Value, ErrorCode> {
         ),
         RawState::Closed => Err(ErrorCode::BadState),
     }?;
-    crate::plugin_v2::json::encode(&value, iris_api::v2::MESSAGE_LIMIT - 1024)?;
+    crate::bounded_json::encode(&value, iris_api::v2::MESSAGE_LIMIT - 1024)
+        .map_err(crate::plugin_v2::json_error)?;
     Ok(value)
 }

@@ -2,6 +2,7 @@
 name = "iris-v2-contract-guest"
 version = "0.0.2"
 edition = "2024"
+rust-version = "1.100"
 publish = false
 
 [lib]

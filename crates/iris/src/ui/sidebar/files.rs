@@ -1,5 +1,5 @@
 //! Unified `Files` sidebar view: 3-variant `DirRow` (`Up`, `Item(CatalogItem)`, `LoadMore`)
-//! driving local directories, built-in `iris.webdav`, external `MediaSource` plugins,
+//! driving local directories, `MediaSource` plugins,
 //! and favorites with a single virtualized renderer.
 
 use std::ops::Range;
@@ -120,7 +120,9 @@ impl IrisWindow {
                                         })),
                                 ),
                         )
-                        .child(self.render_source_filters(cx))
+                        .when(!self.plugin_view.source_filters.is_empty(), |d| {
+                            d.child(self.render_source_filters(cx))
+                        })
                         .when(loading, |d| {
                             d.child(
                                 div()

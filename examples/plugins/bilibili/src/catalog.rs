@@ -4,9 +4,13 @@
 //! Bangumi/PGC (`bangumi/follow/list`, `pgc/season/index/result`, `pgc/view/web/season`),
 //! Cloud History (`history/cursor`), Live (`xlive`), and multi-P UGC folders.
 
+mod cards;
+mod paging;
 mod parser;
 
-pub use parser::{cover_resource, parse_browse_response, strip_em};
+pub use cards::{cover_resource, strip_em};
+pub(crate) use paging::{PageCache, PageTarget};
+pub use parser::parse_browse_response;
 
 use crate::{
     auth::{StoredSession, WbiKeys},
@@ -17,6 +21,7 @@ use std::collections::{BTreeMap, BTreeSet};
 pub struct BrowsePlan {
     pub url: String,
     pub needs_wbi: bool,
+    pub needs_mid: bool,
     pub kind: BrowseKind,
 }
 
@@ -36,7 +41,9 @@ pub enum BrowseKind {
         page_num: u32,
     },
     Dynamic,
-    FavFolders,
+    FavFolders {
+        query: Option<String>,
+    },
     FavItems {
         folder_id: String,
         media_id: String,
@@ -62,6 +69,25 @@ pub enum BrowseKind {
         tab: String,
         page_num: u32,
     },
+}
+
+impl BrowseKind {
+    pub fn requires_auth(&self) -> bool {
+        match self {
+            Self::Dynamic
+            | Self::FavFolders { .. }
+            | Self::FavItems { .. }
+            | Self::BangumiFollow { .. }
+            | Self::History => true,
+            Self::Live { tab, .. } => tab == "following",
+            Self::Recommend { .. }
+            | Self::Search { .. }
+            | Self::Popular { .. }
+            | Self::BangumiIndex { .. }
+            | Self::SeasonEpisodes { .. }
+            | Self::UgcPages { .. } => false,
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -96,6 +122,7 @@ pub fn plan_browse(
                     wbi::unsigned_query(&params)
                 ),
                 needs_wbi: false,
+                needs_mid: false,
                 kind: BrowseKind::FavItems {
                     folder_id: folder.to_owned(),
                     media_id: media_id.to_owned(),
@@ -110,6 +137,7 @@ pub fn plan_browse(
                     wbi::encode_query_component(season_id)
                 ),
                 needs_wbi: false,
+                needs_mid: false,
                 kind: BrowseKind::SeasonEpisodes {
                     folder_id: folder.to_owned(),
                 },
@@ -122,6 +150,7 @@ pub fn plan_browse(
                     wbi::encode_query_component(bvid)
                 ),
                 needs_wbi: false,
+                needs_mid: false,
                 kind: BrowseKind::UgcPages {
                     folder_id: folder.to_owned(),
                     bvid: bvid.to_owned(),
@@ -160,6 +189,9 @@ pub fn plan_browse(
             ("page_size", "20".into()),
         ];
         let query_str = if let Some(mixin) = wbi.mixin() {
+            if now_secs == 0 {
+                return Err("系统时钟不可用，无法生成 B站 WBI 签名".into());
+            }
             wbi::sign_wbi_query(&params, &mixin, now_secs)
         } else {
             wbi::unsigned_query(&params)
@@ -167,6 +199,7 @@ pub fn plan_browse(
         return Ok(BrowsePlan {
             url: format!("https://api.bilibili.com/x/web-interface/wbi/search/type?{query_str}"),
             needs_wbi: wbi.mixin().is_none(),
+            needs_mid: false,
             kind: BrowseKind::Search {
                 search_type,
                 order,
@@ -190,6 +223,9 @@ pub fn plan_browse(
                 ("feed_version", "V8".into()),
             ];
             let query_str = if let Some(mixin) = wbi.mixin() {
+                if now_secs == 0 {
+                    return Err("系统时钟不可用，无法生成 B站 WBI 签名".into());
+                }
                 wbi::sign_wbi_query(&params, &mixin, now_secs)
             } else {
                 wbi::unsigned_query(&params)
@@ -199,6 +235,7 @@ pub fn plan_browse(
                     "https://api.bilibili.com/x/web-interface/wbi/index/top/feed/rcmd?{query_str}"
                 ),
                 needs_wbi: wbi.mixin().is_none(),
+                needs_mid: false,
                 kind: BrowseKind::Recommend { page_num },
             })
         }
@@ -226,6 +263,7 @@ pub fn plan_browse(
             Ok(BrowsePlan {
                 url,
                 needs_wbi: false,
+                needs_mid: false,
                 kind: BrowseKind::Popular { tab, page_num },
             })
         }
@@ -243,32 +281,41 @@ pub fn plan_browse(
                     wbi::unsigned_query(&params)
                 ),
                 needs_wbi: false,
+                needs_mid: false,
                 kind: BrowseKind::Dynamic,
             })
         }
         "favorites" => {
-            if !session.is_authenticated() || session.dede_user_id.is_empty() {
+            if !session.is_authenticated() {
                 return Err("请先登录哔哩哔哩账号以读取云端收藏夹".into());
             }
+            let folder_query = query
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned);
             Ok(BrowsePlan {
                 url: format!(
                     "https://api.bilibili.com/x/v3/fav/folder/created/list-all?up_mid={}",
                     wbi::encode_query_component(&session.dede_user_id)
                 ),
                 needs_wbi: false,
-                kind: BrowseKind::FavFolders,
+                needs_mid: session.dede_user_id.is_empty(),
+                kind: BrowseKind::FavFolders {
+                    query: folder_query,
+                },
             })
         }
         "bangumi" => {
+            let explicit_tab = filters.get("tab").map(String::as_str);
+            let needs_mid = session.is_authenticated()
+                && session.dede_user_id.is_empty()
+                && explicit_tab.is_none_or(|t| t.starts_with("follow_"));
             let default_tab = if session.is_authenticated() && !session.dede_user_id.is_empty() {
                 "follow_1"
             } else {
                 "index_1"
             };
-            let tab = filters
-                .get("tab")
-                .map(String::as_str)
-                .unwrap_or(default_tab);
+            let tab = explicit_tab.unwrap_or(default_tab);
             if let Some(ft) = tab.strip_prefix("follow_")
                 && session.is_authenticated()
                 && !session.dede_user_id.is_empty()
@@ -279,6 +326,7 @@ pub fn plan_browse(
                         wbi::encode_query_component(&session.dede_user_id)
                     ),
                     needs_wbi: false,
+                    needs_mid: false,
                     kind: BrowseKind::BangumiFollow {
                         follow_type: ft.to_owned(),
                         page_num,
@@ -291,6 +339,7 @@ pub fn plan_browse(
                         "https://api.bilibili.com/pgc/season/index/result?season_type={st}&type=1&order=2&page={page_num}&pagesize=20"
                     ),
                     needs_wbi: false,
+                    needs_mid,
                     kind: BrowseKind::BangumiIndex {
                         season_type: st.to_owned(),
                         page_num,
@@ -310,6 +359,7 @@ pub fn plan_browse(
                     wbi::encode_query_component(view_at)
                 ),
                 needs_wbi: false,
+                needs_mid: false,
                 kind: BrowseKind::History,
             })
         }
@@ -325,6 +375,7 @@ pub fn plan_browse(
                         "https://api.live.bilibili.com/xlive/web-ucenter/user/following?page={page_num}&page_size=20"
                     ),
                     needs_wbi: false,
+                    needs_mid: false,
                     kind: BrowseKind::Live { tab, page_num },
                 })
             } else {
@@ -333,6 +384,7 @@ pub fn plan_browse(
                         "https://api.live.bilibili.com/xlive/web-interface/v1/second/getListByArea?sort=online&page={page_num}&page_size=20"
                     ),
                     needs_wbi: false,
+                    needs_mid: false,
                     kind: BrowseKind::Live {
                         tab: "hot".into(),
                         page_num,

@@ -47,11 +47,16 @@ enum CurrentFile {
     Path(PathBuf),
 }
 
-struct Inner {
+struct Shared {
     network: NetworkGrant,
     ledger: Ledger,
     capabilities: BTreeSet<Capability>,
-    root: Arc<TempRoot>,
+    temp_dir: PathBuf,
+    root: Mutex<Option<Arc<TempRoot>>>,
+}
+
+struct Inner {
+    shared: Arc<Shared>,
     state: Mutex<State>,
     activity: Activity,
     cancel: HttpCancel,
@@ -61,18 +66,20 @@ struct Inner {
 pub struct FileExecutor(Arc<Inner>);
 
 impl FileExecutor {
-    /// Create on a host background worker; directory I/O is never done by an import.
+    /// Lightweight constructor; `TempRoot` is created lazily on the first artifact write.
     pub fn new(setup: FileSetup) -> Result<Self, ErrorCode> {
-        let root = TempRoot::new(
-            &setup.temporary_directory,
-            setup.network.owner().into(),
-            setup.ledger.clone(),
-        )?;
-        Ok(Self(Arc::new(Inner {
+        Ok(Self::from_shared(Arc::new(Shared {
             network: setup.network,
             ledger: setup.ledger,
             capabilities: setup.capabilities,
-            root,
+            temp_dir: setup.temporary_directory,
+            root: Mutex::new(None),
+        })))
+    }
+
+    fn from_shared(shared: Arc<Shared>) -> Self {
+        Self(Arc::new(Inner {
+            shared,
             activity: Activity::default(),
             cancel: HttpCancel::default(),
             state: Mutex::new(State {
@@ -83,25 +90,36 @@ impl FileExecutor {
                 writers: BTreeMap::new(),
                 current: None,
             }),
-        })))
+        }))
     }
 
-    /// Only the actual current local media selected by the host is admitted.
-    pub fn set_current_media(
-        &self,
-        media: Id,
-        generation: Generation,
-        file: Arc<PinnedFile>,
-    ) -> Result<(), ErrorCode> {
-        if !self.0.capabilities.contains(&Capability::ReadState) {
-            return Err(ErrorCode::Denied);
+    /// Creates an isolated window-scoped executor sharing the installation's lazy `TempRoot`.
+    pub(crate) fn for_window(&self) -> Self {
+        Self::from_shared(self.0.shared.clone())
+    }
+
+    pub(crate) fn root_is_quiescent(&self) -> bool {
+        self.0
+            .shared
+            .root
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .is_none_or(|root| root.is_quiescent())
+    }
+
+    pub(super) fn temp_root(&self) -> Result<Arc<TempRoot>, ErrorCode> {
+        let mut slot = self.0.shared.root.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(existing) = slot.as_ref() {
+            return Ok(existing.clone());
         }
-        let mut state = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
-        if state.stopped || state.generation.is_some_and(|g| g != generation) {
-            return Err(ErrorCode::StaleHandle);
-        }
-        state.current = Some((media, generation, CurrentFile::Pinned(file)));
-        Ok(())
+        let created = TempRoot::new(
+            &self.0.shared.temp_dir,
+            self.0.shared.network.owner().into(),
+            self.0.shared.ledger.clone(),
+        )?;
+        *slot = Some(created.clone());
+        Ok(created)
     }
 
     /// The native player supplies its current local path; it is never serialized
@@ -112,7 +130,7 @@ impl FileExecutor {
         generation: Generation,
         path: Option<PathBuf>,
     ) -> Result<(), ErrorCode> {
-        if !self.0.capabilities.contains(&Capability::ReadState) {
+        if !self.0.shared.capabilities.contains(&Capability::ReadState) {
             return Err(ErrorCode::Denied);
         }
         let mut state = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -126,8 +144,8 @@ impl FileExecutor {
         Ok(())
     }
 
-    fn bind(&self, context: &TaskContext) -> Result<(), ErrorCode> {
-        if context.role != Role::Control || context.owner != self.0.network.owner() {
+    pub(super) fn bind(&self, context: &TaskContext) -> Result<(), ErrorCode> {
+        if context.role != Role::Control || context.owner != self.0.shared.network.owner() {
             return Err(ErrorCode::Denied);
         }
         let mut state = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -163,13 +181,13 @@ impl FileExecutor {
         id: Id,
         generation: Generation,
     ) -> Result<Arc<Artifact>, ErrorCode> {
-        if owner != self.0.network.owner() {
+        if owner != self.0.shared.network.owner() {
             return Err(ErrorCode::Denied);
         }
         self.artifact(id, generation)
     }
 
-    fn publish(
+    pub(super) fn publish(
         &self,
         artifact: Arc<Artifact>,
         result: ArtifactResult,
@@ -215,7 +233,7 @@ impl Executor for FileExecutor {
         context: TaskContext,
     ) -> Result<Operation, ErrorCode> {
         self.bind(&context)?;
-        if !task.authorized(&self.0.capabilities) {
+        if !task.authorized(&self.0.shared.capabilities) {
             return Err(ErrorCode::Denied);
         }
         let this = self.clone();
@@ -236,7 +254,7 @@ impl Executor for FileExecutor {
                     }
                     file.clone()
                 };
-                let lease = self.0.ledger.reserve(
+                let lease = self.0.shared.ledger.reserve(
                     &context.owner,
                     &[(Resource::FileHash, 1), (Resource::HostBytes, 65536)],
                 )?;
@@ -283,6 +301,7 @@ impl Executor for FileExecutor {
                 ) as usize;
                 let lease = self
                     .0
+                    .shared
                     .ledger
                     .reserve(&context.owner, &[(Resource::HostBytes, count as u64)])?;
                 Ok(Operation::blocking(move || {
@@ -340,6 +359,6 @@ impl Executor for FileExecutor {
     }
 
     fn is_quiescent(&self) -> bool {
-        self.0.activity.is_idle() && self.0.root.is_quiescent()
+        self.0.activity.is_idle()
     }
 }

@@ -1,3 +1,10 @@
+//! Bounded host-executed cryptographic operation specs (`iris_v2.host_crypto`).
+//!
+//! Intentionally retained in the ABI v2 contract so low-level or non-Rust Wasm
+//! guests can delegate digest, HMAC, and AEAD/cipher work to the host without
+//! shipping guest-side crypto implementations, even though high-level framing
+//! helpers were omitted from `iris-plugin-sdk`.
+
 use super::Id;
 use serde::{Deserialize, Serialize};
 

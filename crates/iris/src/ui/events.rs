@@ -44,14 +44,14 @@ impl PendingSubtitles {
         }
     }
 
-    pub(super) fn clear(&mut self) {
-        self.paths.clear();
-    }
-
     pub(super) fn advance(&mut self, from: u64, to: u64) {
-        if self.generation == from {
+        if self.generation == from && !self.paths.is_empty() {
             self.generation = to;
         }
+    }
+
+    pub(super) fn clear(&mut self) {
+        self.paths.clear();
     }
 }
 
@@ -61,6 +61,17 @@ fn split_open_paths(mut paths: Vec<PathBuf>) -> (Vec<PathBuf>, Vec<PathBuf>) {
         .extract_if(.., |path| library::is_subtitle(path))
         .collect();
     (paths, subtitles)
+}
+
+pub(in crate::ui) fn should_suppress_playback_error_toast(
+    media_load_pending: bool,
+    scoped_released: bool,
+) -> bool {
+    media_load_pending || scoped_released
+}
+
+pub(in crate::ui) fn should_record_progress(resume_playback: bool, scoped_released: bool) -> bool {
+    resume_playback && !scoped_released
 }
 
 impl IrisWindow {
@@ -269,6 +280,7 @@ impl IrisWindow {
         if saw_ended_now
             && !was_ended
             && !self.media_load_pending()
+            && !self.plugin_view.scoped_released
             && self.active().session.state().ended
         {
             self.save_progress_sync();
@@ -318,10 +330,13 @@ impl IrisWindow {
             need_notify = false;
         }
 
-        if let Some(code) = last_error {
-            if !self.media_load_pending() {
-                self.active_mut().pending_subtitles.clear();
-            }
+        if let Some(code) = last_error
+            && !should_suppress_playback_error_toast(
+                self.media_load_pending(),
+                self.plugin_view.scoped_released,
+            )
+        {
+            self.active_mut().pending_subtitles.clear();
             self.sync_now_playing(true);
             self.show_toast(
                 format!("{}（错误 {code}）", super::strings::errors::mpv_error(code)),
@@ -336,7 +351,10 @@ impl IrisWindow {
     }
 
     pub(super) fn record_progress_memory(&mut self) {
-        if !self.settings.resume_playback {
+        if !should_record_progress(
+            self.settings.resume_playback,
+            self.plugin_view.scoped_released,
+        ) {
             return;
         }
         if let Some((path, pos, dur, eof)) = self.active().session.progress() {
@@ -377,6 +395,13 @@ impl IrisWindow {
     }
 
     pub(super) fn finish_media_open(&mut self, cx: &mut Context<Self>) {
+        self.plugin_view.scoped_released = false;
+        if self.active().session.scoped_stream().is_none() {
+            self.plugin_view.stream_plugin = None;
+            self.plugin_view.playlist.clear();
+            self.plugin_view.playlist_binding = None;
+            self.plugin_view.playlist_current = None;
+        }
         self.refresh_annotations(cx);
         if let Some(uri) = self.active().session.current_media_uri() {
             if self.active().session.may_share_current_identity() {
@@ -433,7 +458,7 @@ impl IrisWindow {
             p.extension()
                 .is_some_and(|e| e.eq_ignore_ascii_case("irisplugin"))
         });
-        for package in packages.into_iter().take(2) {
+        for package in packages.into_iter().take(1) {
             self.review_plugin_path(package, cx);
         }
         let (paths, subtitles) = split_open_paths(paths);
@@ -495,13 +520,29 @@ impl IrisWindow {
         }
     }
 
+    fn schedule_loading_indicator(&self, generation: u64, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(150))
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                let vp = this.active_mut();
+                if vp.load_generation == generation && vp.pending_path.is_some() {
+                    vp.loading_visible = true;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
     pub(crate) fn open_path(&mut self, path: &Path, cx: &mut Context<Self>) {
         self.cancel_media_loads();
         self.close_plugin_browse();
+        self.save_progress_sync();
         if !self.advance_plugin_media(cx) {
             return;
         }
-        self.save_progress_sync();
         self.overlays.close_menus();
         self.catalog.active_source = ActiveSource::Local;
         self.catalog.active_stream_meta = None;
@@ -532,19 +573,7 @@ impl IrisWindow {
             .background_executor()
             .spawn(async move { player::prepare(&target_path, cached) });
 
-        cx.spawn(async move |this, cx| {
-            cx.background_executor()
-                .timer(Duration::from_millis(150))
-                .await;
-            let _ = this.update(cx, |this, cx| {
-                let vp = this.active_mut();
-                if vp.load_generation == generation && vp.pending_path.is_some() {
-                    vp.loading_visible = true;
-                    cx.notify();
-                }
-            });
-        })
-        .detach();
+        self.schedule_loading_indicator(generation, cx);
 
         cx.spawn(async move |this, cx| {
             let prepared = task.await;
@@ -555,7 +584,7 @@ impl IrisWindow {
                 {
                     let vp = this.active_mut();
                     vp.pending_path = None;
-                    vp.loading_visible = false;
+                    vp.commit_media_open_generation();
                 }
                 let result = prepared.and_then(|prepared| {
                     let resume = if this.settings.resume_playback {
@@ -591,10 +620,10 @@ impl IrisWindow {
     fn open_multi_queue(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
         self.cancel_media_loads();
         self.close_plugin_browse();
+        self.save_progress_sync();
         if !self.advance_plugin_media(cx) {
             return;
         }
-        self.save_progress_sync();
         self.overlays.close_menus();
         self.catalog.active_source = ActiveSource::Local;
         self.catalog.active_stream_meta = None;
@@ -608,6 +637,7 @@ impl IrisWindow {
         let task = cx
             .background_executor()
             .spawn(async move { player::prepare_queue(paths) });
+        self.schedule_loading_indicator(generation, cx);
 
         cx.spawn(async move |this, cx| {
             let prepared = task.await;
@@ -618,7 +648,7 @@ impl IrisWindow {
                 {
                     let vp = this.active_mut();
                     vp.pending_path = None;
-                    vp.loading_visible = false;
+                    vp.commit_media_open_generation();
                 }
                 let Some(prepared) = prepared else {
                     this.active_mut().pending_subtitles.paths.clear();
@@ -626,7 +656,7 @@ impl IrisWindow {
                     this.show_toast("所选项目中没有可播放的媒体", cx);
                     return;
                 };
-                let count = prepared.len();
+                let count = prepared.entries().len();
                 this.queue.replace_from_entries(prepared.entries());
                 let resume = if this.settings.resume_playback {
                     prepared.target().map_or(0., |p| this.store.resume_path(p))
@@ -710,7 +740,7 @@ impl IrisWindow {
         let Some(bridge) = &mut self.media_keys else {
             return;
         };
-        let session = &self.viewports[0].session;
+        let session = &self.viewport.session;
         let media = match session.kind() {
             Some(kind @ (Kind::Video | Kind::Audio)) if session.state().loaded => {
                 let title = session
@@ -760,8 +790,8 @@ mod tests {
         pending.add(3, vec!["superseded.srt".into()]);
         assert!(pending.take(4).is_empty());
 
-        pending.add(5, vec!["while-resolving.srt".into()]);
+        pending.add(5, vec!["resolved.srt".into()]);
         pending.advance(5, 6);
-        assert_eq!(pending.take(6), [PathBuf::from("while-resolving.srt")]);
+        assert_eq!(pending.take(6), [PathBuf::from("resolved.srt")]);
     }
 }

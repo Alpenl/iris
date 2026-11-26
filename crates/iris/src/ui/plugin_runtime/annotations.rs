@@ -3,14 +3,17 @@ use crate::{
     theme::ThemeTokens,
     ui::kit::{form::chip_button, hstack, vstack},
 };
-use gpui::{Context, IntoElement, ParentElement, StatefulInteractiveElement, Styled, div, px};
+use gpui::{
+    Context, IntoElement, ParentElement, StatefulInteractiveElement, Styled, div,
+    prelude::FluentBuilder, px,
+};
 use iris_api::v2::{
     Capability, ErrorCode, GuestError, HostEvent, Id, Reply, enhance::AnnotationEdit,
 };
 use iris_core::{
     media_uri::MediaUri,
     plugin_v2::{
-        ledger::Resource,
+        ledger::{Ledger, Resource},
         runtime::{Resources, WindowAccess},
         selection::{
             SelectionGrants, annotation_error_code, edit_to_store, error_code_to_annotation,
@@ -18,12 +21,37 @@ use iris_core::{
         },
         ui::Action,
     },
-    store::{AnnotationEdit as StoreAnnotationEdit, AnnotationError, ColorLabel, TimeMarker},
+    store::{
+        AnnotationEdit as StoreAnnotationEdit, AnnotationError, AnnotationSnapshot,
+        AnnotationTarget, ColorLabel, TimeMarker,
+    },
     vfs::HttpCancel,
 };
 use std::any::Any;
 use std::collections::BTreeMap;
 use std::sync::Arc;
+
+fn transact_annotations(
+    target: &AnnotationTarget,
+    edit: Option<(&[MediaUri], &StoreAnnotationEdit)>,
+    owner: &str,
+    ledger: &Ledger,
+    check_live: impl Fn() -> Result<(), AnnotationError>,
+) -> Result<AnnotationSnapshot, ErrorCode> {
+    target
+        .transact(
+            edit,
+            owner,
+            |owner, bytes| {
+                ledger
+                    .reserve(owner, &[(Resource::HostBytes, bytes)])
+                    .map(|lease| Arc::new(lease) as Arc<dyn Any + Send + Sync>)
+                    .map_err(error_code_to_annotation)
+            },
+            check_live,
+        )
+        .map_err(annotation_error_code)
+}
 
 #[derive(Default)]
 pub(super) struct AnnotationView {
@@ -172,27 +200,20 @@ impl IrisWindow {
             move |access| {
                 let result: Result<_, ErrorCode> = (|| {
                     let uris = permit.uris()?;
-                    let ledger = access.resources.ledger.clone();
-                    let snapshot = target
-                        .transact(
-                            store_edit.as_ref().map(|edit| (uris, edit)),
-                            &access.owner,
-                            |owner, bytes| {
-                                ledger
-                                    .reserve(owner, &[(Resource::HostBytes, bytes)])
-                                    .map(|lease| Arc::new(lease) as Arc<dyn Any + Send + Sync>)
-                                    .map_err(error_code_to_annotation)
-                            },
-                            || {
-                                permit.check().map_err(error_code_to_annotation)?;
-                                if !binding.is_live() || access.cancel.is_cancelled() {
-                                    Err(AnnotationError::Cancelled)
-                                } else {
-                                    Ok(())
-                                }
-                            },
-                        )
-                        .map_err(annotation_error_code)?;
+                    let snapshot = transact_annotations(
+                        &target,
+                        store_edit.as_ref().map(|edit| (uris, edit)),
+                        &access.owner,
+                        &access.resources.ledger,
+                        || {
+                            permit.check().map_err(error_code_to_annotation)?;
+                            if !binding.is_live() || access.cancel.is_cancelled() {
+                                Err(AnnotationError::Cancelled)
+                            } else {
+                                Ok(())
+                            }
+                        },
+                    )?;
                     let values = if store_edit.is_some() {
                         Vec::new()
                     } else {
@@ -271,26 +292,19 @@ impl IrisWindow {
         let cancel = self.plugin_view.enhance.annotations.cancel.clone();
         let saving = edit.is_some();
         let job = cx.background_executor().spawn(async move {
-            let ledger = resources.ledger.clone();
-            let result = target
-                .transact(
-                    edit.as_ref().map(|edit| (std::slice::from_ref(&uri), edit)),
-                    "host.annotation-job",
-                    |owner, bytes| {
-                        ledger
-                            .reserve(owner, &[(Resource::HostBytes, bytes)])
-                            .map(|lease| Arc::new(lease) as Arc<dyn Any + Send + Sync>)
-                            .map_err(error_code_to_annotation)
-                    },
-                    || {
-                        if cancel.is_cancelled() {
-                            Err(AnnotationError::Cancelled)
-                        } else {
-                            Ok(())
-                        }
-                    },
-                )
-                .map_err(annotation_error_code);
+            let result = transact_annotations(
+                &target,
+                edit.as_ref().map(|edit| (std::slice::from_ref(&uri), edit)),
+                "host.annotation-job",
+                &resources.ledger,
+                || {
+                    if cancel.is_cancelled() {
+                        Err(AnnotationError::Cancelled)
+                    } else {
+                        Ok(())
+                    }
+                },
+            );
             (result, lease)
         });
         cx.spawn(async move |this, cx| {
@@ -441,32 +455,34 @@ impl IrisWindow {
                     )),
                 )
                 .children(markers)
-                .child(
-                    hstack(4.)
-                        .child(
-                            chip_button("marker-prev-page", "上一页", false, t).on_click(
-                                cx.listener(move |this, _, _, cx| {
-                                    this.plugin_view.enhance.annotations.marker_page =
-                                        page.saturating_sub(1);
-                                    cx.notify();
-                                }),
+                .when(pages > 1, |d| {
+                    d.child(
+                        hstack(4.)
+                            .child(
+                                chip_button("marker-prev-page", "上一页", false, t).on_click(
+                                    cx.listener(move |this, _, _, cx| {
+                                        this.plugin_view.enhance.annotations.marker_page =
+                                            page.saturating_sub(1);
+                                        cx.notify();
+                                    }),
+                                ),
+                            )
+                            .child(
+                                div()
+                                    .text_size(t.text_sm)
+                                    .child(format!("{} / {pages}", page + 1)),
+                            )
+                            .child(
+                                chip_button("marker-next-page", "下一页", false, t).on_click(
+                                    cx.listener(move |this, _, _, cx| {
+                                        this.plugin_view.enhance.annotations.marker_page =
+                                            (page + 1).min(pages - 1);
+                                        cx.notify();
+                                    }),
+                                ),
                             ),
-                        )
-                        .child(
-                            div()
-                                .text_size(t.text_sm)
-                                .child(format!("{} / {pages}", page + 1)),
-                        )
-                        .child(
-                            chip_button("marker-next-page", "下一页", false, t).on_click(
-                                cx.listener(move |this, _, _, cx| {
-                                    this.plugin_view.enhance.annotations.marker_page =
-                                        (page + 1).min(pages - 1);
-                                    cx.notify();
-                                }),
-                            ),
-                        ),
-                )
+                    )
+                })
                 .into_any_element(),
         )
     }

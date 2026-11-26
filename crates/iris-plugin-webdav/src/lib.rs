@@ -24,6 +24,7 @@ struct WindowState {
     jobs: BTreeMap<Id, browse::Job>,
     cache: Option<browse::Cache>,
     config: Option<config::Transaction>,
+    editing: Option<String>,
 }
 impl WindowState {
     fn cancel(&mut self, request: Id, host: &mut impl Host) {
@@ -69,12 +70,13 @@ impl WebDav {
                     // The host revokes the old scope before delivering this one;
                     // directory pagination cache stays valid within the same context.
                     self.lost_scope(window);
-                    let cache = (state.generation.context == generation.context)
-                        .then(|| state.cache.take())
-                        .flatten();
+                    let same_context = state.generation.context == generation.context;
+                    let cache = same_context.then(|| state.cache.take()).flatten();
+                    let editing = same_context.then(|| state.editing.take()).flatten();
                     state = WindowState {
                         generation,
                         cache,
+                        editing,
                         ..Default::default()
                     };
                 }
@@ -233,6 +235,7 @@ impl WebDav {
         }
         let commands = match event {
             HostEvent::Command { id, .. } | HostEvent::Action { id, .. } if id == "add_server" => {
+                state.editing = None;
                 vec![HostCommand::OpenModal {
                     modal: Box::new(modal::build_modal(None, false)),
                 }]
@@ -242,12 +245,15 @@ impl WebDav {
                     return Ok(modal::toast("未找到该 WebDAV 连接"));
                 };
                 match action {
-                    SourceManageAction::Configure => vec![HostCommand::OpenModal {
-                        modal: Box::new(modal::build_modal(
-                            Some(conn),
-                            conn.auth != protocol::WebDavAuth::None,
-                        )),
-                    }],
+                    SourceManageAction::Configure => {
+                        state.editing = Some(conn.id.clone());
+                        vec![HostCommand::OpenModal {
+                            modal: Box::new(modal::build_modal(
+                                Some(conn),
+                                conn.auth != protocol::WebDavAuth::None,
+                            )),
+                        }]
+                    }
                     SourceManageAction::Remove => {
                         self.remove_config(window, state, &source_id, host)
                     }
@@ -255,6 +261,12 @@ impl WebDav {
             }
             HostEvent::ModalSubmit { id, values } => {
                 self.save_config(window, state, &id, &values, host)
+            }
+            HostEvent::ModalCancel { id } => {
+                if id == modal::EDIT_MODAL_ID {
+                    state.editing = None;
+                }
+                Vec::new()
             }
             HostEvent::SourceBrowse {
                 request_id,
@@ -274,13 +286,23 @@ impl WebDav {
                         .as_ref()
                         .ok_or(ErrorCode::StaleHandle)
                         .and_then(|cache| {
-                            cache.page(request_id, &source_id, &path, query.as_deref(), &cursor)
+                            cache.page(
+                                request_id,
+                                &source_id,
+                                folder_id.as_deref(),
+                                query.as_deref(),
+                                &cursor,
+                            )
                         })
                         .unwrap_or_else(|e| browse::failure(request_id, e)));
                 }
                 self.start_job(
                     state,
-                    browse::Intent::Browse { path, query },
+                    browse::Intent::Browse {
+                        path,
+                        folder_id,
+                        query,
+                    },
                     request_id,
                     &source_id,
                     host,
@@ -336,31 +358,9 @@ impl WebDav {
     }
 }
 
-#[cfg(target_arch = "wasm32")]
-mod wasm {
-    use super::*;
-    use iris_plugin_sdk::api::v2::{GuestError, Reply};
-    std::thread_local! { static PLUGIN: std::cell::RefCell<WebDav> = std::cell::RefCell::new(WebDav::default()); }
-    fn dispatch(value: Value) -> Reply<HostCommand> {
-        let result = serde_json::from_value(value)
-            .map_err(|_| ErrorCode::InvalidArgument)
-            .and_then(|event| {
-                PLUGIN.with_borrow_mut(|plugin| {
-                    plugin.event(event, &mut iris_plugin_sdk::client::WasmHost)
-                })
-            });
-        match result {
-            Ok(ok) => Reply::Ok { ok },
-            Err(code) => Reply::Error {
-                error: GuestError {
-                    code: code as i32,
-                    message: format!("{code:?}"),
-                },
-            },
-        }
-    }
-    iris_plugin_sdk::export_plugin!(dispatch);
-}
+iris_plugin_sdk::export_typed_plugin!(WebDav, |plugin, event| {
+    plugin.event(event, &mut iris_plugin_sdk::client::WasmHost)
+});
 
 #[cfg(test)]
 mod tests;

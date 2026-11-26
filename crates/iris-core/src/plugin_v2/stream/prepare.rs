@@ -58,6 +58,8 @@ pub struct Playback {
     pub profile: Option<Profile>,
     pub kind: Kind,
     pub title: String,
+    pub source_id: Option<String>,
+    pub entry_id: Option<String>,
     pub is_live: bool,
     pub attachments: Vec<AttachmentView>,
     pub variants: Vec<iris_api::StreamVariant>,
@@ -205,9 +207,10 @@ impl Preparation {
                     .map(|i| Ok::<_, ErrorCode>((i, blob(i.hashes)?)))
                     .transpose()?;
                 let reader = factory.direct(primary, fallback_urls, proof)?;
-                let prefix = probe_prefix(&reader, 4096, cancel).inspect_err(|err| {
-                    log::warn!("plugin primary stream probe failed: {err:?}");
-                })?;
+                let (prefix, eof) = probe_prefix_eof(&reader, ADAPTIVE_PROBE_LIMIT, cancel)
+                    .inspect_err(|err| {
+                        log::warn!("plugin primary stream probe failed: {err:?}");
+                    })?;
                 if adaptive(&prefix) {
                     if identity.is_some() || !fallback_urls.is_empty() {
                         return Err(ErrorCode::Unsupported);
@@ -220,6 +223,8 @@ impl Preparation {
                     )?)?;
                     is_live = document.live;
                     remote_manifest::live::attach(&session, primary.clone(), &document)?;
+                } else if !eof && adaptive_undecided(&prefix) {
+                    return Err(ErrorCode::Unsupported);
                 } else {
                     session.commit(session.prepare_reader(reader)?)?;
                 }
@@ -233,10 +238,7 @@ impl Preparation {
                     .reader(resource_id.clone(), size.map(|n| n.0))?;
                 // RandomAccess is an opaque byte representation, not an escape
                 // hatch for raw playlists. Adaptive output uses VirtualManifest.
-                let prefix = probe_prefix(&reader, 4096, cancel)?;
-                if adaptive(&prefix) {
-                    return Err(ErrorCode::Unsupported);
-                }
+                ensure_non_adaptive_prefix(&reader, cancel)?;
                 session.commit(session.prepare_reader(reader)?)?;
             }
             StreamSource::VirtualManifest {
@@ -259,9 +261,9 @@ impl Preparation {
                 let route_id = format!("{}_{}", if audio { "audio" } else { "sub" }, attachment.id);
                 let prepared: Result<(Arc<dyn Reader>, &str), ErrorCode> = if audio {
                     match factory.reader(&attachment.resource, None) {
-                        Ok(reader) => match probe_prefix(&reader, 4096, cancel) {
-                            Ok(prefix) if adaptive(&prefix) => return Err(ErrorCode::Unsupported),
-                            Ok(_) => Ok((reader, "bin")),
+                        Ok(reader) => match ensure_non_adaptive_prefix(&reader, cancel) {
+                            Ok(()) => Ok((reader, "bin")),
+                            Err(ErrorCode::Unsupported) => return Err(ErrorCode::Unsupported),
                             Err(err) => Err(err),
                         },
                         Err(err) => Err(err),
@@ -326,6 +328,8 @@ impl Preparation {
             profile,
             kind,
             title: spec.title.clone().unwrap_or_default(),
+            source_id: spec.source_id.clone(),
+            entry_id: spec.entry_id.clone(),
             is_live,
             attachments,
             variants: spec.variants.clone(),
@@ -333,28 +337,72 @@ impl Preparation {
         })
     }
 }
+pub(crate) const ADAPTIVE_PROBE_LIMIT: usize = 4096;
 pub(crate) fn probe_prefix<R: Reader + ?Sized>(
     reader: &Arc<R>,
     limit: usize,
     cancel: &HttpCancel,
 ) -> Result<Vec<u8>, ErrorCode> {
-    let mut out = Vec::with_capacity(limit.min(4096));
+    probe_prefix_eof(reader, limit, cancel).map(|(bytes, _)| bytes)
+}
+pub(crate) fn probe_prefix_eof<R: Reader + ?Sized>(
+    reader: &Arc<R>,
+    limit: usize,
+    cancel: &HttpCancel,
+) -> Result<(Vec<u8>, bool), ErrorCode> {
+    let mut out = Vec::with_capacity(limit.min(ADAPTIVE_PROBE_LIMIT));
+    let mut eof = false;
     while out.len() < limit {
         let step = reader.read_at(out.len() as u64, (limit - out.len()) as u32, cancel)?;
         if step.blob.bytes.is_empty() {
+            eof = step.eof;
             break;
         }
         out.extend_from_slice(&step.blob.bytes);
         if step.eof {
+            eof = true;
             break;
         }
     }
-    Ok(out)
+    Ok((out, eof))
+}
+pub(crate) fn ensure_non_adaptive_prefix<R: Reader + ?Sized>(
+    reader: &Arc<R>,
+    cancel: &HttpCancel,
+) -> Result<(), ErrorCode> {
+    let mut out = Vec::with_capacity(ADAPTIVE_PROBE_LIMIT);
+    let mut eof = false;
+    while out.len() < ADAPTIVE_PROBE_LIMIT && adaptive_undecided(&out) {
+        let step = reader.read_at(
+            out.len() as u64,
+            (ADAPTIVE_PROBE_LIMIT - out.len()) as u32,
+            cancel,
+        )?;
+        if step.blob.bytes.is_empty() {
+            eof = step.eof;
+            break;
+        }
+        out.extend_from_slice(&step.blob.bytes);
+        if adaptive(&out) {
+            return Err(ErrorCode::Unsupported);
+        }
+        if step.eof {
+            eof = true;
+            break;
+        }
+    }
+    if adaptive(&out) || (!eof && adaptive_undecided(&out)) {
+        return Err(ErrorCode::Unsupported);
+    }
+    Ok(())
 }
 pub(crate) fn adaptive(bytes: &[u8]) -> bool {
     crate::loopback_http::is_adaptive_manifest(bytes)
 }
-pub(crate) fn subtitle_format(bytes: &[u8]) -> Result<&'static str, ErrorCode> {
+pub(crate) fn adaptive_undecided(bytes: &[u8]) -> bool {
+    crate::loopback_http::is_adaptive_prefix_undecided(bytes)
+}
+pub fn subtitle_format(bytes: &[u8]) -> Result<&'static str, ErrorCode> {
     if bytes.len() > 10 << 20 {
         return Err(ErrorCode::QuotaExceeded);
     }

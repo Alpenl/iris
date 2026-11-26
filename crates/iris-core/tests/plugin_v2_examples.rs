@@ -27,6 +27,15 @@ fn wait(mut ready: impl FnMut() -> bool) {
         std::thread::sleep(Duration::from_millis(10));
     }
 }
+struct TestDir(PathBuf);
+impl Drop for TestDir {
+    fn drop(&mut self) {
+        if self.0.starts_with(std::env::temp_dir()) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+}
+
 #[test]
 #[ignore = "build real SDK examples with scripts/test-plugin-v2-examples.py"]
 fn user_packages_provide_theme_timer_and_real_random_access_pcm() {
@@ -44,13 +53,16 @@ fn user_packages_provide_theme_timer_and_real_random_access_pcm() {
             "baidupan" => "community.baidupan".to_owned(),
             _ => format!("example.{name}"),
         };
-        let root =
-            std::env::temp_dir().join(format!("iris-example-{}-{}", std::process::id(), name));
-        assert!(!root.exists(), "fixture root must be new");
+        let root = TestDir(std::env::temp_dir().join(format!(
+            "iris-example-{}-{}",
+            std::process::id(),
+            name
+        )));
+        assert!(!root.0.exists(), "fixture root must be new");
         let resources = Resources::new().unwrap();
         let bytes = std::fs::read(input.join(format!("{id}.irisplugin"))).unwrap();
         let package = Package::from_zip(&bytes, Provenance::User).unwrap();
-        let mut installer = Installer::new(root.join("packages"), resources.ledger.clone());
+        let mut installer = Installer::new(root.0.join("packages"), resources.ledger.clone());
         installer
             .install(
                 &bytes,
@@ -68,8 +80,8 @@ fn user_packages_provide_theme_timer_and_real_random_access_pcm() {
             disabled: BTreeSet::new(),
             runtime: Setup {
                 resources: resources.clone(),
-                state_directory: root.join("state"),
-                temporary_directory: root.join("temp"),
+                state_directory: root.0.join("state"),
+                temporary_directory: root.0.join("temp"),
                 vault: CredentialVault::in_memory(),
                 wake: Arc::new(|| {}),
             },
@@ -161,7 +173,5 @@ fn user_packages_provide_theme_timer_and_real_random_access_pcm() {
         drop((manager, hub));
         wait(|| resources.ledger.used(None, Resource::HostBytes) == 0);
         assert_eq!(resources.ledger.used(None, Resource::WasmBytes), 0);
-        assert!(root.starts_with(std::env::temp_dir()));
-        std::fs::remove_dir_all(root).unwrap();
     }
 }

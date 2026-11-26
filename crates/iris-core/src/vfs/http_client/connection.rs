@@ -1,10 +1,11 @@
 //! Resolution, connection setup and cancellation shared by VFS and authenticated playback.
+mod dns;
 pub(crate) mod doh;
 
 use std::any::Any;
 use std::collections::BTreeMap;
 use std::io::{self, Read, Write};
-use std::net::{IpAddr, Shutdown, SocketAddr, TcpStream, ToSocketAddrs};
+use std::net::{IpAddr, Shutdown, SocketAddr, TcpStream};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -15,6 +16,7 @@ use url::{Host, Url};
 
 use super::address::{AddressKind, address_kind};
 use super::{CONNECT_TIMEOUT, IO_TIMEOUT};
+use dns::resolve_system;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum HttpClientError {
@@ -103,6 +105,7 @@ struct CancelState {
     next_id: u64,
     sockets: BTreeMap<u64, TcpStream>,
     connects: BTreeMap<u64, Arc<Waker>>,
+    callbacks: BTreeMap<u64, Arc<dyn Fn() + Send + Sync>>,
     children: Vec<std::sync::Weak<Mutex<CancelState>>>,
 }
 
@@ -113,7 +116,7 @@ impl HttpCancel {
         if Arc::ptr_eq(&self.0, &child.0) {
             return Ok(());
         }
-        let mut state = self.0.lock().unwrap();
+        let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
         if state.cancelled {
             drop(state);
             child.cancel();
@@ -130,8 +133,8 @@ impl HttpCancel {
         Ok(())
     }
     pub fn cancel(&self) {
-        let children = {
-            let mut state = self.0.lock().unwrap();
+        let (callbacks, children) = {
+            let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
             state.cancelled = true;
             for socket in state.sockets.values() {
                 let _ = socket.shutdown(Shutdown::Both);
@@ -139,8 +142,14 @@ impl HttpCancel {
             for wake in state.connects.values() {
                 let _ = wake.wake();
             }
-            std::mem::take(&mut state.children)
+            (
+                std::mem::take(&mut state.callbacks),
+                std::mem::take(&mut state.children),
+            )
         };
+        for wake in callbacks.into_values() {
+            wake();
+        }
         for child in children {
             if let Some(arc) = child.upgrade() {
                 Self(arc).cancel();
@@ -149,7 +158,7 @@ impl HttpCancel {
     }
 
     pub(crate) fn child(&self) -> Result<Self> {
-        let mut state = self.0.lock().unwrap();
+        let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
         if state.cancelled {
             bail!("HTTP request cancelled");
         }
@@ -160,11 +169,11 @@ impl HttpCancel {
     }
 
     pub fn is_cancelled(&self) -> bool {
-        self.0.lock().unwrap().cancelled
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).cancelled
     }
 
     pub(crate) fn register(&self, socket: &TcpStream) -> Result<SocketRegistration> {
-        let mut state = self.0.lock().unwrap();
+        let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
         if state.cancelled {
             bail!("HTTP request cancelled");
         }
@@ -177,7 +186,7 @@ impl HttpCancel {
         self.register_shared_wake(Arc::new(wake))
     }
     pub(crate) fn register_shared_wake(&self, wake: Arc<Waker>) -> Result<ConnectRegistration> {
-        let mut state = self.0.lock().unwrap();
+        let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
         if state.cancelled {
             bail!("HTTP request cancelled");
         }
@@ -186,13 +195,33 @@ impl HttpCancel {
         state.connects.insert(id, wake);
         Ok(ConnectRegistration(self.clone(), id))
     }
+    /// Registers a wakeup callback invoked after `CancelState`'s lock is released
+    /// when `cancel()` runs. Fails immediately if already cancelled.
+    pub(crate) fn register_callback(
+        &self,
+        wake: Arc<dyn Fn() + Send + Sync>,
+    ) -> Result<CancelCallbackRegistration> {
+        let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if state.cancelled {
+            bail!("HTTP request cancelled");
+        }
+        state.next_id += 1;
+        let id = state.next_id;
+        state.callbacks.insert(id, wake);
+        Ok(CancelCallbackRegistration(self.clone(), id))
+    }
 }
 
 pub(crate) struct SocketRegistration(HttpCancel, u64);
 
 impl Drop for SocketRegistration {
     fn drop(&mut self) {
-        self.0.0.lock().unwrap().sockets.remove(&self.1);
+        self.0
+            .0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .sockets
+            .remove(&self.1);
     }
 }
 
@@ -200,7 +229,25 @@ pub(crate) struct ConnectRegistration(HttpCancel, u64);
 
 impl Drop for ConnectRegistration {
     fn drop(&mut self) {
-        self.0.0.lock().unwrap().connects.remove(&self.1);
+        self.0
+            .0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .connects
+            .remove(&self.1);
+    }
+}
+
+pub(crate) struct CancelCallbackRegistration(HttpCancel, u64);
+
+impl Drop for CancelCallbackRegistration {
+    fn drop(&mut self) {
+        self.0
+            .0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .callbacks
+            .remove(&self.1);
     }
 }
 
@@ -275,6 +322,14 @@ impl TimedSocket {
         self.tcp
     }
 
+    fn restore_deadline(&mut self, cancel: &HttpCancel, deadline: Option<Instant>) -> Result<()> {
+        let timeout = remaining_timeout(cancel, deadline, self.idle_timeout)?;
+        self.deadline = deadline;
+        self.tcp.set_read_timeout(Some(timeout))?;
+        self.tcp.set_write_timeout(Some(timeout))?;
+        Ok(())
+    }
+
     fn remaining(&self) -> io::Result<Option<Duration>> {
         self.deadline
             .map(|d| {
@@ -323,7 +378,8 @@ impl Transport {
             Self::Tls(s) => &mut s.sock,
         };
         socket.deadline = deadline;
-        socket.tcp.set_read_timeout(Some(socket.idle_timeout))
+        socket.tcp.set_read_timeout(Some(socket.idle_timeout))?;
+        socket.tcp.set_write_timeout(Some(socket.idle_timeout))
     }
 }
 
@@ -370,73 +426,6 @@ pub(super) fn remaining_timeout(
         );
     }
     Ok(left)
-}
-
-type LookupResult = std::result::Result<Vec<IpAddr>, String>;
-type Lookup = Arc<(Mutex<Option<LookupResult>>, std::sync::Condvar)>;
-
-fn resolve_system(
-    host: &str,
-    cancel: &HttpCancel,
-    deadline: Option<Instant>,
-    scope: &NetworkScope,
-) -> Result<Vec<IpAddr>> {
-    // The platform resolver preserves the hosts file, split DNS, and Bonjour.
-    // Share one outstanding lookup per host and isolate its bounded workers
-    // from numeric-address playback and TCP connection setup.
-    static LOOKUPS: Mutex<BTreeMap<String, Lookup>> = Mutex::new(BTreeMap::new());
-    let end = Instant::now() + remaining_timeout(cancel, deadline, CONNECT_TIMEOUT)?;
-    let mut pending = LOOKUPS.lock().unwrap();
-    let lookup = if let Some(lookup) = pending.get(host) {
-        lookup.clone()
-    } else {
-        let limit = 16;
-        if pending.len() >= limit {
-            bail!("system DNS lookup limit reached");
-        }
-        let dns_reservation = scope.policy.as_ref().map(|p| p.reserve_dns()).transpose()?;
-        let lookup = Arc::new((Mutex::new(None), std::sync::Condvar::new()));
-        let worker = lookup.clone();
-        let hostname = host.to_owned();
-        std::thread::Builder::new()
-            .name("iris-http-dns".into())
-            .spawn(move || {
-                let _dns_reservation = dns_reservation;
-                let worker_deadline = Instant::now() + CONNECT_TIMEOUT;
-                let worker_cancel = HttpCancel::default();
-                let result = (hostname.as_str(), 0)
-                    .to_socket_addrs()
-                    .map_err(|err| err.to_string())
-                    .and_then(|addrs| {
-                        let ips: Vec<_> = addrs.take(65).map(|addr| addr.ip()).collect();
-                        if ips.len() > 64 {
-                            Err("system DNS result exceeds address limit".into())
-                        } else if doh::should_bypass_fake_ip(&hostname, &ips) {
-                            doh::resolve_a_records(&hostname, &worker_cancel, worker_deadline)
-                                .map_err(|err| format!("DoH fallback failed: {err}"))
-                        } else {
-                            Ok(ips)
-                        }
-                    });
-                *worker.0.lock().unwrap() = Some(result);
-                worker.1.notify_all();
-                LOOKUPS.lock().unwrap().remove(&hostname);
-            })?;
-        pending.insert(host.to_owned(), lookup.clone());
-        lookup
-    };
-    drop(pending);
-
-    let mut result = lookup.0.lock().unwrap();
-    loop {
-        let left = remaining_timeout(cancel, Some(end), Duration::from_millis(50))?;
-        if let Some(result) = result.as_ref() {
-            return result
-                .clone()
-                .map_err(|err| anyhow!("system DNS lookup failed: {err}"));
-        }
-        result = lookup.1.wait_timeout(result, left).unwrap().0;
-    }
 }
 
 fn connect_tcp(
@@ -575,7 +564,7 @@ fn connect_authorized(
             remaining_timeout(cancel, Some(handshake_end), CONNECT_TIMEOUT)?;
             conn.complete_io(&mut tcp)?;
         }
-        tcp.deadline = deadline;
+        tcp.restore_deadline(cancel, deadline)?;
         Ok((
             Transport::Tls(Box::new(rustls::StreamOwned::new(conn, tcp))),
             registration,
@@ -587,7 +576,21 @@ fn connect_authorized(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{
+        HttpCancel, NetworkScope, TimedSocket, Transport, filter_resolved_ips, validate_stream_url,
+    };
+    use std::io::Read;
+    use std::net::{IpAddr, SocketAddr, TcpStream};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+    use url::Url;
+
+    impl TimedSocket {
+        pub(crate) fn remaining_deadline_for_test(&self) -> Option<Instant> {
+            self.deadline
+        }
+    }
 
     #[test]
     fn resolved_policy_applies_ports_and_pins_private_redirects() {
@@ -683,5 +686,76 @@ mod tests {
         parent.cancel();
         assert!(child.is_cancelled());
         assert!(parent.child().is_err());
+    }
+
+    #[test]
+    fn cancel_callback_runs_outside_lock_and_respects_drop() {
+        let cancel = HttpCancel::default();
+        let fired = Arc::new(AtomicBool::new(false));
+        let dropped_fired = Arc::new(AtomicBool::new(false));
+        let cancel_clone = cancel.clone();
+        let fired_clone = fired.clone();
+        let _active = cancel
+            .register_callback(Arc::new(move || {
+                // Calling is_cancelled() inside the callback proves CancelState lock was released.
+                assert!(cancel_clone.is_cancelled());
+                fired_clone.store(true, Ordering::Release);
+            }))
+            .unwrap();
+        let dropped_clone = dropped_fired.clone();
+        let removed = cancel
+            .register_callback(Arc::new(move || {
+                dropped_clone.store(true, Ordering::Release);
+            }))
+            .unwrap();
+        drop(removed);
+        cancel.cancel();
+        assert!(fired.load(Ordering::Acquire));
+        assert!(!dropped_fired.load(Ordering::Acquire));
+        assert!(cancel.register_callback(Arc::new(|| {})).is_err());
+    }
+
+    #[test]
+    fn set_body_deadline_resets_both_read_and_write_socket_timeouts() {
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let tcp = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let _accepted = listener.accept().unwrap();
+        tcp.set_read_timeout(Some(Duration::from_millis(20)))
+            .unwrap();
+        tcp.set_write_timeout(Some(Duration::from_millis(20)))
+            .unwrap();
+        let mut transport = Transport::Plain(TimedSocket {
+            tcp,
+            deadline: Some(Instant::now() + Duration::from_millis(20)),
+            idle_timeout: Duration::from_secs(20),
+        });
+        transport.set_body_deadline(None).unwrap();
+        let Transport::Plain(timed) = transport else {
+            unreachable!();
+        };
+        assert!(timed.deadline.is_none());
+        assert!(timed.tcp.read_timeout().unwrap().unwrap() >= Duration::from_secs(15));
+        assert!(timed.tcp.write_timeout().unwrap().unwrap() >= Duration::from_secs(15));
+    }
+
+    #[test]
+    fn restore_deadline_resets_shrunken_handshake_socket_timeouts_to_idle_timeout() {
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let tcp = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let _accepted = listener.accept().unwrap();
+        tcp.set_read_timeout(Some(Duration::from_millis(25)))
+            .unwrap();
+        tcp.set_write_timeout(Some(Duration::from_millis(25)))
+            .unwrap();
+        let cancel = HttpCancel::default();
+        let mut timed = TimedSocket {
+            tcp,
+            deadline: Some(Instant::now() + Duration::from_millis(25)),
+            idle_timeout: Duration::from_secs(20),
+        };
+        timed.restore_deadline(&cancel, None).unwrap();
+        assert!(timed.deadline.is_none());
+        assert!(timed.tcp.read_timeout().unwrap().unwrap() >= Duration::from_secs(15));
+        assert!(timed.tcp.write_timeout().unwrap().unwrap() >= Duration::from_secs(15));
     }
 }

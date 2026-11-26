@@ -2,35 +2,12 @@ use super::Id;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(untagged, deny_unknown_fields)]
-pub enum TaskResult {
-    Ok { ok: TaskValue },
-    Error { error: TaskError },
-}
-#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TaskError {
     pub code: i32,
     pub message: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum TaskValue {
-    Origin(OriginResult),
-    Http(HttpResult),
-    Read(ReadResult),
-    Write(WriteResult),
-    Opened(HandleResult),
-    AuthBegin(AuthBegin),
-    AuthCode(AuthCode),
-    AuthRejected(AuthRejected),
-    Artifact(ArtifactResult),
-    ArtifactWriter(ArtifactWriterResult),
-    Hash(HashResult),
-    StoreRead(StoreRead),
-    StoreWrite(StoreWrite),
-}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OriginResult {

@@ -1,7 +1,7 @@
-//! Rotating diagnostics, panic capture, privacy redaction, and telemetry-ready structured events.
+//! Rotating diagnostics, panic capture, privacy redaction, and structured JSONL events.
 //!
-//! All data remains strictly local (`iris.log` + `events.jsonl` with bounded rotation).
-//! Future opt-in telemetry can attach via [`register_sink`] without modifying instrumentation call sites.
+//! Text logs write to `iris.log`; structured events write solely to `events.jsonl`
+//! (no dual-write into `iris.log`).
 
 mod event;
 mod redact;
@@ -16,9 +16,9 @@ use std::sync::{Arc, Once, OnceLock};
 use serde_json::{Value, json};
 
 pub use event::{EVENT_SCHEMA_VERSION, EventLevel, TelemetryEvent, TelemetrySink};
-pub use redact::{redact_json, redact_text, redact_url, url_host};
+pub use redact::{redact_json, redact_text, url_host};
 
-use event::{JsonlFileSink, global_bus};
+use event::global_bus;
 use writer::{DEFAULT_MAX_BACKUPS, DEFAULT_MAX_FILE_BYTES, RotatingFile};
 
 static TEXT_LOG: OnceLock<Arc<RotatingFile>> = OnceLock::new();
@@ -42,7 +42,7 @@ pub fn session_id() -> &'static str {
     global_bus().session_id()
 }
 
-/// Registers an additional telemetry sink (e.g. a future opt-in uploader or test collector).
+/// Registers an additional telemetry sink (e.g. an integration test collector).
 pub fn register_sink(sink: Arc<dyn TelemetrySink>) {
     global_bus().register_sink(sink);
 }
@@ -84,12 +84,7 @@ pub fn init() {
         );
 
         let text_file = if let Some(path) = log_path() {
-            match RotatingFile::open(
-                path.clone(),
-                DEFAULT_MAX_FILE_BYTES,
-                DEFAULT_MAX_BACKUPS,
-                false,
-            ) {
+            match RotatingFile::open(path.clone(), DEFAULT_MAX_FILE_BYTES, DEFAULT_MAX_BACKUPS) {
                 Ok(rotating) => {
                     let rotating = Arc::new(rotating);
                     let marker = format!("--- session_start {} ---\n", session_id());
@@ -125,10 +120,9 @@ pub fn init() {
                 events_path.clone(),
                 DEFAULT_MAX_FILE_BYTES,
                 DEFAULT_MAX_BACKUPS,
-                false,
             ) {
                 Ok(rotating) => {
-                    register_sink(Arc::new(JsonlFileSink::new(Arc::new(rotating))));
+                    global_bus().set_jsonl_file(Arc::new(rotating));
                     true
                 }
                 Err(e) => {
@@ -177,22 +171,14 @@ pub fn flush() {
 }
 
 /// Emits a structured, automatically redacted event to `events.jsonl` and any registered
-/// telemetry sinks, and writes a correlated summary line to `log`.
+/// observer sinks without duplicating the line into `iris.log`.
 pub fn event(
     level: EventLevel,
     category: &'static str,
     event: &'static str,
     fields: Value,
 ) -> TelemetryEvent {
-    let emitted = global_bus().emit(level, category, event, fields);
-    let summary = serde_json::to_string(&emitted.fields).unwrap_or_else(|_| "{}".into());
-    log::log!(
-        target: "iris::event",
-        level.to_log_level(),
-        "[{category}.{event}] seq={} {summary}",
-        emitted.seq
-    );
-    emitted
+    global_bus().emit(level, category, event, fields)
 }
 
 /// Convenience structured-event helper for callers without a direct `serde_json` dependency.
@@ -210,22 +196,19 @@ pub fn event_kv(
 }
 
 fn format_panic_payload(info: &PanicHookInfo<'_>) -> (String, String, String) {
-    let thread = std::thread::current()
-        .name()
-        .unwrap_or("unnamed")
-        .to_owned();
+    let thread = redact_text(std::thread::current().name().unwrap_or("unnamed"));
     let location = info.location().map_or_else(
         || "<unknown>".to_owned(),
-        |loc| format!("{}:{}:{}", loc.file(), loc.line(), loc.column()),
+        |loc| redact_text(&format!("{}:{}:{}", loc.file(), loc.line(), loc.column())),
     );
     let message = if let Some(s) = info.payload().downcast_ref::<&str>() {
-        (*s).to_owned()
+        redact_text(s)
     } else if let Some(s) = info.payload().downcast_ref::<String>() {
-        s.clone()
+        redact_text(s)
     } else {
         "non-string panic payload".to_owned()
     };
-    (thread, redact_text(&location), redact_text(&message))
+    (thread, location, message)
 }
 
 fn install_panic_hook() {
@@ -242,7 +225,8 @@ fn install_panic_hook() {
             backtrace.truncate(end);
             backtrace.push_str("\n<truncated>");
         }
-        global_bus().emit(
+        // Fields are already redacted once above; skip redundant re-redaction passes.
+        let emitted = global_bus().emit_sanitized(
             EventLevel::Error,
             "app",
             "panic",
@@ -253,10 +237,14 @@ fn install_panic_hook() {
                 "backtrace": backtrace,
             }),
         );
-        log::error!(
-            target: "iris::panic",
-            "panic on thread '{thread}' at {location}: {message}\n{backtrace}"
+        let line = format!(
+            "[panic ts={} ERROR iris::panic] panic on thread '{thread}' at {location}: {message}\n{backtrace}\n",
+            emitted.ts_ms
         );
+        if let Some(text) = TEXT_LOG.get() {
+            let _ = text.write_bytes(line.as_bytes(), true);
+        }
+        eprint!("{line}");
         flush();
         prev(info);
     }));

@@ -3,12 +3,13 @@
 
 use gpui::{Context, Window};
 use iris_api::v2::{HostCommand, HostEvent, source::PlaybackSnapshot};
+use iris_core::media_uri::MediaUri;
 use iris_core::player::Command;
 use iris_core::plugin_v2::ui::{self as plugin, PollReport};
 use iris_core::preset::SidebarMode;
 
 use super::IrisWindow;
-use super::state::{ActiveSource, SourceErrorKind};
+use super::state::{ActiveSource, PopoverKind, SourceErrorKind};
 
 impl IrisWindow {
     pub(super) fn has_active_modal(&self) -> bool {
@@ -99,8 +100,12 @@ impl IrisWindow {
             actions,
             notices,
             dirty,
-            ..
+            status_changed,
         } = report;
+
+        if status_changed {
+            self.locations.reload();
+        }
 
         for action in actions {
             if action.is_live(self.plugins.generation()) {
@@ -121,9 +126,11 @@ impl IrisWindow {
         }
         if dirty.modal {
             self.plugin_view.modal.on_dirty();
-            if let Some(window) = window {
-                self.sync_plugin_modal_focus(window);
-            }
+        }
+        if self.plugin_view.modal.focus_pending
+            && let Some(window) = window
+        {
+            self.sync_plugin_modal_focus(window);
         }
         self.sync_view_timer(cx);
         should_notify
@@ -191,8 +198,8 @@ impl IrisWindow {
                 if self.plugin_view.modal.clear_submitting_for(pid)
                     && self.plugins.active_modal().is_some_and(|(p, _)| p == pid)
                 {
-                    self.plugin_view.modal.error = Some(message.clone().into());
-                    self.show_error_toast(message, cx);
+                    self.plugin_view.modal.error = Some(message.into());
+                    cx.notify();
                 } else {
                     self.show_toast(message, cx);
                 }
@@ -330,6 +337,103 @@ impl IrisWindow {
         self.invoke_plugin_widget_action(plugin_id, action_id, None, window, cx);
     }
 
+    pub(super) fn cleanup_plugin_playback(&mut self, pid: Option<&str>, sid: Option<&str>) {
+        self.cancel_plugin_requests(pid, sid);
+        let uri_matches = matches!(
+            self.active().session.current_media_uri(),
+            Some(MediaUri::Plugin {
+                plugin_id,
+                source_id,
+                ..
+            }) if pid.is_none_or(|p| p == plugin_id) && sid.is_none_or(|s| s == source_id)
+        );
+        let meta_matches = self
+            .catalog
+            .active_stream_meta
+            .as_ref()
+            .is_some_and(|m| m.matches_source(pid, sid));
+        let owner_matches = sid.is_none()
+            && iris_core::plugin_v2::stream::prepare::stream_session(&self.active().session)
+                .is_some_and(|session| match pid {
+                    None => true,
+                    Some(target) => {
+                        self.plugin_view.stream_plugin.as_deref() == Some(target)
+                            || self
+                                .plugin_view
+                                .playlist_binding
+                                .as_ref()
+                                .is_some_and(|b| b.installed.plugin_id == target)
+                            || self
+                                .plugins
+                                .list()
+                                .iter()
+                                .find(|p| p.id == target)
+                                .and_then(|p| p.binding.as_ref())
+                                .is_some_and(|b| {
+                                    b.installed.installation_id == session.factory.owner()
+                                })
+                    }
+                });
+        let playlist_matches = sid.is_some_and(|target_sid| {
+            self.plugin_view
+                .playlist_binding
+                .as_ref()
+                .is_some_and(|b| pid.is_none_or(|p| b.installed.plugin_id == p))
+                && self
+                    .plugin_view
+                    .playlist_current
+                    .as_ref()
+                    .is_some_and(|(cur_sid, _)| cur_sid == target_sid)
+        });
+        if uri_matches || meta_matches || owner_matches || playlist_matches {
+            self.save_progress_sync();
+            let _ = self.active_mut().session.stop();
+            self.active_mut().session.release_scoped();
+            self.plugin_view.scoped_released = false;
+            self.active_mut().image.reset();
+            self.sleep_preventer.set_active(false);
+            self.sync_now_playing(true);
+            self.plugin_view.stream_plugin = None;
+            self.plugin_view.playlist_current = None;
+            self.catalog.active_stream_meta = None;
+            if self.overlays.popover == Some(PopoverKind::Variants) {
+                self.overlays.popover = None;
+                self.overlays.popover_index = None;
+            }
+        } else {
+            self.catalog
+                .clear_stream_meta_for(&mut self.overlays, pid, sid);
+        }
+        if self
+            .plugin_view
+            .playlist_binding
+            .as_ref()
+            .is_some_and(|b| pid.is_none_or(|p| b.installed.plugin_id == p))
+        {
+            if let Some(target_sid) = sid {
+                self.plugin_view
+                    .playlist
+                    .retain(|entry| entry.source_id != target_sid);
+                if self
+                    .plugin_view
+                    .playlist_current
+                    .as_ref()
+                    .is_some_and(|(cur_sid, _)| cur_sid == target_sid)
+                {
+                    self.plugin_view.playlist_current = None;
+                }
+                if self.plugin_view.playlist.is_empty() {
+                    self.plugin_view.playlist_binding = None;
+                    self.plugin_view.playlist_current = None;
+                }
+            } else {
+                self.plugin_view.playlist.clear();
+                self.plugin_view.playlist_binding = None;
+                self.plugin_view.playlist_current = None;
+            }
+        }
+    }
+
     pub(super) fn toggle_plugin_enabled(
         &mut self,
         id: &str,
@@ -340,7 +444,7 @@ impl IrisWindow {
             .set_plugin_enabled(&mut self.settings, id, enabled);
         if !enabled {
             self.text_inputs.clear_plugin_sidebar_fields(id);
-            self.cancel_plugin_requests(Some(id), None);
+            self.cleanup_plugin_playback(Some(id), None);
         }
         let snap = self.plugin_snapshot();
         let report = self.plugins.set_enabled_with_snapshot(id, enabled, snap);
@@ -357,27 +461,12 @@ impl IrisWindow {
         self.preset_rt
             .set_plugin_enabled(&mut self.settings, id, true);
         self.text_inputs.clear_plugin_sidebar_fields(id);
-        self.cancel_plugin_requests(Some(id), None);
+        self.cleanup_plugin_playback(Some(id), None);
         self.plugins.dismiss_modal(id);
         if self.settings.theme_id == format!("plugin:{id}") {
             self.settings.theme_id = "graphite".into();
             self.persist_user_settings();
             self.sync_theme_tokens(cx);
-        }
-        if let Some(session) =
-            iris_core::plugin_v2::stream::prepare::stream_session(&self.active().session)
-        {
-            let owner_matches = self
-                .plugins
-                .list()
-                .iter()
-                .find(|p| p.id == id)
-                .and_then(|p| p.binding.as_ref())
-                .is_some_and(|b| b.installed.installation_id == session.factory.owner());
-            if owner_matches {
-                let _ = self.active_mut().session.stop();
-                self.active_mut().session.release_scoped();
-            }
         }
         let report = self.plugins.uninstall(id, keep_data);
         self.apply_poll_report(report, None, cx);
@@ -386,7 +475,7 @@ impl IrisWindow {
     }
 
     pub(super) fn reload_plugins(&mut self, cx: &mut Context<Self>) {
-        self.cancel_plugin_requests(None, None);
+        self.cleanup_plugin_playback(None, None);
         let snap = self.plugin_snapshot();
         let report = self
             .plugins
@@ -411,9 +500,9 @@ impl IrisWindow {
         request_id: &str,
         message: String,
         cx: &mut Context<Self>,
-    ) {
+    ) -> bool {
         let Some(kind) = self.catalog.take_error(plugin_id, request_id) else {
-            return;
+            return false;
         };
         match kind {
             SourceErrorKind::Resolve => {
@@ -432,5 +521,6 @@ impl IrisWindow {
             }
         }
         self.show_toast(format!("数据源错误 · {message}"), cx);
+        true
     }
 }

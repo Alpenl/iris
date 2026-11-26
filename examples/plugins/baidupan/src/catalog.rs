@@ -1,8 +1,10 @@
 //! Baidu Netdisk catalog browsing (`files` directory hierarchy, `videos`/`photos`/`audio`
 //! category views, and global recursive search), pagination, caching, and playlist building.
 
+mod paging;
 mod parser;
 
+pub(crate) use paging::{PageCache, PageTarget};
 pub use parser::{ParsedBrowse, parse_browse_response};
 
 use crate::{
@@ -427,6 +429,7 @@ pub fn dedup_browse_page(
         .next_page
         .as_ref()
         .is_some_and(|next| cursors.contains(next) || cursor == Some(next.as_str()))
+        || (cursor.is_some() && page.entries.is_empty())
     {
         page.next_page = None;
     }

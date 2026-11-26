@@ -47,6 +47,18 @@ impl Plugin {
         self.preparing.clear();
         self.sources = None;
     }
+    pub fn wants_control_reap(&self, has_windows: bool) -> bool {
+        let Some(control) = &self.control else {
+            return false;
+        };
+        !matches!(control.status(), Status::Ready | Status::Initializing)
+            && (matches!(control.status(), Status::Stopping | Status::Stopped)
+                || self.binding.as_ref().is_none_or(|b| !b.is_live())
+                || !matches!(self.status, PluginStatus::Failed(_))
+                || self.restart
+                || !self.enabled
+                || !has_windows)
+    }
 }
 pub(super) struct Window {
     pub inbox: Arc<Inbox>,
@@ -68,6 +80,7 @@ pub(super) struct Worker {
     pub windows: BTreeMap<Id, Window>,
     pub reviews: BTreeMap<Id, PendingReview>,
     pub review_slots: BTreeSet<Id>,
+    pub official_reviews: BTreeMap<String, Review>,
     pub origins: BTreeMap<Id, super::origin::PendingOrigin>,
     pub origin_slots: BTreeSet<Id>,
     pub retiring: Vec<Control>,
@@ -90,6 +103,7 @@ impl Worker {
             windows: BTreeMap::new(),
             reviews: BTreeMap::new(),
             review_slots: BTreeSet::new(),
+            official_reviews: BTreeMap::new(),
             origins: BTreeMap::new(),
             origin_slots: BTreeSet::new(),
             retiring: Vec::new(),
@@ -139,15 +153,11 @@ impl Worker {
             {
                 return;
             }
+            let has_windows = !self.windows.is_empty();
             let cleaning = !self.retiring.is_empty()
                 || self.plugins.values().any(|p| {
-                    p.control.as_ref().is_some_and(|c| {
-                        !c.is_quiescent()
-                            && matches!(
-                                c.status(),
-                                Status::Stopping | Status::Stopped | Status::Failed(_)
-                            )
-                    })
+                    p.wants_control_reap(has_windows)
+                        && p.control.as_ref().is_some_and(|c| !c.is_quiescent())
                 });
             let pending_attach = !self.shutdown
                 && self.plugins.values().any(|p| {
@@ -239,11 +249,22 @@ impl Worker {
             .collect();
         for id in stale {
             if let Some(review) = self.reviews.remove(&id) {
+                let expired = review.expires <= Instant::now();
+                let window_gone = !self.windows.contains_key(&review.window);
                 if review.review.is_some() {
                     self.review_slots.remove(&id);
                 }
                 review.cancel.store(true, Ordering::Release);
-                self.error(review.window, None, Some(id), ErrorCode::StaleHandle, None);
+                if window_gone
+                    && !expired
+                    && let Some(inner) = review.review
+                    && inner.is_bundled()
+                {
+                    self.official_reviews
+                        .insert(inner.manifest().id.clone(), inner);
+                } else {
+                    self.error(review.window, None, Some(id), ErrorCode::StaleHandle, None);
+                }
             }
         }
     }
@@ -271,11 +292,17 @@ impl Worker {
             if let Err(error) = source_result {
                 self.fail_plugin(&id, error);
             }
-            if let Some(Status::Failed(
-                error @ (ErrorCode::Denied | ErrorCode::InvalidArgument | ErrorCode::BadState),
-            )) = self.plugins[&id].control.as_ref().map(Control::status)
+            if let Some(Status::Failed(error)) =
+                self.plugins[&id].control.as_ref().map(Control::status)
             {
-                self.fail_plugin(&id, error);
+                if matches!(
+                    error,
+                    ErrorCode::Denied | ErrorCode::InvalidArgument | ErrorCode::BadState
+                ) {
+                    self.fail_plugin(&id, error);
+                } else {
+                    self.fail_control(&id, error);
+                }
             }
             let uninstalling = self.uninstalling.contains(&id);
             let plugin = self.plugins.get_mut(&id).unwrap();
@@ -304,24 +331,13 @@ impl Worker {
                 plugin.status = status;
                 self.dirty = true;
             }
-            if plugin.control.as_ref().is_some_and(|c| {
-                !matches!(c.status(), Status::Ready | Status::Initializing) && c.is_quiescent()
-            }) {
-                // An ordinary control trap may leave authorized independent
-                // media alive. Keep that Control until an explicit stop/reload.
-                if plugin
-                    .control
-                    .as_ref()
-                    .is_some_and(|c| matches!(c.status(), Status::Stopping | Status::Stopped))
-                    || plugin.binding.as_ref().is_none_or(|b| !b.is_live())
-                    || !matches!(plugin.status, PluginStatus::Failed(_))
-                    || plugin.restart
-                    || !plugin.enabled
-                    || self.windows.is_empty()
-                {
-                    plugin.control.take();
-                    self.dirty = true;
-                }
+            // An ordinary control trap may leave authorized independent
+            // media alive. Keep that Control until an explicit stop/reload.
+            if plugin.wants_control_reap(!self.windows.is_empty())
+                && plugin.control.as_ref().is_some_and(Control::is_quiescent)
+            {
+                plugin.control.take();
+                self.dirty = true;
             }
         }
     }
@@ -333,8 +349,15 @@ impl Worker {
             if self
                 .submit(false, "scan", move || {
                     Work::Scanned(super::jobs::guarded(|| match bootstrap {
-                        Some(bootstrap) => bootstrap.entries(installer, &setup),
-                        None => installer.entries(),
+                        Some(bootstrap) => {
+                            bootstrap.scan(installer, &setup, &AtomicBool::new(false))
+                        }
+                        None => installer.entries().map(|entries| {
+                            super::super::official::BootstrapScan {
+                                entries,
+                                pending_reviews: Vec::new(),
+                            }
+                        }),
                     }))
                 })
                 .is_ok()
@@ -342,6 +365,9 @@ impl Worker {
                 self.scanning = true;
                 self.rescan = false;
             }
+        }
+        if !self.official_reviews.is_empty() {
+            self.surface_official_reviews();
         }
         let ids: Vec<_> = self.plugins.keys().cloned().collect();
         for id in ids {
@@ -402,7 +428,16 @@ impl Worker {
             let allowed: BTreeSet<_> = self
                 .plugins
                 .values()
-                .filter(|p| p.attached.contains(&window.inbox.id))
+                .filter(|p| {
+                    p.enabled
+                        && !matches!(
+                            p.status,
+                            PluginStatus::Failed(_)
+                                | PluginStatus::Stopping
+                                | PluginStatus::Disabled
+                        )
+                        && p.attached.contains(&window.inbox.id)
+                })
                 .filter_map(|p| {
                     p.binding
                         .as_ref()
@@ -443,6 +478,7 @@ impl Worker {
         }
     }
     pub fn fail_plugin(&mut self, id: &str, error: ErrorCode) {
+        let mut installation_id = None;
         if let Some(plugin) = self.plugins.get_mut(id) {
             plugin.stop();
             plugin.restart = false;
@@ -450,14 +486,64 @@ impl Worker {
             plugin.failure = Some(error);
             self.dirty = true;
             if let Ok(record) = &plugin.record {
-                for window in self.windows.values() {
-                    window
-                        .inbox
-                        .requests
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .cancel_owner(&record.installation_id);
-                }
+                installation_id = Some(record.installation_id.clone());
+            }
+        }
+        if let Some(installation_id) = installation_id {
+            self.fail_plugin_requests(id, &installation_id, error);
+        }
+    }
+    /// Marks a plugin's control actor failed without revoking its `Binding` or
+    /// stopping already-admitted `Playback` relays, while cancelling stranded
+    /// `SourceRequests` and clearing window readiness.
+    fn fail_control(&mut self, id: &str, error: ErrorCode) {
+        let mut installation_id = None;
+        if let Some(plugin) = self.plugins.get_mut(id) {
+            if plugin.failure.is_some() {
+                return;
+            }
+            plugin.restart = false;
+            plugin.status = PluginStatus::Failed(error);
+            plugin.failure = Some(error);
+            plugin.preparing.clear();
+            plugin.sources = None;
+            self.dirty = true;
+            if let Ok(record) = &plugin.record {
+                installation_id = Some(record.installation_id.clone());
+            }
+        }
+        if let Some(installation_id) = installation_id {
+            self.fail_plugin_requests(id, &installation_id, error);
+        }
+    }
+    fn fail_plugin_requests(&self, id: &str, installation_id: &str, error: ErrorCode) {
+        let window_ids: Vec<Id> = self.windows.keys().copied().collect();
+        for window_id in window_ids {
+            let ids = {
+                let window = &self.windows[&window_id];
+                let ready_playback_ids: BTreeSet<Id> = window
+                    .inbox
+                    .notices
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .iter()
+                    .filter_map(|n| match n {
+                        Notice::Playback { ticket, .. } => Some(ticket.id),
+                        _ => None,
+                    })
+                    .collect();
+                window
+                    .inbox
+                    .requests
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .cancel_owner(installation_id)
+                    .into_iter()
+                    .filter(|req_id| !ready_playback_ids.contains(req_id))
+                    .collect::<Vec<_>>()
+            };
+            for req_id in ids {
+                self.error(window_id, Some(id.to_owned()), Some(req_id), error, None);
             }
         }
     }
@@ -466,7 +552,7 @@ impl Worker {
         let Some(control) = &plugin.control else {
             return Ok(());
         };
-        if !plugin.binding.as_ref().is_some_and(|b| b.is_live()) {
+        if plugin.failure.is_some() || !plugin.binding.as_ref().is_some_and(|b| b.is_live()) {
             return Ok(());
         }
         let sources = control.sources();
@@ -477,10 +563,10 @@ impl Worker {
         {
             return Ok(());
         }
-        let bytes = crate::plugin_v2::json::encode(&sources, iris_api::v2::MESSAGE_LIMIT)?;
+        let bytes = estimate_sources_bytes(sources)?;
         let lease = self.shared.ledger.reserve(
             &control.installed().installation_id,
-            &[(Resource::HostBytes, bytes.len() as u64 * 32 + 4096)],
+            &[(Resource::HostBytes, bytes * 32 + 4096)],
         )?;
         plugin.sources = Some(Arc::new(SourceSnapshot {
             sources: sources.to_vec(),
@@ -489,4 +575,24 @@ impl Worker {
         self.dirty = true;
         Ok(())
     }
+}
+
+fn estimate_sources_bytes(
+    sources: &[iris_api::v2::source::SourceDescriptor],
+) -> Result<u64, ErrorCode> {
+    let mut total: usize = 2;
+    for s in sources {
+        total = total
+            .saturating_add(160)
+            .saturating_add(s.id.len())
+            .saturating_add(s.name.len())
+            .saturating_add(s.subtitle.as_ref().map_or(0, String::len))
+            .saturating_add(s.icon.as_ref().map_or(0, String::len))
+            .saturating_add(s.badge.as_ref().map_or(0, String::len))
+            .saturating_add(s.auth_command_id.as_ref().map_or(0, String::len));
+        if total > iris_api::v2::MESSAGE_LIMIT {
+            return Err(ErrorCode::QuotaExceeded);
+        }
+    }
+    Ok(total as u64)
 }

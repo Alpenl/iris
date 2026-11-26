@@ -6,11 +6,20 @@ mod account;
 mod resolve;
 mod subtitles;
 
-use super::*;
-use iris_plugin_sdk::api::v2::{
-    task::Task,
-    task_result::{HttpResult, ReadResult, StoreWrite},
+use crate::{
+    ActiveHttp, BaiduPanPlugin, HttpFlow, OAuthRetry, WindowState, auth, catalog, sign, ui,
 };
+use iris_plugin_sdk::{
+    api::v2::{
+        ErrorCode, HostCommand, Id,
+        task::Task,
+        task_result::{HttpResult, ReadResult, StoreWrite},
+    },
+    client::{Host, completed},
+    error_message,
+    serde_json::{self, Value},
+};
+use std::collections::BTreeMap;
 
 const MAX_HTTP_BODY: usize = 8 * 1024 * 1024;
 
@@ -29,6 +38,39 @@ impl BaiduPanPlugin {
         host: &mut impl Host,
         now_ms: u64,
     ) -> Vec<HostCommand> {
+        if let Some(cursor) = cursor.as_deref().filter(|c| c.starts_with("local:")) {
+            let target = catalog::PageTarget {
+                account_epoch: self.account_epoch,
+                source: source_id,
+                folder: folder_id,
+                query,
+                filters,
+            };
+            let result = state
+                .browse_page
+                .as_mut()
+                .filter(|cache| self.session.is_authenticated() && cache.matches(&target, cursor))
+                .ok_or_else(|| "目录分页已失效，请刷新目录".to_owned())
+                .and_then(catalog::PageCache::next);
+            if state
+                .browse_page
+                .as_ref()
+                .is_some_and(|cache| !cache.has_more())
+            {
+                state.browse_page = None;
+            }
+            return match result {
+                Ok(page) => vec![HostCommand::ProvideSourcePage {
+                    request_id,
+                    page: Box::new(page),
+                }],
+                Err(message) => vec![HostCommand::SourceError {
+                    request_id,
+                    message,
+                }],
+            };
+        }
+        state.browse_page = None;
         let plan = match catalog::plan_browse(
             &source_id,
             folder_id.as_deref(),
@@ -61,6 +103,7 @@ impl BaiduPanPlugin {
             Some(25_000),
             Some(request_id),
             HttpFlow::Browse {
+                account_epoch: self.account_epoch,
                 request_id,
                 source_id,
                 kind: plan.kind,
@@ -74,7 +117,7 @@ impl BaiduPanPlugin {
         ) {
             return vec![HostCommand::SourceError {
                 request_id,
-                message: format!("无法发起网盘目录请求：{e:?}"),
+                message: format!("无法发起网盘目录请求：{}", error_message(e)),
             }];
         }
         Vec::new()
@@ -88,20 +131,34 @@ impl BaiduPanPlugin {
         host: &mut impl Host,
         now_ms: u64,
     ) -> Result<Vec<HostCommand>, ErrorCode> {
-        let now_secs = (now_ms / 1000).max(1_700_000_000);
+        let now_secs = now_ms / 1000;
+
+        if state.logout_secret_op.is_some_and(|(id, _)| id == op) {
+            state.logout_secret_op = None;
+            return Ok(Vec::new());
+        }
+
+        if state.background_secret_ops.remove(&op) {
+            if state.background_secret_ops.is_empty() {
+                state.background_secret_epoch = None;
+            }
+            return Ok(Vec::new());
+        }
 
         if state
             .secret_write_op
             .as_ref()
-            .is_some_and(|(id, _, _, _)| *id == op)
+            .is_some_and(|(id, ..)| *id == op)
         {
-            let (_, next_session, close_modal, notify_login) =
+            let (_, epoch, next_session, next_quota, close_modal, notify_login) =
                 state.secret_write_op.take().unwrap();
+            if epoch != self.account_epoch {
+                return Ok(Vec::new());
+            }
             if completed::<StoreWrite>(result).is_ok_and(|w| w.stored) {
-                self.session = next_session;
-                state.qr = None;
+                let mut cmds = self.commit_session(state, next_session, next_quota, host);
                 self.request_quota(state, host);
-                let mut cmds = self.sync_ui(state);
+                cmds.extend(self.sync_ui(state));
                 cmds.extend(self.maybe_sync_sources());
                 if close_modal {
                     cmds.push(HostCommand::CloseModal {
@@ -248,19 +305,28 @@ impl BaiduPanPlugin {
             | HttpFlow::ResolveStreaming { request_id, .. } => vec![HostCommand::SourceError {
                 request_id: *request_id,
                 message: if code == ErrorCode::Denied {
-                    format!("百度网盘网络请求被拒绝：{code:?}{denied_hint}")
+                    format!(
+                        "百度网盘网络请求被拒绝：{}{denied_hint}",
+                        error_message(code)
+                    )
                 } else {
-                    format!("百度网盘网络请求失败 ({code:?})")
+                    format!("百度网盘网络请求失败 ({})", error_message(code))
                 },
             }],
             HttpFlow::OAuthRefresh { retry, .. } => {
                 if let Some(request_id) = retry.request_id() {
                     vec![HostCommand::SourceError {
                         request_id,
-                        message: format!("刷新 OAuth 令牌失败 ({code:?})，请重新登录"),
+                        message: format!(
+                            "刷新 OAuth 令牌失败 ({})，请重新登录",
+                            error_message(code)
+                        ),
                     }]
                 } else {
-                    vec![ui::toast(format!("刷新 OAuth 令牌失败：{code:?}"))]
+                    vec![ui::toast(format!(
+                        "刷新 OAuth 令牌失败：{}",
+                        error_message(code)
+                    ))]
                 }
             }
             HttpFlow::QrGetSign { .. }
@@ -271,15 +337,14 @@ impl BaiduPanPlugin {
                 notify_on_success: true,
                 ..
             } => vec![ui::toast(if code == ErrorCode::Denied {
-                format!("百度账号请求被拒绝：{code:?}{denied_hint}")
+                format!("百度账号请求被拒绝：{}{denied_hint}", error_message(code))
             } else {
-                format!("百度账号请求失败：{code:?}")
+                format!("百度账号请求失败：{}", error_message(code))
             })],
             HttpFlow::SubtitleLocate { .. }
             | HttpFlow::SubtitleOpenApiMeta { .. }
             | HttpFlow::SubtitleOpenApiHead { .. } => {
-                self.pump_next_subtitle(state, host, now_secs);
-                Vec::new()
+                self.pump_next_subtitle(state, host, now_secs)
             }
             _ => Vec::new(),
         }
@@ -319,6 +384,7 @@ impl BaiduPanPlugin {
 
         match job.flow {
             HttpFlow::Browse {
+                account_epoch,
                 request_id,
                 source_id,
                 kind,
@@ -328,6 +394,12 @@ impl BaiduPanPlugin {
                 filters,
                 retried_oauth,
             } => {
+                if account_epoch != self.account_epoch {
+                    return vec![HostCommand::SourceError {
+                        request_id,
+                        message: "账号状态已变更，请刷新目录".into(),
+                    }];
+                }
                 let Ok(json) = serde_json::from_slice::<Value>(&body) else {
                     return vec![HostCommand::SourceError {
                         request_id,
@@ -361,6 +433,7 @@ impl BaiduPanPlugin {
                     self.prefs.show_thumbnails,
                 ) {
                     Ok(mut parsed) => {
+                        parsed.page.folder_id = folder_id.clone();
                         if let Some(dir) = &parsed.cache_dir {
                             catalog::merge_folder_cache(
                                 &mut state.folder_caches,
@@ -380,10 +453,27 @@ impl BaiduPanPlugin {
                             cursor.as_deref(),
                             &mut parsed.page,
                         );
-                        vec![HostCommand::ProvideSourcePage {
-                            request_id,
-                            page: Box::new(parsed.page),
-                        }]
+                        let target = catalog::PageTarget {
+                            account_epoch,
+                            source: source_id,
+                            folder: folder_id,
+                            query,
+                            filters,
+                        };
+                        let mut cache = catalog::PageCache::new(target, request_id, parsed.page);
+                        match cache.next() {
+                            Ok(page) => {
+                                state.browse_page = cache.has_more().then_some(cache);
+                                vec![HostCommand::ProvideSourcePage {
+                                    request_id,
+                                    page: Box::new(page),
+                                }]
+                            }
+                            Err(message) => vec![HostCommand::SourceError {
+                                request_id,
+                                message,
+                            }],
+                        }
                     }
                     Err(message) => vec![HostCommand::SourceError {
                         request_id,
@@ -396,7 +486,7 @@ impl BaiduPanPlugin {
             | HttpFlow::QrPoll { .. }
             | HttpFlow::QrConfirmLogin { .. }
             | HttpFlow::UserInfo { .. }
-            | HttpFlow::Quota
+            | HttpFlow::Quota { .. }
             | HttpFlow::OAuthRefresh { .. }) => {
                 self.finish_account_flow(state, flow, &job.headers, &body, host, now_ms, now_secs)
             }

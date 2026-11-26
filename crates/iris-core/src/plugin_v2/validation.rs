@@ -183,7 +183,7 @@ pub fn command(command: &HostCommand) -> Result<(), ErrorCode> {
             if request_id.0 == 0 || request_id.0 > i64::MAX as u64 {
                 return Err(ErrorCode::InvalidArgument);
             }
-            super::network::normalize_url(origin, super::network::TransportKind::Http).map(|_| ())
+            super::network::parse_consent_origin_url(origin).map(|_| ())
         }
         SeekRelative { seconds } => finite(*seconds, -86400., 86400.),
         SeekAbsolute { seconds } => finite(*seconds, 0., 7. * 86400.),
@@ -523,5 +523,34 @@ mod tests {
             action_id: "x".into(),
         };
         assert_eq!(overlay(&[button], false), Err(ErrorCode::Denied));
+    }
+
+    #[test]
+    fn request_origin_accepts_http_and_websocket_schemes_only() {
+        for origin in [
+            "https://example.com/path",
+            "http://192.168.1.50:5244/dav",
+            "ws://192.168.1.50:8080/live",
+            "wss://chat.example.com/socket",
+        ] {
+            assert_eq!(
+                command(&HostCommand::RequestOrigin {
+                    request_id: iris_api::v2::Id(1),
+                    origin: origin.into(),
+                }),
+                Ok(()),
+                "origin `{origin}` should be valid"
+            );
+        }
+        for origin in ["ftp://example.com/file", "file:///etc/passwd", "not-a-url"] {
+            assert!(
+                command(&HostCommand::RequestOrigin {
+                    request_id: iris_api::v2::Id(1),
+                    origin: origin.into(),
+                })
+                .is_err(),
+                "origin `{origin}` should be rejected"
+            );
+        }
     }
 }

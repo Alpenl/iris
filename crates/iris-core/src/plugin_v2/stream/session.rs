@@ -203,6 +203,9 @@ impl StreamSession {
                 .clone();
             if let Some(refresh) = refresh {
                 let cancel = self.cancel.child().map_err(|_| ErrorCode::Cancelled)?;
+                request_cancel
+                    .link(&cancel)
+                    .map_err(|_| ErrorCode::Cancelled)?;
                 refresh.refresh(&cancel)?;
                 if request_cancel.is_cancelled() {
                     return Err(ErrorCode::Cancelled);
@@ -483,6 +486,7 @@ impl StreamSession {
         let skip_probe = matches!(
             definition,
             Definition::Document(_)
+                | Definition::Direct
                 | Definition::Bound(ResourceBinding {
                     kind: ResourceKind::Key,
                     ..

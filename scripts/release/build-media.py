@@ -79,7 +79,8 @@ def download(pin, destination):
         client = urllib.request.build_opener(HttpsRedirect())
         with client.open(pin["url"], timeout=180) as response, destination.open("wb") as out:
             shutil.copyfileobj(response, out)
-    digest = hashlib.file_digest(destination.open("rb"), "sha256").hexdigest()
+    with destination.open("rb") as fh:
+        digest = hashlib.file_digest(fh, "sha256").hexdigest()
     if digest != pin["sha256"]:
         raise RuntimeError(f"Checksum mismatch: {destination}: {digest}")
 
@@ -140,14 +141,14 @@ def main():
     prefix.mkdir(exist_ok=args.resume)
     evidence = output / "compliance"
     evidence.mkdir(exist_ok=args.resume)
-    lock = json.loads(LOCK.read_text())
+    lock = json.loads(LOCK.read_text(encoding="utf-8"))
     validate_lock(lock)
     epoch = lock["source_date_epoch"]
     identity_path = work / "build-identity.json"
     identity = {"target": args.target, "output": str(output)}
-    if identity_path.exists() and json.loads(identity_path.read_text()) != identity:
+    if identity_path.exists() and json.loads(identity_path.read_text(encoding="utf-8")) != identity:
         parser.error("Resume target/output does not match the original build")
-    identity_path.write_text(json.dumps(identity))
+    identity_path.write_text(json.dumps(identity), encoding="utf-8", newline="\n")
     env = os.environ.copy()
     # Never discover Homebrew, MSYS2 or host media dependencies via pkg-config/CMake.
     env.update(SOURCE_DATE_EPOCH=str(epoch), LC_ALL="C", TZ="UTC", PKG_CONFIG_PATH="",
@@ -158,19 +159,19 @@ def main():
     stamps = work / "completed-commands"
     stamps.mkdir(exist_ok=True)
     def execute(command, cwd=None):
-        key = hashlib.sha256((str(cwd) + json.dumps(list(map(str, command)))).encode()).hexdigest()
+        key = hashlib.sha256((str(cwd) + json.dumps(list(map(str, command)))).encode("utf-8")).hexdigest()
         stamp = stamps / key
         if args.resume and stamp.exists():
-            return stamp.read_text()
+            return stamp.read_text(encoding="utf-8")
         try:
             text = run(command, cwd, env)
         except subprocess.CalledProcessError as failure:
-            with (evidence / "commands.log").open("a", encoding="utf-8") as log:
+            with (evidence / "commands.log").open("a", encoding="utf-8", newline="\n") as log:
                 log.write("FAILED $ " + shlex.join(map(str, command)) + "\n" + failure.output + "\n")
             raise
-        with (evidence / "commands.log").open("a", encoding="utf-8") as log:
+        with (evidence / "commands.log").open("a", encoding="utf-8", newline="\n") as log:
             log.write("$ " + shlex.join(map(str, command)) + "\n" + text + "\n")
-        stamp.write_text(text)
+        stamp.write_text(text, encoding="utf-8", newline="\n")
         print(text, flush=True)
         return text
     for tool in ("meson", "cmake", "ninja", "pkg-config", "make", "sh"):
@@ -192,7 +193,13 @@ def main():
         env["PATH"] = str(toolchain / "bin") + os.pathsep + env["PATH"]
         cc, cxx = "x86_64-w64-mingw32-clang", "x86_64-w64-mingw32-clang++"
         cross = work / "windows.ini"
-        cross.write_text("[binaries]\nc = '" + cc + "'\ncpp = '" + cxx + "'\nar = 'llvm-ar'\nstrip = 'llvm-strip'\nwindres = 'x86_64-w64-mingw32-windres'\npkg-config = 'pkg-config'\n[host_machine]\nsystem = 'windows'\ncpu_family = 'x86_64'\ncpu = 'x86_64'\nendian = 'little'\n[properties]\nneeds_exe_wrapper = true\n")
+        cross.write_text(
+            "[binaries]\nc = '" + cc + "'\ncpp = '" + cxx + "'\nar = 'llvm-ar'\nstrip = 'llvm-strip'\n"
+            "windres = 'x86_64-w64-mingw32-windres'\npkg-config = 'pkg-config'\n[host_machine]\nsystem = 'windows'\n"
+            "cpu_family = 'x86_64'\ncpu = 'x86_64'\nendian = 'little'\n[properties]\nneeds_exe_wrapper = true\n",
+            encoding="utf-8",
+            newline="\n",
+        )
         meson_platform = ["--cross-file", str(cross)]
         cmake_platform = ["-DCMAKE_SYSTEM_NAME=Windows", "-DCMAKE_RC_COMPILER=x86_64-w64-mingw32-windres"]
         ff_platform = ["--target-os=mingw32", "--arch=x86_64", "--enable-cross-compile",
@@ -228,7 +235,7 @@ def main():
     mpv_meson_text = mpv_meson.read_text(encoding="utf-8")
     patched_mpv_meson = mpv_meson_text.replace(", '-L/usr/local/lib'", "")
     if patched_mpv_meson != mpv_meson_text:
-        mpv_meson.write_text(patched_mpv_meson, encoding="utf-8")
+        mpv_meson.write_text(patched_mpv_meson, encoding="utf-8", newline="\n")
     elif "'-L/usr/local/lib'" in mpv_meson_text:
         raise RuntimeError("Unexpected -L/usr/local/lib flag in mpv/meson.build")
     # Explicit vendoring, not network-capable Meson/CMake fallback downloads.
@@ -306,11 +313,11 @@ def main():
              "--pkg-config=pkg-config", "--extra-cflags=-I" + str(prefix / "include"),
              "--extra-ldflags=-L" + str(prefix / "lib") + ("" if windows else " -Wl,-headerpad_max_install_names"),
              *ff_platform], ffbuild)
-    config = (ffbuild / "config.h").read_text()
+    config = (ffbuild / "config.h").read_text(encoding="utf-8")
     for flag in ("GPL", "VERSION3", "NONFREE", "CHROMAPRINT"):
         if not re.search(r"^#define CONFIG_" + flag + r" 0$", config, re.M):
             raise RuntimeError("FFmpeg license configuration rejected: " + flag)
-    components = (ffbuild / "config_components.h").read_text()
+    components = (ffbuild / "config_components.h").read_text(encoding="utf-8")
     for capability in ("HEVC_DECODER", "LIBDAV1D_DECODER", "PNG_DECODER", "MJPEG_DECODER", "TIFF_DECODER", "WEBP_DECODER",
                        "MOV_DEMUXER", "SCALE_FILTER", "FORMAT_FILTER", "HFLIP_FILTER", "VFLIP_FILTER"):
         if not re.search(r"^#define CONFIG_" + capability + r" 1$", components, re.M):
@@ -338,12 +345,12 @@ def main():
     else:
         options += ["-Dswift-build=enabled", "-Dcoreaudio=enabled", "-Dgl-cocoa=enabled", "-Dcocoa=enabled", "-Dvideotoolbox-gl=enabled"]
     meson("mpv", options)
-    mpvoptions = json.loads((work / "build/mpv/meson-info/intro-buildoptions.json").read_text())
+    mpvoptions = json.loads((work / "build/mpv/meson-info/intro-buildoptions.json").read_text(encoding="utf-8"))
     values = {entry["name"]: entry["value"] for entry in mpvoptions}
     for name, expected in (("gpl", False), ("libmpv", True), ("cplayer", False), ("default_library", "shared")):
         if values.get(name) != expected:
             raise RuntimeError(f"mpv license configuration rejected: {name}")
-    mpvconfig = (work / "build/mpv/config.h").read_text()
+    mpvconfig = (work / "build/mpv/config.h").read_text(encoding="utf-8")
     if not re.search(r"^#define HAVE_GPL 0$", mpvconfig, re.M):
         raise RuntimeError("mpv actual compiled configuration enables GPL")
     if windows and not re.search(r"^#define HAVE_D3D11 1$", mpvconfig, re.M):
@@ -361,7 +368,11 @@ def main():
         if "mpv_render_context_create" not in exports:
             raise RuntimeError("libmpv client exports missing")
         definition = prefix / "lib/mpv.def"
-        definition.write_text("LIBRARY " + dlls[0].name + "\nEXPORTS\n" + "\n".join(exports) + "\n")
+        definition.write_text(
+            "LIBRARY " + dlls[0].name + "\nEXPORTS\n" + "\n".join(exports) + "\n",
+            encoding="utf-8",
+            newline="\n",
+        )
         execute(["llvm-dlltool", "-m", "i386:x86-64", "-d", str(definition), "-l", str(prefix / "lib/mpv.lib")])
     else:
         prefix_root = prefix.as_posix().rstrip("/") + "/"
@@ -391,14 +402,19 @@ def main():
     shutil.copytree(ROOT / "scripts/release", src / "iris-build-recipes", dirs_exist_ok=True, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
     shutil.copytree(evidence, src / "build-evidence", dirs_exist_ok=True, ignore=shutil.ignore_patterns("corresponding-source.tar.gz"))
     source_archive(src, evidence / "corresponding-source.tar.gz", epoch)
-    inventory = {p.relative_to(prefix).as_posix(): hashlib.file_digest(p.open("rb"), "sha256").hexdigest()
-                 for p in sorted(prefix.rglob("*")) if p.is_file()}
+    inventory = {}
+    for p in sorted(prefix.rglob("*")):
+        if p.is_file():
+            with p.open("rb") as fh:
+                inventory[p.relative_to(prefix).as_posix()] = hashlib.file_digest(fh, "sha256").hexdigest()
     manifest = {"schema": 1, "target": args.target, "host": platform.platform(), "source_date_epoch": epoch,
                 "sources": {n: lock["sources"][n] for n in needed}, "tools": records,
                 "ffmpeg": {"gpl": False, "version3": False, "nonfree": False, "chromaprint": False, "shared": True},
                 "mpv": {"gpl": False, "libmpv": True, "cplayer": False, "d3d11": windows},
                 "files": inventory, "signing": "unsigned media SDK; sign each library during application packaging"}
-    (evidence / "build-manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+    (evidence / "build-manifest.json").write_text(
+        json.dumps(manifest, indent=2) + "\n", encoding="utf-8", newline="\n"
+    )
     (evidence / "NOTICES.txt").write_text(
         "Iris media SDK: dynamically linked LGPL-2.1-or-later mpv, FFmpeg, libplacebo and FriBidi.\n"
         "No GPL, version3, nonfree, FFTW or Chromaprint components are enabled.\n"
@@ -407,7 +423,10 @@ def main():
         "Full upstream license and copyright notices are in licenses/. Exact sources, configuration, and recipes\n"
         "are in corresponding-source.tar.gz. You may replace the shared media libraries with compatible modified\n"
         "versions; reverse engineering for debugging such modifications is permitted under the LGPL.\n"
-        "Apple Developer ID signatures can be removed and replaced by your own signatures for modified local builds.\n")
+        "Apple Developer ID signatures can be removed and replaced by your own signatures for modified local builds.\n",
+        encoding="utf-8",
+        newline="\n",
+    )
     print("Media SDK created:", output)
 
 

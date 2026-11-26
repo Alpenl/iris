@@ -43,8 +43,10 @@ impl IrisWindow {
                     .tooltip
                     .clone()
                     .unwrap_or_else(|| format!("插件状态 · {pid}"));
+                let status_id =
+                    SharedString::from(format!("plugin-status:{}:{pid}:{i}", pid.len()));
                 div()
-                    .id(("plugin-status", i))
+                    .id(status_id)
                     .h(px((f32::from(t.control_h_sm) - 2.).max(20.)))
                     .px(px(7.))
                     .flex()
@@ -102,14 +104,20 @@ impl IrisWindow {
                         &pid,
                         wi,
                         widget,
-                        WidgetSurface::Sidebar { window },
+                        WidgetSurface::Sidebar {
+                            section_ix: si,
+                            window,
+                        },
                         t,
                         cx,
                     ));
                 }
                 section_els.push(
                     div()
-                        .id(("plugin-section", si))
+                        .id(SharedString::from(format!(
+                            "plugin-section:{}:{pid}:{si}",
+                            pid.len()
+                        )))
                         .flex()
                         .flex_col()
                         .gap(px(6.))
@@ -127,7 +135,10 @@ impl IrisWindow {
             }
             panel_els.push(
                 surface_card(0., t)
-                    .id(SharedString::from(format!("plugin-panel:{pid}")))
+                    .id(SharedString::from(format!(
+                        "plugin-panel:{}:{pid}",
+                        pid.len()
+                    )))
                     .p(px(0.))
                     .rounded(t.radius_lg)
                     .overflow_hidden()

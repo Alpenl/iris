@@ -5,10 +5,18 @@ use gpui::{
     Styled, div, px, relative,
 };
 use iris_api::v2::{
-    HostCommand,
+    Generation, HostCommand,
     enhance::{HeatRange, SkipRange},
 };
 use iris_core::player::Command;
+
+fn can_seek_skip_range(
+    rendered_generation: Generation,
+    current_generation: Generation,
+    has_timeline_ranges: bool,
+) -> bool {
+    current_generation == rendered_generation && has_timeline_ranges
+}
 
 impl IrisWindow {
     fn timeline_ranges(&self) -> Option<(&[HeatRange], &[SkipRange])> {
@@ -54,7 +62,6 @@ impl IrisWindow {
                     .into_any_element(),
             );
         }
-        let media = self.plugin_view.enhance.sequence;
         let generation = self.plugins.generation();
         for (index, range) in skip.iter().enumerate() {
             let (start, end) = (ratio(range.start_ms.0), ratio(range.end_ms.0));
@@ -77,10 +84,11 @@ impl IrisWindow {
                         MouseButton::Left,
                         cx.listener(move |this, _, _, cx| {
                             cx.stop_propagation();
-                            if this.plugin_view.enhance.sequence == media
-                                && this.plugins.generation() == generation
-                                && this.timeline_ranges().is_some()
-                            {
+                            if can_seek_skip_range(
+                                generation,
+                                this.plugins.generation(),
+                                this.timeline_ranges().is_some(),
+                            ) {
                                 this.command(Command::SeekAbsolute(target), cx);
                             }
                         }),
@@ -89,5 +97,28 @@ impl IrisWindow {
             );
         }
         marks
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::can_seek_skip_range;
+    use iris_api::v2::{Generation, Id};
+
+    #[test]
+    fn skip_range_remains_clickable_within_generation_and_rejects_stale_media() {
+        let cur = Generation {
+            media: Id(4),
+            seek: Id(0),
+            context: Id(2),
+        };
+        let next_media = Generation {
+            media: Id(5),
+            seek: Id(0),
+            context: Id(2),
+        };
+        assert!(can_seek_skip_range(cur, cur, true));
+        assert!(!can_seek_skip_range(cur, cur, false));
+        assert!(!can_seek_skip_range(cur, next_media, true));
     }
 }

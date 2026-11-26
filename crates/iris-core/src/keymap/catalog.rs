@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::effective_gpui_context;
+use super::effective_gpui_context_for_os;
 
 /// Built-in keyboard shortcut scheme families.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
@@ -56,6 +56,14 @@ impl ActionEntry {
     /// Returns all effective GPUI `KeyContext` predicates where this action should be active
     /// for `keystroke`, enforcing the `!TextInput` firewall on unmodified `Workspace` keys.
     pub fn gpui_contexts(&self, keystroke: &str) -> &'static [&'static str] {
+        self.gpui_contexts_for_os(keystroke, cfg!(target_os = "macos"))
+    }
+
+    pub(super) fn gpui_contexts_for_os(
+        &self,
+        keystroke: &str,
+        is_macos: bool,
+    ) -> &'static [&'static str] {
         if keystroke.trim().is_empty() {
             return &[];
         }
@@ -68,12 +76,16 @@ impl ActionEntry {
             "rotate_cw" | "rotate_ccw" | "toggle_hflip" | "toggle_vflip" => {
                 &["Viewport && media == video", "Viewport && media == image"]
             }
-            "quit" | "open_settings" => match effective_gpui_context(self.context, keystroke) {
-                Some("Workspace && !Modal") => &["Workspace"],
-                Some("Workspace && !TextInput && !Modal") => &["Workspace && !TextInput && !Modal"],
-                _ => &[],
-            },
-            _ => match effective_gpui_context(self.context, keystroke) {
+            "quit" | "open_settings" => {
+                match effective_gpui_context_for_os(self.context, keystroke, is_macos) {
+                    Some("Workspace && !Modal") => &["Workspace"],
+                    Some("Workspace && !TextInput && !Modal") => {
+                        &["Workspace && !TextInput && !Modal"]
+                    }
+                    _ => &[],
+                }
+            }
+            _ => match effective_gpui_context_for_os(self.context, keystroke, is_macos) {
                 Some("Viewport && media == video") => &["Viewport && media == video"],
                 Some("Viewport && media == image") => &["Viewport && media == image"],
                 Some("Viewport && media == audio") => &["Viewport && media == audio"],

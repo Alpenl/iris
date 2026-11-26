@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::library::{self, Entry, FolderEntry, Kind, ScanResult, SortBy, SortOrder, natural_cmp};
+use crate::library::{Entry, FolderEntry, Kind, SortBy, SortOrder, natural_cmp};
 use crate::media_uri::MediaUri;
 
 /// Playable quality/variant descriptor independent of plugin transport schemas.
@@ -36,42 +36,6 @@ impl LocalDirectory {
 
     pub fn subfolders(&self) -> &[FolderEntry] {
         &self.subfolders
-    }
-
-    pub fn set(
-        &mut self,
-        folder: Option<PathBuf>,
-        entries: Vec<Entry>,
-        subfolders: Vec<FolderEntry>,
-    ) {
-        self.folder = folder;
-        self.entries = entries;
-        self.subfolders = subfolders;
-    }
-
-    pub fn sort(&mut self, by: SortBy, order: SortOrder) {
-        library::sort_entries(&mut self.entries, by, order);
-    }
-
-    pub fn enqueue(&mut self, extra: Vec<Entry>) {
-        for entry in extra {
-            if !self.entries.iter().any(|e| e.path == entry.path) {
-                self.entries.push(entry);
-            }
-        }
-    }
-
-    pub fn remove_entry(&mut self, path: &Path) -> bool {
-        if let Some(ix) = self.entries.iter().position(|e| e.path == path) {
-            self.entries.remove(ix);
-            true
-        } else {
-            false
-        }
-    }
-
-    pub fn clear_entries(&mut self) {
-        self.entries.clear();
     }
 
     pub fn to_catalog_items(&self) -> Vec<CatalogItem> {
@@ -131,13 +95,6 @@ impl CatalogItem {
             is_live: false,
             variants: Vec::new(),
         }
-    }
-
-    pub fn from_scan_result(scan: &ScanResult) -> Vec<Self> {
-        let mut out = Vec::with_capacity(scan.subfolders.len() + scan.entries.len());
-        out.extend(scan.subfolders.iter().map(Self::from_local_folder));
-        out.extend(scan.entries.iter().map(Self::from_local_entry));
-        out
     }
 
     pub fn is_folder(&self) -> bool {
@@ -384,12 +341,6 @@ impl PlayQueue {
         )
     }
 
-    /// Replaces the entire queue with media items from `catalog_items`.
-    pub fn replace_from_catalog(&mut self, catalog_items: &[CatalogItem]) {
-        self.clear();
-        self.extend_catalog(catalog_items);
-    }
-
     /// Replaces the entire queue from local [`Entry`] items.
     pub fn replace_from_entries(&mut self, entries: &[Entry]) {
         self.clear();
@@ -426,19 +377,6 @@ impl PlayQueue {
         self.removed.clear();
     }
 
-    pub fn dedup(&mut self) {
-        dedup_suffix(&mut self.items, 0, |item| &item.uri);
-        self.removed.clear();
-    }
-
-    pub fn sort_by_title(&mut self, ascending: bool) {
-        self.items.sort_by(|a, b| {
-            let ord = natural_cmp(&a.title, &b.title);
-            if ascending { ord } else { ord.reverse() }
-        });
-        self.removed.clear();
-    }
-
     /// Steps relative to the current item or to the gap left by its removal.
     /// With no known position, starts from the first (next) or last (previous) item.
     pub fn step(&self, current: &MediaUri, delta: isize, wrap: bool) -> Option<&QueueItem> {
@@ -468,7 +406,10 @@ impl PlayQueue {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{
+        CatalogItem, CatalogItemKind, Entry, FolderEntry, Kind, MediaFilter, MediaUri, PlayQueue,
+        QueueItem, SortBy, filter_catalog_items, sort_catalog_items,
+    };
     use std::path::PathBuf;
 
     #[test]
@@ -568,13 +509,11 @@ mod tests {
         let http_uri = MediaUri::HttpUrl("https://cdn.example.com/ep3.mp4".into());
 
         let mut q = PlayQueue::new();
-        assert!(q.push(QueueItem::new(local_uri.clone(), "ep10.mp4", Kind::Video)));
-        assert!(!q.push(QueueItem::new(local_uri.clone(), "ep10.mp4", Kind::Video)));
         assert!(q.push(QueueItem::new(cloud_uri.clone(), "ep2.mkv", Kind::Video)));
+        assert!(!q.push(QueueItem::new(cloud_uri.clone(), "ep2.mkv", Kind::Video)));
         assert!(q.push(QueueItem::new(http_uri.clone(), "ep3.mp4", Kind::Video)));
+        assert!(q.push(QueueItem::new(local_uri.clone(), "ep10.mp4", Kind::Video)));
         assert_eq!(q.len(), 3);
-
-        q.sort_by_title(true);
         assert_eq!(q.items()[0].uri, cloud_uri);
         assert_eq!(q.items()[1].uri, http_uri);
         assert_eq!(q.items()[2].uri, local_uri);

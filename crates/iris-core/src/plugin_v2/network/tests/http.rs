@@ -99,6 +99,11 @@ fn execute(
     run(executor.prepare(task, &BTreeMap::new(), context(ledger))?)
 }
 fn run(operation: crate::plugin_v2::actor::Operation) -> Result<IoOutcome, ErrorCode> {
+    let mut outcome = receive(operation)?;
+    outcome.acknowledge();
+    Ok(outcome)
+}
+fn receive(operation: crate::plugin_v2::actor::Operation) -> Result<IoOutcome, ErrorCode> {
     let pool = crate::plugin_v2::pool::IoPool::new()?;
     let (tx, rx) = mpsc::sync_channel(1);
     operation.dispatch(
@@ -114,6 +119,40 @@ fn run(operation: crate::plugin_v2::actor::Operation) -> Result<IoOutcome, Error
 }
 fn handle(outcome: &IoOutcome) -> Id {
     serde_json::from_value(outcome.value["stream_handle"].clone()).unwrap()
+}
+
+#[test]
+fn discarded_http_opens_reclaim_handles_and_quota_before_retry() {
+    let (url, rx, server) = server(vec![
+        b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\ndata";
+        16
+    ]);
+    let (_grant, executor, origin, ledger) = setup(&url);
+    let baseline = ledger.used(None, Resource::HostBytes);
+    for attempt in 0..16 {
+        let context = context(&ledger);
+        let cancel = context.cancel.clone();
+        let opened = receive(
+            executor
+                .prepare(start(&url, origin, false, false), &BTreeMap::new(), context)
+                .unwrap(),
+        )
+        .unwrap();
+        let id = handle(&opened);
+        assert_eq!(ledger.used(None, Resource::ControlHttp), 1);
+        // Both request cancellation and an abandoned delivery must reclaim it.
+        if attempt % 2 == 0 {
+            cancel.cancel();
+        }
+        drop(opened);
+        for resource in [Resource::Http, Resource::ControlHttp, Resource::Handle] {
+            assert_eq!(ledger.used(None, resource), 0);
+        }
+        assert_eq!(ledger.used(None, Resource::HostBytes), baseline);
+        assert_eq!(executor.close(id.0), Err(ErrorCode::StaleHandle));
+        rx.recv_timeout(Duration::from_secs(3)).unwrap();
+    }
+    server.join().unwrap();
 }
 
 #[test]

@@ -109,6 +109,7 @@ pub fn entry_from_path(path: PathBuf) -> Option<Entry> {
     })
 }
 
+#[cfg(not(windows))]
 fn is_unc_str(raw: &str) -> bool {
     if raw.len() >= 8 && raw.as_bytes()[..8].eq_ignore_ascii_case(br"\\?\UNC\") {
         return true;
@@ -140,12 +141,16 @@ pub fn is_slow_network_path(path: &Path) -> bool {
                 _ => {}
             }
         }
+        false
     }
 
-    let unc = is_unc_str(&path.to_string_lossy());
-    #[cfg(target_os = "macos")]
-    let unc = unc || (path.is_absolute() && macos_network_mount(path));
-    unc
+    #[cfg(not(windows))]
+    {
+        let unc = is_unc_str(&path.to_string_lossy());
+        #[cfg(target_os = "macos")]
+        let unc = unc || (path.is_absolute() && macos_network_mount(path));
+        unc
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -421,12 +426,6 @@ fn scan_dir_with_mode(dir: &Path, slow_share: bool) -> ScanResult {
     }
 }
 
-/// Scans `dir` for playable media files and immediate non-hidden subfolders,
-/// sorted in natural name order.
-pub fn scan_dir(dir: &Path) -> ScanResult {
-    scan_dir_with_mode(dir, false)
-}
-
 /// Scans `dir` for media files and subfolders, switching automatically to a zero-`stat`
 /// fast scan on slow network shares with more than 150 entries.
 pub fn scan_local_or_share(dir: &Path) -> ScanResult {
@@ -513,8 +512,13 @@ fn take_digits(s: &str) -> (&str, &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use std::cmp::Ordering::*;
+    use super::{
+        Entry, Kind, SortBy, SortOrder, is_slow_network_path, is_subtitle, kind_of, natural_cmp,
+        safe_resolve_path, scan_dir_with_mode, sort_entries,
+    };
+    use crate::test_util::TestDir;
+    use std::cmp::Ordering::{Equal, Greater, Less};
+    use std::path::{Path, PathBuf};
 
     fn sorted(names: &[&str]) -> Vec<String> {
         let mut v: Vec<String> = names.iter().map(|s| s.to_string()).collect();
@@ -598,20 +602,17 @@ mod tests {
         let resolved_unc = safe_resolve_path(Path::new(r"\\nas\media\Movies\..\Anime\.\ep1.mkv"));
         assert_eq!(resolved_unc, PathBuf::from(r"\\nas\media\Anime\ep1.mkv"));
 
-        let dir = std::env::temp_dir().join(format!("iris-fast-share-scan-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = TestDir::new("fast-share-scan");
         std::fs::create_dir_all(dir.join("SubFolder")).unwrap();
         for i in 1..=160 {
             std::fs::write(dir.join(format!("ep{i}.mp4")), b"stub").unwrap();
         }
-        let res = scan_dir_with_mode(&dir, true);
+        let res = scan_dir_with_mode(dir.path(), true);
         assert_eq!(res.subfolders.len(), 1);
         assert_eq!(res.entries.len(), 160);
         assert_eq!(res.entries[0].name, "ep1.mp4");
         assert_eq!(res.entries[1].name, "ep2.mp4");
         assert_eq!(res.entries[9].name, "ep10.mp4");
         assert_eq!(res.entries[0].size, 0);
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

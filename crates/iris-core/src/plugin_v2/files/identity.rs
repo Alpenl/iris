@@ -240,22 +240,4 @@ impl PinnedFile {
         }
         Ok(read)
     }
-    pub fn sha256(&self, cancel: &HttpCancel) -> Result<[u8; 32], ErrorCode> {
-        let mut hash = ring::digest::Context::new(&ring::digest::SHA256);
-        let mut bytes = [0; 65536];
-        let mut offset = 0;
-        while offset < self.initial.size {
-            let n = self.read_at(offset, &mut bytes, cancel)?;
-            if n == 0 {
-                return Err(ErrorCode::IoError);
-            }
-            hash.update(&bytes[..n]);
-            offset += n as u64;
-        }
-        self.unchanged()?;
-        hash.finish()
-            .as_ref()
-            .try_into()
-            .map_err(|_| ErrorCode::Internal)
-    }
 }
