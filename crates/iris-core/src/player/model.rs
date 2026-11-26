@@ -53,6 +53,8 @@ pub enum PlayerActionError {
     NoVisualMedia,
     InvalidSubtitlePath,
     SubtitleFileNotFound,
+    /// mpv takes UTF-8 paths; a lossy conversion would name a different file.
+    NonUnicodePath,
 }
 
 impl std::fmt::Display for PlayerActionError {
@@ -69,6 +71,7 @@ impl std::fmt::Display for PlayerActionError {
             Self::SubtitleFileNotFound => {
                 f.write_str("subtitle path does not exist or is not a regular file")
             }
+            Self::NonUnicodePath => f.write_str("path is not valid Unicode and cannot reach mpv"),
         }
     }
 }

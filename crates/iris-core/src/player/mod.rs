@@ -46,6 +46,13 @@ pub trait MonitorLutFilter: Send + Sync {
 
 static NEXT_COMMAND_RECEIPT: AtomicU64 = AtomicU64::new(1);
 
+/// mpv only takes UTF-8 paths. A lossy conversion would name a different file, and
+/// for `screenshot-to-file` it could overwrite one.
+fn mpv_path(path: &Path) -> Result<&str> {
+    path.to_str()
+        .ok_or_else(|| PlayerActionError::NonUnicodePath.into())
+}
+
 pub(super) fn next_command_receipt() -> Result<u64> {
     NEXT_COMMAND_RECEIPT
         .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
@@ -224,11 +231,13 @@ impl Session {
         let loading_luts = std::mem::take(&mut self.enhancements.loading_luts);
         if stopped_lut.is_some() || !loading_luts.is_empty() {
             if matches!(self.kind, Some(Kind::Video | Kind::Photo)) {
-                let _ =
+                Self::log_mpv_err(
+                    "restore hwdec",
                     self.mpv
-                        .command_async(&["set", "hwdec", self.user_hwdec.get().mpv_value()]);
+                        .command_async(&["set", "hwdec", self.user_hwdec.get().mpv_value()]),
+                );
             }
-            let _ = self.mpv.command_async(&["set", "vf", ""]);
+            Self::log_mpv_err("reset vf", self.mpv.command_async(&["set", "vf", ""]));
         }
         self.enhancements.tracks.stopping();
         let need_stop_receipt = stopped_lut.is_some()
@@ -459,7 +468,7 @@ impl Session {
     ) -> Result<()> {
         let saved_remote = req.clone();
         let main_url = vfs::validate_stream_url(&req.playback_url)?;
-        let clean_headers = origin_headers(&main_url, &req.headers);
+        let clean_headers = origin_headers(&main_url, &req.headers)?;
         let relay = PlaybackRelay::start(main_url.clone(), clean_headers)?;
         let playback_url = relay.url(&main_url)?;
         let mut owned_opts: Vec<(&'static str, String)> = Vec::new();
@@ -550,7 +559,7 @@ impl Session {
         photo: Option<Photo>,
         resume: f64,
     ) -> Result<()> {
-        let mpv_path = path.to_string_lossy().into_owned();
+        let mpv_path = mpv_path(path)?;
         let canonical_uri = MediaUri::Local(path.to_path_buf()).to_uri_string();
         let kind = kind.unwrap_or(Kind::Video);
         let mut owned_opts: Vec<(&'static str, String)> = Vec::new();
@@ -567,7 +576,7 @@ impl Session {
             owned_opts.iter().map(|(k, v)| (*k, v.as_str())).collect();
         let entry_id = self
             .mpv
-            .loadfile_with_options(&mpv_path, "replace", &opt_refs)?;
+            .loadfile_with_options(mpv_path, "replace", &opt_refs)?;
         self.clear_media_source();
         self.source = MediaSourceState::Local;
         self.reset_for_load(
@@ -637,7 +646,10 @@ impl Session {
             return;
         };
         for sub_mem in std::mem::take(pending_subs) {
-            let _ = self.mpv.command_async(&["sub-add", &sub_mem, "auto"]);
+            Self::log_mpv_err(
+                "attach remote subtitle",
+                self.mpv.command_async(&["sub-add", &sub_mem, "auto"]),
+            );
         }
     }
 

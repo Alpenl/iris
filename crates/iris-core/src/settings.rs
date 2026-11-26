@@ -155,6 +155,10 @@ pub struct Settings {
     pub audio_device: String,
     /// Global UI typography & control height scale multiplier (`0.85`..=`1.35`).
     pub ui_font_scale: f32,
+    /// When a local TUN proxy answers DNS with benchmark Fake-IPs, resolve the
+    /// hostname through public DoH resolvers instead of refusing the request.
+    /// This discloses the hostname to those resolvers, so users can opt out.
+    pub fake_ip_doh_fallback: bool,
 }
 
 impl Default for Settings {
@@ -194,6 +198,7 @@ impl Default for Settings {
             hidden_dock_buttons: Vec::new(),
             audio_device: "auto".into(),
             ui_font_scale: DEFAULT_UI_FONT_SCALE,
+            fake_ip_doh_fallback: true,
         }
     }
 }
@@ -392,6 +397,11 @@ impl Settings {
                         s.ui_font_scale = scale.clamp(MIN_UI_FONT_SCALE, MAX_UI_FONT_SCALE);
                     }
                 }
+                ("fake_ip_doh_fallback", v) => {
+                    if let Some(b) = parse_bool(v) {
+                        s.fake_ip_doh_fallback = b;
+                    }
+                }
                 _ => {}
             }
         }
@@ -548,6 +558,10 @@ impl Settings {
             DEFAULT_UI_FONT_SCALE
         };
         text.push_str(&format!("ui_font_scale = {ui_font_scale:.2}\n"));
+        text.push_str(&format!(
+            "fake_ip_doh_fallback = {}\n",
+            self.fake_ip_doh_fallback
+        ));
 
         fs_util::atomic_write(path, &text)
     }
@@ -639,6 +653,7 @@ mod tests {
             hidden_dock_buttons: vec!["screenshot".into(), "loop".into()],
             audio_device: "coreaudio/BuiltInSpeakerDevice".into(),
             ui_font_scale: 1.15,
+            fake_ip_doh_fallback: false,
         };
         custom.save_to(&file).unwrap();
         let loaded = Settings::load_from(&file);
@@ -662,6 +677,15 @@ mod tests {
         assert!(clamped.hidden_dock_buttons.is_empty());
         assert_eq!(clamped.audio_device, "auto");
         assert_eq!(clamped.ui_font_scale, MAX_UI_FONT_SCALE);
+        assert!(
+            clamped.fake_ip_doh_fallback,
+            "the DoH fallback defaults to on"
+        );
+
+        std::fs::write(&file, "fake_ip_doh_fallback = maybe\n").unwrap();
+        assert!(Settings::load_from(&file).fake_ip_doh_fallback);
+        std::fs::write(&file, "fake_ip_doh_fallback = off\n").unwrap();
+        assert!(!Settings::load_from(&file).fake_ip_doh_fallback);
 
         std::fs::write(&file, "ui_font_scale = NaN\n").unwrap();
         assert_eq!(

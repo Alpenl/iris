@@ -29,16 +29,7 @@ pub(crate) fn is_tchar(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b)
 }
 
-pub(crate) fn sanitize_header_name(name: &str) -> String {
-    name.split(['\r', '\n', '\0'])
-        .next()
-        .unwrap_or("")
-        .bytes()
-        .filter(|&b| is_tchar(b))
-        .map(char::from)
-        .collect()
-}
-
+/// Cleans a header value received from a server before it is stored.
 pub(crate) fn sanitize_header_value(value: &str) -> String {
     value
         .chars()
@@ -48,23 +39,34 @@ pub(crate) fn sanitize_header_value(value: &str) -> String {
         .to_string()
 }
 
-pub(crate) fn sanitize_headers(headers: &BTreeMap<String, String>) -> BTreeMap<String, String> {
-    headers
-        .iter()
-        .filter_map(|(k, v)| {
-            let name = sanitize_header_name(k);
-            (!name.is_empty()).then(|| (name, sanitize_header_value(v)))
-        })
-        .collect()
+/// Validates caller-supplied request headers. Invalid names and control bytes
+/// are rejected instead of rewritten: truncating `X-A\r\nHost: b` or dropping
+/// characters would silently send something other than what the caller asked
+/// for. Only optional whitespace around a value is trimmed (RFC 9110 5.5).
+pub(crate) fn validate_request_headers(
+    headers: &BTreeMap<String, String>,
+) -> Result<BTreeMap<String, String>> {
+    let mut clean = BTreeMap::new();
+    for (name, value) in headers {
+        if name.is_empty() || !name.bytes().all(is_tchar) {
+            bail!("invalid HTTP request header name");
+        }
+        if value.bytes().any(|b| b == 0x7f || (b < 0x20 && b != b'\t')) {
+            // The value itself may be a credential; name the header only.
+            bail!("invalid HTTP request header value for {name}");
+        }
+        clean.insert(name.clone(), value.trim_matches([' ', '\t']).to_owned());
+    }
+    Ok(clean)
 }
 
 pub(crate) fn origin_headers(
     url: &Url,
     headers: &BTreeMap<String, String>,
-) -> BTreeMap<String, String> {
+) -> Result<BTreeMap<String, String>> {
     use base64::{Engine, engine::general_purpose::STANDARD};
     use percent_encoding::percent_decode_str;
-    let mut clean = sanitize_headers(headers);
+    let mut clean = validate_request_headers(headers)?;
     if (!url.username().is_empty() || url.password().is_some())
         && header_ci(&clean, "authorization").is_none()
     {
@@ -76,7 +78,7 @@ pub(crate) fn origin_headers(
             format!("Basic {}", STANDARD.encode(credentials)),
         );
     }
-    clean
+    Ok(clean)
 }
 
 fn header_ci<'a>(headers: &'a BTreeMap<String, String>, name: &str) -> Option<&'a str> {
@@ -309,7 +311,7 @@ fn open_stream_with_credentials(
         bail!("invalid HTTP method");
     }
     let mut cur_headers = if url.origin() == credential_origin.origin() {
-        origin_headers(credential_origin, headers)
+        origin_headers(credential_origin, headers)?
     } else {
         BTreeMap::new()
     };
@@ -618,7 +620,8 @@ pub(crate) fn fetch_range(
 mod tests {
     use super::{
         CONNECT_TIMEOUT, HttpCancel, IO_TIMEOUT, NetworkScope, Request, ensure_identity_headers,
-        fetch_range, open_stream, read_bounded, validate_stream_url,
+        fetch_range, open_stream, origin_headers, read_bounded, validate_request_headers,
+        validate_stream_url,
     };
     use anyhow::{Result, bail};
     use std::collections::BTreeMap;
@@ -627,6 +630,32 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::thread;
     use std::time::Instant;
+
+    #[test]
+    fn request_headers_are_rejected_instead_of_rewritten() {
+        let one = |name: &str, value: &str| BTreeMap::from([(name.to_owned(), value.to_owned())]);
+        let clean = validate_request_headers(&one("Referer", "  https://a.example/\t")).unwrap();
+        assert_eq!(clean["Referer"], "https://a.example/");
+        assert_eq!(
+            validate_request_headers(&one("X-Tab", "a\tb")).unwrap()["X-Tab"],
+            "a\tb"
+        );
+        for (name, value) in [
+            ("X-A\r\nHost", "evil.example"),
+            ("X A", "v"),
+            ("", "v"),
+            ("Cookie", "SESSDATA=secret\r\nX-Injected: 1"),
+            ("Cookie", "secret\0tail"),
+            ("Cookie", "secret\u{7f}"),
+        ] {
+            let error = validate_request_headers(&one(name, value)).unwrap_err();
+            assert!(!error.to_string().contains("secret"), "{error}");
+        }
+        let url = validate_stream_url("https://user:pass@a.example/v.mp4").unwrap();
+        assert!(origin_headers(&url, &one("Cookie", "a\nb")).is_err());
+        let with_basic = origin_headers(&url, &BTreeMap::new()).unwrap();
+        assert!(with_basic["Authorization"].starts_with("Basic "));
+    }
 
     fn test_fetch_head(
         url: &str,
@@ -720,12 +749,28 @@ mod tests {
     }
 
     #[test]
-    fn crlf_injection_is_stripped_on_wire_and_head_bytes_are_bounded() {
+    fn crlf_injection_is_rejected_before_connecting_and_head_bytes_are_bounded() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
+        let url = format!("http://{}/photo.jpg", listener.local_addr().unwrap());
+        for (name, value) in [
+            ("Authorization", "Bearer secret\r\nX-Injected: evil"),
+            ("X-Bad\r\nEvil: 1", "value"),
+            ("X-Nul", "val\0ue-secret"),
+        ] {
+            let headers = BTreeMap::from([(name.to_owned(), value.to_owned())]);
+            let error = test_fetch_head(&url, &headers, 64).unwrap_err().to_string();
+            assert!(!error.contains("secret"), "{error}");
+        }
+        // Rejection happens before connecting, so nothing reached the listener.
+        listener.set_nonblocking(true).unwrap();
+        assert_eq!(
+            listener.accept().map(|_| ()).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        listener.set_nonblocking(false).unwrap();
+
         let captured = Arc::new(Mutex::new(String::new()));
         let captured_srv = Arc::clone(&captured);
-
         let srv = thread::spawn(move || {
             let (mut sock, _) = listener.accept().unwrap();
             let mut buf = [0u8; 4096];
@@ -740,26 +785,17 @@ mod tests {
             let _ = sock.write_all(&body);
         });
 
-        let mut headers = BTreeMap::new();
-        headers.insert(
-            "Authorization".into(),
-            "Bearer good\r\nX-Injected: evil".into(),
-        );
-        headers.insert("X-Bad\r\nEvil: 1".into(), "val\0ue\r\n".into());
-
-        let head =
-            test_fetch_head(&format!("http://127.0.0.1:{port}/photo.jpg"), &headers, 64).unwrap();
+        let headers = BTreeMap::from([("Authorization".into(), " Bearer good\t".into())]);
+        let head = test_fetch_head(&url, &headers, 64).unwrap();
         assert_eq!(head.len(), 64);
         assert!(head.iter().all(|&b| b == b'Z'));
         srv.join().unwrap();
 
         let raw_req = captured.lock().unwrap().clone();
-        for line in raw_req.split("\r\n") {
-            assert!(
-                !line.starts_with("X-Injected:") && !line.starts_with("Evil:"),
-                "header injection must never create a separate header line: {raw_req}"
-            );
-        }
+        assert!(
+            raw_req.contains("\r\nAuthorization: Bearer good\r\n"),
+            "valid headers are sent trimmed: {raw_req}"
+        );
     }
 
     #[test]

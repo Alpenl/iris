@@ -54,23 +54,26 @@ fn check(code: c_int, context: impl FnOnce() -> String) -> Result<()> {
     }
 }
 
-fn cstr(s: &str) -> CString {
-    CString::new(s).unwrap_or_else(|_| {
-        let mut bytes: Vec<u8> = s.bytes().filter(|&b| b != 0).collect();
-        bytes.push(0);
-        CString::from_vec_with_nul(bytes).unwrap_or_default()
+/// Converts an argument for libmpv. An interior NUL would silently change what
+/// mpv receives (for example a different path, URL or option value), so it is
+/// rejected. The context never echoes the argument, which may carry secrets.
+fn cstr(s: &str) -> Result<CString> {
+    CString::new(s).map_err(|_| Error {
+        code: sys::MPV_ERROR_INVALID_PARAMETER,
+        context: "string argument contains an interior NUL byte".into(),
     })
 }
 
 /// Stack-backed C string for short NUL-free strings (avoids heap allocations on hot paths).
-fn with_cstr<R>(s: &str, f: impl FnOnce(*const c_char) -> R) -> R {
+/// Interior NUL bytes are rejected exactly like [`cstr`].
+fn with_cstr<R>(s: &str, f: impl FnOnce(*const c_char) -> Result<R>) -> Result<R> {
     let bytes = s.as_bytes();
     if bytes.len() < 128 && !bytes.contains(&0) {
         let mut buf = [0u8; 128];
         buf[..bytes.len()].copy_from_slice(bytes);
         f(buf.as_ptr().cast())
     } else {
-        let owned = cstr(s);
+        let owned = cstr(s)?;
         f(owned.as_ptr())
     }
 }
@@ -113,7 +116,7 @@ impl Mpv {
     }
 
     pub fn set_option(&mut self, name: &str, value: &str) -> Result<()> {
-        let (n, v) = (cstr(name), cstr(value));
+        let (n, v) = (cstr(name)?, cstr(value)?);
         // SAFETY: `self.handle` is valid and `n`, `v` are NUL-terminated `CString`s.
         check(
             unsafe { sys::mpv_set_option_string(self.handle, n.as_ptr(), v.as_ptr()) },
@@ -129,7 +132,7 @@ impl Mpv {
     }
 
     pub fn request_log_messages(&self, min_level: &str) -> Result<()> {
-        let l = cstr(min_level);
+        let l = cstr(min_level)?;
         // SAFETY: `self.handle` is valid and `l` is a NUL-terminated `CString`.
         check(
             unsafe { sys::mpv_request_log_messages(self.handle, l.as_ptr()) },
@@ -139,7 +142,10 @@ impl Mpv {
 
     /// Runs a command synchronously, e.g. `["loadfile", path]`.
     pub fn command(&self, args: &[&str]) -> Result<()> {
-        let owned: Vec<CString> = args.iter().map(|a| cstr(a)).collect();
+        let owned = args
+            .iter()
+            .map(|a| cstr(a))
+            .collect::<Result<Vec<CString>>>()?;
         let mut ptrs: Vec<*const c_char> = owned.iter().map(|c| c.as_ptr()).collect();
         ptrs.push(ptr::null());
         // SAFETY: `self.handle` is valid and `ptrs` is a NULL-terminated array of C strings
@@ -152,7 +158,10 @@ impl Mpv {
 
     /// Runs a command without waiting for it (the reply event is ignored).
     pub fn command_async(&self, args: &[&str]) -> Result<()> {
-        let owned: Vec<CString> = args.iter().map(|a| cstr(a)).collect();
+        let owned = args
+            .iter()
+            .map(|a| cstr(a))
+            .collect::<Result<Vec<CString>>>()?;
         let mut ptrs: Vec<*const c_char> = owned.iter().map(|c| c.as_ptr()).collect();
         ptrs.push(ptr::null());
         // SAFETY: `self.handle` is valid and `ptrs` is a NULL-terminated array of C strings
@@ -182,16 +191,18 @@ impl Mpv {
             context: "loadfile_with_options: too many options".into(),
         })?;
 
-        let cmd_key = cstr("_name");
-        let cmd_val = cstr("loadfile");
-        let url_key = cstr("url");
-        let url_val = cstr(url);
-        let flags_key = cstr("flags");
-        let flags_val = cstr(flags);
-        let opts_key = cstr("options");
+        let cmd_key = cstr("_name")?;
+        let cmd_val = cstr("loadfile")?;
+        let url_key = cstr("url")?;
+        let url_val = cstr(url)?;
+        let flags_key = cstr("flags")?;
+        let flags_val = cstr(flags)?;
+        let opts_key = cstr("options")?;
 
-        let opt_cstrs: Vec<(CString, CString)> =
-            options.iter().map(|&(k, v)| (cstr(k), cstr(v))).collect();
+        let opt_cstrs = options
+            .iter()
+            .map(|&(k, v)| Ok((cstr(k)?, cstr(v)?)))
+            .collect::<Result<Vec<(CString, CString)>>>()?;
         let mut opt_keys: Vec<*mut c_char> = opt_cstrs
             .iter()
             .map(|(k, _)| k.as_ptr().cast_mut())
@@ -286,7 +297,8 @@ impl Mpv {
                 // SAFETY: `self.handle` is valid and `n`, `v` are valid NUL-terminated C strings.
                 check(
                     unsafe { sys::mpv_set_property_string(self.handle, n, v) },
-                    || format!("set_property {name}={value}"),
+                    // The value may be a URL, header or credential; keep only the name.
+                    || format!("set_property {name}"),
                 )
             })
         })
@@ -354,10 +366,10 @@ impl Mpv {
     }
 
     pub fn get_property_string(&self, name: &str) -> Result<String> {
-        // SAFETY: `self.handle` is valid and `n` is a NUL-terminated C string.
-        let p = with_cstr(name, |n| unsafe {
-            sys::mpv_get_property_string(self.handle, n)
-        });
+        let p = with_cstr(name, |n| {
+            // SAFETY: `self.handle` is valid and `n` is a NUL-terminated C string.
+            Ok(unsafe { sys::mpv_get_property_string(self.handle, n) })
+        })?;
         if p.is_null() {
             return Err(Error {
                 code: sys::MPV_ERROR_PROPERTY_UNAVAILABLE,
@@ -372,7 +384,7 @@ impl Mpv {
     }
 
     pub fn observe_property(&self, id: u64, name: &str, format: Format) -> Result<()> {
-        let n = cstr(name);
+        let n = cstr(name)?;
         // SAFETY: `self.handle` is valid and `n` is a NUL-terminated `CString`.
         check(
             unsafe { sys::mpv_observe_property(self.handle, id, n.as_ptr(), format.raw()) },
@@ -503,10 +515,18 @@ mod tests {
         with_cstr(input, |ptr| {
             assert!(!ptr.is_null());
             // SAFETY: `with_cstr` always passes a valid NUL-terminated C string for the callback duration.
-            unsafe { CStr::from_ptr(ptr) }
+            Ok(unsafe { CStr::from_ptr(ptr) }
                 .to_string_lossy()
-                .into_owned()
+                .into_owned())
         })
+        .unwrap()
+    }
+
+    fn rejects_with_cstr(input: &str) -> Error {
+        with_cstr(input, |_| -> Result<()> {
+            panic!("an interior NUL must not reach libmpv")
+        })
+        .unwrap_err()
     }
 
     #[test]
@@ -523,12 +543,18 @@ mod tests {
         let s200 = "c".repeat(200);
         assert_eq!(roundtrip_with_cstr(&s200), s200);
 
-        assert_eq!(roundtrip_with_cstr("\0"), "");
-        assert_eq!(roundtrip_with_cstr("ab\0cd\0ef"), "abcdef");
-
+        // Stripping NUL bytes would hand mpv a different path or URL than the caller
+        // passed, so both the stack and heap paths reject them without echoing input.
         let long_with_nul = format!("{}\0{}", "x".repeat(100), "y".repeat(100));
-        let expected_long = format!("{}{}", "x".repeat(100), "y".repeat(100));
-        assert_eq!(roundtrip_with_cstr(&long_with_nul), expected_long);
+        for input in ["\0", "ab\0cd\0ef", "secret-token\0", long_with_nul.as_str()] {
+            let error = rejects_with_cstr(input);
+            assert_eq!(error.code, super::sys::MPV_ERROR_INVALID_PARAMETER);
+            assert!(!error.context.contains("secret"));
+        }
+        let long_secret = format!("{}secret\0", "z".repeat(200));
+        let error = super::cstr(&long_secret).unwrap_err();
+        assert_eq!(error.code, super::sys::MPV_ERROR_INVALID_PARAMETER);
+        assert!(!error.context.contains("secret"));
     }
 
     #[test]

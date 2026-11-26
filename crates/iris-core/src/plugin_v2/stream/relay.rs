@@ -139,7 +139,11 @@ fn serve_listener(bound: &mut BoundRelay, service: &Arc<Service>) {
                     Ok((socket, peer)) if peer.ip().is_loopback() => {
                         let mut socket = TcpStream::from(socket);
                         if let Ok(worker) = reserve_worker(service) {
-                            let _ = std::thread::Builder::new().name("iris-v2-range".into()).spawn(move || {
+                            // A second handle answers the client when no worker thread can
+                            // start; it is dropped right after `spawn` so the worker's close
+                            // still ends the connection.
+                            let fallback = socket.try_clone();
+                            let spawned = std::thread::Builder::new().name("iris-v2-range".into()).spawn(move || {
                                 let service = worker.service.clone();
                                 let Ok(cancel) = service.session.cancellation().child() else { return; };
                                 let Ok(_socket) = cancel.register(&socket) else { return; };
@@ -187,6 +191,14 @@ fn serve_listener(bound: &mut BoundRelay, service: &Arc<Service>) {
                                 }
                                 cancel.cancel();
                             });
+                            if let Err(error) = spawned {
+                                log::warn!(
+                                    "plugin stream relay could not start a range worker: {error}"
+                                );
+                                if let Ok(mut socket) = fallback {
+                                    let _ = socket.write_all(b"HTTP/1.1 503 Busy\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
+                                }
+                            }
                         } else {
                             // Nonblocking small rejection; never wait for a
                             // malicious peer while admitting other clients.

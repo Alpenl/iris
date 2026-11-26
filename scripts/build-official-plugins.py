@@ -9,6 +9,7 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import tomllib
 import zipfile
 
 sys.dont_write_bytecode = True
@@ -203,19 +204,61 @@ def validate_official_manifest(manifest: dict):
     )
 
 
+OFFICIAL_SOURCE_CRATES = ("iris-api", "iris-plugin-sdk", "iris-plugin-guides", "iris-plugin-webdav")
+
+
+def lock_closure(lock_text: str, roots) -> bytes:
+    """Canonical bytes of the Cargo.lock packages reachable from `roots`.
+
+    Lock entries list every dependency kind for every target, so the closure is a
+    superset of what the Wasm build compiles. Host-only packages stay out of it.
+    """
+    lock = tomllib.loads(lock_text)
+    by_name: dict[str, list[dict]] = {}
+    for item in lock.get("package", []):
+        by_name.setdefault(item["name"], []).append(item)
+
+    def resolve(spec: str) -> dict:
+        # Dependency entries are "name", "name version" or "name version (source)".
+        name, _, rest = spec.partition(" ")
+        version, _, source = rest.partition(" ")
+        candidates = [
+            item for item in by_name.get(name, [])
+            if (not version or item["version"] == version)
+            and (not source or f"({item.get('source', '')})" == source)
+        ]
+        _require(len(candidates) == 1, f"Cargo.lock entry {spec!r} does not name exactly one package")
+        return candidates[0]
+
+    seen: dict[tuple[str, str, str], dict] = {}
+    pending = [resolve(name) for name in roots]
+    while pending:
+        item = pending.pop()
+        key = (item["name"], item["version"], item.get("source", ""))
+        if key not in seen:
+            seen[key] = item
+            pending.extend(resolve(spec) for spec in item.get("dependencies", []))
+    closure = {"version": lock.get("version"), "package": [seen[key] for key in sorted(seen)]}
+    return json.dumps(closure, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
 def source_hash() -> str:
-    paths = [ROOT / name for name in ("Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "scripts/build-official-plugins.py")]
-    for name in ("iris-api", "iris-plugin-sdk", "iris-plugin-guides", "iris-plugin-webdav"):
+    paths = [ROOT / name for name in ("Cargo.toml", "rust-toolchain.toml", "scripts/build-official-plugins.py")]
+    for name in OFFICIAL_SOURCE_CRATES:
         crate = ROOT / "crates" / name
         paths += [crate / "Cargo.toml", *sorted((crate / "src").rglob("*.rs"))]
         if (crate / "plugin.json").is_file():
             paths.append(crate / "plugin.json")
+    # Git checkouts may use CRLF. The digest describes source content.
+    entries = [(path.relative_to(ROOT).as_posix(), path.read_bytes().replace(b"\r\n", b"\n")) for path in paths]
+    # Only the plugins' own dependency closure is stamped, so a host-only
+    # dependency bump does not force rebuilding the committed archives.
+    lock_text = (ROOT / "Cargo.lock").read_text(encoding="utf-8")
+    entries.append(("Cargo.lock#official-plugins", lock_closure(lock_text, OFFICIAL_SOURCE_CRATES)))
     digest = hashlib.sha256()
-    for path in sorted(paths):
-        name = path.relative_to(ROOT).as_posix().encode("utf-8")
-        # Git checkouts may use CRLF. The digest describes source content.
-        data = path.read_bytes().replace(b"\r\n", b"\n")
-        digest.update(len(name).to_bytes(8, "little") + name)
+    for name, data in sorted(entries):
+        encoded = name.encode("utf-8")
+        digest.update(len(encoded).to_bytes(8, "little") + encoded)
         digest.update(len(data).to_bytes(8, "little") + data)
     return digest.hexdigest()
 

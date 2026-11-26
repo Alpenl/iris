@@ -2,7 +2,7 @@
 
 use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -61,11 +61,17 @@ impl EventPump {
         &self,
         scoped: Weak<dyn ScopedStream>,
     ) -> Weak<dyn ScopedStream> {
-        std::mem::replace(&mut *self.scoped.lock().unwrap(), scoped)
+        std::mem::replace(
+            &mut *self.scoped.lock().unwrap_or_else(PoisonError::into_inner),
+            scoped,
+        )
     }
 
     pub(in crate::player) fn set_relay(&self, relay: Weak<Service>) -> Weak<Service> {
-        std::mem::replace(&mut *self.relay.lock().unwrap(), relay)
+        std::mem::replace(
+            &mut *self.relay.lock().unwrap_or_else(PoisonError::into_inner),
+            relay,
+        )
     }
 
     pub(in crate::player) fn stop(&self, mpv: &Mpv) {
@@ -98,6 +104,14 @@ pub(in crate::player) fn active_playlist_entry_id(mpv: &Mpv) -> Option<i64> {
 pub(in crate::player) fn spawn_event_pump(
     mpv: Arc<Mpv>,
 ) -> Result<(EventPump, UnboundedReceiver<SessionUpdate>)> {
+    // Unbounded on purpose. mpv coalesces property changes (one pending change
+    // per observed property), log lines never reach `tx`, and the remaining
+    // events follow playlist and user actions, so the inflow while the UI is
+    // slow is limited by mpv's own update rate. A bounded channel would have to
+    // either block this thread, which also owns `continue_hook` and is joined
+    // by `EventPump::stop` on the UI thread (the thread that drains `rx`), or
+    // drop updates such as `EndFile` and `CommandReply` that the session state
+    // relies on.
     let (tx, rx) = unbounded();
     let done = Arc::new(AtomicBool::new(false));
     let stopped = done.clone();
@@ -137,13 +151,18 @@ pub(in crate::player) fn spawn_event_pump(
                     Event::Hook { userdata, id } => {
                         match *userdata {
                             HOOK_LOAD => {
-                                restricted = scoped_source.lock().unwrap().upgrade().is_some_and(
-                                    |session| {
+                                restricted = scoped_source
+                                    .lock()
+                                    .unwrap_or_else(PoisonError::into_inner)
+                                    .upgrade()
+                                    .is_some_and(|session| {
                                         session.root_url().ok()
                                             == mpv.get_property_string("stream-open-filename").ok()
-                                    },
-                                );
-                                let service = source.lock().unwrap().upgrade();
+                                    });
+                                let service = source
+                                    .lock()
+                                    .unwrap_or_else(PoisonError::into_inner)
+                                    .upgrade();
                                 if let Some(service) = service {
                                     match enable_hls(&mpv, &service) {
                                         Ok(prepared) => hls = prepared,

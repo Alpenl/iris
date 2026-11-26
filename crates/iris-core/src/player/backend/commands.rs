@@ -21,9 +21,10 @@ impl Session {
         // Temporarily clear per-file lavf/demuxer restrictions only once no async
         // plugin/scoped track additions remain in flight, then immediately restore
         // the scoped attachment policy whenever scoped playback or plugin tracks exist.
+        // Convert before relaxing the policy so this early return cannot skip the restore.
+        let target = super::super::mpv_path(resolved)?;
         let _ = super::references::disable_hls(&self.mpv);
-        let target = resolved.to_string_lossy();
-        let sub_add = self.mpv.command(&["sub-add", &target, "select"]);
+        let sub_add = self.mpv.command(&["sub-add", target, "select"]);
         let restore = if self.needs_attachment_policy() {
             super::super::scoped::restore_attachment_policy(&self.mpv)
         } else {
@@ -186,7 +187,7 @@ impl Session {
                     .set_property_f64_async("sub-delay", d.clamp(-60., 60.))?;
             }
             Command::LoadSubtitle(path) => {
-                let raw_in = path.to_string_lossy();
+                let raw_in = super::super::mpv_path(&path)?;
                 if raw_in.split_once("://").is_some_and(|(scheme, _)| {
                     !scheme.is_empty()
                         && scheme
@@ -311,10 +312,10 @@ impl Session {
                     .command_async(&["set", "chapter", &ix.to_string()])?;
             }
             Command::Screenshot { path, with_subs } => {
-                let target = path.to_string_lossy();
+                let target = super::super::mpv_path(&path)?;
                 let flags = if with_subs { "subtitles" } else { "video" };
                 self.mpv
-                    .command_async(&["screenshot-to-file", &target, flags])?;
+                    .command_async(&["screenshot-to-file", target, flags])?;
             }
         }
         Ok(())

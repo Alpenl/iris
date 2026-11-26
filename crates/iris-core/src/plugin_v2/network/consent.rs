@@ -313,7 +313,7 @@ fn resolve(
                         .filter(|ip| !matches!(ip, IpAddr::V6(v6) if v6.is_unicast_link_local()))
                         .collect();
                     let snapshot: Vec<_> = ips.iter().copied().collect();
-                    if crate::vfs::http_client::doh::should_bypass_fake_ip(&host, &snapshot) {
+                    if crate::vfs::http_client::doh::use_fallback(&host, &snapshot) {
                         let doh_deadline = Instant::now() + Duration::from_secs(8);
                         let real = crate::vfs::http_client::doh::resolve_a_records(
                             &host,

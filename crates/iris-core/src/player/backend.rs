@@ -132,7 +132,10 @@ impl Session {
         }
     }
 
-    fn log_mpv_err<T>(context: &str, result: std::result::Result<T, iris_mpv::Error>) {
+    pub(in crate::player) fn log_mpv_err<T>(
+        context: &str,
+        result: std::result::Result<T, iris_mpv::Error>,
+    ) {
         if let Err(error) = result {
             log::debug!("mpv {context} ignored: {error}");
         }
@@ -422,7 +425,10 @@ impl Session {
                         .map(|vid| vid.is_empty() || vid == "no")
                         .unwrap_or(true)
                 {
-                    let _ = self.mpv.command_async(&["set", "vid", "1"]);
+                    Self::log_mpv_err(
+                        "select first video track",
+                        self.mpv.command_async(&["set", "vid", "1"]),
+                    );
                 }
                 return;
             }
@@ -518,9 +524,18 @@ impl Session {
                 && !self.state.is_live
                 && start < end
             {
-                let _ = self.mpv.set_property_f64_async("ab-loop-a", start);
-                let _ = self.mpv.set_property_f64_async("ab-loop-b", end);
-                let _ = self.mpv.command_async(&["set", "ab-loop-count", "inf"]);
+                Self::log_mpv_err(
+                    "restore ab-loop-a",
+                    self.mpv.set_property_f64_async("ab-loop-a", start),
+                );
+                Self::log_mpv_err(
+                    "restore ab-loop-b",
+                    self.mpv.set_property_f64_async("ab-loop-b", end),
+                );
+                Self::log_mpv_err(
+                    "restore ab-loop-count",
+                    self.mpv.command_async(&["set", "ab-loop-count", "inf"]),
+                );
                 self.state.ab_start = Some(start);
                 self.state.ab_end = Some(end);
             }

@@ -136,6 +136,25 @@ fn redaction_strips_user_paths_url_tokens_and_secret_fields() {
 }
 
 #[test]
+fn redaction_covers_generic_csrf_and_session_id_names() {
+    // Bilibili-style form bodies carry the `bili_jct` value as a bare `csrf` field.
+    assert_eq!(
+        redact_text("aid=1&csrf=999&ok=1"),
+        "aid=1&csrf=<redacted>&ok=1"
+    );
+    assert_eq!(redact_text("xsrf=abc"), "xsrf=<redacted>");
+    assert_eq!(
+        redact_text("PHPSESSID=abc; JSESSIONID=def; ASP.NET_SessionId=ghi"),
+        "PHPSESSID=<redacted>; JSESSIONID=<redacted>; ASP.NET_SessionId=<redacted>"
+    );
+    // Numeric stream session ids in structured events stay readable.
+    let payload = redact_json(json!({"session": 5, "csrf": "999", "X-Csrf": "1"}));
+    assert_eq!(payload["session"], 5);
+    assert_eq!(payload["csrf"], "<redacted>");
+    assert_eq!(payload["X-Csrf"], "<redacted>");
+}
+
+#[test]
 fn redaction_covers_ipv6_urls_delimited_userinfo_escaped_json_and_hyphen_underscore_keys() {
     // (a) IPv6 bracketed literals, balanced/unbalanced path delimiters, and Basic Auth userinfo.
     assert_eq!(

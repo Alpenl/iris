@@ -221,6 +221,18 @@ def is_under(path: Path, parent: Path) -> bool:
         return False
 
 
+POISON_UNWRAP_RE = re.compile(r"\.(?:lock|read|write)\(\)\s*\.(?:unwrap|expect)\(")
+
+
+def check_lock_poisoning(rel: Path, text: str):
+    """Production code recovers a poisoned lock instead of cascading one panic into every later caller."""
+    match = POISON_UNWRAP_RE.search(prod_prefix(text))
+    _require(
+        match is None,
+        f"{rel} unwraps a lock result in production code; use `.unwrap_or_else(PoisonError::into_inner)`",
+    )
+
+
 def check_file_line_budget(rel: Path, text: str) -> int | None:
     """Validate file line budgets and trailing `#[cfg(test)] mod` placement; return prod lines."""
     total_lines = len(text.splitlines())
@@ -440,6 +452,8 @@ def main():
         prod_lines = check_file_line_budget(rel, text)
         if prod_lines is not None and prod_lines > PROD_WARN_LINES:
             soft_warnings.append(f"{rel} ({prod_lines} prod lines)")
+        if not is_standalone_test_file(path, rel):
+            check_lock_poisoning(rel, text)
 
     # 5. Bidirectional SVG icon registry & zero-reference check
     icons_on_disk = {p.name for p in (ROOT / "Resources/Icons").glob("*.svg")}
@@ -523,7 +537,7 @@ def main():
         print("Note (files > 650 prod lines):", ", ".join(soft_warnings))
     print(
         "All checks passed: Python syntax, recursive UI/mpv boundary, devtools gate, "
-        "layer dependencies, file size budgets (<850 prod / <1000 total), SVG icons, "
+        "layer dependencies, file size budgets (<850 prod / <1000 total), lock poisoning, SVG icons, "
         "plugin manifests, and toolchain sync: OK"
     )
 

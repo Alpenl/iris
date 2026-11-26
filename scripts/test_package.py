@@ -92,6 +92,51 @@ class OfficialPluginVerificationTests(unittest.TestCase):
             self.invoke("--verify-embedded")
         self.assertEqual(self.snapshot(), before)
 
+    def test_source_stamp_covers_only_the_plugin_dependency_closure(self):
+        def lock(host_version="1.0.0", leaf_checksum="aa"):
+            return f"""version = 4
+
+[[package]]
+name = "plugin"
+version = "0.1.0"
+dependencies = ["dep 1.0.0", "leaf"]
+
+[[package]]
+name = "dep"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "11"
+
+[[package]]
+name = "dep"
+version = "2.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "22"
+
+[[package]]
+name = "leaf"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "{leaf_checksum}"
+
+[[package]]
+name = "host"
+version = "{host_version}"
+dependencies = ["dep 2.0.0 (registry+https://github.com/rust-lang/crates.io-index)"]
+"""
+
+        closure = json.loads(official_plugins.lock_closure(lock(), ["plugin"]))
+        self.assertEqual(
+            [(p["name"], p["version"]) for p in closure["package"]],
+            [("dep", "1.0.0"), ("leaf", "0.3.0"), ("plugin", "0.1.0")],
+        )
+        base = official_plugins.lock_closure(lock(), ["plugin"])
+        self.assertEqual(official_plugins.lock_closure(lock(host_version="9.0.0"), ["plugin"]), base)
+        self.assertNotEqual(official_plugins.lock_closure(lock(leaf_checksum="bb"), ["plugin"]), base)
+        self.assertEqual(official_plugins.lock_closure(lock().replace("\n", "\r\n"), ["plugin"]), base)
+        with self.assertRaisesRegex(AssertionError, "exactly one package"):
+            official_plugins.lock_closure(lock(), ["dep"])
+
     def test_index_json_uses_lf_and_check_rejects_crlf(self):
         self.invoke("--output", self.embedded)
         index_path = self.embedded / "index.json"
@@ -899,6 +944,25 @@ class CheckProjectHelperTests(unittest.TestCase):
         sneaky_trailing = clean_src + "pub fn sneaky_after_tests() {}\n"
         with self.assertRaisesRegex(AssertionError, "after inline `mod tests`"):
             check_project.check_file_line_budget(rel, sneaky_trailing)
+
+    def test_lock_poisoning_gate_checks_production_code_only(self):
+        rel = Path("crates/iris-core/src/demo.rs")
+        clean = (
+            "fn ok(m: &Mutex<u8>) -> u8 { *m.lock().unwrap_or_else(PoisonError::into_inner) }\n"
+            "// m.lock().unwrap() in a comment is fine\n"
+            "#[cfg(test)]\n"
+            "mod tests {\n"
+            "    #[test] fn t() { let _ = M.lock().unwrap(); }\n"
+            "}\n"
+        )
+        check_project.check_lock_poisoning(rel, clean)
+        for bad in (
+            "fn f() { let _ = M.lock().unwrap(); }\n",
+            "fn f() { let _ = R.read()\n        .expect(\"poisoned\"); }\n",
+            "fn f() { *R.write().unwrap() = 1; }\n",
+        ):
+            with self.assertRaisesRegex(AssertionError, "unwraps a lock result"):
+                check_project.check_lock_poisoning(rel, bad)
 
     def test_standalone_tests_rs_classified_as_test_file(self):
         self.assertTrue(check_project.is_standalone_test_file(Path("examples/plugins/baidupan/src/tests.rs"), Path("examples/plugins/baidupan/src/tests.rs")))
