@@ -26,6 +26,18 @@ fn directory() -> PathBuf {
     path
 }
 
+/// `TempRoot` removes its empty parent on drop; a leftover parent must still be empty.
+fn remove_released_parent(dir: PathBuf) {
+    match std::fs::remove_dir(&dir) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => panic!(
+            "temporary parent {} was not released: {error}",
+            dir.display()
+        ),
+    }
+}
+
 fn idle(root: &TempRoot) {
     let end = Instant::now() + Duration::from_secs(3);
     while !root.is_quiescent() {
@@ -132,7 +144,7 @@ fn artifacts_keep_disk_quota_until_cleanup() {
     assert_eq!(ledger.used(None, Resource::TempBytes), 0);
     assert_eq!(ledger.used(None, Resource::Handle), 0);
     drop(root);
-    std::fs::remove_dir(dir).unwrap();
+    remove_released_parent(dir);
 }
 
 #[test]
@@ -264,7 +276,7 @@ fn inert_artifacts_keep_writes_serial_and_cancellable() {
     assert_eq!(ledger.used(None, Resource::Handle), 0);
     drop(executor);
     assert_eq!(ledger.used(None, Resource::HostBytes), 0);
-    std::fs::remove_dir(dir).unwrap();
+    remove_released_parent(dir);
 }
 
 #[test]

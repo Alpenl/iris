@@ -40,15 +40,18 @@ impl MonitorLut {
     pub(crate) fn filter(&self) -> Result<String, ErrorCode> {
         let path = self.artifact.path();
         let path = path.to_str().ok_or(ErrorCode::Unsupported)?;
+        // `path` stays `&str` on every target so the same call passes clippy on each.
         #[cfg(windows)]
-        let path = {
+        let owned = {
             let stripped = path
                 .strip_prefix(r"\\?\")
                 .filter(|s| !s.starts_with("UNC\\") && s.len() < 240)
                 .unwrap_or(path);
             stripped.replace('\\', "/")
         };
-        let option = escape(path.as_ref(), ":\\'");
+        #[cfg(windows)]
+        let path = owned.as_str();
+        let option = escape(path, ":\\'");
         let graph = format!(
             "lut3d=file={}:interp=trilinear",
             escape(&option, "[]=;,\\'")

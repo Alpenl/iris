@@ -554,7 +554,9 @@ mod tests {
         fn filter_spec(&self) -> anyhow::Result<String> {
             let path = self.0.to_str().expect("utf-8 test path");
             #[cfg(windows)]
-            let path = path.replace('\\', "/");
+            let owned = path.replace('\\', "/");
+            #[cfg(windows)]
+            let path = owned.as_str();
             let escape = |value: &str, special: &str| {
                 let mut out = String::new();
                 for ch in value.chars() {
@@ -565,7 +567,7 @@ mod tests {
                 }
                 out
             };
-            let option = escape(&path, ":\\'");
+            let option = escape(path, ":\\'");
             let graph = format!(
                 "lut3d=file={}:interp=trilinear",
                 escape(&option, "[]=;,\\'")

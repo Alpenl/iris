@@ -13,7 +13,7 @@ import argparse
 import hashlib
 import json
 import os
-from pathlib import Path, PurePosixPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 import plistlib
 import posixpath
 import re
@@ -738,15 +738,22 @@ def verify_sdk_files(prefix, files):
     resolved_prefix = prefix.resolve()
     for relative, digest in files.items():
         posix = PurePosixPath(relative)
+        # Windows drive syntax (`C:/x`, `C:x`) is relative on POSIX hosts; parse it
+        # explicitly so the same lock is rejected on every packaging platform.
+        windows = PureWindowsPath(relative)
         path = Path(relative)
         if (
             not relative
             or "\\" in relative
             or posix.is_absolute()
+            or windows.is_absolute()
             or path.is_absolute()
+            or windows.drive
+            or windows.anchor
             or path.drive
             or path.anchor
             or ".." in posix.parts
+            or ".." in windows.parts
             or ".." in path.parts
         ):
             raise RuntimeError("SDK path outside pinned prefix: " + relative)

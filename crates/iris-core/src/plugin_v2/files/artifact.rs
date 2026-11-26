@@ -63,7 +63,7 @@ pub struct TempRoot {
     parent_path: PathBuf,
     owner: String,
     ledger: Ledger,
-    parent: Dir,
+    parent: Option<Dir>,
     name: String,
     activity: Activity,
 }
@@ -93,7 +93,7 @@ impl TempRoot {
             parent_path,
             owner,
             ledger,
-            parent,
+            parent: Some(parent),
             name,
             activity: Activity::default(),
         }))
@@ -164,7 +164,12 @@ impl TempRoot {
 impl Drop for TempRoot {
     fn drop(&mut self) {
         drop(self.dir.take());
-        let _ = self.parent.remove_dir(&self.name);
+        if let Some(parent) = self.parent.take() {
+            let _ = parent.remove_dir(&self.name);
+        }
+        // The parent handle is closed before removing the now-empty
+        // per-installation directory, so the cleanup does not depend on
+        // whether the platform allows removing a directory that is still open.
         let _ = std::fs::remove_dir(&self.parent_path);
     }
 }
