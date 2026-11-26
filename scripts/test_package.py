@@ -15,6 +15,7 @@ import tempfile
 import types
 import unittest
 from unittest.mock import patch
+import urllib.error
 import zipfile
 
 sys.dont_write_bytecode = True
@@ -880,6 +881,53 @@ class PluginV2CiTests(unittest.TestCase):
                 self.assertEqual(resolved, zig_exe)
                 self.assertEqual(zig_exe.read_bytes(), b"MZ-valid")
                 dl_mock.assert_called_once()
+
+    def test_download_zig_retries_only_transient_network_errors(self):
+        payload = b"pinned zig archive"
+        digest = hashlib.sha256(payload).hexdigest()
+
+        def dns_failure():
+            return urllib.error.URLError("nodename nor servname provided, or not known")
+
+        def http_error(code):
+            return urllib.error.HTTPError("https://ziglang.org/download/", code, "status", None, None)
+
+        attempts_max = run_plugin_v2_ci.ZIG_DOWNLOAD_ATTEMPTS
+        cases = [
+            ("dns, then 503, then success", [dns_failure(), http_error(503), io.BytesIO(payload)], None, 3),
+            ("dns on every attempt", [dns_failure() for _ in range(attempts_max)], urllib.error.URLError, attempts_max),
+            ("404 is permanent", [http_error(404)], urllib.error.HTTPError, 1),
+            ("digest mismatch is never retried", [io.BytesIO(b"tampered")], RuntimeError, 1),
+        ]
+        for label, responses, expected_error, attempts in cases:
+            with self.subTest(label), tempfile.TemporaryDirectory() as directory:
+                archive = Path(directory) / f"zig-x86_64-macos-{run_plugin_v2_ci.ZIG_VERSION}.tar.xz"
+                with patch.object(run_plugin_v2_ci.urllib.request, "urlopen", side_effect=responses) as urlopen, \
+                     patch.object(run_plugin_v2_ci.time, "sleep") as sleep, \
+                     contextlib.redirect_stderr(io.StringIO()):
+                    if expected_error is None:
+                        run_plugin_v2_ci._download_zig(archive, digest)
+                    else:
+                        with self.assertRaises(expected_error):
+                            run_plugin_v2_ci._download_zig(archive, digest)
+                self.assertEqual(urlopen.call_count, attempts)
+                self.assertEqual(
+                    [call.args for call in sleep.call_args_list],
+                    [(run_plugin_v2_ci.ZIG_DOWNLOAD_RETRY_SECONDS * n,) for n in range(1, attempts)],
+                )
+                # No .part leftovers; the archive exists only after a verified download.
+                self.assertEqual(
+                    sorted(p.name for p in Path(directory).iterdir()),
+                    [archive.name] if expected_error is None else [],
+                )
+                if expected_error is None:
+                    self.assertEqual(archive.read_bytes(), payload)
+
+        transient = run_plugin_v2_ci._is_transient_download_error
+        self.assertTrue(transient(TimeoutError("The read operation timed out")))
+        self.assertTrue(transient(ConnectionResetError()))
+        self.assertTrue(transient(http_error(429)))
+        self.assertFalse(transient(OSError(28, "No space left on device")))
 
     def test_configure_mpv_env_leaves_posix_unset_and_defaults_only_on_windows(self):
         with tempfile.TemporaryDirectory() as directory:
