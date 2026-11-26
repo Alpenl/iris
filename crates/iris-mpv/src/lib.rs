@@ -191,7 +191,12 @@ impl Mpv {
             context: "loadfile_with_options: too many options".into(),
         })?;
 
-        let cmd_key = cstr("_name")?;
+        // The legacy `name` key on purpose: mpv 0.42 added `_name` but still
+        // accepts `name`, while 0.41 (the last Homebrew bottle for Intel macs)
+        // only knows `name` and rejects the whole command as an invalid
+        // parameter. `loadfile` has no argument called `name`, so the key is
+        // unambiguous on both.
+        let cmd_key = cstr("name")?;
         let cmd_val = cstr("loadfile")?;
         let url_key = cstr("url")?;
         let url_val = cstr(url)?;
