@@ -1,0 +1,8 @@
+HTTP/1.1 100 Continue
+
+HTTP/1.1 206 Partial Content
+Content-Range: bytes 0-3/10
+Content-Length: 4
+Content-Type: video/mp4
+
+abcd

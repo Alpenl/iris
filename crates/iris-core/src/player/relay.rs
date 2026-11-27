@@ -20,6 +20,8 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use mio::{Events, Interest, Poll, Token, Waker};
+#[doc(hidden)]
+pub use playlist::fuzz_hls;
 use playlist::{is_hls, rewrite_playlist};
 use ring::aead::{Aad, CHACHA20_POLY1305, LessSafeKey, Nonce, UnboundKey};
 use ring::rand::{SecureRandom, SystemRandom};

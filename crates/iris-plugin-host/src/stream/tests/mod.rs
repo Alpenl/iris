@@ -1,3 +1,4 @@
+mod bench;
 mod relay;
 mod remote;
 mod session;

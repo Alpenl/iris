@@ -1,0 +1,22 @@
+HTTP/1.1 100 Continue
+
+HTTP/1.1 100 Continue
+
+HTTP/1.1 100 Continue
+
+HTTP/1.1 100 Continue
+
+HTTP/1.1 100 Continue
+
+HTTP/1.1 100 Continue
+
+HTTP/1.1 100 Continue
+
+HTTP/1.1 100 Continue
+
+HTTP/1.1 200 OK
+Set-Cookie: a=1
+Set-Cookie: b=2
+Content-Length: 2
+
+ok
