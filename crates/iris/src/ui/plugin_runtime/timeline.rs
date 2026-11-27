@@ -5,7 +5,7 @@ use gpui::{
     StatefulInteractiveElement, Styled, div, px, relative,
 };
 use iris_api::v2::{
-    Generation, HostCommand,
+    Generation,
     enhance::{HeatRange, SkipRange},
 };
 use iris_core::player::Command;
@@ -20,14 +20,7 @@ fn can_seek_skip_range(
 
 impl AppModel {
     fn timeline_ranges(&self) -> Option<(&[HeatRange], &[SkipRange])> {
-        let (owner, update, index) = self.plugin_view.enhance.timeline.as_ref()?;
-        if update.is_cancelled() || !self.plugin_view.enhance.bindings.get(owner)?.is_live() {
-            return None;
-        }
-        match &update.commands[*index] {
-            HostCommand::SetTimelineMeta { heat, skip, .. } => Some((heat, skip)),
-            _ => None,
-        }
+        self.plugins.timeline_ranges()
     }
 }
 

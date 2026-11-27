@@ -27,7 +27,7 @@ impl AppModel {
             self.show_toast("请选择 .irisplugin 插件包", cx);
             return;
         }
-        match self.plugins.client().review(path) {
+        match self.plugins.review_package(path) {
             Ok(_) => self.show_toast("正在验证插件包…", cx),
             Err(error) => {
                 log::warn!("plugin review rejected: {error:?}");
@@ -66,13 +66,10 @@ impl AppModel {
     ) {
         // Only the visible sheet is dismissed. A separate pending sheet stays pending.
         if let Some(origin) = self.plugin_view.origin.take() {
-            let _ = self
-                .plugins
-                .client()
-                .confirm_origin(origin.id, false, false);
+            let _ = self.plugins.confirm_origin(origin.id, false, false);
             self.plugin_view.consent_busy.remove(&origin.id);
         } else if let Some(review) = self.plugin_view.review.take() {
-            let _ = self.plugins.client().dismiss_review(review.id);
+            let _ = self.plugins.dismiss_review(review.id);
             self.plugin_view.review_created = None;
             self.plugin_view.consent_busy.remove(&review.id);
         }
@@ -93,11 +90,8 @@ impl AppModel {
             }
             (
                 origin.id,
-                self.plugins.client().confirm_origin(
-                    origin.id,
-                    true,
-                    self.plugin_view.insecure_auth,
-                ),
+                self.plugins
+                    .confirm_origin(origin.id, true, self.plugin_view.insecure_auth),
             )
         } else if let Some(review) = &self.plugin_view.review {
             if self.plugin_view.consent_busy.contains(&review.id) {
@@ -105,7 +99,7 @@ impl AppModel {
             }
             (
                 review.id,
-                self.plugins.client().approve(
+                self.plugins.approve_review(
                     review.id,
                     review.manifest.permissions.iter().copied().collect(),
                     self.plugin_view.keep_identity,

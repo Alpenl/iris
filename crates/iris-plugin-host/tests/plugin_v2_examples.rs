@@ -7,7 +7,7 @@ use iris_plugin_host::{
     ledger::Resource,
     package::{Package, Provenance},
     runtime::{Resources, Setup},
-    ui::PluginManager,
+    ui::WindowSession,
 };
 use std::{
     collections::BTreeSet,
@@ -86,7 +86,7 @@ fn user_packages_provide_theme_timer_and_real_random_access_pcm() {
         })
         .unwrap();
         let (client, _) = hub.open_window(Generation::default(), None).unwrap();
-        let mut manager = PluginManager::new(client, Some(id.clone()));
+        let mut manager = WindowSession::new(client, Some(id.clone()));
         wait(|| {
             manager.poll();
             manager.client().is_ready(&id)

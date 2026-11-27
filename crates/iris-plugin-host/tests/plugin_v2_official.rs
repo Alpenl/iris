@@ -11,7 +11,7 @@ use iris_plugin_host::{
     ledger::Resource,
     package::{Package, Provenance},
     runtime::{Resources, Setup},
-    ui::PluginManager,
+    ui::WindowSession,
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -151,7 +151,7 @@ fn official_guides_wasm_persists_state_across_single_window_reopen() {
         fixture.hub().open_window(Generation::default(), None),
         Err(iris_api::v2::ErrorCode::Backpressure)
     ));
-    let mut one = PluginManager::new(one, None);
+    let mut one = WindowSession::new(one, None);
     wait(|| {
         one.poll();
         one.client().is_ready("iris.guides") && !one.sidebar_panels().is_empty()
@@ -210,7 +210,7 @@ fn official_guides_wasm_persists_state_across_single_window_reopen() {
         .hub()
         .open_window(Generation::default(), None)
         .unwrap();
-    let mut reopened = PluginManager::new(reopened, None);
+    let mut reopened = WindowSession::new(reopened, None);
     wait(|| {
         reopened.poll();
         reopened

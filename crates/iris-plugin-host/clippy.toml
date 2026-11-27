@@ -1,3 +1,7 @@
+disallowed-types = [
+    { path = "iris_core::player::Session", reason = "Plugin host must depend only on decoupled player ports/DTOs, never Session" },
+]
+
 disallowed-methods = [
     { path = "iris_core::player::Session::render_handle", reason = "Plugin host must never access video render handles" },
 ]

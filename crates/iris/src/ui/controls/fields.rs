@@ -113,7 +113,7 @@ fn render_variant_selector(
     if meta
         .plugin_id
         .as_deref()
-        .is_some_and(|pid| !m.plugins.client().is_ready(pid))
+        .is_some_and(|pid| !m.plugins.is_ready(pid))
         || m.active().session.current_media_uri().is_none()
     {
         return None;

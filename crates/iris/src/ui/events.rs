@@ -449,6 +449,7 @@ impl AppModel {
     pub(super) fn finish_media_open(&mut self, cx: &mut Context<Self>) {
         self.plugin_view.scoped_released = false;
         if self.active().session.scoped_stream().is_none() {
+            self.plugins.clear_active_stream();
             self.plugin_view.stream_plugin = None;
             self.plugin_view.playlist.clear();
             self.plugin_view.playlist_binding = None;

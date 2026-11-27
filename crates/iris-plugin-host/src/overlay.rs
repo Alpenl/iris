@@ -36,6 +36,11 @@ pub struct PaintCue {
     pub y: f32,
     pub progress: f32,
 }
+/// Ownership handle keeping one shaped overlay glyph's `HostBytes` lease alive.
+pub struct OverlayGlyphLease {
+    _lease: Reservation,
+}
+
 /// Keep the frame alive while its cloned text/layout is retained by the UI.
 pub struct OverlayFrame {
     pub cues: Vec<PaintCue>,
@@ -43,6 +48,15 @@ pub struct OverlayFrame {
     pub next_change: Option<Duration>,
     pub omitted: usize,
     _memory: Reservation,
+    ledger: Ledger,
+}
+impl OverlayFrame {
+    /// Reserves bounded host memory for one cached shaped glyph line owned by `owner`.
+    pub fn reserve_glyph(&self, owner: &str) -> Result<OverlayGlyphLease, ErrorCode> {
+        self.ledger
+            .reserve(owner, &[(Resource::HostBytes, 32768)])
+            .map(|lease| OverlayGlyphLease { _lease: lease })
+    }
 }
 pub struct OverlayBank {
     ledger: Ledger,
@@ -267,6 +281,7 @@ impl OverlayBank {
             next_change: None,
             omitted: 0,
             _memory: memory,
+            ledger: self.ledger.clone(),
         };
         let mut next = None::<u64>;
         let mut owners = BTreeMap::<&str, usize>::new();

@@ -134,10 +134,40 @@ impl Client {
         }
     }
 
+    pub(crate) fn notify_wake(&self) {
+        if let ClientState::Connected { inbox, .. } = &self.state {
+            inbox.notify();
+        }
+    }
+
+    pub(crate) fn waker(&self) -> Option<Arc<dyn Fn() + Send + Sync>> {
+        match &self.state {
+            ClientState::Connected { inbox, .. } => {
+                let weak = Arc::downgrade(inbox);
+                Some(Arc::new(move || {
+                    if let Some(inbox) = weak.upgrade() {
+                        inbox.notify();
+                    }
+                }))
+            }
+            ClientState::Unavailable { .. } => None,
+        }
+    }
+
     pub fn poll(&self) -> Vec<Notice> {
+        self.poll_bounded(usize::MAX, usize::MAX)
+    }
+
+    /// Drains up to `max_notices` live notices and `max_commands` live guest commands,
+    /// discarding stale-generation entries immediately while leaving unread notices in
+    /// [`Inbox`] so backpressure (`notices.len() >= 32`) remains enforced.
+    pub(crate) fn poll_bounded(&self, max_notices: usize, max_commands: usize) -> Vec<Notice> {
         let inbox = match &self.state {
             ClientState::Connected { inbox, .. } => inbox,
             ClientState::Unavailable { error, .. } => {
+                if max_notices == 0 {
+                    return Vec::new();
+                }
                 return error
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
@@ -155,59 +185,90 @@ impl Client {
         let mut state = inbox.lock();
         state.wake_pending = false;
         let generation = state.generation;
-        let drained: Vec<Notice> = state.notices.drain(..).collect();
-        drained
-            .into_iter()
-            .filter_map(|mut notice| {
-                let keep = match &mut notice {
-                    Notice::Commands(batch) => {
-                        if !batch.binding.is_live() || batch.update.is_cancelled() {
-                            false
-                        } else if batch.update.window.is_none()
-                            || batch.update.generation == generation
-                        {
-                            true
-                        } else if batch.update.generation.context == generation.context {
-                            batch.indices.retain(|&index| {
-                                super::dispatch::is_slot_command(&batch.update.commands[index])
-                            });
-                            !batch.indices.is_empty()
-                        } else {
-                            false
-                        }
+        let mut out = Vec::new();
+        let mut command_count = 0usize;
+        while out.len() < max_notices
+            && let Some(mut notice) = state.notices.pop_front()
+        {
+            let keep = match &mut notice {
+                Notice::Commands(batch) => {
+                    if !batch.binding.is_live() || batch.update.is_cancelled() {
+                        false
+                    } else if batch.update.window.is_none() || batch.update.generation == generation
+                    {
+                        true
+                    } else if batch.update.generation.context == generation.context {
+                        batch.indices.retain(|&index| {
+                            super::dispatch::is_slot_command(&batch.update.commands[index])
+                        });
+                        !batch.indices.is_empty()
+                    } else {
+                        false
                     }
-                    Notice::Page {
-                        binding,
-                        generation: g,
-                        page,
-                        ..
-                    } => {
-                        binding.is_live()
-                            && g.context == generation.context
-                            && state
-                                .requests
-                                .target(&binding.installed.installation_id, page.view)
-                                .is_ok()
-                    }
-                    Notice::Playback {
-                        binding,
-                        generation: g,
-                        ticket,
-                        ..
-                    } => binding.is_live() && *g == generation && !ticket.cancel.is_cancelled(),
-                    Notice::Browser {
-                        binding,
-                        generation: g,
-                        ..
-                    } => binding.is_live() && *g == generation,
-                    Notice::Origin(review) => {
-                        review.binding.is_live() && review.generation == generation
-                    }
-                    _ => true,
-                };
-                keep.then_some(notice)
-            })
-            .collect()
+                }
+                Notice::Page {
+                    binding,
+                    generation: g,
+                    page,
+                    ..
+                } => {
+                    binding.is_live()
+                        && g.context == generation.context
+                        && state
+                            .requests
+                            .target(&binding.installed.installation_id, page.view)
+                            .is_ok()
+                }
+                Notice::Playback {
+                    binding,
+                    generation: g,
+                    ticket,
+                    ..
+                } => binding.is_live() && *g == generation && !ticket.cancel.is_cancelled(),
+                Notice::Browser {
+                    binding,
+                    generation: g,
+                    ..
+                } => binding.is_live() && *g == generation,
+                Notice::Origin(review) => {
+                    review.binding.is_live() && review.generation == generation
+                }
+                _ => true,
+            };
+            if !keep {
+                continue;
+            }
+            if let Notice::Commands(batch) = &mut notice {
+                let remaining = max_commands.saturating_sub(command_count);
+                if remaining == 0 {
+                    state.notices.push_front(notice);
+                    break;
+                }
+                if batch.indices.len() > remaining {
+                    let rest = batch.indices.split_off(remaining);
+                    let head = Notice::Commands(super::Commands {
+                        binding: batch.binding.clone(),
+                        update: batch.update.clone(),
+                        indices: std::mem::take(&mut batch.indices),
+                    });
+                    batch.indices = rest;
+                    state.notices.push_front(notice);
+                    out.push(head);
+                    break;
+                }
+                command_count += batch.indices.len();
+            }
+            out.push(notice);
+        }
+        let rearm = !state.notices.is_empty() && !state.closed;
+        if rearm {
+            state.wake_pending = true;
+        }
+        drop(state);
+        if rearm {
+            let _ = inbox.wake.unbounded_send(());
+        }
+        out
     }
 
     pub fn send(&self, plugin: &str, event: HostEvent<serde_json::Value>) -> Result<(), ErrorCode> {

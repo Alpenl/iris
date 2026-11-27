@@ -89,7 +89,17 @@ impl WindowAccess {
     /// Background worker only. The returned lease must live until mpv has
     /// acknowledged removal, including cancelled/replaced pending additions.
     pub fn prepare_attachment(&self, spec: AttachmentSpec) -> Result<Arc<Attachment>, ErrorCode> {
-        self.check(self.generation, Capability::MediaEnhance)?;
+        self.prepare_attachment_for(self.generation, spec)
+    }
+
+    /// Validates `generation` against this window capability before preparing a
+    /// sealed loopback attachment.
+    pub fn prepare_attachment_for(
+        &self,
+        generation: Generation,
+        spec: AttachmentSpec,
+    ) -> Result<Arc<Attachment>, ErrorCode> {
+        self.check(generation, Capability::MediaEnhance)?;
         super::validation::identifier(&spec.id)?;
         super::validation::text(&spec.label, 256)?;
         if let Some(lang) = &spec.lang {
@@ -108,7 +118,7 @@ impl WindowAccess {
             EnhancementResource::Artifact { handle } => Arc::new(ArtifactReader {
                 artifact: self
                     .files
-                    .approved_artifact(&self.owner, *handle, self.generation)?,
+                    .approved_artifact(&self.owner, *handle, generation)?,
                 ledger: self.resources.ledger.clone(),
             }),
         };
@@ -159,7 +169,7 @@ impl WindowAccess {
             let bound = BoundRelay::bind()?;
             let session = StreamSession::new(
                 Id(next_id()?),
-                self.generation,
+                generation,
                 bound.authority()?,
                 factory,
                 None,
@@ -184,7 +194,7 @@ impl WindowAccess {
             label: spec.label,
             lang: spec.lang,
             audio: spec.subtitle.is_none(),
-            generation: self.generation,
+            generation,
             url,
             route,
             registry: self.attachments.clone(),

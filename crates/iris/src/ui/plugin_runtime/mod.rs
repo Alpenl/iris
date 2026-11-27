@@ -15,11 +15,12 @@ use super::kit::text_buffer::TextInputBuffers;
 use super::views::DirtyRegions;
 use crate::assets::Icon;
 use gpui::{Context, SharedString, Window};
-use iris_api::v2::{Capability, ErrorCode, Generation, Id, source::PlaylistEntry};
+use iris_api::v2::{Capability, ErrorCode, Id, source::PlaylistEntry};
 use iris_api::{PluginModal, SidebarPanel};
 use iris_core::preset::SidebarMode;
 use iris_plugin_host::{
     hub::{Binding, OriginSummary, PluginStatus, ReviewSummary},
+    overlay::OverlayFrame,
     requests::AcceptedPage,
 };
 use std::collections::{BTreeMap, BTreeSet};
@@ -126,7 +127,10 @@ pub(super) struct PluginView {
     pub filter_values: std::collections::BTreeMap<String, String>,
     pub view_timers: BTreeMap<ViewTimerSlot, ((String, u32), gpui::Task<()>)>,
     thumbnails: thumbnails::Thumbnails,
-    enhance: enhance::EnhancementView,
+    pub(super) overlay_frame: Option<Arc<OverlayFrame>>,
+    pub(super) overlay_wake: Option<gpui::Task<()>>,
+    pub(super) glyphs: overlay::GlyphCache,
+    pub(super) annotations: annotations::AnnotationView,
 }
 
 impl PluginView {
@@ -152,7 +156,10 @@ impl PluginView {
             filter_values: std::collections::BTreeMap::new(),
             view_timers: BTreeMap::new(),
             thumbnails: thumbnails::Thumbnails::default(),
-            enhance: enhance::EnhancementView::default(),
+            overlay_frame: None,
+            overlay_wake: None,
+            glyphs: overlay::GlyphCache::default(),
+            annotations: annotations::AnnotationView::default(),
         }
     }
 }
@@ -199,10 +206,6 @@ impl AppModel {
         "插件源".into()
     }
 
-    pub(super) fn plugin_media_id(&self) -> Id {
-        self.plugins.generation().media
-    }
-
     pub(in crate::ui) fn plugin_source_entries<'a>(
         &'a self,
         source_id: &'a str,
@@ -226,15 +229,7 @@ impl AppModel {
             .session
             .current()
             .map(std::path::Path::to_owned);
-        for info in self.plugins.list() {
-            if let Ok(access) = self.plugins.client().access(&info.id) {
-                let _ = access.files.set_current_path(
-                    self.plugin_media_id(),
-                    access.generation,
-                    path.clone(),
-                );
-            }
-        }
+        self.plugins.set_current_local_file(path);
     }
 
     pub(in crate::ui) fn precheck_plugin_capability(
@@ -242,39 +237,12 @@ impl AppModel {
         plugin_id: &str,
         capability: Capability,
     ) -> Result<(), ErrorCode> {
-        if self.plugins.generation().media.0.checked_add(1).is_none() {
-            return Err(ErrorCode::QuotaExceeded);
-        }
-        if self.plugins.client().window_id() == Id(0) {
-            return Err(ErrorCode::StaleHandle);
-        }
-        let Some(info) = self.plugins.list().iter().find(|p| p.id == plugin_id) else {
-            return Err(ErrorCode::StaleHandle);
-        };
-        if !info.enabled {
-            return Err(ErrorCode::StaleHandle);
-        }
-        match info.status {
-            PluginStatus::Ready => {}
-            PluginStatus::Failed(code) => return Err(code),
-            PluginStatus::Loading | PluginStatus::Dormant => return Err(ErrorCode::Backpressure),
-            PluginStatus::Disabled | PluginStatus::Stopping => return Err(ErrorCode::StaleHandle),
-        }
-        let Some(binding) = info.binding.as_ref().filter(|b| b.is_live()) else {
-            return Err(ErrorCode::StaleHandle);
-        };
-        if !binding.installed.grants.contains(&capability) {
-            return Err(ErrorCode::Denied);
-        }
-        if !self.plugins.client().is_ready(plugin_id) {
-            return Err(ErrorCode::Backpressure);
-        }
-        Ok(())
+        self.plugins.precheck_capability(plugin_id, capability)
     }
 
     pub(super) fn close_plugin_browse(&mut self) {
         if let Some((plugin, view)) = self.plugin_view.view.take() {
-            let _ = self.plugins.client().close_view(&plugin, view);
+            let _ = self.plugins.close_view(&plugin, view);
         }
         self.catalog.cancel_browse();
         self.plugin_view.pages.clear();
@@ -285,33 +253,13 @@ impl AppModel {
     }
 
     pub(super) fn advance_plugin_media(&mut self, cx: &mut Context<Self>) -> bool {
-        self.plugin_view.enhance.annotations.selections.clear();
-        std::mem::take(&mut self.plugin_view.enhance.annotations.cancel).cancel();
-        if self.plugins.client().window_id() == Id(0) {
-            let had_scoped = self.active().session.scoped_stream().is_some();
-            self.active_mut().session.release_scoped();
-            if had_scoped {
-                self.plugin_view.scoped_released = true;
-            }
-            self.plugin_view.stream_plugin = None;
-            self.plugin_view.playlist.clear();
-            self.plugin_view.playlist_binding = None;
-            self.plugin_view.playlist_current = None;
-            return true;
-        }
-        let old = self.plugins.generation();
-        let Some(media) = old.media.0.checked_add(1) else {
-            return false;
-        };
-        match self.plugins.client().advance(Generation {
-            media: Id(media),
-            seek: Id(0),
-            context: old.context,
-        }) {
+        std::mem::take(&mut self.plugin_view.annotations.cancel).cancel();
+        let connected = self.plugins.is_connected();
+        match self.plugins.advance_media() {
             Ok(()) => {
-                // The previous StreamSession is already cancelled by `advance`;
-                // stop and release the old relay immediately so its Http,
-                // RelayWorker, and PlaybackSession quotas are freed before
+                // The previous StreamSession is already cancelled and cleared by
+                // `advance_media`; stop and release the old relay immediately so its
+                // Http, RelayWorker, and PlaybackSession quotas are freed before
                 // resolving the next video.
                 let had_scoped = self.active().session.scoped_stream().is_some();
                 self.active_mut().session.release_scoped();
@@ -319,7 +267,7 @@ impl AppModel {
                     self.plugin_view.scoped_released = true;
                 }
                 self.plugin_view.stream_plugin = None;
-                if let Some(origin) = self.plugin_view.origin.take() {
+                if connected && let Some(origin) = self.plugin_view.origin.take() {
                     self.plugin_view.consent_busy.remove(&origin.id);
                     self.restore_modal_focus_if_unblocked();
                     self.sync_view_timer(cx);
@@ -327,12 +275,7 @@ impl AppModel {
                 self.plugin_view.playlist.clear();
                 self.plugin_view.playlist_binding = None;
                 self.plugin_view.playlist_current = None;
-                self.plugin_view.enhance.media_announced = None;
-                self.plugin_view.enhance.overlay_generation = self.plugins.generation();
                 self.reset_timed_overlays();
-                self.plugin_view.enhance.pending.clear();
-                self.plugin_view.enhance.lut_owner = None;
-                self.plugin_view.enhance.timeline = None;
                 true
             }
             Err(error) => {
@@ -350,38 +293,13 @@ impl AppModel {
         // Playback seeking does not revoke unrelated directory, configuration
         // or login work in ControlStore. StreamSession owns its read epoch;
         // timed overlays carry an independent inner generation in their events.
-        let Some(seek) = self
-            .plugin_view
-            .enhance
-            .overlay_generation
-            .seek
-            .0
-            .checked_add(1)
-        else {
-            return;
-        };
-        self.plugin_view.enhance.overlay_generation.seek = Id(seek);
-        self.reset_timed_overlays();
-        self.plugin_view
-            .enhance
-            .pending
-            .retain(|(_, key), _| !key.starts_with("overlay:"));
-        if let Some(session) =
-            iris_plugin_host::stream::prepare::stream_session(&self.active().session)
-        {
-            let plugin = self
-                .plugins
-                .list()
-                .iter()
-                .find(|plugin| {
-                    plugin
-                        .binding
-                        .as_ref()
-                        .is_some_and(|b| b.installed.installation_id == session.factory.owner())
-                })
-                .map(|plugin| plugin.id.clone());
-            if let Some(plugin) = plugin {
-                self.notify_stream_status(&plugin, None, cx);
+        self.plugin_view.overlay_frame = None;
+        self.plugin_view.glyphs.clear();
+        self.plugin_view.overlay_wake = None;
+        if let Some(report) = self.plugins.advance_overlay_seek() {
+            let regions = self.apply_poll_report(report, None, cx);
+            if regions.any() {
+                self.notify_regions(regions, cx);
             }
         }
     }
@@ -434,7 +352,7 @@ impl AppModel {
             })
             .cloned()
         {
-            let _ = self.plugins.client().dismiss_review(review.id);
+            let _ = self.plugins.dismiss_review(review.id);
             self.plugin_view.review = None;
             self.plugin_view.review_created = None;
             self.plugin_view.consent_busy.remove(&review.id);
@@ -464,16 +382,14 @@ impl AppModel {
     ) {
         let pending = std::mem::take(&mut self.plugin_view.deferred);
         for (plugin, command) in pending {
-            if self.plugins.client().is_ready(&plugin) {
+            if self.plugins.is_ready(&plugin) {
                 self.invoke_plugin_command(&plugin, &command, window, cx);
             } else if self
                 .plugins
                 .list()
                 .iter()
                 .find(|p| p.id == plugin)
-                .is_none_or(|p| {
-                    p.enabled && !matches!(p.status, iris_plugin_host::hub::PluginStatus::Failed(_))
-                })
+                .is_none_or(|p| p.enabled && !matches!(p.status, PluginStatus::Failed(_)))
             {
                 self.plugin_view.deferred.push((plugin, command));
             }
@@ -487,20 +403,12 @@ impl AppModel {
         if !self.active().session.state().loaded {
             return DirtyRegions::NONE;
         }
-        let media = self.plugin_media_id();
-        if self.plugin_view.enhance.media_announced == Some(media) {
-            return DirtyRegions::NONE;
-        }
-        self.plugin_view.enhance.media_announced = Some(media);
+        self.bind_plugin_current_file();
         let snap = self.plugin_snapshot();
-        self.broadcast_plugin_event(
-            iris_api::v2::HostEvent::MediaOpened {
-                generation: self.plugins.generation(),
-                snapshot: snap,
-            },
-            None,
-            cx,
-        )
+        let Some(report) = self.plugins.announce_media_opened(snap) else {
+            return DirtyRegions::NONE;
+        };
+        self.apply_poll_report(report, None, cx)
     }
 
     fn desired_view_timers(&self) -> BTreeMap<ViewTimerSlot, (String, u32)> {

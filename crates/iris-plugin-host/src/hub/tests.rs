@@ -398,7 +398,7 @@ fn origin_consent_cannot_be_approved_by_reopened_window_or_after_close() {
 
 #[test]
 fn presentation_slots_keep_accounting_and_only_dirty_changed_values() {
-    use crate::ui::PluginManager;
+    use crate::ui::WindowSession;
     let mut f = Fixture::new();
     f.install_bytes(&package_with(
         "test.presentation",
@@ -408,7 +408,7 @@ fn presentation_slots_keep_accounting_and_only_dirty_changed_values() {
     ));
     let hub = f.hub();
     let (client, _) = hub.open_window(Generation::default(), None).unwrap();
-    let mut ui = PluginManager::new(client, None);
+    let mut ui = WindowSession::new(client, None);
     wait(|| {
         ui.poll();
         !ui.sidebar_panels().is_empty()
@@ -446,8 +446,8 @@ fn two_isolated_plugin_hosts_do_not_share_state_and_inbox_snapshot_is_consistent
     f2.install("test.host_b");
     let host1 = PluginHost::from_parts(f1.resources.clone(), f1.hub());
     let host2 = PluginHost::from_parts(f2.resources.clone(), f2.hub());
-    let (mut m1, _) = host1.open_manager(&[], "dark");
-    let (mut m2, _) = host2.open_manager(&[], "dark");
+    let (mut m1, _) = host1.open_window(&[], "dark");
+    let (mut m2, _) = host2.open_window(&[], "dark");
     wait(|| {
         m1.poll();
         m2.poll();
@@ -820,12 +820,12 @@ fn overwrite_reinstall_without_keep_identity_scrubs_prior_data_and_object() {
 
 #[test]
 fn reload_with_snapshot_respects_updated_disabled_set() {
-    use crate::ui::PluginManager;
+    use crate::ui::WindowSession;
     let mut f = Fixture::new();
     f.install("test.toggle");
     let hub = f.hub();
     let (client, _) = hub.open_window(Generation::default(), None).unwrap();
-    let mut ui = PluginManager::new(client, None);
+    let mut ui = WindowSession::new(client, None);
     wait(|| {
         ui.poll();
         ui.client()

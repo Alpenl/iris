@@ -35,6 +35,7 @@ use crate::settings::Settings;
 use iris_base::net::http_client::{origin_headers, validate_stream_url};
 
 pub use enhance::ExternalTrack;
+pub use inspect::PlaybackSnapshotInput;
 pub use machine::coalesce_updates;
 pub use model::{
     AspectMode, AudioDevice, BackendDiagnostics, Chapter, Command, MediaStats, PlaybackState,

@@ -84,9 +84,6 @@ impl iris_core::player::ScopedStream for Playback {
     fn stop(&self) {
         self.relay.stop();
     }
-    fn as_any(&self) -> &(dyn std::any::Any + Send + Sync) {
-        self
-    }
 }
 
 impl Playback {
@@ -119,14 +116,6 @@ impl Playback {
     }
 }
 
-/// Extracts the underlying protocol-2 [`StreamSession`] if `session` is playing a plugin stream.
-pub fn stream_session(session: &iris_core::player::Session) -> Option<Arc<StreamSession>> {
-    session
-        .scoped_stream()?
-        .as_any()
-        .downcast_ref::<Playback>()
-        .map(|p| p.relay.session().clone())
-}
 impl Preparation {
     pub fn prepare(
         self,

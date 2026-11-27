@@ -29,6 +29,11 @@ pub struct BackgroundResult<T> {
     pub value: T,
     _lease: Reservation,
 }
+impl<T> BackgroundResult<T> {
+    pub(crate) fn into_parts(self) -> (T, Reservation) {
+        (self.value, self._lease)
+    }
+}
 impl WindowAccess {
     pub fn request_cancel(&self, parent: &HttpCancel) -> Result<HttpCancel, ErrorCode> {
         let child = self.cancel.child().map_err(|_| ErrorCode::Cancelled)?;
@@ -53,6 +58,18 @@ impl WindowAccess {
         &self,
         work: impl FnOnce(Self) -> Result<T, ErrorCode> + Send + 'static,
     ) -> Result<oneshot::Receiver<Result<BackgroundResult<T>, ErrorCode>>, ErrorCode> {
+        let (tx, rx) = oneshot::channel();
+        self.background_with(work, move |result| {
+            let _ = tx.send(result);
+        })?;
+        Ok(rx)
+    }
+
+    pub(crate) fn background_with<T: Send + 'static>(
+        &self,
+        work: impl FnOnce(Self) -> Result<T, ErrorCode> + Send + 'static,
+        complete: impl FnOnce(Result<BackgroundResult<T>, ErrorCode>) + Send + 'static,
+    ) -> Result<(), ErrorCode> {
         if self.cancel.is_cancelled() {
             return Err(ErrorCode::Cancelled);
         }
@@ -61,7 +78,6 @@ impl WindowAccess {
             &[(Resource::Task, 1), (Resource::HostBytes, 2 << 20)],
         )?;
         let access = self.clone();
-        let (tx, rx) = oneshot::channel();
         self.resources.io.submit(
             Role::Control,
             &self.owner,
@@ -74,13 +90,12 @@ impl WindowAccess {
                     }
                 }))
                 .unwrap_or(Err(ErrorCode::Internal));
-                let _ = tx.send(result.map(|value| BackgroundResult {
+                complete(result.map(|value| BackgroundResult {
                     value,
                     _lease: lease,
                 }));
             }),
-        )?;
-        Ok(rx)
+        )
     }
 }
 impl Control {

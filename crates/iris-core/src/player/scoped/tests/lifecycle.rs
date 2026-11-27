@@ -1,4 +1,3 @@
-use std::any::Any;
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -55,9 +54,6 @@ impl ScopedStream for TestStream {
     }
     fn stop(&self) {
         self.stops.fetch_add(1, Ordering::SeqCst);
-    }
-    fn as_any(&self) -> &(dyn Any + Send + Sync) {
-        self
     }
 }
 

@@ -1,13 +1,66 @@
-//! Media stats, audio device enumeration, and JSON track/chapter parsers for [`Session`].
+//! Media stats, pure playback snapshot queries, audio device enumeration, and JSON
+//! track/chapter parsers for [`Session`].
 
 use std::path::Path;
 
 use crate::library::Kind;
+use crate::media_uri::MediaUri;
 
 use super::Session;
 use super::model::{AudioDevice, BackendDiagnostics, Chapter, MediaStats, Track, TrackKind};
 
+/// Pure-data query snapshot of [`Session`] state and raw identity metadata,
+/// containing zero plugin or protocol (`iris-api`) dependencies. Identity-sharing
+/// and `ReadState` privacy filtering belong to the plugin host facade.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PlaybackSnapshotInput {
+    pub kind: Option<Kind>,
+    pub media_uri: Option<MediaUri>,
+    pub local_file_name: Option<String>,
+    pub current_title: Option<String>,
+    pub private_identity: bool,
+    pub position: f64,
+    pub duration: f64,
+    pub paused: bool,
+    pub volume: f64,
+    pub muted: bool,
+    pub speed: f64,
+    pub current_chapter: i64,
+    pub is_live: bool,
+    pub buffering: bool,
+}
+
+impl PlaybackSnapshotInput {
+    pub(super) fn from_machine(machine: &super::machine::PlayerMachine) -> Self {
+        let state = &machine.state;
+        Self {
+            kind: machine.kind(),
+            media_uri: machine.current_media_uri(),
+            local_file_name: machine
+                .current_path()
+                .and_then(Path::file_name)
+                .map(|n| n.to_string_lossy().into_owned()),
+            current_title: machine.current_title().map(str::to_owned),
+            private_identity: machine.private_identity(),
+            position: state.time_pos,
+            duration: state.duration,
+            paused: state.paused,
+            volume: state.volume,
+            muted: state.muted,
+            speed: state.speed,
+            current_chapter: state.current_chapter,
+            is_live: state.is_live,
+            buffering: state.buffering,
+        }
+    }
+}
+
 impl Session {
+    /// Returns a pure-data snapshot query structure for decoupled presentation/plugin facades.
+    pub fn playback_snapshot_input(&self) -> PlaybackSnapshotInput {
+        PlaybackSnapshotInput::from_machine(&self.machine)
+    }
+
     pub fn tracks_of(&self, kind: TrackKind) -> Vec<&Track> {
         self.machine
             .state
@@ -352,5 +405,52 @@ mod tests {
         );
         assert_eq!(devs.len(), 2);
         assert_eq!(devs[1].description, "USB DAC");
+    }
+
+    #[test]
+    fn playback_snapshot_input_reports_pure_state_and_private_identity_flag() {
+        let mut machine =
+            super::super::machine::PlayerMachine::new(super::super::CommandReceipts::new());
+        assert_eq!(
+            super::PlaybackSnapshotInput::from_machine(&machine).kind,
+            None
+        );
+        #[cfg(windows)]
+        let clip_path = std::path::PathBuf::from(r"C:\movies\clip.mp4");
+        #[cfg(not(windows))]
+        let clip_path = std::path::PathBuf::from("/movies/clip.mp4");
+        let clip_uri = url::Url::from_file_path(&clip_path).unwrap().to_string();
+        machine.begin_load(
+            3,
+            MediaIdentity {
+                local_path: Some(clip_path.clone()),
+                uri: clip_uri,
+                title: Some("Clip Title".into()),
+                private_identity: false,
+                kind: Kind::Video,
+                photo: None,
+            },
+            false,
+            OpeningTransport::Local,
+            false,
+        );
+        machine.state.time_pos = 12.5;
+        machine.state.duration = 90.0;
+        machine.state.current_chapter = 2;
+        let snap = super::PlaybackSnapshotInput::from_machine(&machine);
+        assert_eq!(snap.kind, Some(Kind::Video));
+        assert_eq!(
+            snap.media_uri,
+            Some(crate::media_uri::MediaUri::Local(clip_path))
+        );
+        assert_eq!(snap.local_file_name.as_deref(), Some("clip.mp4"));
+        assert_eq!(snap.current_title.as_deref(), Some("Clip Title"));
+        assert!(!snap.private_identity);
+        assert_eq!(snap.position, 12.5);
+        assert_eq!(snap.duration, 90.0);
+        assert_eq!(snap.current_chapter, 2);
+
+        machine.set_private_identity(true);
+        assert!(super::PlaybackSnapshotInput::from_machine(&machine).private_identity);
     }
 }

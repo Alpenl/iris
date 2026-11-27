@@ -6,7 +6,6 @@ use super::super::{
 use gpui::Context;
 use iris_core::media_uri::MediaUri;
 use iris_plugin_host::{hub::Notice, requests::RequestTarget};
-use std::sync::Arc;
 
 impl AppModel {
     pub(in crate::ui) fn apply_plugin_notice(
@@ -159,13 +158,16 @@ impl AppModel {
                 let resolved_variant = playback.active_variant.clone();
                 let settings = self.settings.clone();
                 self.active_mut().commit_media_open_generation();
-                match self.active_mut().session.open_scoped(
-                    Arc::new(playback).into_scoped(),
-                    uri.clone(),
-                    &settings,
-                    resume,
-                ) {
-                    Ok(()) => {
+                let viewport = &mut self.viewport;
+                let admitted = self
+                    .plugins
+                    .admit_playback(pid, generation, playback, |scoped| {
+                        viewport
+                            .session
+                            .open_scoped(scoped, uri.clone(), &settings, resume)
+                    });
+                match admitted {
+                    Ok(Ok(())) => {
                         self.active_mut().session.set_private_identity(private);
                         self.plugin_view.stream_plugin = Some(pid.clone());
                         self.plugin_view.playlist_current = playlist_current;
@@ -206,10 +208,19 @@ impl AppModel {
                         self.finish_media_open(cx);
                         self.notify_stream_status(pid, Some(ticket.id), cx);
                     }
-                    Err(error) => {
+                    Ok(Err(error)) => {
                         log::warn!("open_scoped failed for {pid}: {error:#}");
                         self.active_mut().pending_subtitles.clear();
                         self.show_error_toast("无法打开插件媒体，请检查网络或鉴权状态", cx);
+                    }
+                    Err(code) => {
+                        log::warn!("admit_playback rejected for {pid}: {code:?}");
+                        self.active_mut().pending_subtitles.clear();
+                        if code != iris_api::v2::ErrorCode::Cancelled
+                            && code != iris_api::v2::ErrorCode::StaleHandle
+                        {
+                            self.show_error_toast("无法打开插件媒体，请检查网络或鉴权状态", cx);
+                        }
                     }
                 }
                 self.active_mut().image.reset();
@@ -275,7 +286,7 @@ impl AppModel {
             Notice::Review(review) => {
                 let new_id = review.id;
                 if let Some(old) = self.plugin_view.review.replace(review) {
-                    let _ = self.plugins.client().dismiss_review(old.id);
+                    let _ = self.plugins.dismiss_review(old.id);
                     self.plugin_view.consent_busy.remove(&old.id);
                 }
                 self.plugin_view.consent_busy.remove(&new_id);
@@ -287,7 +298,7 @@ impl AppModel {
             Notice::Origin(origin) => {
                 let new_id = origin.id;
                 if let Some(old) = self.plugin_view.origin.replace(origin) {
-                    let _ = self.plugins.client().confirm_origin(old.id, false, false);
+                    let _ = self.plugins.confirm_origin(old.id, false, false);
                     self.plugin_view.consent_busy.remove(&old.id);
                 }
                 self.plugin_view.consent_busy.remove(&new_id);
@@ -321,7 +332,7 @@ impl AppModel {
                 self.show_toast(format!("已删除插件 {plugin_id}"), cx);
                 DirtyRegions::ALL
             }
-            Notice::Commands(_) => DirtyRegions::NONE, // Consumed into Action/slots by PluginManager.
+            Notice::Commands(_) => DirtyRegions::NONE, // Consumed into WindowAction/slots by WindowSession.
         }
     }
 }

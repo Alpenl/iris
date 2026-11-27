@@ -139,11 +139,11 @@ fn non_quarantine_control_failure_fails_in_flight_requests_and_clears_readiness(
 
 #[test]
 fn plugin_manager_poll_stays_clean_when_zero_plugins_are_ready() {
-    use crate::ui::PluginManager;
+    use crate::ui::WindowSession;
 
     // 1. Unavailable client: first poll drains the one-shot error, subsequent polls are clean.
     let (unavailable, _) = Client::unavailable(ErrorCode::Internal);
-    let mut offline_ui = PluginManager::new(unavailable, None);
+    let mut offline_ui = WindowSession::new(unavailable, None);
     let first = offline_ui.poll();
     assert_eq!(first.notices.len(), 1);
     assert!(!first.status_changed);
@@ -164,7 +164,7 @@ fn plugin_manager_poll_stays_clean_when_zero_plugins_are_ready() {
     })
     .unwrap();
     let (client, _) = hub.open_window(Generation::default(), None).unwrap();
-    let mut ui = PluginManager::new(client, None);
+    let mut ui = WindowSession::new(client, None);
     wait(|| {
         ui.poll();
         ui.list()

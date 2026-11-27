@@ -1,4 +1,3 @@
-use std::any::Any;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -32,9 +31,6 @@ impl ScopedStream for FakeScopedStream {
     }
     fn stop(&self) {
         self.stops.fetch_add(1, Ordering::SeqCst);
-    }
-    fn as_any(&self) -> &(dyn Any + Send + Sync) {
-        self
     }
 }
 
