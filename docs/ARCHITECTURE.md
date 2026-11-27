@@ -14,7 +14,7 @@ crates/
   iris-plugin-webdav/  官方 WebDAV 数据源插件（iris.webdav）：使用公开 SDK 编译的多实例远程存储 Wasm 包
   iris-core/           无头领域核心：纯状态机播放器会话、统一目录与独立队列、稀疏工作区预设、键位引擎、照片探测、凭据库与日志脱敏；不依赖 GPUI、iris-api 或插件运行时
   iris-plugin-host/    Wasm 插件宿主运行时（pulley64）：显式 PluginHost、单窗口 WindowSession 门面、能力授权、有界网络/私有产物与三模流中继；不依赖 GPUI、iris-mpv 或 Session
-  iris-app/            无头应用编排层：PlaybackController 播放控制纵切（会话事件与加载世代状态机、窄 VideoAttachSlot 绑定与幂等两阶段停机协调）、PluginController 插件纵切（弹窗提交保活、来源分页/解析、安装与 Origin 授权、增强与叠层生命周期）及跨层契约测试；传递依赖零 GPUI，不直接依赖 iris-mpv
+  iris-app/            无头应用编排层：PlaybackController 播放控制纵切、CatalogController 目录/队列/书签/持久化纵切、PluginController 插件纵切及跨层契约测试；传递依赖零 GPUI，不直接依赖 iris-mpv
   iris/                GPUI 应用：窗口、ThemeTokens 动态令牌、ui/kit 共用原语、统一 VideoSurfaceBackend 平台视频层与系统桥接、单实例、调试管道
 ```
 
@@ -47,7 +47,7 @@ crates/
   - `vault.rs`：系统安全凭据库 `CredentialVault`（macOS Keychain / Windows Credential Manager，单条上限 2048B，失败显式报错）。v2 插件按安装身份 `plugin-v2.<installation_id>` 隔离（兼容读取迁移期 `builtin.<id>` 与 `ext.<id>`），Windows 下采用 `app.iris.vault.v2:` 小写十六进制编码目标名以消除大小写不敏感碰撞并保护作用域/键名边界。`credential_index.json` 只保存作用域与键名，测试可用 `in_memory()`。
   - `preset.rs` + `preset/runtime.rs`：`1B+` 稀疏工作区预设（`Option<T>` 补丁 + 显式插件启停差量与退出指令），`settings.conf` 始终只存纯净个人基线，运行期通过内存 `PresetRevert` 自动回正（全局字号 `ui_font_scale` 属个人偏好不进预设）。
 - `crates/iris-plugin-host/src/`：显式 `PluginHost` 与 `WindowSession` 门面（零全局单例，零 `Session` 依赖，支持同进程多宿主并行测试）、有界 Wasmtime Pulley64 字节码运行时、安装/能力授权、网络、三模流（`DirectHttp` / `RandomAccess` / `VirtualHls`）、轻量私有文件产物与哈希（`FileExecutor`）及媒体增强；`iris-plugin-sdk` 和两个官方插件 crate 使用同一套公开 Guest 入口。
-- `crates/iris-app/src/{playback,plugins}/`：无头应用编排层——`playback`（`PlaybackController`）单一拥有 `Session`、`load_generation`、`PendingSubtitles`、加载态、统计缓存、延后 OSD 播报标志、NowPlaying 节流快照、一次性窄 `VideoAttachSlot` 令牌与幂等两阶段停机协调器 `WindowShutdownCoordinator`（严格保证 `VideoSurface -> Session::shutdown()` 顺序）；`plugins`（`PluginController`）单一拥有 `PluginHost`、`WindowSession`、模态框提交/错误状态、远程目录浏览与流解析请求表、插件播放列表与清晰度元数据、安装审核/Origin 授权状态、媒体增强/时间轴叠层与远程缩略图缓存状态。两者对外均输出纯领域变化摘要与最小平台副作用描述（不接收窗口可见性、不感知 `DirtyRegions`）。
+- `crates/iris-app/src/{catalog,playback,plugins}/`：无头应用编排层——`playback/`（`PlaybackController`）单一拥有 `Session`、`load_generation`、`PendingSubtitles`、加载态、统计缓存、延后 OSD 播报标志、NowPlaying 节流快照、一次性窄 `VideoAttachSlot` 令牌与幂等两阶段停机协调器 `WindowShutdownCoordinator`；`catalog/`（`CatalogController`）单一拥有本地与远程目录条目、筛选/排序/搜索状态、单调递增异步请求代数栅栏、跨源 `PlayQueue`、`LocationStore` 书签以及 `Store` 周期落盘意图/完成回执与退出同步刷盘状态机；`plugins/`（`PluginController`）单一拥有 `PluginHost`、`WindowSession`、模态框提交/错误状态、远程目录浏览与流解析请求表、插件播放列表与清晰度元数据、安装审核/Origin 授权状态、媒体增强/时间轴叠层与远程缩略图缓存状态。三者对外均仅输出纯领域变化摘要与最小平台副作用描述（不接收窗口可见性、不感知 `DirtyRegions`）。
 - `crates/iris-core/src/photo/{mod,containers,heif,exif,icc}.rs`：魔数优先单遍照片头解析（JPEG/PNG/WebP/HEIF/TIFF 尺寸、方向、EXIF 摘要与内嵌 ICC 原色匹配）。
 - `crates/iris-core/src/{keymap/,bookmarks,legacy/,logging/,input,geometry,library,settings,fs_util}.rs`：三方案键位目录与结构化 `ConflictTarget`、常驻位置书签与旧版数据兼容、单一集中脱敏日志与结构化事件流（`iris.log` + `events.jsonl`）、指针手势策略、几何变换与慢速共享盘优化扫描。
 - `crates/iris/src/video/{mod,mac,windows}.rs`：跨平台共享的 `VideoSurfaceBackend` trait（`attach`、`set_bounds`、`set_scale`、`set_visible`），在 macOS（`MacVideoSurface`）与 Windows（`WinVideoSurface`）上由编译器验证统一签名，并通过 `VideoSurface` 新类型对窗口层隐藏平台差异。

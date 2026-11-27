@@ -299,7 +299,9 @@ fn window_buttons(
     let session = m.session();
     let cur_uri = session.current_media_uri();
     let has_media = cur_uri.is_some();
-    let favorite = cur_uri.as_ref().is_some_and(|u| m.store.is_favorite(u));
+    let favorite = cur_uri
+        .as_ref()
+        .is_some_and(|u| m.catalog.store().is_favorite(u));
     let palette_open = m.overlays.palette_open;
     let info_open = m.overlays.info_open;
     let settings_open = m.overlays.settings_open;

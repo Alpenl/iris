@@ -32,7 +32,7 @@ pub(super) fn render_sidebar_sources(model: &Entity<AppModel>, cx: &App) -> impl
         .into_iter()
         .map(|(pid, pname, desc)| (pid.to_string(), pname.to_string(), desc.clone()))
         .collect();
-    let bookmarks: Vec<PinnedBookmark> = m.locations.bookmarks.clone();
+    let bookmarks: Vec<PinnedBookmark> = m.catalog.bookmarks().to_vec();
 
     div()
         .id("sidebar-sources-scroll")
@@ -134,7 +134,7 @@ pub(super) fn render_sidebar_sources(model: &Entity<AppModel>, cx: &App) -> impl
                             model,
                             move |this, _, _, cx| {
                                 if this.confirm_destructive(confirm_key.clone(), cx) {
-                                    this.locations.remove_bookmark(&bm_id);
+                                    this.catalog.remove_bookmark(&bm_id);
                                     this.notify_sidebar(cx);
                                     this.show_toast("已移除书签", cx);
                                 }
@@ -146,7 +146,7 @@ pub(super) fn render_sidebar_sources(model: &Entity<AppModel>, cx: &App) -> impl
                             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                             .on_click(model_listener(model, move |this, _, _, cx| {
                                 if this.confirm_destructive(confirm_key.clone(), cx) {
-                                    this.locations.remove_bookmark(&bm_id);
+                                    this.catalog.remove_bookmark(&bm_id);
                                     this.notify_sidebar(cx);
                                     this.show_toast("已移除书签", cx);
                                 }

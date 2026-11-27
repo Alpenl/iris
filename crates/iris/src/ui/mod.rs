@@ -40,17 +40,15 @@ use gpui::{
     Subscription, Task, Window, div, prelude::FluentBuilder, px,
 };
 use iris_app::{
-    MediaKeyInput, MediaKeyOutcome, PlaybackController, PluginController, WindowShutdownCoordinator,
+    CatalogController, MediaKeyInput, MediaKeyOutcome, PlaybackController, PluginController,
+    WindowShutdownCoordinator,
 };
-use iris_core::bookmarks::LocationStore;
-use iris_core::catalog::PlayQueue;
 use iris_core::input::{self, PointerCommand, PointerInput};
 use iris_core::keymap::Keymap;
 use iris_core::library::Kind;
 use iris_core::player::{Command, Session};
-use iris_core::preset::{PresetManager, PresetRuntime};
+use iris_core::preset::{PresetManager, PresetRuntime, SidebarMode};
 use iris_core::settings::{MAX_SPEED, MIN_SPEED, Settings, Side};
-use iris_core::store::Store;
 
 pub(crate) use actions::{
     CycleAspect, CyclePreset, NextChapter, OpenCommandPalette, OpenFile, OpenNextMedia,
@@ -61,7 +59,7 @@ pub(crate) use actions::{
 
 use chrome::WindowChromeState;
 use kit::text_field::TextInputHub;
-use state::{CatalogState, OverlayState, PopoverKind};
+use state::{CatalogUiState, OverlayState, PopoverKind};
 use viewport::Viewport;
 use views::{
     DirtyRegions, DockView, PluginPanel, SettingsPanel, Sidebar, UiVisibility, ViewHandles,
@@ -75,8 +73,8 @@ pub(in crate::ui) struct AppModel {
     focus: FocusHandle,
     playback: PlaybackController,
     viewport: Viewport,
-    catalog: CatalogState,
-    queue: PlayQueue,
+    catalog: CatalogController,
+    catalog_ui: CatalogUiState,
     overlays: OverlayState,
     text_inputs: TextInputHub,
     chrome: WindowChromeState,
@@ -86,10 +84,6 @@ pub(in crate::ui) struct AppModel {
     keymap: Keymap,
     plugins: PluginController,
     plugin_ui: plugin_runtime::PluginUiState,
-    locations: LocationStore,
-    store: Store,
-    store_flush: Option<Task<()>>,
-    last_save: Instant,
     shutdown: WindowShutdownCoordinator,
     sleep_preventer: SleepPreventer,
     _pinch_monitor: Option<PinchMonitor>,
@@ -332,20 +326,24 @@ impl AppModel {
         }
 
         let initial_scale = window.scale_factor() as f64;
-        let mut catalog = CatalogState::default();
-        if let Some(p) = presets.get(&settings.active_preset)
-            && let Some(l) = &p.layout
-            && let Some(mode) = l.sidebar_mode
-        {
-            catalog.sidebar_mode = mode;
-        }
+        let initial_sidebar_mode = presets
+            .get(&settings.active_preset)
+            .and_then(|p| p.layout.as_ref())
+            .and_then(|l| l.sidebar_mode)
+            .unwrap_or(SidebarMode::Files);
+        let catalog = CatalogController::load(
+            initial_sidebar_mode,
+            settings.sort_by,
+            settings.sort_order,
+            now,
+        );
 
         Self {
             focus,
             playback,
             viewport: Viewport::new(video),
             catalog,
-            queue: PlayQueue::new(),
+            catalog_ui: CatalogUiState::default(),
             overlays: OverlayState::default(),
             text_inputs,
             chrome: WindowChromeState::new(now, initial_scale),
@@ -355,10 +353,6 @@ impl AppModel {
             keymap,
             plugins,
             plugin_ui: plugin_runtime::PluginUiState::default(),
-            locations: LocationStore::load(),
-            store: Store::load(),
-            store_flush: None,
-            last_save: now,
             shutdown: WindowShutdownCoordinator::default(),
             sleep_preventer: SleepPreventer::new(),
             _pinch_monitor: pinch_monitor,
@@ -426,7 +420,7 @@ impl AppModel {
         UiVisibility {
             dock_visible: self.chrome_shown(),
             sidebar_plugins_visible: self.sidebar_is_visible()
-                && self.catalog.sidebar_mode == iris_core::preset::SidebarMode::Plugins,
+                && self.catalog.sidebar_mode() == SidebarMode::Plugins,
             settings_open: self.overlays.settings_open,
             palette_open: self.overlays.palette_open,
             popover_open: self.overlays.popover.is_some(),
@@ -552,10 +546,10 @@ impl AppModel {
         let sleep_preventer = &mut self.sleep_preventer;
         let media_keys = &mut self.media_keys;
         let plugins = &self.plugins;
-        let store_flush = &mut self.store_flush;
-        let store = &mut self.store;
-        let last_save = &mut self.last_save;
+        let catalog_ui = &mut self.catalog_ui;
+        let catalog = &mut self.catalog;
         let settings = &mut self.settings;
+        let preset_rt = &mut self.preset_rt;
         let chrome = &self.chrome;
         let viewport = &self.viewport;
         let playback = &self.playback;
@@ -568,21 +562,14 @@ impl AppModel {
             },
             || plugins.shutdown(),
             || {
-                store_flush.take();
-                if iris_app::should_record_progress(settings.resume_playback, scoped_released) {
-                    if let Some((path, pos, dur, eof)) = playback.session().progress() {
-                        let path = path.to_path_buf();
-                        store.remember_path(&path, pos, dur, eof);
-                    } else if let Some((uri_str, pos, dur, eof)) = playback.session().uri_progress()
-                    {
-                        let uri = iris_core::media_uri::MediaUri::parse(uri_str);
-                        store.remember(&uri, pos, dur, eof);
-                    }
-                }
-                if store.is_dirty() {
-                    store.save();
-                }
-                *last_save = Instant::now();
+                catalog_ui.store_flush.take();
+                let progress = iris_app::PluginPlayer::progress(playback.session());
+                catalog.flush_on_shutdown(
+                    progress,
+                    settings.resume_playback,
+                    scoped_released,
+                    Instant::now(),
+                );
                 let st = playback.session().state();
                 settings.volume = Some(st.volume.clamp(0., 100.));
                 if settings.remember_speed {
@@ -595,7 +582,7 @@ impl AppModel {
                     settings.window_width = Some(w);
                     settings.window_height = Some(h);
                 }
-                settings.save();
+                preset_rt.record_user_edit(settings);
             },
             || drop(viewport.take_video_surface()),
             || playback.shutdown(),

@@ -1,4 +1,4 @@
-use super::can_step_queue;
+use iris_app::can_step_queue;
 use iris_core::{
     catalog::{PlayQueue, QueueItem},
     library::Kind,

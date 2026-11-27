@@ -200,7 +200,7 @@ impl ViewportView {
             && (!fullscreen || chrome_visible)
             && session
                 .current()
-                .is_some_and(|cur| m.catalog.photo_paths.iter().any(|p| p == cur));
+                .is_some_and(|cur| m.catalog.photo_paths().iter().any(|p| p == cur));
         let dir_side = m.settings.directory_side;
         let info_open = m.overlays.info_open;
         let dir_popup_open = m.overlays.dir_popup.is_open();

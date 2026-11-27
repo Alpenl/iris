@@ -7,7 +7,6 @@ mod consent;
 pub(in crate::ui) use consent::render_host_consent;
 pub(in crate::ui) mod overlay;
 pub(in crate::ui) mod sources;
-pub(in crate::ui) use sources::remote_search_query;
 mod thumbnails;
 pub(in crate::ui) mod timeline;
 
@@ -84,15 +83,8 @@ impl AppModel {
         self.plugins.source_badge(plugin_id, source_id).into()
     }
 
-    pub(in crate::ui) fn plugin_source_entries<'a>(
-        &'a self,
-        source_id: &'a str,
-    ) -> impl Iterator<Item = &'a iris_api::v2::source::SourceEntry> {
-        self.plugins.source_entries(source_id)
-    }
-
     pub(super) fn close_plugin_browse(&mut self) {
-        let out = self.plugins.close_browse(&mut self.catalog.active_source);
+        let out = self.catalog.close_plugin_browse(&mut self.plugins);
         self.plugin_ui.browse_timeout = None;
         if out
             .effects
@@ -130,7 +122,7 @@ impl AppModel {
 
     fn desired_view_timers(&self) -> BTreeMap<ViewTimerSlot, (String, u32)> {
         let sidebar_visible =
-            self.sidebar_is_visible() && self.catalog.sidebar_mode == SidebarMode::Plugins;
+            self.sidebar_is_visible() && self.catalog.sidebar_mode() == SidebarMode::Plugins;
         let modal_timer = self.plugins.active_modal_timer();
         let sidebar_timers = if sidebar_visible {
             self.plugins.sidebar_panel_timers()

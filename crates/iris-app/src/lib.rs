@@ -3,9 +3,16 @@
 //! Coordinates `iris-core` domain engines and the `iris-plugin-host` facade without
 //! depending on `gpui`, native windowing crates, or `iris-mpv` directly.
 
+pub mod catalog;
 pub mod playback;
 pub mod plugins;
 
+pub use catalog::{
+    BookmarkAction, CatalogController, CatalogCounts, CompletedFavoriteScan, DirRow,
+    DirectStreamTarget, FavoriteScanJob, LocalRefreshTicket, OpenBatchPlan, OpenMediaBatchAction,
+    SAVE_EVERY, StepAction, StoreFlushIntent, StoreFlushReceipt, can_step_queue,
+    fav_uri_to_catalog_item, parse_direct_stream_input, plan_open_paths, resolve_queue_paths,
+};
 pub use playback::{
     EofOutcome, MediaKeyInput, MediaKeyOutcome, NowPlayingSnapshot, PendingSubtitles,
     PlaybackActionOutcome, PlaybackController, PlaybackDomainChanges, PlaybackEventReport,
@@ -13,7 +20,6 @@ pub use playback::{
     WindowShutdownCoordinator, aspect_label, compute_now_playing, should_prevent_display_sleep,
     should_recover_after_gpu_reset, split_open_paths, track_label,
 };
-
 pub use plugins::{
     ActiveSource, ActiveStreamMeta, OpenUrlOutcome, PendingHostAnnotation, PlayerProgress,
     PluginBatchOutcome, PluginContext, PluginController, PluginDomainChanges, PluginModalState,

@@ -44,16 +44,18 @@ impl AppModel {
             }
             "open" => self.open_path(Path::new(arg), cx),
             "filter" => {
-                self.catalog.filter = match arg {
+                let filter = match arg {
                     "video" => MediaFilter::Video,
                     "photo" => MediaFilter::Photo,
                     "audio" => MediaFilter::Audio,
                     "favorites" => MediaFilter::FavoritesOnly,
                     _ => MediaFilter::All,
                 };
+                let cur_uri = self.session().current_media_uri();
+                self.catalog.set_filter(filter, cur_uri.as_ref());
                 self.rebuild_directory_rows();
                 self.scan_visible_favorites(cx);
-                eprintln!("[iris/control] filter {:?}", self.catalog.filter);
+                eprintln!("[iris/control] filter {:?}", self.catalog.filter());
                 self.notify_regions(
                     DirtyRegions {
                         sidebar: true,
@@ -69,7 +71,7 @@ impl AppModel {
                 let state = session.state();
                 let fav = session
                     .current_media_uri()
-                    .is_some_and(|u| self.store.is_favorite(&u));
+                    .is_some_and(|u| self.catalog.store().is_favorite(&u));
                 let vp_size = window.viewport_size();
                 eprintln!(
                     "[iris/control] state pos={:.2} dur={:.2} paused={} vol={} muted={} speed={:.2} loop={} aspect={:?} sub_delay={:.1} video={:?} hwdec={} dir={} dir_w={:.0} side={:?} popup={} settings={} info={} popover={:?} chrome={} fullscreen={} video_rect={:?} dock={:?} filter={:?} favorite={} renders={} win=({:.1},{:.1})",
@@ -100,7 +102,7 @@ impl AppModel {
                         b.size.width,
                         b.size.height
                     )),
-                    self.catalog.filter,
+                    self.catalog.filter(),
                     fav,
                     self.chrome.render_count.get(),
                     f32::from(vp_size.width),
@@ -114,10 +116,10 @@ impl AppModel {
                     self.settings.seek_step,
                     self.settings.always_on_top,
                     self.settings.photo_filmstrip,
-                    self.catalog.thumbs.len(),
-                    self.catalog.sidebar_mode,
-                    self.catalog.rows.len(),
-                    self.queue.len(),
+                    self.catalog_ui.thumbs.len(),
+                    self.catalog.sidebar_mode(),
+                    self.catalog.rows().len(),
+                    self.catalog.queue().len(),
                     self.text_inputs.search_open,
                     self.text_inputs.search_input.text(),
                     self.overlays.palette_open,

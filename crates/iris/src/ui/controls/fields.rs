@@ -5,8 +5,8 @@ use gpui::{
     App, Entity, InteractiveElement, IntoElement, MouseButton, ParentElement, ScrollWheelEvent,
     StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder, px,
 };
+use iris_core::media_uri::MediaUri;
 use iris_core::player::{AspectMode, Command, TrackKind, format_time};
-use iris_core::{catalog::PlayQueue, media_uri::MediaUri};
 
 use super::super::AppModel;
 use super::super::actions::{
@@ -22,15 +22,6 @@ use super::super::views::{DirtyRegions, model_listener};
 use super::{anchor_wrap, dock_sep, render_volume};
 use crate::assets::Icon;
 use crate::theme::{FONT_MONO, ThemeTokens};
-
-fn can_step_queue(queue: &PlayQueue, current: Option<&MediaUri>, delta: isize) -> bool {
-    match current {
-        Some(current) => queue
-            .step(current, delta, true)
-            .is_some_and(|next| &next.uri != current),
-        None => !queue.is_empty(),
-    }
-}
 
 pub(super) fn render_plugin_toolbar_slot(
     model: &Entity<AppModel>,
@@ -146,10 +137,8 @@ fn can_step_media(m: &AppModel, delta: isize) -> bool {
         .map(std::path::Path::to_path_buf)
         .map(MediaUri::Local)
         .or_else(|| m.session().current_media_uri());
-    if !m.queue.is_empty() {
-        return can_step_queue(&m.queue, current.as_ref(), delta);
-    }
-    m.catalog.playable_count > 1 || m.can_step_plugin_playlist(current.as_ref(), delta)
+    m.catalog
+        .can_step_media(&m.plugins, current.as_ref(), delta)
 }
 
 fn step_button(
@@ -493,31 +482,12 @@ pub(super) fn photo_transport(
 ) -> impl IntoElement {
     let m = model.read(cx);
     let session = m.session();
-    let standalone_remote = m.catalog.current_playable_number.is_none()
-        && session.current().is_none()
-        && m.catalog.active_source.is_local()
-        && m.catalog.filter != iris_core::catalog::MediaFilter::FavoritesOnly;
-    let (pos_str, total_str) = if standalone_remote {
-        if !m.queue.is_empty() {
-            let pos = session
-                .current_media_uri()
-                .and_then(|u| {
-                    (0..m.queue.len()).find(|&i| m.queue.get(i).is_some_and(|q| q.uri == u))
-                })
-                .map_or_else(|| "—".to_string(), |i| (i + 1).to_string());
-            (pos, m.queue.len().to_string())
-        } else if session.current_uri().is_some() {
-            ("1".to_string(), "1".to_string())
-        } else {
-            ("—".to_string(), "0".to_string())
-        }
-    } else {
-        let pos = m
-            .catalog
-            .current_playable_number
-            .map_or_else(|| "—".to_string(), |number| number.to_string());
-        (pos, m.catalog.playable_count.to_string())
-    };
+    let cur_uri = session.current_media_uri();
+    let (pos_str, total_str) = m.catalog.photo_counter_strings(
+        cur_uri.as_ref(),
+        session.current().is_some(),
+        session.current_uri().is_some(),
+    );
     let counter = hstack(if compact { 4. } else { 6. })
         .pl(px(if compact { 6. } else { 10. }))
         .font_family(FONT_MONO)

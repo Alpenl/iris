@@ -8,7 +8,6 @@ pub(crate) const OPEN_STREAM_LABEL: &str = "打开网络流…";
 pub(in crate::ui) const OPEN_STREAM_DIALOG_TITLE: &str = "打开网络流";
 pub(crate) const MEDIA_INFO_LABEL: &str = "媒体详情";
 pub(crate) const RESET_APPEARANCE_LABEL: &str = "恢复默认外观";
-pub(in crate::ui) const DEFAULT_PLUGIN_MEDIA_TITLE: &str = "插件媒体";
 
 pub(in crate::ui) fn audio_device_label(dev: &AudioDevice, verbose_auto: bool) -> String {
     if dev.name == "auto" {

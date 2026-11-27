@@ -8,8 +8,7 @@ use gpui::{
     PathPromptOptions, SharedString, StatefulInteractiveElement, Styled, Window, div,
     prelude::FluentBuilder, px, uniform_list,
 };
-use iris_core::catalog::QueueItem;
-use iris_core::library;
+use iris_app::resolve_queue_paths;
 use iris_core::media_uri::MediaUri;
 
 use super::super::AppModel;
@@ -32,26 +31,18 @@ impl AppModel {
             let Ok(Ok(Some(paths))) = rx.await else {
                 return;
             };
-            let items: Vec<QueueItem> = cx
+            let items = cx
                 .background_executor()
-                .spawn(async move {
-                    paths
-                        .into_iter()
-                        .map(|p| library::safe_resolve_path(&p))
-                        .filter_map(library::entry_from_path)
-                        .map(|e| QueueItem::from_local_entry(&e))
-                        .collect()
-                })
+                .spawn(async move { resolve_queue_paths(paths) })
                 .await;
             if items.is_empty() {
                 return;
             }
             let _ = this.update(cx, |this, cx| {
-                let first = items.first().cloned();
-                let added = this.queue.extend(items);
                 let idle =
                     this.session().current_media_uri().is_none() && !this.media_load_pending();
-                if idle && let Some(q) = first {
+                let (added, auto_open) = this.catalog.extend_queue_with_idle_check(items, idle);
+                if let Some(q) = auto_open {
                     this.open_media_uri(&q.uri, Some(q.title), cx);
                 }
                 this.notify_regions(
@@ -74,8 +65,8 @@ impl Sidebar {
         let model = self.model.clone();
         let m = model.read(cx);
         let t = ThemeTokens::of(cx);
-        let item_count = m.queue.len();
-        let has_catalog = m.catalog.items.iter().any(|item| !item.is_folder());
+        let item_count = m.catalog.queue().len();
+        let has_catalog = m.catalog.items().iter().any(|item| !item.is_folder());
 
         div()
             .flex_1()
@@ -102,7 +93,7 @@ impl Sidebar {
                         d.child(
                             bordered_button("q-add-cat", "+ 加入当前目录", false, t).on_click(
                                 model_listener(&model, |this, _, _, cx| {
-                                    let added = this.queue.extend_catalog(&this.catalog.items);
+                                    let added = this.catalog.extend_queue_from_catalog();
                                     this.notify_regions(
                                         DirtyRegions {
                                             sidebar: true,
@@ -135,7 +126,7 @@ impl Sidebar {
                         let t = ThemeTokens::of(cx);
                         range
                             .filter_map(|ix| {
-                                let item = m.queue.get(ix)?;
+                                let item = m.catalog.queue().get(ix)?;
                                 let badge: Option<SharedString> = match &item.uri {
                                     MediaUri::Local(_) => None,
                                     MediaUri::Plugin {
@@ -153,7 +144,7 @@ impl Sidebar {
                                     t,
                                 )
                                 .on_click(model_listener(&model, move |this, _, _, cx| {
-                                    this.queue.remove_at(ix);
+                                    this.catalog.remove_queue_at(ix);
                                     cx.stop_propagation();
                                     this.notify_regions(
                                         DirtyRegions {
@@ -174,7 +165,7 @@ impl Sidebar {
                                             meta: badge,
                                             is_current: cur_uri.as_ref() == Some(&item.uri),
                                             is_live: false,
-                                            progress: m.store.progress_ratio(&item.uri),
+                                            progress: m.catalog.store().progress_ratio(&item.uri),
                                             trailing: Some(remove.into_any_element()),
                                         },
                                         t,
@@ -184,12 +175,14 @@ impl Sidebar {
                                         model_listener(
                                             &model,
                                             move |this, ev: &MouseDownEvent, w, cx| {
-                                                if let Some(item) = this.queue.get(ix) {
+                                                if let Some(item) =
+                                                    this.catalog.queue().get(ix).cloned()
+                                                {
                                                     this.overlays.open_context_menu(ContextMenu {
                                                         pos: ev.position,
                                                         target: ContextTarget::Media {
-                                                            uri: item.uri.clone(),
-                                                            title: item.title.clone(),
+                                                            uri: item.uri,
+                                                            title: item.title,
                                                             kind: Some(item.kind),
                                                             folder_id: None,
                                                         },
@@ -204,7 +197,9 @@ impl Sidebar {
                                     .on_click(model_listener(
                                         &model,
                                         move |this, _, _, cx| {
-                                            if let Some(item) = this.queue.get(ix).cloned() {
+                                            if let Some(item) =
+                                                this.catalog.queue().get(ix).cloned()
+                                            {
                                                 this.open_media_uri(
                                                     &item.uri,
                                                     Some(item.title),

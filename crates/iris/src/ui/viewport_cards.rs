@@ -98,14 +98,14 @@ pub(super) fn render_empty_state(
     cx: &App,
 ) -> impl IntoElement {
     let m = model.read(cx);
-    let recents: Vec<(MediaUri, Option<String>, String)> = m
-        .store
+    let store = m.catalog.store();
+    let recents: Vec<(MediaUri, Option<String>, String)> = store
         .recent()
         .iter()
         .take(6)
         .map(|uri| {
-            let stored_title = m.store.recent_title(uri).map(str::to_owned);
-            let label = m.store.recent_display_name(uri);
+            let stored_title = store.recent_title(uri).map(str::to_owned);
+            let label = store.recent_display_name(uri);
             (uri.clone(), stored_title, label)
         })
         .collect();
@@ -266,7 +266,7 @@ pub(super) fn render_empty_state(
                                     })
                                     .on_click(model_listener(model, |this, _, _, cx| {
                                         if this.confirm_destructive("clear-recent", cx) {
-                                            this.store.clear_recent();
+                                            this.catalog.clear_recent();
                                             this.notify_viewport(cx);
                                             this.show_toast("已清除最近打开记录", cx);
                                         }
@@ -330,12 +330,12 @@ pub(super) fn render_photo_filmstrip(
     cx: &App,
 ) -> Option<impl IntoElement> {
     let m = model.read(cx);
-    let photos = &m.catalog.photo_paths;
+    let photos = m.catalog.photo_paths();
     if photos.len() < 2 {
         return None;
     }
     let current = m.session().current();
-    let cur_ix = m.catalog.filmstrip_index;
+    let cur_ix = m.catalog.filmstrip_index();
     const WINDOW: usize = 11;
     let start = cur_ix
         .saturating_sub(WINDOW / 2)
@@ -371,7 +371,7 @@ pub(super) fn render_photo_filmstrip(
                     .children(slice.iter().enumerate().map(|(offset, path)| {
                         let is_cur = Some(path.as_path()) == current;
                         let p_open = path.clone();
-                        let thumb = m.catalog.thumbs.get(path);
+                        let thumb = m.catalog_ui.thumbs.get(path);
                         div()
                             .id(("thumb", start + offset))
                             .w(px(56.))

@@ -28,26 +28,10 @@ pub(super) fn render_titlebar(
         .and_then(|p| p.file_name())
         .map(|n| n.to_string_lossy().into_owned())
         .or_else(|| session.current_title().map(str::to_string));
-    let remote_badge = !m.catalog.active_source.is_local();
-    let folder = if remote_badge {
-        m.catalog
-            .active_source
-            .display_badge()
-            .unwrap_or_else(|| "远程数据源".into())
-    } else {
-        m.catalog
-            .local_dir
-            .folder()
-            .and_then(|f| f.file_name())
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| {
-                if session.current_uri().is_some() {
-                    "远程媒体".into()
-                } else {
-                    "未打开".into()
-                }
-            })
-    };
+    let remote_badge = !m.catalog.active_source().is_local();
+    let folder = m
+        .catalog
+        .titlebar_folder_label(session.current_uri().is_some());
     let pinned = m.settings.always_on_top;
     let modal_open = m.has_active_modal();
 

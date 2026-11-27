@@ -17,13 +17,18 @@ impl AppModel {
         &mut self,
         f: impl FnOnce(&mut PluginController, PluginContext<'_, Session>) -> R,
     ) -> R {
-        let ctx = PluginContext {
-            player: self.playback.session_mut(),
-            store: &mut self.store,
-            settings: &self.settings,
-            active_source: &mut self.catalog.active_source,
-        };
-        f(&mut self.plugins, ctx)
+        let plugins = &mut self.plugins;
+        let player = self.playback.session_mut();
+        let settings = &self.settings;
+        self.catalog.with_plugin_parts(|store, active_source| {
+            let ctx = PluginContext {
+                player,
+                store,
+                settings,
+                active_source,
+            };
+            f(plugins, ctx)
+        })
     }
 
     pub(super) fn has_active_modal(&self) -> bool {
@@ -60,11 +65,10 @@ impl AppModel {
         cx.spawn(async move |this, cx| {
             timer.await;
             let _ = this.update(cx, |this, cx| {
-                let out = this.plugins.on_source_request_timeout(
-                    &mut this.catalog.active_source,
-                    &plugin_id,
-                    request_id,
-                );
+                let plugins = &mut this.plugins;
+                let out = this.catalog.with_plugin_parts(|_, active_source| {
+                    plugins.on_source_request_timeout(active_source, &plugin_id, request_id)
+                });
                 let regions = this.apply_plugin_outcome(out, None, cx);
                 if regions.any() {
                     this.notify_regions(regions, cx);
@@ -100,7 +104,7 @@ impl AppModel {
 
         let d = outcome.domain;
         if d.locations_reloaded {
-            self.locations.reload();
+            self.catalog.reload_locations();
         }
         if d.close_overlays {
             self.overlays.close_all();
@@ -168,7 +172,8 @@ impl AppModel {
                         Some(self.spawn_plugin_source_timeout(plugin_id, request_id, timeout, cx));
                 }
                 PluginSideEffect::MediaResolveStarted => {
-                    let _ = self.catalog.remote_load.take();
+                    self.catalog.cancel_remote_load();
+                    self.catalog_ui.remote_load = None;
                     self.playback.begin_plugin_resolve();
                     regions.root = true;
                     regions.viewport = true;
@@ -181,7 +186,8 @@ impl AppModel {
                 }
                 PluginSideEffect::MediaOpenSucceeded => {
                     self.plugin_ui.resolve_timeout = None;
-                    let _ = self.catalog.remote_load.take();
+                    self.catalog.cancel_remote_load();
+                    self.catalog_ui.remote_load = None;
                     self.overlays.close_menus();
                     self.playback.commit_media_open_generation();
                     self.active_mut().image.reset();
@@ -190,7 +196,8 @@ impl AppModel {
                 }
                 PluginSideEffect::MediaOpenFailed { .. } => {
                     self.plugin_ui.resolve_timeout = None;
-                    let _ = self.catalog.remote_load.take();
+                    self.catalog.cancel_remote_load();
+                    self.catalog_ui.remote_load = None;
                     self.overlays.close_menus();
                     self.playback.commit_media_open_generation();
                     if let Some(np) = self.playback.on_media_open_failed(Instant::now()) {
@@ -282,17 +289,22 @@ impl AppModel {
         cx: &mut Context<Self>,
     ) {
         let text_inputs = &self.text_inputs;
-        let ctx = PluginContext {
-            player: self.playback.session_mut(),
-            store: &mut self.store,
-            settings: &self.settings,
-            active_source: &mut self.catalog.active_source,
-        };
-        let out = self.plugins.submit_active_modal(
-            ctx,
-            |pid, modal| text_inputs.collect_modal_values(pid, modal),
-            Instant::now(),
-        );
+        let plugins = &mut self.plugins;
+        let player = self.playback.session_mut();
+        let settings = &self.settings;
+        let out = self.catalog.with_plugin_parts(|store, active_source| {
+            let ctx = PluginContext {
+                player,
+                store,
+                settings,
+                active_source,
+            };
+            plugins.submit_active_modal(
+                ctx,
+                |pid, modal| text_inputs.collect_modal_values(pid, modal),
+                Instant::now(),
+            )
+        });
         let regions = self.apply_plugin_outcome(out, Some(window), cx);
         if regions.any() {
             self.notify_regions(regions, cx);

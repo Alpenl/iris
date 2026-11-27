@@ -1,5 +1,5 @@
-//! Cohesive UI domain state structs: overlays, dialogs, active catalog state,
-//! scrub/pointer tracking, escape-dismissal priority, and bounded LRU thumbnail cache.
+//! Cohesive UI domain state structs: overlays, dialogs, window-local catalog GPUI
+//! handles, scrub/pointer tracking, escape-dismissal priority, and bounded LRU thumbnail cache.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -7,14 +7,11 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use gpui::{RenderImage, ScrollHandle, SharedString, UniformListScrollHandle};
-pub(super) use iris_app::ActiveSource;
-use iris_core::catalog::{CatalogItem, LocalDirectory, MediaFilter};
-use iris_core::preset::{PresetCaptureScope, SidebarMode};
+use iris_core::preset::PresetCaptureScope;
 
 use super::chrome::DirectoryPopup;
 use super::context_menu::ContextMenu;
 use super::kit::text_buffer::TextInputBuffers;
-use super::sidebar::DirRow;
 
 /// Cap in-memory decoded thumbnails to keep RAM usage tiny.
 pub(super) const MAX_THUMB_CACHE: usize = 80;
@@ -74,73 +71,16 @@ pub(super) enum EscapeStep {
     Noop,
 }
 
-/// Dropping the window or superseding a load must wake its blocking network read.
-pub(super) struct RemoteLoad {
-    pub(super) cancel: iris_base::net::http_client::HttpCancel,
-    pub(super) _task: gpui::Task<()>,
-}
-
-impl Drop for RemoteLoad {
-    fn drop(&mut self) {
-        self.cancel.cancel();
-    }
-}
-
-/// Unified sidebar catalog & virtual-list browsing state.
-pub(super) struct CatalogState {
-    pub(super) sidebar_mode: SidebarMode,
-    pub(super) active_source: ActiveSource,
-    pub(super) local_dir: LocalDirectory,
-    pub(super) filter: MediaFilter,
-    pub(super) rows: Vec<DirRow>,
-    pub(super) items: Vec<CatalogItem>,
-    pub(super) playable_count: usize,
-    pub(super) current_playable_number: Option<usize>,
-    pub(super) sorted_source_items: Vec<CatalogItem>,
-    pub(super) favorite_uris: Vec<iris_core::media_uri::MediaUri>,
-    pub(super) favorite_items: Vec<CatalogItem>,
-    pub(super) favorite_scan: Option<gpui::Task<()>>,
-    pub(super) photo_paths: Vec<PathBuf>,
-    pub(super) video_count: usize,
-    pub(super) audio_count: usize,
-    pub(super) photo_count: usize,
-    pub(super) favorite_count: usize,
-    pub(super) thumbs: ThumbCache,
-    pub(super) dir_scroll: UniformListScrollHandle,
-    pub(super) remote_load: Option<RemoteLoad>,
-    pub(super) directory_refresh: Option<gpui::Task<()>>,
-    pub(super) filmstrip_index: usize,
-    pub(super) remote_work_slot: Arc<futures::lock::Mutex<()>>,
-}
-
-impl Default for CatalogState {
-    fn default() -> Self {
-        Self {
-            sidebar_mode: SidebarMode::Files,
-            active_source: ActiveSource::Local,
-            local_dir: LocalDirectory::default(),
-            filter: MediaFilter::All,
-            rows: Vec::new(),
-            items: Vec::new(),
-            playable_count: 0,
-            current_playable_number: None,
-            sorted_source_items: Vec::new(),
-            favorite_uris: Vec::new(),
-            favorite_items: Vec::new(),
-            favorite_scan: None,
-            photo_paths: Vec::new(),
-            video_count: 0,
-            audio_count: 0,
-            photo_count: 0,
-            favorite_count: 0,
-            thumbs: ThumbCache::default(),
-            dir_scroll: UniformListScrollHandle::new(),
-            remote_load: None,
-            directory_refresh: None,
-            filmstrip_index: 0,
-            remote_work_slot: Arc::new(futures::lock::Mutex::new(())),
-        }
-    }
+/// Window-local GPUI handles (`ThumbCache`, virtual-list scroll handle, and background
+/// `gpui::Task`s) paired with [`iris_app::CatalogController`].
+#[derive(Default)]
+pub(in crate::ui) struct CatalogUiState {
+    pub(in crate::ui) thumbs: ThumbCache,
+    pub(in crate::ui) dir_scroll: UniformListScrollHandle,
+    pub(in crate::ui) favorite_scan: Option<gpui::Task<()>>,
+    pub(in crate::ui) directory_refresh: Option<gpui::Task<()>>,
+    pub(in crate::ui) remote_load: Option<gpui::Task<()>>,
+    pub(in crate::ui) store_flush: Option<gpui::Task<()>>,
 }
 
 /// Manages mutually exclusive modals, popovers, command palette, and shortcut recorder.
@@ -401,7 +341,7 @@ impl Default for ScrubState {
 
 /// Bounded LRU thumbnail cache with priority decode queue and concurrency cap.
 #[derive(Default)]
-pub(super) struct ThumbCache {
+pub(in crate::ui) struct ThumbCache {
     entries: HashMap<PathBuf, (u64, Arc<RenderImage>)>,
     pending: VecDeque<PathBuf>,
     inflight: HashSet<PathBuf>,
@@ -487,28 +427,5 @@ impl ThumbCache {
             return true;
         }
         false
-    }
-}
-
-#[cfg(test)]
-mod remote_lifecycle_tests {
-    use super::{CatalogState, RemoteLoad};
-
-    #[test]
-    fn replacing_remote_load_cancels_reader_and_serializes_preparation() {
-        let cancel = iris_base::net::http_client::HttpCancel::default();
-        let mut catalog = CatalogState {
-            remote_load: Some(RemoteLoad {
-                cancel: cancel.clone(),
-                _task: gpui::Task::ready(()),
-            }),
-            ..Default::default()
-        };
-        let active = catalog.remote_work_slot.try_lock().unwrap();
-        catalog.remote_load = None;
-        assert!(cancel.is_cancelled());
-        assert!(catalog.remote_work_slot.try_lock().is_none());
-        drop(active);
-        assert!(catalog.remote_work_slot.try_lock().is_some());
     }
 }
