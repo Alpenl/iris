@@ -1,5 +1,10 @@
-//! Bounded URL contribution matching. Patterns select a resolver; they never
-//! grant network access. Queries/fragments are not part of a routing pattern.
+//! Bounded URL contribution matching and pure URL/Origin/header policy checks.
+//! Patterns select a resolver; they never grant network access. Queries/fragments
+//! are not part of a routing pattern.
+mod policy;
+pub use policy::{Origin, TransportKind, normalize_url, parse_consent_origin_url};
+pub(crate) use policy::{matches_host, validate_declaration, validate_headers};
+
 pub fn valid_pattern(pattern: &str) -> bool {
     parse_pattern(pattern, "https").is_some()
 }

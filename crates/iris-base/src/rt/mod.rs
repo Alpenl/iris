@@ -36,7 +36,7 @@ pub mod budget {
     pub const SYSTEM_DNS_WORKERS_GLOBAL: usize = 64;
 
     pub const WASM_EPOCH_THREADS_PER_ENGINE: usize = 1;
-    pub const ARTIFACT_CLEANUP_THREADS_GLOBAL: usize = 1;
+    pub const ARTIFACT_CLEANUP_THREADS_PER_HOST: usize = 1;
     pub const PLUGIN_COORDINATOR_THREADS_PER_HUB: usize = 1;
 
     pub const PLUGIN_CONTROL_STORES_PER_PLUGIN: u64 = 1;
@@ -421,7 +421,6 @@ impl ThreadRole {
         match self {
             Self::ControlPipe => Some(budget::CONTROL_PIPE_THREADS),
             Self::SingleInstanceIpc => Some(budget::SINGLE_INSTANCE_THREADS),
-            Self::ArtifactCleanup => Some(budget::ARTIFACT_CLEANUP_THREADS_GLOBAL),
             Self::VideoSurface
             | Self::MpvEventPump
             | Self::MediaRelayListener
@@ -429,6 +428,7 @@ impl ThreadRole {
             | Self::MediaRelayWorker
             | Self::SystemDnsWorker
             | Self::WasmEpochTimer
+            | Self::ArtifactCleanup
             | Self::PluginCoordinator
             | Self::PluginStoreActor
             | Self::PluginPoolWorker

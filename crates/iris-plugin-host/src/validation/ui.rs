@@ -130,10 +130,7 @@ pub fn widgets(values: &[Widget]) -> Result<(), ErrorCode> {
                 }
             }
             Widget::Link { url, .. } => {
-                super::super::network::normalize_url(
-                    url,
-                    super::super::network::TransportKind::Http,
-                )?;
+                crate::url_resolver::normalize_url(url, crate::url_resolver::TransportKind::Http)?;
             }
             _ => {}
         }

@@ -203,7 +203,7 @@ DirectHttp、RandomAccess、VirtualManifest 共用受控播放准入。远端及
 | `MediaRelayWorker` | `iris-media-request` | 8 / 中继 | 32 | 超限或起线程失败立即回 `503 Busy` | `CancelToken` 触发 `TcpStream::shutdown(Both)`，由 `MediaRelayReaper` `join` |
 | `SystemDnsWorker` | `iris-http-dns` | 16 并发查询 | 64 | `ACTIVE_DNS_LOOKUPS` 超限拒绝新建 | 受 `Deadline` 约束，解析完成后自动退出并归还信号量 |
 | `WasmEpochTimer` | `iris-wasm-epoch` | 1 / `RuntimeEngine` | `Engine` 数 | 起线程失败回滚活跃计数并返回 `Internal` | 无活跃 Guest 调用时 `Condvar` 挂起，`Engine` 析构时唤醒退出 |
-| `ArtifactCleanup` | `iris-artifact-cleanup` | 1 | 1 | `WouldBlock` 跳过重复后台清理 | 启动期一次性扫描清理残留临时目录后立即退出 |
+| `ArtifactCleanup` | `iris-artifact-cleanup` | 1 / `PluginHost` | `PluginHost` 数 | 起线程失败回退调用方同步清理；删除失败保留 `Ledger` 额度 | 按需懒启动；宿主关闭时有界排空并有界等待 `join`，晚到产物原地同步清理 |
 | `PluginCoordinator` | `iris-plugin-coordinator` | 1 / `PluginHost` | `PluginHost` 数 | 起线程失败 `PluginHost::new` 返回 `Internal` | `PluginHost` 释放后置 `shutdown`，待在途作业与退役实例归零后退出 |
 | `PluginStoreActor` | `iris-v2-` (`Control` / `Stream`) | Control 1/插件、Stream 2/插件 | Control 64、Stream 8 | `Ledger` 预留失败返回 `QuotaExceeded` | `Actor::stop` 触发 `CancelToken` 与唤醒，`is_quiescent` 确认 `done && outstanding == 0` |
 | `PluginPoolWorker` | `iris-v2-` (`{control,stream,package,setup}-io-{id}`) | 按宿主分片公平轮转 | 4 + 8 + 2 + 2 = 16 | 队列满返回 `Backpressure`；空闲 30s 自动缩容 | 按需懒启动，`Dispatcher::drop` 唤醒全部工作线程退出 |

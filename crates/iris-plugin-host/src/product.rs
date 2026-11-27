@@ -17,8 +17,8 @@ use std::{
 };
 
 /// Explicit host runtime context owned by the application or an isolated test.
-/// Dropping or calling [`PluginHost::shutdown`] tears down the coordinator without
-/// process-wide mutable statics.
+/// Dropping or calling [`PluginHost::shutdown`] tears down the coordinator and
+/// drains temporary artifact cleanup without process-wide mutable statics.
 pub struct PluginHost {
     resources: Result<Resources, ErrorCode>,
     hub: Mutex<Option<Hub>>,
@@ -147,9 +147,13 @@ impl PluginHost {
         HostAnnotationJob::new(resources.ledger)
     }
 
-    /// Signals coordinator shutdown and releases the host connection handle.
+    /// Signals coordinator shutdown, drains pending artifact deletions within
+    /// bounded timeouts, and releases the host connection handle.
     pub fn shutdown(&self) {
         let _ = self.hub.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Ok(resources) = &self.resources {
+            resources.shutdown();
+        }
     }
 }
 

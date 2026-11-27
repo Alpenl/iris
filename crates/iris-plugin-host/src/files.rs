@@ -5,6 +5,7 @@ mod executor;
 mod hashing;
 pub mod identity;
 pub use artifact::{Artifact, ArtifactWriter, TempRoot};
+pub(crate) use artifact::{ArtifactCleaner, CleanerQueue};
 pub use executor::{FileExecutor, FileSetup};
 pub use hashing::hash_media;
 

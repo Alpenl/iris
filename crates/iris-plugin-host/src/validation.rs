@@ -70,12 +70,7 @@ pub fn manifest(manifest: &iris_api::v2::Manifest) -> Result<(), ErrorCode> {
     if let Some(value) = &manifest.chrome {
         chrome(value)?;
     }
-    super::network::NetworkGrant::new(
-        "manifest-check".into(),
-        manifest.permissions.iter().copied().collect(),
-        manifest.network.clone(),
-        &super::ledger::Ledger::default(),
-    )?;
+    super::url_resolver::validate_declaration(&mut manifest.network.clone())?;
     for pattern in &manifest.url_patterns {
         if !super::url_resolver::valid_pattern(pattern) {
             return Err(ErrorCode::InvalidArgument);
@@ -173,8 +168,8 @@ fn variants(values: &[iris_api::StreamVariant]) -> Result<(), ErrorCode> {
     Ok(())
 }
 pub fn remote(resource: &iris_api::v2::stream::RemoteResource) -> Result<(), ErrorCode> {
-    super::network::normalize_url(&resource.url, super::network::TransportKind::Http)?;
-    super::network::raw::validate_headers(&resource.headers)
+    super::url_resolver::normalize_url(&resource.url, super::url_resolver::TransportKind::Http)?;
+    super::url_resolver::validate_headers(&resource.headers)
 }
 pub fn command(command: &HostCommand) -> Result<(), ErrorCode> {
     use HostCommand::*;
@@ -183,7 +178,7 @@ pub fn command(command: &HostCommand) -> Result<(), ErrorCode> {
             if request_id.0 == 0 || request_id.0 > i64::MAX as u64 {
                 return Err(ErrorCode::InvalidArgument);
             }
-            super::network::parse_consent_origin_url(origin).map(|_| ())
+            super::url_resolver::parse_consent_origin_url(origin).map(|_| ())
         }
         SeekRelative { seconds } => finite(*seconds, -86400., 86400.),
         SeekAbsolute { seconds } => finite(*seconds, 0., 7. * 86400.),

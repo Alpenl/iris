@@ -3,7 +3,7 @@
 mod executor;
 mod serial;
 use super::{
-    installation::valid_identity,
+    crypto::valid_identity,
     json_error,
     ledger::{Ledger, Resource},
 };

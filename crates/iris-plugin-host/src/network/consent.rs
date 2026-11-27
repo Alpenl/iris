@@ -1,11 +1,9 @@
 //! Host-owned Origin consent. DNS resolution produces a review only; it never
 //! grants access. Persisted pins cannot be modified through Guest state APIs.
-use super::{
-    AddressKind, NetworkGrant, Origin, TransportKind, address_kind, grant::validate_pins,
-    normalize_url,
-};
+use super::{AddressKind, NetworkGrant, Origin, TransportKind, address_kind, grant::validate_pins};
+pub use crate::url_resolver::parse_consent_origin_url;
 use crate::{
-    installation::valid_identity,
+    crypto::valid_identity,
     json_error,
     ledger::{Ledger, Reservation, Resource},
 };
@@ -256,19 +254,6 @@ impl OriginStore {
         }
         Ok(())
     }
-}
-pub fn parse_consent_origin_url(raw: &str) -> Result<(Origin, TransportKind), ErrorCode> {
-    for kind in [
-        TransportKind::Http,
-        TransportKind::WebSocket,
-        TransportKind::Tcp { tls: false },
-        TransportKind::Tcp { tls: true },
-    ] {
-        if let Ok(url) = normalize_url(raw, kind) {
-            return Ok((Origin::of(&url)?.http_equivalent(), kind));
-        }
-    }
-    Err(ErrorCode::Denied)
 }
 fn consent_transport(grant: &NetworkGrant, origin: &str) -> Result<TransportKind, ErrorCode> {
     if grant.has_capability(Capability::NetHttp) || grant.has_capability(Capability::NetWs) {

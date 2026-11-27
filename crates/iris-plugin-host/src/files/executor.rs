@@ -1,6 +1,6 @@
 //! Scoped inert artifact staging and current-media hashing executor.
 mod writer;
-use super::{Artifact, TempRoot, hash_media, identity::PinnedFile};
+use super::{Artifact, ArtifactCleaner, CleanerQueue, TempRoot, hash_media, identity::PinnedFile};
 use crate::{
     actor::{Executor, IoOutcome, Operation, TaskContext},
     instance::Blob,
@@ -50,6 +50,8 @@ struct Shared {
     ledger: Ledger,
     capabilities: BTreeSet<Capability>,
     temp_dir: PathBuf,
+    _standalone_cleaner: Option<ArtifactCleaner>,
+    cleaner: CleanerQueue,
     root: Mutex<Option<Arc<TempRoot>>>,
 }
 
@@ -66,11 +68,27 @@ pub struct FileExecutor(Arc<Inner>);
 impl FileExecutor {
     /// Lightweight constructor; `TempRoot` is created lazily on the first artifact write.
     pub fn new(setup: FileSetup) -> Result<Self, ErrorCode> {
+        let cleaner = ArtifactCleaner::new();
+        let queue = cleaner.queue();
         Ok(Self::from_shared(Arc::new(Shared {
             network: setup.network,
             ledger: setup.ledger,
             capabilities: setup.capabilities,
             temp_dir: setup.temporary_directory,
+            _standalone_cleaner: Some(cleaner),
+            cleaner: queue,
+            root: Mutex::new(None),
+        })))
+    }
+
+    pub(crate) fn with_cleaner(setup: FileSetup, cleaner: CleanerQueue) -> Result<Self, ErrorCode> {
+        Ok(Self::from_shared(Arc::new(Shared {
+            network: setup.network,
+            ledger: setup.ledger,
+            capabilities: setup.capabilities,
+            temp_dir: setup.temporary_directory,
+            _standalone_cleaner: None,
+            cleaner,
             root: Mutex::new(None),
         })))
     }
@@ -111,10 +129,11 @@ impl FileExecutor {
         if let Some(existing) = slot.as_ref() {
             return Ok(existing.clone());
         }
-        let created = TempRoot::new(
+        let created = TempRoot::with_cleaner(
             &self.0.shared.temp_dir,
             self.0.shared.network.owner().into(),
             self.0.shared.ledger.clone(),
+            self.0.shared.cleaner.clone(),
         )?;
         *slot = Some(created.clone());
         Ok(created)

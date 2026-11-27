@@ -1,8 +1,8 @@
-use super::{
-    instance::{Blob, State, checked_range, next_id},
-    json_error,
-    ledger::Resource,
-};
+mod context;
+pub use context::{Blob, DetachedBlob};
+pub(crate) use context::{HostCallbacks, State, checked_range};
+
+use super::{json_error, ledger::Resource};
 use iris_api::v2::{CHUNK_LIMIT, ErrorCode, MESSAGE_LIMIT, Role, crypto::CryptoSpec, task::Task};
 use iris_core::bounded_json::decode;
 use ring::rand::{SecureRandom, SystemRandom};
@@ -116,7 +116,7 @@ pub(crate) fn linker(engine: &Engine) -> Result<Linker<State>, ErrorCode> {
                         .reserve(&caller.data().owner, &[(Resource::Handle, 1)])?;
                     let bytes = read(&mut caller, ptr, len, CHUNK_LIMIT)?;
                     let blob = Blob::new(&caller.data().ledger, &caller.data().owner, bytes)?;
-                    let id = next_id()?;
+                    let id = (caller.data().alloc_handle)()?;
                     caller.data_mut().blobs.insert(id, Arc::new(blob));
                     caller.data_mut().blob_handles.insert(id, handle);
                     Ok(id)

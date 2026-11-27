@@ -145,7 +145,7 @@ flowchart LR
 | `host_random(dst: i32, len: i32) -> i32` | 宿主 CSPRNG，最多 64 KiB，0 成功或负码；不提供确定性“安全随机”回退。 |
 | `host_clock(kind: i32) -> i64` | kind=0 为 Unix 毫秒，1 为实例启动后的单调毫秒；不支持返回负码，不授予环境/文件访问。 |
 
-op_id、handle、request_id 使用 1..=i64::MAX，宿主绑定身份和代次，运行期不循环复用；JSON 中按十进制字符串传递。不同 Store 不共享裸句柄，通过宿主显式转交新授权引用。
+op_id、handle、request_id 使用 1..=i64::MAX，由宿主唯一无状态进程级单调计数器 `instance::NEXT_HANDLE: AtomicU64` 分配，进程生命周期内不循环复用，避免退役与并发 `Store` / `PluginHost` 实例之间发生数值句柄碰撞；该计数器不持有任何宿主、会话或配额状态，所有句柄解引用仍由所属 `Store` / `PluginHost` 绑定身份与代次独立校验；JSON 中按十进制字符串传递。不同 Store 不共享裸句柄，通过宿主显式转交新授权引用。
 
 accepted op 最终产生一个终态事件：完成、失败或取消；成功的 HTTP 头事件可创建后续读取用 stream_handle。实例退出时未交付的终态事件转为宿主账本终态并释放，不要求再次唤醒已销毁 Guest。中间进度可合并，终态通知必须预留队列容量。
 
@@ -286,7 +286,7 @@ StreamStore 的上下文刷新在同一原始传输能力和 Origin 授权集合
 
 - 临时产物位于插件私有受配额目录（惰性创建），以不透明句柄传递，插件不能提交任意宿主路径。
 - `ArtifactBegin { format }` 创建写入句柄，`ArtifactWrite { handle, blob, finish }` 每次最多写 1 MiB，`ArtifactRead { handle, offset, len }` 每次最多读 1 MiB；产物句柄绑定安装身份、控制实例和媒体代次。
-- 检查规范路径、目录归属、文件身份及符号链接/hardlink/reparse 关系，防止路径比较、竞态或大小写差异绕过；取消、过期与卸载由后台异步回收临时目录与配额。
+- 检查规范路径、目录归属、文件身份及符号链接/hardlink/reparse 关系，防止路径比较、竞态或大小写差异绕过；清理队列与 `iris-artifact-cleanup` 工作线程由所属 `Resources` / `PluginHost` 实例按需持有并在宿主关闭时执行有界排空与有界等待 `join`（排空后仍删除失败的文件记录告警日志、保留在磁盘且不提前释放 `Ledger` 磁盘/句柄额度；工作线程关闭后晚到析构的 `Artifact` / `ArtifactWriter` 回退至调用方线程原地同步删除，失败时同样保持失败闭合配额）。
 
 ## 8. 媒体增强、叠层与工作台
 
