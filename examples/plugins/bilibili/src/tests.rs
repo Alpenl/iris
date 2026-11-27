@@ -376,8 +376,8 @@ fn qr_login_dash_upos_selection_danmaku_and_bcc_subtitles_work_end_to_end() {
     );
     let win_spec = OverlayWindow {
         revision: Id(1),
-        start_ms: Id(0),
-        end_ms: Id(120_000),
+        start_ms: iris_plugin_sdk::api::v2::WireU64(0),
+        end_ms: iris_plugin_sdk::api::v2::WireU64(120_000),
     };
     let cues = danmaku::cues_for_window(&items, &win_spec, 80);
     assert_eq!(cues.len(), 2);

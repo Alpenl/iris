@@ -64,7 +64,7 @@ fn fallback_verifies_plaintext_before_splicing_and_does_not_trust_etags_across_c
     let hash = ring::digest::digest(&ring::digest::SHA256, &correct);
     let hashes = Arc::new(Blob::new(&ledger, "stream-tests", hash.as_ref().to_vec()).unwrap());
     let identity = ByteIdentity {
-        size: Id(65536),
+        size: iris_api::v2::WireU64(65536),
         chunk_bytes: 65536,
         hashes: Id(1),
     };
@@ -378,7 +378,7 @@ fn verified_reader_ignores_per_edge_etag_changes_after_probe_prefix() {
         .extend_from_slice(ring::digest::digest(&ring::digest::SHA256, &body[65536..]).as_ref());
     let hashes = Arc::new(Blob::new(&ledger, "stream-tests", hash_bytes).unwrap());
     let identity = ByteIdentity {
-        size: Id(total as u64),
+        size: iris_api::v2::WireU64(total as u64),
         chunk_bytes: 65536,
         hashes: Id(1),
     };

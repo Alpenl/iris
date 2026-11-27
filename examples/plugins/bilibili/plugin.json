@@ -119,5 +119,12 @@
     "https://bilibili.com/bangumi/play/*",
     "https://live.bilibili.com/*",
     "https://b23.tv/*"
+  ],
+  "sensitive_keys": [
+    "sessdata",
+    "bili_jct",
+    "dedeuserid",
+    "buvid3",
+    "buvid4"
   ]
 }

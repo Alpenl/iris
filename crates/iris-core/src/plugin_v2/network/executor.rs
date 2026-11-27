@@ -320,7 +320,8 @@ impl Executor for NetworkExecutor {
                         return Err(error);
                     }
                     let mut value = metadata(id, &state)?;
-                    value["written"] = serde_json::json!(Id(blob.bytes.len() as u64));
+                    value["written"] =
+                        serde_json::json!(iris_api::v2::WireU64(blob.bytes.len() as u64));
                     let mut outcome = IoOutcome::new(value, None);
                     outcome.pending = Some(Box::new(busy));
                     Ok(outcome)

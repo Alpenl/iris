@@ -74,6 +74,9 @@ pub struct Manifest {
     pub chrome: Option<ChromeLayoutSpec>,
     #[serde(default)]
     pub url_patterns: Vec<String>,
+    /// Plugin-specific secret/cookie/parameter names redacted by the host logger.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sensitive_keys: Vec<String>,
 }
 
 impl Manifest {
@@ -105,11 +108,25 @@ impl Manifest {
         }
         if self.commands.len() > 256
             || self.url_patterns.len() > 64
+            || self.sensitive_keys.len() > 64
             || self.network.net_hosts.len() > 128
             || self.network.tcp_targets.len() > 32
             || self.network.public_ports.len() > 32
         {
             return Err("too many manifest contributions");
+        }
+        let mut sensitive = std::collections::BTreeSet::new();
+        for key in &self.sensitive_keys {
+            let trimmed = key.trim_matches(['_', '-']);
+            if trimmed.len() < 3
+                || key.len() > 128
+                || !key
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+                || !sensitive.insert(key.to_ascii_lowercase())
+            {
+                return Err("invalid sensitive key");
+            }
         }
         SourceDescriptor::validate_all(&self.sources)?;
         let mut commands = std::collections::BTreeSet::new();
@@ -128,5 +145,43 @@ impl Manifest {
             return Err("too many context menu commands");
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Manifest;
+
+    fn sample_manifest() -> Manifest {
+        serde_json::from_str(
+            r#"{
+                "id": "community.demo",
+                "name": "Demo",
+                "version": "0.0.2",
+                "protocol": 2,
+                "abi": 2,
+                "entry": "plugin.wasm"
+            }"#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn manifest_validates_sensitive_keys_format_and_duplicates() {
+        let mut m = sample_manifest();
+        assert!(m.validate().is_ok());
+
+        m.sensitive_keys = vec!["sessdata".into(), "bili_jct".into(), "x-custom-auth".into()];
+        assert!(m.validate().is_ok());
+
+        // Case-insensitive duplicates rejected.
+        m.sensitive_keys = vec!["sessdata".into(), "SESSDATA".into()];
+        assert!(m.validate().is_err());
+
+        // Overly short keys (< 3 chars after trimming) or non-key characters rejected.
+        for bad in ["a", "id", "__a__", "bad key", "bad=key"] {
+            m.sensitive_keys = vec![bad.into()];
+            assert!(m.validate().is_err(), "{bad}");
+        }
     }
 }

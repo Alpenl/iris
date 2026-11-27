@@ -1,6 +1,6 @@
 # 2026-11-24 · 插件系统 v2 战略转向与决策记录
 
-> **状态：源码已切换 protocol: 2 并于 `0.0.2` 完成精简重构（移除零调用方的外部工具 BYOB、DASH 与受限 HLS 文本通道，收敛为 `VirtualHls`、`PixelGrid` + `ViewTimer`、`SourceDescriptor.badge` 与 `HostCommand::Log`）。** 已实现产品行为以 [PLUGINS.md](PLUGINS.md) 与 [ARCHITECTURE.md](ARCHITECTURE.md) 为准。
+> **状态：源码已切换 protocol: 2 并于 `0.0.2` 完成精简重构与沙箱加固（Wasmtime 切换为 `pulley64` 只读字节码解释执行、主进程零 JIT 可执行内存豁免；协议整数拆分为句柄 `Id` 与数值 `WireU64`；跨平台官方插件字节级确定性复现；移除零调用方的外部工具 BYOB、DASH 与受限 HLS 文本通道，收敛为 `VirtualHls`、`PixelGrid` + `ViewTimer`、`SourceDescriptor.badge` 与 `HostCommand::Log`）。** 已实现产品行为以 [PLUGINS.md](PLUGINS.md) 与 [ARCHITECTURE.md](ARCHITECTURE.md) 为准。
 > 本文记录方向、取舍及复审结论；接口、配额、错误语义、迁移顺序与验收矩阵以 [PLUGIN_V2_ARCHITECTURE.md](PLUGIN_V2_ARCHITECTURE.md) 为准。开发入口的实现和验证记录见 [PLUGIN_V2_IMPLEMENTATION.md](PLUGIN_V2_IMPLEMENTATION.md)；未记录通过的契约仍待验收，性能目标不是实测结果。
 
 ## 一、为何提前建设插件 v2
@@ -27,10 +27,26 @@
 
 | 层次 | 拍板方案 | 边界与依据 |
 |---|---|---|
-| 插件逻辑、协议解析与重封装 | `wasmtime` 内存 JIT，控制与播放实例分开 | 跨平台分发 Wasm 字节码；编译、实例化、执行都离开 UI 线程，接受宿主能力、配额与执行预算限制。 |
+| 插件逻辑、协议解析与重封装 | `wasmtime` `pulley64` 内存字节码解释执行，控制与播放实例分开 | 跨平台分发 Wasm 字节码并在后台编译为只读 `pulley64` 字节码（零 `PROT_EXEC` / `MAP_JIT` 可执行页）；编译、实例化、执行都离开 UI 线程，接受宿主能力、配额与执行预算限制。 |
 | 哈希、随机数、对称密码学与私有产物 | 有界宿主原语 + 轻量 `FileExecutor` | 可以利用可用的原生实现和硬件加速；本地文件哈希是单独授权的异步作业，不能借纯计算接口读取任意文件。原第三层 BYOB 外部原生工具适配器已于 `0.0.2` 移除。 |
 
-不继续扩展 JSON-lines 子进程作为二进制数据面，原因是分发和传输复杂度；不能据此断言任何子进程方案都无法播放 4K。QuickJS/Luau、解释型 Wasm 不作为本轮路线，也不以未经同机测试的体积、性能数字否定它们。
+不继续扩展 JSON-lines 子进程作为二进制数据面，原因是分发和传输复杂度；不能据此断言任何子进程方案都无法播放 4K。QuickJS/Luau 不作为本轮路线，也不以未经同机测试的体积、性能数字否定它们。
+
+#### 3.1.1 Wasmtime `pulley64` 对比 Cranelift JIT 与独立 Helper 进程评估（#14）
+
+主进程同时链接 FFmpeg / libmpv 并解析不可信远端流，若开启 `com.apple.security.cs.allow-unsigned-executable-memory` 会削弱 macOS Hardened Runtime 的 W^X 纵深防御。我们在同一台机器（Windows 11 26300 / Intel Family 6 Model 154 / 16 LP / Rust 1.100.0 `release`）对比实测了 Cranelift 原生 JIT 与 Wasmtime 内置 `pulley64` 字节码解释器：
+
+| 负载 | Cranelift JIT | Pulley (`pulley64`) | 结论 |
+|---|---:|---:|---|
+| 整机烟测墙钟 p50 / p95（5 次独立冷进程） | 1,719 ms / 1,828 ms | 2,344 ms / 2,485 ms | 后台一次性冷编译，不阻塞 UI |
+| 整机峰值工作集 p50 / p95 | 54.86 MiB / 55.11 MiB | 49.96 MiB / 50.05 MiB | `pulley64` 降低约 5.0 MiB 峰值内存 |
+| `iris.guides`（517 KiB）编译 / 实例化 / 1,000 次 `iris_on_event` | 637.2 ms / 0.33 ms / 4.14 ms | 571.3 ms / 0.16 ms / 26.45 ms | 单次调度 26.5 µs |
+| `iris.webdav`（1.09 MiB）编译 / 实例化 / 1,000 次 `iris_on_event` | 1,404.9 ms / 0.17 ms / 1.91 ms | 1,133.8 ms / 0.12 ms / 29.65 ms | 单次调度 29.6 µs |
+| `community.bilibili`（1.61 MiB）编译 / 实例化 / 1,000 次 `iris_on_event` | 1,301.6 ms / 0.11 ms / 2.41 ms | 1,395.7 ms / 0.12 ms / 34.24 ms | 单次调度 34.2 µs |
+
+独立签名 Plugin Host Helper 进程方案对比：即便拆分出 Helper 进程，Helper 自身仍需持有未签名可执行内存权限，且须为 `ControlStore`、`StreamStore`、Blob 句柄表、私有产物与网络流跨越进程 IPC 重建全套流控、孤儿进程清理及双二进制签名/公证/安装包校验，工程复杂度与故障面显著上升，而每次控制事件仅节省约 25–32 µs（媒体解复用、解密哈希与硬解均已在宿主原生层执行）。
+
+**决议：直接切换 `RuntimeEngine` 目标为 `pulley64`（只读内存 `PROT_READ` / `PAGE_READONLY`），从 `Resources/Iris.entitlements` 移除 `com.apple.security.cs.allow-unsigned-executable-memory`（保持空 `<dict/>` 并在打包阶段强校验签名 entitlements 完全一致）。**
 
 `iris-api` 的常规依赖仍仅限 `serde`；`iris-core` 不直接依赖 `tokio`。选用同步 Wasmtime 调用接口，宿主 I/O 通过任务和完成事件异步化；“不直接依赖 tokio”不等于禁止异步协议。新增依赖按实际版本、特性和传递依赖运行许可证门禁。
 
@@ -89,6 +105,24 @@ ABI 明确 wasm32 内存模型、UTF-8 JSON 控制编码、`u64 (ptr, len)` 布�
 除了 Wasm 内存，宿主统计实例总量、缓冲、句柄、队列、临时文件和叠层驻留量。10,000 条 / 4 MiB 是每插件叠层驻留窗口的默认预算，不是整部影片总量上限；直播与点播均支持窗口更新、分页、拖动重载，超限明确背压，不静默丢失数据。
 
 超时、取消、越权、资源耗尽、清单逃逸与迁移回归必须有可复现测试。现有工程门禁通过仅说明现有工程约束通过，不说明 v2 接口已经实现或性能达标。
+
+### 4.5 协议编码语义拆分、插件敏感键声明与 WIT / Component Model 重评条件（#18）
+
+1. **句柄 `Id` 与数值 `WireU64` 分离**：协议层将能力句柄/请求标识/单调版本号保留为 `Id`（宿主能力句柄额外满足 `1..=i64::MAX`），将字节大小、偏移、长度、毫秒时间戳/时长、码率与序列号迁移至语义明确的 `WireU64`。两者在 JSON 线上均采用规范无符号十进制字符串表示（避免 IEEE-754 精度丢失且完全保持线上兼容）。
+2. **去硬编码脱敏**：宿主 `logging::redact` 移除针对单一站点（如 Bilibili `sessdata`、`bili_jct` 等）的硬编码 Cookie 名，改由双保险机制覆盖：（a）插件在 `plugin.json` 的 `sensitive_keys` 字段声明专属敏感键名，包加载时自动注册到宿主脱敏器；（b）宿主 `CredentialVault` 在读写机密时自动追踪机密值（≥ 8 字节），即使日志中未携带可识别键名也会按值抹除。
+3. **WIT / WebAssembly Component Model 重评触发条件**：当前保持“有界严格 JSON 控制面 + `Id`/`WireU64` + 裸字节 `Blob` 句柄表”以维持 `iris-api` 仅依赖 `serde`、支持无 `wit-bindgen` 的轻量 C/Zig/Rust Guest。仅当满足以下任一条件时启动 WIT / Component Model 迁移重评：
+   - 官方同时维护 2 套及以上非 Rust 语言插件 SDK，且手写 JSON / `WireU64` 契约同步出现重复偏差；
+   - 新增双向流式类型化资源接口，导致控制面 JSON 编解码在实测播放/控制路径 CPU 占比超过 5% 或手工胶水变体超过 30 个；
+   - Wasmtime Component Model 在 `pulley64` 零可执行页目标下的体积、冷编译耗时与无 `tokio` 同步宿主调用开销均满足同机回归预算。
+
+### 4.6 官方插件跨平台逐字节可复现构建基准（#19）
+
+实测表明，在钉死 `Rust 1.100.0` 并通过 `--remap-path-prefix` 完整消除宿主工作区、Cargo 注册表及 `rust-src` 路径与分隔符差异（Section 11 `.rodata` 字符串完全一致）后，不同宿主目标二进制（`x86_64-pc-windows-msvc`、`aarch64-apple-darwin`、`x86_64-apple-darwin`、`x86_64-unknown-linux-gnu`）的编译器与链接器在 Wasm Section 3/9 的内部单态化函数表顺序上仍存在宿主相关排序差异。
+
+因此采用“**唯一规范构建目标（`x86_64-unknown-linux-gnu` 固定容器）+ 全平台逐字节校验**”方案：
+
+1. `scripts/build-official-plugins.py` 将 SHA-256 锁定的 `linux/amd64` 镜像（`rust:1.100.0-slim-bookworm@sha256:5d3170f8660a07782d5ff42abc55601d2df51d49e5397a8f22247341a658e128`）定为唯一规范构建环境：Linux `x86_64` 直接原生构建，macOS（Intel / Apple Silicon）与 Windows 自动调度 Docker/Podman `linux/amd64` 容器（Windows 无容器时自动回退 WSL2 `x86_64`），任何开发主机均可重建出与仓库逐字节一致的 `.irisplugin` 产物。
+2. 移除 `--verify-embedded` 的平台跳过分支：`check.yml` 与 `release-build.yml` 先在锁定 `linux/amd64` 容器内从源码重编并逐字节比对 `Resources/Plugins`，再将重编产物分发至 macOS（ARM64 / Intel）与 Windows 节点执行逐字节归档比对、本机无宿主路径泄漏编译检查及 `pulley64` 运行时自检。
 
 ## 五、存量内置插件：二拆一升与原子切换
 

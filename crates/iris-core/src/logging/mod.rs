@@ -16,7 +16,8 @@ use std::sync::{Arc, Once, OnceLock};
 use serde_json::{Value, json};
 
 pub use event::{EVENT_SCHEMA_VERSION, EventLevel, TelemetryEvent, TelemetrySink};
-pub use redact::{redact_json, redact_text, url_host};
+pub(crate) use redact::record_secret_value;
+pub use redact::{redact_json, redact_text, register_sensitive_keys, url_host};
 
 use event::global_bus;
 use writer::{DEFAULT_MAX_BACKUPS, DEFAULT_MAX_FILE_BYTES, RotatingFile};

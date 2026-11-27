@@ -1,6 +1,6 @@
 use super::identity::PinnedFile;
 use crate::vfs::HttpCancel;
-use iris_api::v2::{ErrorCode, Id, task::FileHash, task_result::HashResult};
+use iris_api::v2::{ErrorCode, WireU64, task::FileHash, task_result::HashResult};
 use md5::Digest;
 use ring::digest;
 use std::time::{Duration, Instant};
@@ -78,6 +78,6 @@ pub fn hash_media(
     Ok(HashResult {
         algorithm: algorithm.into(),
         digest,
-        bytes: Id(size),
+        bytes: WireU64(size),
     })
 }

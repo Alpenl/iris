@@ -36,7 +36,7 @@ pub fn check() -> Result<serde_json::Value, ErrorCode> {
             engine: engine.clone(),
             module,
             role: Role::Control,
-            owner: "host-jit-smoke".into(),
+            owner: "host-runtime-smoke".into(),
             grants: package.manifest.permissions.iter().copied().collect(),
             ledger: ledger.clone(),
             cancel,
@@ -54,6 +54,6 @@ pub fn check() -> Result<serde_json::Value, ErrorCode> {
         return Err(ErrorCode::Internal);
     }
     Ok(
-        serde_json::json!({"status":"ok","protocol":iris_api::PROTOCOL_VERSION,"abi":iris_api::v2::ABI_VERSION,"os":std::env::consts::OS,"arch":std::env::consts::ARCH,"debug":cfg!(debug_assertions),"plugins":rows}),
+        serde_json::json!({"status":"ok","protocol":iris_api::PROTOCOL_VERSION,"abi":iris_api::v2::ABI_VERSION,"engine":RuntimeEngine::TARGET,"os":std::env::consts::OS,"arch":std::env::consts::ARCH,"debug":cfg!(debug_assertions),"plugins":rows}),
     )
 }

@@ -8,7 +8,7 @@ use crate::{
     store::{self, AnnotationError},
 };
 use iris_api::v2::{
-    Capability, ErrorCode, Id,
+    Capability, ErrorCode, Id, WireU64,
     enhance::{AnnotationEdit, AnnotationPage, ColorLabel, TimeMarker},
 };
 
@@ -90,7 +90,7 @@ pub fn page_to_api(page: store::AnnotationPage) -> AnnotationPage {
             .into_iter()
             .map(|m| TimeMarker {
                 id: m.id,
-                position_ms: Id(m.position_ms),
+                position_ms: WireU64(m.position_ms),
                 label: m.label,
                 color: m.color.map(color_to_api),
             })

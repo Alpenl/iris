@@ -5,7 +5,7 @@ use crate::plugin_v2::stream::{
     range::decimal,
 };
 use iris_api::v2::{
-    ErrorCode, Id,
+    ErrorCode, WireU64,
     stream::{
         ByteRange, HlsKey, HlsSegment, HlsTrack, ResourceExtension, ResourceKind, ResourceSpan,
         TrackKind,
@@ -41,8 +41,8 @@ pub fn parse_media(
         lang: None,
         codec: None,
         default: true,
-        sequence: Id(0),
-        discontinuity_sequence: Id(0),
+        sequence: WireU64(0),
+        discontinuity_sequence: WireU64(0),
         segments: Vec::new(),
     };
     let mut seen = BTreeSet::new();
@@ -102,8 +102,8 @@ pub fn parse_media(
                         }
                     };
                     let range = ByteRange {
-                        offset: Id(offset),
-                        len: Id(len),
+                        offset: WireU64(offset),
+                        len: WireU64(len),
                     };
                     range_end(&range)?;
                     Ok::<_, ErrorCode>(range)
@@ -119,7 +119,7 @@ pub fn parse_media(
             }
             track.segments.push(HlsSegment {
                 resource: ResourceSpan { resource_id, range },
-                duration_ms: Id(duration.take().ok_or(ErrorCode::InvalidArgument)?),
+                duration_ms: WireU64(duration.take().ok_or(ErrorCode::InvalidArgument)?),
                 init: init.clone(),
                 key: key.as_ref().map(|(resource_id, iv)| HlsKey {
                     resource_id: resource_id.clone(),
@@ -155,9 +155,9 @@ pub fn parse_media(
                         }
                         target = Some(n);
                     }
-                    "#EXT-X-MEDIA-SEQUENCE" => track.sequence = Id(decimal(value)?),
+                    "#EXT-X-MEDIA-SEQUENCE" => track.sequence = WireU64(decimal(value)?),
                     "#EXT-X-DISCONTINUITY-SEQUENCE" => {
-                        track.discontinuity_sequence = Id(decimal(value)?)
+                        track.discontinuity_sequence = WireU64(decimal(value)?)
                     }
                     _ => {
                         if !matches!(value, "VOD" | "EVENT") {
@@ -197,8 +197,8 @@ pub fn parse_media(
                         }
                         let (len, offset) = byte_range(&v)?;
                         Ok(ByteRange {
-                            len: Id(len),
-                            offset: Id(offset.ok_or(ErrorCode::RangeInvalid)?),
+                            len: WireU64(len),
+                            offset: WireU64(offset.ok_or(ErrorCode::RangeInvalid)?),
                         })
                     })
                     .transpose()?;

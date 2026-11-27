@@ -399,7 +399,7 @@ impl CredentialVault {
     pub fn get_secret(&self, scope: &str, key: &str) -> Option<String> {
         let scope = validate_id_part("scope", scope).ok()?;
         let key = validate_id_part("key", key).ok()?;
-        match &self.backend {
+        let found = match &self.backend {
             VaultBackend::InMemory(store) => {
                 let guard = store.lock().unwrap_or_else(|e| e.into_inner());
                 guard.get(scope)?.get(key).cloned()
@@ -426,7 +426,11 @@ impl CredentialVault {
                     None
                 })
             }
+        };
+        if let Some(secret) = &found {
+            crate::logging::record_secret_value(secret);
         }
+        found
     }
 
     /// Strict reads distinguish an absent key from a locked or unavailable
@@ -434,7 +438,7 @@ impl CredentialVault {
     pub fn try_get_secret(&self, scope: &str, key: &str) -> Result<Option<String>> {
         let scope = validate_id_part("scope", scope)?;
         let key = validate_id_part("key", key)?;
-        match &self.backend {
+        let found = match &self.backend {
             VaultBackend::InMemory(store) => Ok(store
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -456,20 +460,25 @@ impl CredentialVault {
                     .ok_or_else(|| vault_err(VaultErrorKind::Busy, "credential vault is busy"))?;
                 os_store::get(scope, key).map_err(|e| vault_err(VaultErrorKind::Backend, e))
             }
+        }?;
+        if let Some(secret) = &found {
+            crate::logging::record_secret_value(secret);
         }
+        Ok(found)
     }
 
     /// Stores or deletes (`secret = None`) a secret under `(scope, key)`.
     pub fn set_secret(&self, scope: &str, key: &str, secret: Option<&str>) -> Result<()> {
         let scope = validate_id_part("scope", scope)?;
         let key = validate_id_part("key", key)?;
-        if let Some(s) = secret
-            && s.len() > MAX_SECRET_BYTES
-        {
-            return Err(vault_err(
-                VaultErrorKind::QuotaExceeded,
-                format!("secret exceeds maximum size ({MAX_SECRET_BYTES} bytes)"),
-            ));
+        if let Some(s) = secret {
+            if s.len() > MAX_SECRET_BYTES {
+                return Err(vault_err(
+                    VaultErrorKind::QuotaExceeded,
+                    format!("secret exceeds maximum size ({MAX_SECRET_BYTES} bytes)"),
+                ));
+            }
+            crate::logging::record_secret_value(s);
         }
 
         match &self.backend {
@@ -562,7 +571,7 @@ impl CredentialVault {
         let Ok(scope) = validate_id_part("scope", scope) else {
             return BTreeMap::new();
         };
-        match &self.backend {
+        let out = match &self.backend {
             VaultBackend::InMemory(store) => {
                 let guard = store.lock().unwrap_or_else(|e| e.into_inner());
                 guard.get(scope).cloned().unwrap_or_default()
@@ -601,7 +610,11 @@ impl CredentialVault {
                     BTreeMap::new()
                 })
             }
+        };
+        for secret in out.values() {
+            crate::logging::record_secret_value(secret);
         }
+        out
     }
 }
 

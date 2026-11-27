@@ -154,7 +154,7 @@ impl FileExecutor {
                 drop(state);
                 let value = ArtifactResult {
                     artifact: artifact.id,
-                    bytes: Id(artifact.size()),
+                    bytes: iris_api::v2::WireU64(artifact.size()),
                     format: artifact.format.clone(),
                 };
                 this.publish(artifact, value, &context)
@@ -172,7 +172,7 @@ impl FileExecutor {
                 drop(state);
                 let weak = Arc::downgrade(&this.0);
                 Ok(IoOutcome::new(
-                    serde_json::json!({"written":Id(data.bytes.len() as u64)}),
+                    serde_json::json!({"written":iris_api::v2::WireU64(data.bytes.len() as u64)}),
                     None,
                 )
                 .on_discard(move || discard(&weak, id)))

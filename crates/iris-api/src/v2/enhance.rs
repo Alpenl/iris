@@ -1,4 +1,4 @@
-use super::{Id, stream::RemoteResource};
+use super::{Id, WireU64, stream::RemoteResource};
 use crate::{Color, OverlayNode};
 use serde::{Deserialize, Serialize};
 
@@ -27,8 +27,8 @@ pub enum CueContent {
 #[serde(deny_unknown_fields)]
 pub struct TimedCue {
     pub id: String,
-    pub start_ms: Id,
-    pub duration_ms: Id,
+    pub start_ms: WireU64,
+    pub duration_ms: WireU64,
     pub layout: CueLayout,
     pub content: CueContent,
 }
@@ -36,15 +36,15 @@ pub struct TimedCue {
 #[serde(deny_unknown_fields)]
 pub struct OverlayWindow {
     pub revision: Id,
-    pub start_ms: Id,
-    pub end_ms: Id,
+    pub start_ms: WireU64,
+    pub end_ms: WireU64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TimeMarker {
     pub id: String,
-    pub position_ms: Id,
+    pub position_ms: WireU64,
     pub label: String,
     pub color: Option<ColorLabel>,
 }
@@ -96,15 +96,15 @@ pub enum SubtitleFormat {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Chapter {
-    pub start_ms: Id,
+    pub start_ms: WireU64,
     pub title: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HeatRange {
-    pub start_ms: Id,
-    pub end_ms: Id,
+    pub start_ms: WireU64,
+    pub end_ms: WireU64,
     /// Relative intensity, 0..=100. The host chooses presentation colors.
     pub intensity: u8,
 }
@@ -112,7 +112,7 @@ pub struct HeatRange {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SkipRange {
-    pub start_ms: Id,
-    pub end_ms: Id,
+    pub start_ms: WireU64,
+    pub end_ms: WireU64,
     pub label: String,
 }

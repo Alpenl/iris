@@ -41,8 +41,19 @@ pub struct RuntimeEngine(Arc<Inner>);
 pub(crate) struct ExecutionGuard(RuntimeEngine);
 
 impl RuntimeEngine {
+    pub const TARGET: &'static str = "pulley64";
+
     pub fn new() -> Result<Self, ErrorCode> {
+        Self::with_pulley(true)
+    }
+
+    fn with_pulley(pulley: bool) -> Result<Self, ErrorCode> {
         let mut config = Config::new();
+        if pulley {
+            config
+                .target(Self::TARGET)
+                .map_err(|_| ErrorCode::Internal)?;
+        }
         config
             .epoch_interruption(true)
             .wasm_multi_memory(false)
@@ -335,5 +346,74 @@ mod tests {
         );
         drop(inst);
         assert_eq!(ledger.used(None, Resource::WasmBytes), 0);
+    }
+
+    #[test]
+    #[ignore = "comparative Cranelift vs Pulley64 micro-benchmark for decision record"]
+    fn compare_pulley64_vs_cranelift_dispatch_and_plugins() {
+        use crate::plugin_v2::package::{Package, Provenance};
+        use std::time::Instant;
+
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let pins = crate::plugin_v2::official::Bootstrap::embedded(std::path::PathBuf::new())
+            .unwrap()
+            .pins();
+        let mut cases: Vec<(&str, Vec<u8>, bool)> = vec![
+            (
+                "iris.guides",
+                std::fs::read(root.join("Resources/Plugins/iris.guides.irisplugin")).unwrap(),
+                true,
+            ),
+            (
+                "iris.webdav",
+                std::fs::read(root.join("Resources/Plugins/iris.webdav.irisplugin")).unwrap(),
+                true,
+            ),
+        ];
+        let bili_zip = root.join("target/plugin-v2/examples/community.bilibili.irisplugin");
+        if let Ok(bytes) = std::fs::read(&bili_zip) {
+            cases.push(("community.bilibili", bytes, false));
+        }
+
+        for (mode, pulley) in [("cranelift", false), ("pulley64", true)] {
+            let engine = RuntimeEngine::with_pulley(pulley).unwrap();
+            let ledger = Ledger::default();
+            for (label, zip_bytes, bundled) in &cases {
+                let prov = if *bundled {
+                    Provenance::Bundled(&pins)
+                } else {
+                    Provenance::User
+                };
+                let pkg = Package::from_zip(zip_bytes, prov).unwrap();
+                let wasm = pkg.wasm().unwrap();
+                let cancel = Arc::new(AtomicBool::new(false));
+                let t0 = Instant::now();
+                let module = engine.compile(wasm, &cancel).unwrap();
+                let compile_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+                let t1 = Instant::now();
+                let mut inst = Instance::new(InstanceConfig {
+                    engine: engine.clone(),
+                    module,
+                    role: Role::Control,
+                    owner: format!("bench-{mode}-{label}"),
+                    grants: pkg.manifest.permissions.iter().copied().collect(),
+                    ledger: ledger.clone(),
+                    cancel,
+                })
+                .unwrap();
+                let inst_ms = t1.elapsed().as_secs_f64() * 1000.0;
+
+                let t2 = Instant::now();
+                for _ in 0..1_000 {
+                    let _ = inst.on_event(br#"{"event":"shutdown"}"#).unwrap();
+                }
+                let dispatch_1000_ms = t2.elapsed().as_secs_f64() * 1000.0;
+                println!(
+                    "BENCH mode={mode} plugin={label} wasm_bytes={} compile_ms={compile_ms:.3} instantiate_ms={inst_ms:.3} dispatch_1000_ms={dispatch_1000_ms:.3}",
+                    wasm.len()
+                );
+            }
+        }
     }
 }

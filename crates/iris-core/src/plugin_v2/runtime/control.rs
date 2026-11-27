@@ -198,7 +198,7 @@ fn event_generation_stale(event: &HostEvent<serde_json::Value>, current: Generat
 #[cfg(test)]
 mod tests {
     use super::*;
-    use iris_api::v2::enhance::OverlayWindow;
+    use iris_api::v2::{WireU64, enhance::OverlayWindow};
 
     #[test]
     fn overlay_window_accepts_inner_seek_advance_without_stale_handle() {
@@ -209,8 +209,8 @@ mod tests {
         };
         let win = OverlayWindow {
             revision: Id(2),
-            start_ms: Id(0),
-            end_ms: Id(120_000),
+            start_ms: WireU64(0),
+            end_ms: WireU64(120_000),
         };
         let sought = HostEvent::OverlayWindowChanged {
             media: Id(2),

@@ -1,7 +1,7 @@
 use super::{Build, hls_parse, stable_id};
 use crate::plugin_v2::stream::{range::decimal, remote::Fetched};
 use iris_api::v2::{
-    ErrorCode, Id,
+    ErrorCode, WireU64,
     stream::{HlsTrack, HlsVariant, TrackKind, VirtualHls},
 };
 use std::collections::BTreeMap;
@@ -127,7 +127,7 @@ pub(super) fn parse(fetched: &Fetched, build: &mut Build<'_>) -> Result<VirtualH
         if tracks.len() >= 32 {
             return Err(ErrorCode::QuotaExceeded);
         }
-        let bandwidth = Id(decimal(&take(&mut attrs, "BANDWIDTH", false)?)?);
+        let bandwidth = WireU64(decimal(&take(&mut attrs, "BANDWIDTH", false)?)?);
         if bandwidth.0 == 0 {
             return Err(ErrorCode::InvalidArgument);
         }

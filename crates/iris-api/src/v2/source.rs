@@ -1,5 +1,5 @@
 use super::{
-    Id,
+    Id, WireU64,
     stream::{RemoteResource, StreamSpec},
 };
 use crate::{MediaKind, SelectOption, SourceEntryKind, StreamVariant};
@@ -64,8 +64,8 @@ pub struct SourceEntry {
     pub id: String,
     pub name: String,
     pub kind: SourceEntryKind,
-    pub size: Option<Id>,
-    pub modified_secs: Option<Id>,
+    pub size: Option<WireU64>,
+    pub modified_secs: Option<WireU64>,
     pub duration: Option<f64>,
     pub subtitle: Option<String>,
     #[serde(default)]

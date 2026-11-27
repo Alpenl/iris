@@ -90,7 +90,7 @@ pub fn catalog_item_from_source_entry(
 mod tests {
     use super::catalog_item_from_source_entry;
     use crate::{catalog::CatalogItemKind, library::Kind, media_uri::MediaUri};
-    use iris_api::{SourceEntryKind, StreamVariant, v2::Id, v2::source::SourceEntry};
+    use iris_api::{SourceEntryKind, StreamVariant, v2::WireU64, v2::source::SourceEntry};
 
     #[test]
     fn catalog_item_maps_v2_source_entry_fields() {
@@ -98,8 +98,8 @@ mod tests {
             id: "ep1".into(),
             name: "Episode 1".into(),
             kind: SourceEntryKind::Video,
-            size: Some(Id(4096)),
-            modified_secs: Some(Id(1_700_000_000)),
+            size: Some(WireU64(4096)),
+            modified_secs: Some(WireU64(1_700_000_000)),
             duration: Some(123.5),
             subtitle: Some("1080p".into()),
             variants: vec![StreamVariant {

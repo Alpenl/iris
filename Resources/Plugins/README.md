@@ -9,7 +9,6 @@ Rebuild after changes to the official sources, API, SDK or Rust toolchain:
 
 ```text
 rustup target add wasm32-unknown-unknown
-rustup component add rust-src
 python -B scripts/build-official-plugins.py --output Resources/Plugins
 python -B scripts/build-official-plugins.py --check --output Resources/Plugins
 python -B scripts/build-official-plugins.py --verify-embedded
@@ -17,25 +16,27 @@ python -B scripts/test-plugin-v2-official.py
 ```
 
 `--check` validates archive/content hashes, manifests and the source stamp without
-compilation. `--verify-embedded` rebuilds into `target/` and compares distribution
-hashes with this directory. Run native host tests with the required mpv SDK.
-Do not edit the generated archives or hashes by hand.
+compilation. `--verify-embedded` rebuilds into `target/` and enforces byte-for-byte
+equality with this directory on all platforms (Windows, macOS, and Linux). Run native
+host tests with the required mpv SDK. Do not edit the generated archives or hashes by hand.
 
-The archives here were built on Windows with the `rust-src` component installed.
-With it, rustc records standard-library panic locations against that local copy,
-remapped to `/rustup-sysroot`. Without it, they stay `/rustc/<hash>/library/...`,
-and the Wasm bytes differ. Windows CI installs it for the byte comparison.
+`scripts/build-official-plugins.py` uses `x86_64-unknown-linux-gnu` (`Rust 1.100.0`) as
+the single canonical build host: on Linux `x86_64` it builds natively, on macOS and
+Windows it automatically delegates to the SHA-256-pinned `linux/amd64` container
+(`rust:1.100.0-slim-bookworm@sha256:5d3170f8660a07782d5ff42abc55601d2df51d49e5397a8f22247341a658e128`)
+via Docker/Podman (or WSL2 `x86_64` on Windows), and normalizes workspace, Cargo
+registry, and `rust-src` paths to POSIX prefixes (`/cargo/deps/...`, `/rustc/<commit>/...`).
+CI rebuilds inside the pinned `linux/amd64` container and enforces byte-for-byte
+`--verify-embedded` archive equality across Linux, macOS, and Windows.
 
-`iris --check-plugin-runtime` compiles both embedded guests, verifies an in-memory
-cache hit, instantiates them and executes a callback in the actual host process.
-It emits JSON timings and checks that Store/handle accounting returns to zero.
-`scripts/benchmark-plugin-v2.py` records repeated cold-process/hot-cache samples,
-host identity and sampled peak RSS. These are JIT measurements, not 4K/UI results.
+`iris --check-plugin-runtime` compiles both embedded guests to `pulley64` bytecode,
+verifies an in-memory cache hit, instantiates them and executes a callback in the
+actual host process. It emits JSON timings and checks that Store/handle accounting
+returns to zero. `scripts/benchmark-plugin-v2.py` records repeated cold-process/hot-cache
+samples, host identity and sampled peak RSS.
 
-The locked Wasmtime 51 Unix allocator uses mmap/mprotect without MAP_JIT.
-`Resources/Iris.entitlements` therefore grants only
-`com.apple.security.cs.allow-unsigned-executable-memory`; it does not disable
-library validation. See [Apple's entitlement reference](https://developer.apple.com/documentation/bundleresources/entitlements/com.apple.security.cs.allow-unsigned-executable-memory).
-Review this exception when upgrading the allocator. The release packager checks
-the signed entitlement dictionary and runs the actual staged host after signing.
-macOS Intel/ARM results require those hosts; Windows tests cannot establish them.
+Wasmtime compiles plugin modules to `pulley64` interpreter bytecode stored in read-only
+memory (`PROT_READ` / `PAGE_READONLY`), never allocating executable pages (`PROT_EXEC`
+or `MAP_JIT`). `Resources/Iris.entitlements` is therefore an empty `<dict/>` with zero
+JIT or unsigned-executable-memory exceptions. The release packager verifies that signed
+entitlements match `<dict/>` and runs the staged host binary after signing.

@@ -1,4 +1,4 @@
-use super::{Capability, Id};
+use super::{Capability, Id, WireU64};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -88,7 +88,7 @@ pub enum Task {
     },
     ArtifactRead {
         handle: Id,
-        offset: Id,
+        offset: WireU64,
         len: u32,
     },
     ArtifactBegin {

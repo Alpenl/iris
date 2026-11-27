@@ -10,7 +10,6 @@ use crate::{
 use iris_plugin_sdk::api::{
     SelectOption, SourceEntryKind,
     v2::{
-        Id,
         source::{SourceEntry, SourceFilter, SourcePage},
         stream::RemoteResource,
     },
@@ -133,7 +132,7 @@ pub fn parse_browse_response(
                 name,
                 kind: SourceEntryKind::Folder,
                 size: None,
-                modified_secs: mtime.map(Id),
+                modified_secs: mtime.map(iris_plugin_sdk::api::v2::WireU64),
                 duration: None,
                 subtitle: sub,
                 variants: Vec::new(),
@@ -192,8 +191,8 @@ pub fn parse_browse_response(
             id: entry_id,
             name,
             kind: media_kind.to_entry_kind(),
-            size: (size > 0).then_some(Id(size)),
-            modified_secs: mtime.map(Id),
+            size: (size > 0).then_some(iris_plugin_sdk::api::v2::WireU64(size)),
+            modified_secs: mtime.map(iris_plugin_sdk::api::v2::WireU64),
             duration: None,
             subtitle,
             variants: Vec::new(),

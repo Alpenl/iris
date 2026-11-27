@@ -117,7 +117,7 @@ impl Build<'_> {
                 kind,
                 extension,
                 size: if kind == ResourceKind::Key {
-                    Some(iris_api::v2::Id(16))
+                    Some(iris_api::v2::WireU64(16))
                 } else {
                     None
                 },

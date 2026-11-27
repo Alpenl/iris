@@ -10,10 +10,7 @@ use super::{
 use crate::auth::sanitize_text;
 use iris_plugin_sdk::api::{
     SourceEntryKind,
-    v2::{
-        Id,
-        source::{SourceEntry, SourceFilter, SourcePage},
-    },
+    v2::source::{SourceEntry, SourceFilter, SourcePage},
 };
 use serde_json::Value;
 use std::collections::BTreeSet;
@@ -245,7 +242,10 @@ pub fn parse_browse_response(
                             SourceEntryKind::Video
                         },
                         size: None,
-                        modified_secs: m.get("pubtime").and_then(Value::as_u64).map(Id),
+                        modified_secs: m
+                            .get("pubtime")
+                            .and_then(Value::as_u64)
+                            .map(iris_plugin_sdk::api::v2::WireU64),
                         duration: m.get("duration").and_then(Value::as_f64),
                         subtitle: Some(if page_cnt > 1 {
                             format!("{upper} · {page_cnt}P 合集")
@@ -333,7 +333,10 @@ pub fn parse_browse_response(
                         name,
                         kind: SourceEntryKind::Video,
                         size: None,
-                        modified_secs: ep.get("pub_time").and_then(Value::as_u64).map(Id),
+                        modified_secs: ep
+                            .get("pub_time")
+                            .and_then(Value::as_u64)
+                            .map(iris_plugin_sdk::api::v2::WireU64),
                         duration: ep.get("duration").and_then(Value::as_u64).map(|ms| {
                             if ms > 10_000 {
                                 ms as f64 / 1000.
@@ -425,7 +428,10 @@ pub fn parse_browse_response(
                         name,
                         kind: SourceEntryKind::Video,
                         size: None,
-                        modified_secs: item.get("view_at").and_then(Value::as_u64).map(Id),
+                        modified_secs: item
+                            .get("view_at")
+                            .and_then(Value::as_u64)
+                            .map(iris_plugin_sdk::api::v2::WireU64),
                         duration: item.get("duration").and_then(Value::as_f64),
                         subtitle: (!author.is_empty()).then(|| author.to_owned()),
                         variants: Vec::new(),

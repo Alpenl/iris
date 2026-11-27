@@ -1,19 +1,32 @@
 //! Privacy-first PII, path, and credential redaction for logs and structured telemetry events.
 
+use std::collections::{BTreeSet, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, OnceLock, PoisonError};
+
 use serde_json::Value;
 use url::Url;
 
 const REDACTED: &str = "<redacted>";
+const MAX_DYNAMIC_KEYS: usize = 1024;
+const MAX_TRACKED_SECRETS: usize = 256;
+const MIN_TRACKED_SECRET_LEN: usize = 8;
+
+static HAS_DYNAMIC_KEYS: AtomicBool = AtomicBool::new(false);
+static HAS_TRACKED_SECRETS: AtomicBool = AtomicBool::new(false);
+
+#[derive(Default)]
+struct RedactionRegistry {
+    keys: BTreeSet<String>,
+    secrets: VecDeque<String>,
+}
+
+fn registry() -> &'static Mutex<RedactionRegistry> {
+    static REGISTRY: OnceLock<Mutex<RedactionRegistry>> = OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(RedactionRegistry::default()))
+}
 
 const SENSITIVE_KEYS: &[&str] = &[
-    // Session cookie names of the in-repo `examples/plugins/bilibili` source. They can
-    // appear without a `Cookie:` prefix, and plugins cannot yet declare their own
-    // secret names to the host, so the host keeps them here.
-    "sessdata",
-    "bili_jct",
-    "dedeuserid",
-    "buvid3",
-    "buvid4",
     "proxy-authorization",
     "authorization",
     "x-api-key",
@@ -43,23 +56,80 @@ const SENSITIVE_KEYS: &[&str] = &[
     "key",
 ];
 
+/// Registers plugin-declared sensitive field/cookie/parameter names for log redaction.
+pub fn register_sensitive_keys<I, S>(keys: I)
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let mut added = false;
+    let mut reg = registry().lock().unwrap_or_else(PoisonError::into_inner);
+    for raw in keys {
+        let lower = raw.as_ref().trim().to_ascii_lowercase();
+        let trimmed = lower.trim_matches(['_', '-']);
+        if trimmed.len() < 3 || lower.len() > 128 || !lower.bytes().all(is_key_char) {
+            continue;
+        }
+        if reg.keys.len() < MAX_DYNAMIC_KEYS {
+            added |= reg.keys.insert(lower.clone());
+        }
+        if trimmed != lower && reg.keys.len() < MAX_DYNAMIC_KEYS {
+            added |= reg.keys.insert(trimmed.to_owned());
+        }
+    }
+    if added {
+        HAS_DYNAMIC_KEYS.store(true, Ordering::Release);
+    }
+}
+
+/// Tracks an active credential value observed by `CredentialVault` so bare occurrences
+/// without a recognizable key name are still scrubbed from logs and structured events.
+pub(crate) fn record_secret_value(secret: &str) {
+    let trimmed = secret.trim();
+    if trimmed.len() < MIN_TRACKED_SECRET_LEN
+        || trimmed.len() > 2048
+        || trimmed.contains(REDACTED)
+        || trimmed.contains("<USER_HOME>")
+    {
+        return;
+    }
+    let mut reg = registry().lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(pos) = reg.secrets.iter().position(|s| s == trimmed) {
+        reg.secrets.remove(pos);
+    } else if reg.secrets.len() >= MAX_TRACKED_SECRETS {
+        reg.secrets.pop_front();
+    }
+    reg.secrets.push_back(trimmed.to_owned());
+    HAS_TRACKED_SECRETS.store(true, Ordering::Release);
+}
+
 fn is_sensitive_key(lower: &str) -> bool {
     let trimmed = lower.trim_matches(['_', '-']);
-    !trimmed.is_empty()
-        && (SENSITIVE_KEYS.contains(&lower)
-            || SENSITIVE_KEYS.contains(&trimmed)
-            || trimmed.contains("cookie")
-            || trimmed.contains("token")
-            || trimmed.contains("csrf")
-            || trimmed.contains("xsrf")
-            || trimmed.contains("sessionid")
-            || trimmed.contains("sessid")
-            || trimmed.contains("secret")
-            || trimmed.contains("password")
-            || trimmed.contains("passwd")
-            || trimmed.contains("apikey")
-            || trimmed.contains("api_key")
-            || trimmed.contains("api-key"))
+    if trimmed.is_empty() {
+        return false;
+    }
+    if SENSITIVE_KEYS.contains(&lower)
+        || SENSITIVE_KEYS.contains(&trimmed)
+        || trimmed.contains("cookie")
+        || trimmed.contains("token")
+        || trimmed.contains("csrf")
+        || trimmed.contains("xsrf")
+        || trimmed.contains("sessionid")
+        || trimmed.contains("sessid")
+        || trimmed.contains("secret")
+        || trimmed.contains("password")
+        || trimmed.contains("passwd")
+        || trimmed.contains("apikey")
+        || trimmed.contains("api_key")
+        || trimmed.contains("api-key")
+    {
+        return true;
+    }
+    if !HAS_DYNAMIC_KEYS.load(Ordering::Acquire) {
+        return false;
+    }
+    let reg = registry().lock().unwrap_or_else(PoisonError::into_inner);
+    reg.keys.contains(lower) || reg.keys.contains(trimmed)
 }
 
 /// Extracts only `host` (and non-default port if present) from a URL, never exposing
@@ -91,11 +161,36 @@ pub(super) fn redact_url(raw: &str) -> String {
 }
 
 /// Sanitizes arbitrary diagnostic text by removing user home directory names,
-/// embedded URL credentials/queries, and secret key-value pairs.
+/// embedded URL credentials/queries, secret key-value pairs, and vault secret values.
 pub fn redact_text(raw: &str) -> String {
     let without_homes = redact_home_paths(raw);
     let without_urls = redact_embedded_urls(&without_homes);
-    redact_secret_assignments(&without_urls)
+    let without_assignments = redact_secret_assignments(&without_urls);
+    redact_tracked_secrets(without_assignments)
+}
+
+fn redact_tracked_secrets(mut text: String) -> String {
+    if !HAS_TRACKED_SECRETS.load(Ordering::Acquire) || text.len() < MIN_TRACKED_SECRET_LEN {
+        return text;
+    }
+    let mut matched: Vec<String> = {
+        let reg = registry().lock().unwrap_or_else(PoisonError::into_inner);
+        reg.secrets
+            .iter()
+            .filter(|secret| text.contains(secret.as_str()))
+            .cloned()
+            .collect()
+    };
+    if matched.is_empty() {
+        return text;
+    }
+    matched.sort_by_key(|s| std::cmp::Reverse(s.len()));
+    for secret in matched {
+        if text.contains(&secret) {
+            text = text.replace(&secret, REDACTED);
+        }
+    }
+    text
 }
 
 /// Recursively sanitizes all strings and sensitive field keys inside structured JSON payloads.

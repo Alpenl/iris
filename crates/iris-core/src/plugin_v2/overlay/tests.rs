@@ -3,8 +3,8 @@ use std::time::Instant;
 fn cue(id: usize, start: u64) -> TimedCue {
     TimedCue {
         id: format!("cue.{id}"),
-        start_ms: Id(start),
-        duration_ms: Id(1000),
+        start_ms: WireU64(start),
+        duration_ms: WireU64(1000),
         layout: CueLayout::Scroll,
         content: CueContent::Text {
             text: "bounded".into(),
