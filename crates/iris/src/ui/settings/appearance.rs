@@ -618,7 +618,9 @@ pub(super) fn settings_appearance(
                 t,
                 model_listener(model, |this, _, _, cx| {
                     this.settings.fake_ip_doh_fallback = !this.settings.fake_ip_doh_fallback;
-                    iris_core::vfs::set_fake_ip_doh_fallback(this.settings.fake_ip_doh_fallback);
+                    iris_base::net::http_client::doh::set_fallback_enabled(
+                        this.settings.fake_ip_doh_fallback,
+                    );
                     this.preset_rt.record_user_edit(&this.settings);
                     this.notify_settings(cx);
                 }),
@@ -660,7 +662,9 @@ pub(super) fn settings_appearance(
                     };
                     if let Some(resolvers) = next {
                         this.settings.doh_resolvers = resolvers;
-                        let _ = iris_core::vfs::set_doh_resolvers(&this.settings.doh_resolvers);
+                        let _ = iris_base::net::http_client::doh::set_resolvers(
+                            &this.settings.doh_resolvers,
+                        );
                         this.preset_rt.record_user_edit(&this.settings);
                         this.notify_settings(cx);
                     }

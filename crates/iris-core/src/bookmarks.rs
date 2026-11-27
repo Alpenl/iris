@@ -1,21 +1,13 @@
-//! Persistent pinned location bookmarks (`LocationStore`) and temporary DoH setting wrappers.
+//! Persistent pinned location bookmarks (`<data_dir>/locations.json`).
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 use crate::fs_util;
+use crate::legacy::webdav;
 use crate::media_uri::MediaUri;
-
-/// Applies `Settings::fake_ip_doh_fallback` to every host and plugin HTTP client.
-pub fn set_fake_ip_doh_fallback(enabled: bool) {
-    iris_base::net::http_client::doh::set_fallback_enabled(enabled);
-}
-
-/// Applies `Settings::doh_resolvers` to every host and plugin HTTP client.
-pub fn set_doh_resolvers(resolvers: &[String]) -> anyhow::Result<()> {
-    iris_base::net::http_client::doh::set_resolvers(resolvers)
-}
 
 /// User-pinned local folder, network share, or `MediaSource` plugin folder.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -83,16 +75,16 @@ impl LocationStore {
         }
     }
 
-    fn sync_migrated_webdav_bookmarks(&mut self) -> std::collections::BTreeMap<String, String> {
-        let mut remapped = std::collections::BTreeMap::new();
+    fn sync_legacy_webdav(&mut self, incoming: Option<&mut MediaUri>) {
         let target = self.backing_path.clone().or_else(Self::file_path);
-        let Some(path) = target else { return remapped };
+        let Some(path) = target else { return };
         let Ok(text) = fs_util::retry_sharing_violation(|| std::fs::read_to_string(&path)) else {
-            return remapped;
+            return;
         };
         let Ok(disk) = serde_json::from_str::<Self>(&text) else {
-            return remapped;
+            return;
         };
+        let mut remapped = BTreeMap::new();
         for local in &mut self.bookmarks {
             let Some(on_disk) = disk.bookmarks.iter().find(|b| b.id == local.id) else {
                 continue;
@@ -108,17 +100,19 @@ impl LocationStore {
                     source_id: ds,
                     entry_id: de,
                 },
-            ) = (&local.uri, &on_disk.uri)
-                && lp == "iris.webdav"
-                && dp == "iris.webdav"
-                && le == de
-                && ls != ds
+            ) = (&mut local.uri, &on_disk.uri)
             {
-                remapped.insert(ls.clone(), ds.clone());
-                local.uri = on_disk.uri.clone();
+                webdav::reconcile_migrated_source(lp, ls, le, dp, ds, de, &mut remapped);
             }
         }
-        remapped
+        if let Some(MediaUri::Plugin {
+            plugin_id,
+            source_id,
+            ..
+        }) = incoming
+        {
+            webdav::apply_remapped_source(plugin_id, source_id, &remapped);
+        }
     }
 
     pub fn save(&self) {
@@ -136,17 +130,7 @@ impl LocationStore {
     }
 
     pub fn add_bookmark(&mut self, mut bookmark: PinnedBookmark) {
-        let remapped = self.sync_migrated_webdav_bookmarks();
-        if let MediaUri::Plugin {
-            plugin_id,
-            source_id,
-            ..
-        } = &mut bookmark.uri
-            && plugin_id == "iris.webdav"
-            && let Some(migrated) = remapped.get(source_id)
-        {
-            *source_id = migrated.clone();
-        }
+        self.sync_legacy_webdav(Some(&mut bookmark.uri));
         if let Some(existing) = self.bookmarks.iter_mut().find(|b| {
             b.id == bookmark.id || (b.uri == bookmark.uri && b.folder_id == bookmark.folder_id)
         }) {
@@ -158,7 +142,7 @@ impl LocationStore {
     }
 
     pub fn remove_bookmark(&mut self, id: &str) -> bool {
-        self.sync_migrated_webdav_bookmarks();
+        self.sync_legacy_webdav(None);
         let before = self.bookmarks.len();
         self.bookmarks.retain(|b| b.id != id);
         let changed = self.bookmarks.len() != before;
@@ -254,6 +238,7 @@ mod tests {
         .unwrap();
 
         let mut window_store = LocationStore::load_from(&file);
+        let mut window_store_dav_pin = LocationStore::load_from(&file);
         let mut window_store_remove = LocationStore::load_from(&file);
 
         // Simulate background Bootstrap::scan rewriting locations.json on disk.
@@ -285,6 +270,31 @@ mod tests {
                 source_id: migrated_id.into(),
                 entry_id: "/Movies".into(),
             }
+        );
+
+        // 1b. Pinning another folder on the same pre-reload WebDAV connection aligns its source_id.
+        window_store_dav_pin.add_bookmark(PinnedBookmark {
+            id: "bm-dav-2".into(),
+            name: "Legacy NAS Shows".into(),
+            uri: MediaUri::Plugin {
+                plugin_id: "iris.webdav".into(),
+                source_id: legacy_id.into(),
+                entry_id: "/Shows".into(),
+            },
+            folder_id: Some("/Shows".into()),
+        });
+        let after_dav_pin = LocationStore::load_from(&file);
+        assert_eq!(
+            after_dav_pin
+                .bookmarks
+                .iter()
+                .find(|b| b.id == "bm-dav-2")
+                .map(|b| &b.uri),
+            Some(&MediaUri::Plugin {
+                plugin_id: "iris.webdav".into(),
+                source_id: migrated_id.into(),
+                entry_id: "/Shows".into(),
+            })
         );
 
         // 2. Reloading refreshes bookmarks while preserving backing_path for future saves.

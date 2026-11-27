@@ -9,6 +9,8 @@ use percent_encoding::{AsciiSet, CONTROLS, percent_decode_str, utf8_percent_enco
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use url::Url;
 
+pub use crate::plugin_ids::WEBDAV_PLUGIN_ID;
+
 /// Strict component encoding set (encodes `/`, `?`, `#`, `%`, `:`, `@`, spaces, etc.).
 const COMPONENT_ENCODE_SET: &AsciiSet = &CONTROLS
     .add(b' ')
@@ -210,46 +212,13 @@ impl MediaUri {
     /// Parses a persisted URI string, upgrading legacy `webdav://` / `iris-webdav://` records
     /// from earlier Iris versions into canonical `MediaUri::Plugin` form.
     pub fn parse_persisted(raw: &str) -> Self {
-        Self::upgrade_legacy_webdav(raw).unwrap_or_else(|| Self::parse(raw))
-    }
-
-    fn upgrade_legacy_webdav(raw: &str) -> Option<Self> {
-        let s = raw.trim_start();
-        let rest =
-            strip_prefix_ci(s, "webdav://").or_else(|| strip_prefix_ci(s, "iris-webdav://"))?;
-        if let Some((enc_conn, query_rel)) = rest.split_once("?rel=")
-            && !enc_conn.contains('/')
-        {
-            let source_id = percent_decode_str(enc_conn)
-                .decode_utf8_lossy()
-                .into_owned();
-            let entry_id = percent_decode_str(query_rel)
-                .decode_utf8_lossy()
-                .into_owned();
-            return Some(MediaUri::Plugin {
-                plugin_id: "iris.webdav".into(),
-                source_id,
-                entry_id,
-            });
-        }
-        let (source_id, entry_id) = match rest.split_once('/') {
-            Some((enc_conn, enc_path)) => {
-                let conn = percent_decode_str(enc_conn)
-                    .decode_utf8_lossy()
-                    .into_owned();
-                let path = percent_decode_str(enc_path).decode_utf8_lossy();
-                (conn, format!("/{path}"))
-            }
-            None => (
-                percent_decode_str(rest).decode_utf8_lossy().into_owned(),
-                "/".into(),
-            ),
-        };
-        Some(MediaUri::Plugin {
-            plugin_id: "iris.webdav".into(),
-            source_id,
-            entry_id,
-        })
+        crate::legacy::webdav::upgrade_legacy_uri(raw)
+            .map(|u| MediaUri::Plugin {
+                plugin_id: u.plugin_id.to_owned(),
+                source_id: u.source_id,
+                entry_id: u.entry_id,
+            })
+            .unwrap_or_else(|| Self::parse(raw))
     }
 
     /// Converts an unambiguous local file URL. Remote authorities, relative

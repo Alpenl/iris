@@ -1290,7 +1290,7 @@ class CheckProjectHelperTests(unittest.TestCase):
 
         # Repository baseline counts match reviewed audit numbers.
         self.assertEqual(len(check_project.KNOWN_MODULE_CYCLE_EDGES["iris-plugin-host"]), 56)
-        self.assertEqual(len(check_project.KNOWN_MODULE_CYCLE_EDGES["iris-core"]), 2)
+        self.assertEqual(len(check_project.KNOWN_MODULE_CYCLE_EDGES["iris-core"]), 0)
 
     def test_clippy_and_docs_sync_gates_enforce_exact_exemptions_and_crate_lists(self):
         # 1. Disallowed lint suppression scan.

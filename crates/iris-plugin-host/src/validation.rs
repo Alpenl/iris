@@ -189,8 +189,8 @@ pub fn command(command: &HostCommand) -> Result<(), ErrorCode> {
         SeekAbsolute { seconds } => finite(*seconds, 0., 7. * 86400.),
         SetSpeed { speed } => finite(
             *speed,
-            iris_core::player::MIN_SPEED,
-            iris_core::player::MAX_SPEED,
+            iris_core::settings::MIN_SPEED,
+            iris_core::settings::MAX_SPEED,
         ),
         SetVolume { volume } => finite(*volume, 0., 100.),
         SetAbLoop { start, end } => {

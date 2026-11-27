@@ -7,11 +7,11 @@ use std::sync::Arc;
 use anyhow::{Result, ensure};
 
 use crate::library::Kind;
+use crate::settings::{MAX_SPEED, MIN_SPEED};
 
 use super::super::enhance::ExternalTrack;
 use super::super::model::{
-    AspectMode, Command, MAX_SPEED, MIN_SPEED, PlayerActionError, SessionEvent, SessionUpdate,
-    TrackKind,
+    AspectMode, Command, PlayerActionError, SessionEvent, SessionUpdate, TrackKind,
 };
 use super::super::mpv_path;
 use super::{EnhancementView, LoadedTransport, MediaSourceState, MpvOp, PlayerMachine};

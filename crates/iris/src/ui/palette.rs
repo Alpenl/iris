@@ -6,9 +6,9 @@ use gpui::{
     App, Context, Entity, InteractiveElement, IntoElement, MouseButton, ParentElement,
     StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder, px,
 };
+use iris_core::bookmarks::PinnedBookmark;
 use iris_core::keymap;
 use iris_core::preset::{PresetCaptureScope, SidebarMode};
-use iris_core::vfs::PinnedBookmark;
 
 use super::AppModel;
 use super::actions::{ClearAbLoop, CycleAbLoop};
