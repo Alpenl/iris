@@ -11,13 +11,13 @@ workspace = true
 
 [dependencies]
 anyhow.workspace = true
-base64 = "0.22"
-httparse = "1.10"
-log = "0.4"
-mio = { version = "1", features = ["net", "os-poll"] }
-percent-encoding = "2.3"
-rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+base64.workspace = true
+httparse.workspace = true
+log.workspace = true
+mio = { workspace = true, features = ["net", "os-poll"] }
+percent-encoding.workspace = true
+rustls = { workspace = true, features = ["ring", "std", "tls12"] }
 rustls-native-certs = "0.8"
 rustls-pki-types = "1"
-tungstenite = { version = "=0.30.0", default-features = false, features = ["handshake"] }
-url = "2"
+tungstenite = { workspace = true, features = ["handshake"] }
+url.workspace = true

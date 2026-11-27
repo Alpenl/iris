@@ -11,8 +11,28 @@ publish = false
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
-gpui = { version = "=0.2.2", default-features = false, features = ["font-kit", "runtime_shaders"] }
 anyhow = "1"
+base64 = "0.22"
+cocoa = "=0.26.0"
+futures = "0.3"
+gpui = { version = "=0.2.2", default-features = false }
+httparse = "1.10"
+image = { version = "0.25", default-features = false }
+libc = "0.2"
+log = "0.4"
+miniz_oxide = "0.8"
+mio = "1"
+percent-encoding = "2.3"
+ring = "0.17"
+rustls = { version = "0.23", default-features = false }
+serde = "1"
+serde_json = "1"
+tungstenite = { version = "=0.30.0", default-features = false }
+url = "2"
+wasmtime = { version = "=51.0.0", default-features = false }
+windows = "0.61"
+windows-sys = "0.61"
+zip = { version = "=9.8.2", default-features = false }
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
