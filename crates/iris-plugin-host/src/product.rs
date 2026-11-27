@@ -68,14 +68,15 @@ impl PluginHost {
     }
 
     /// Wraps caller-provided `Resources` and `Hub` for deterministic isolated tests.
-    pub fn from_parts(resources: Resources, hub: Hub) -> Self {
+    #[cfg(feature = "test-support")]
+    pub(crate) fn from_parts(resources: Resources, hub: Hub) -> Self {
         Self {
             resources: Ok(resources),
             hub: Mutex::new(Some(hub)),
         }
     }
 
-    pub fn resources(&self) -> Result<Resources, ErrorCode> {
+    pub(crate) fn resources(&self) -> Result<Resources, ErrorCode> {
         self.resources.clone()
     }
 
@@ -84,6 +85,20 @@ impl PluginHost {
         self.resources
             .as_ref()
             .map_or(0, |r| r.ledger.used(None, Resource::HostBytes))
+    }
+
+    /// Returns currently active `ControlStore` reservations across this host instance.
+    pub fn control_stores_used(&self) -> u64 {
+        self.resources
+            .as_ref()
+            .map_or(0, |r| r.ledger.used(None, Resource::ControlStore))
+    }
+
+    /// Returns currently reserved `WasmBytes` across this host instance.
+    pub fn wasm_bytes_used(&self) -> u64 {
+        self.resources
+            .as_ref()
+            .map_or(0, |r| r.ledger.used(None, Resource::WasmBytes))
     }
 
     /// Returns `true` when all dynamic memory, temp-file, stream, relay, and track reservations are zero.

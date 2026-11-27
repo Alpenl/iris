@@ -3,6 +3,12 @@ use std::sync::{atomic::AtomicBool, mpsc};
 mod reads;
 mod windows;
 
+impl Actor {
+    pub(crate) fn open_window(&self, window: Id, generation: Generation) -> Result<(), ErrorCode> {
+        self.shared.open_window(window, generation)
+    }
+}
+
 struct Reject;
 impl Executor for Reject {
     fn prepare(

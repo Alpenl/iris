@@ -101,7 +101,7 @@ impl Refresh for Live {
         outcome
     }
 }
-pub fn attach(
+pub(crate) fn attach(
     session: &Arc<StreamSession>,
     source: RemoteResource,
     document: &Converted,

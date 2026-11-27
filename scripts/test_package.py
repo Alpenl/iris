@@ -1379,15 +1379,46 @@ class CheckProjectHelperTests(unittest.TestCase):
                 with self.assertRaisesRegex(AssertionError, "iris-plugin-host/clippy.toml"):
                     check_project.check_clippy_disallowed_configs(fake_root)
 
-        # 2b. `crates/iris/src` & `crates/iris-app` facade boundary gates + transitive gpui ban.
+        # 2b. `crates/iris/src` & `crates/iris-app` facade boundary gates + `lib.rs` `pub mod` lockdown + transitive gpui ban.
+        check_project.check_plugin_host_lib_no_pub_mod(
+            (check_project.ROOT / "crates/iris-plugin-host/src/lib.rs").read_text(encoding="utf-8")
+        )
+        valid_host_lib = (
+            "#![deny(unreachable_pub, unnameable_types, private_interfaces, private_bounds)]\n"
+            "// pub mod actor;\n"
+            "mod actor;\n"
+            "pub use actor::PublicItem;\n"
+        )
+        check_project.check_plugin_host_lib_no_pub_mod(valid_host_lib)
+        for bad_host_lib in (
+            valid_host_lib + "pub mod official;\n",
+            valid_host_lib + "pub(crate) mod ledger;\n",
+            "#![deny(unreachable_pub, unnameable_types, private_interfaces)]\nmod actor;\n",
+        ):
+            with self.assertRaisesRegex(AssertionError, "lib.rs"):
+                check_project.check_plugin_host_lib_no_pub_mod(bad_host_lib)
+
+        check_project.check_plugin_host_no_doc_hidden(
+            Path("crates/iris-plugin-host/src/lib.rs"),
+            "// #[doc(hidden)]\npub use product::PluginHost;\n",
+        )
+        with self.assertRaisesRegex(AssertionError, re.escape("#[doc(hidden)]")):
+            check_project.check_plugin_host_no_doc_hidden(
+                Path("crates/iris-plugin-host/src/lib.rs"),
+                "#[doc(hidden)]\npub use test_support::StreamReadMemoryProbe;\n",
+            )
+
         iris_ui_rel = Path("crates/iris/src/ui/plugin_ctrl.rs")
         check_project.check_iris_plugin_host_facade_imports(
             iris_ui_rel,
-            "use iris_plugin_host::{PluginHost, WindowSession, PollReport};\n",
+            "use iris_plugin_host::{PluginHost, WindowSession, PollReport, check_embedded_runtime};\n",
         )
         for bad_import in (
             "use iris_plugin_host::{ui::PollReport, ledger::Ledger};\n",
+            "use iris_plugin_host::ui::PollReport;\n",
             "use iris_plugin_host::actor::Update;\n",
+            "fn f() { let _ = iris_plugin_host::official::smoke::check(); }\n",
+            "use iris_plugin_host::test_support::StreamReadMemoryProbe;\n",
             "fn f() { let _ = iris_plugin_host::stream::prepare::subtitle_format(b\"\"); }\n",
             "fn f(cmd: iris_api::v2::HostCommand) { match cmd { _ => {} } }\n",
         ):
@@ -1402,6 +1433,7 @@ class CheckProjectHelperTests(unittest.TestCase):
         for bad_app_import in (
             "use iris_plugin_host::{WindowSession, ledger::Ledger};\n",
             "use iris_plugin_host::ui::WindowSession;\n",
+            "use iris_plugin_host::test_support::StreamReadMemoryProbe;\n",
             "fn f() { let _ = iris_plugin_host::stream::session::new_session_id(); }\n",
         ):
             with self.assertRaisesRegex(AssertionError, "internal `iris-plugin-host` module"):

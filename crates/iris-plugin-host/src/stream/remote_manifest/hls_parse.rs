@@ -26,7 +26,7 @@ pub(super) const fn map_hls_error(err: HlsError) -> ErrorCode {
     }
 }
 
-pub fn parse_media(
+pub(crate) fn parse_media(
     text: &str,
     kind: TrackKind,
     mut bind: impl FnMut(&str, ResourceKind, ResourceExtension) -> Result<String, ErrorCode>,
@@ -299,6 +299,6 @@ fn take(
     Ok(value)
 }
 
-pub fn attributes(input: &str) -> Result<BTreeMap<String, (String, bool)>, ErrorCode> {
+pub(crate) fn attributes(input: &str) -> Result<BTreeMap<String, (String, bool)>, ErrorCode> {
     parse_attribute_map(input, AttributeOptions::STRICT_REMOTE).map_err(map_hls_error)
 }

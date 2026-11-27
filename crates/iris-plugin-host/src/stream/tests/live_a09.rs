@@ -49,7 +49,7 @@ const ALL_RESOURCES: [Resource; 21] = [
     Resource::Dns,
     Resource::Auth,
     Resource::PlaybackSession,
-    Resource::StreamResource,
+    Resource::StreamEntry,
     Resource::RelayWorker,
     Resource::OverlayCues,
     Resource::OverlayBytes,

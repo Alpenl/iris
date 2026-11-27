@@ -7,12 +7,12 @@ use std::{
     path::Path,
 };
 
-pub const PACKAGE_LIMIT: usize = 32 << 20;
-pub const EXPANDED_LIMIT: usize = 64 << 20;
-pub const WASM_LIMIT: usize = 16 << 20;
-pub const ENTRY_LIMIT: usize = 1024;
+pub(crate) const PACKAGE_LIMIT: usize = 32 << 20;
+pub(crate) const EXPANDED_LIMIT: usize = 64 << 20;
+pub(crate) const WASM_LIMIT: usize = 16 << 20;
+pub(crate) const ENTRY_LIMIT: usize = 1024;
 
-pub struct Package {
+pub(crate) struct Package {
     pub manifest: Manifest,
     pub digest: [u8; 32],
     files: BTreeMap<String, Vec<u8>>,
@@ -20,13 +20,13 @@ pub struct Package {
 }
 
 #[derive(Clone, Copy)]
-pub enum Provenance<'a> {
+pub(crate) enum Provenance<'a> {
     User,
     /// Constructed from the bundled index, never from package contents.
     Bundled(&'a BTreeMap<String, [u8; 32]>),
 }
 
-pub fn validate_path(name: &str) -> Result<(), ErrorCode> {
+pub(crate) fn validate_path(name: &str) -> Result<(), ErrorCode> {
     if name.is_empty() || name.len() > 240 || !name.is_ascii() {
         return Err(ErrorCode::InvalidArgument);
     }
@@ -56,7 +56,7 @@ fn valid_stem(stem: &str) -> bool {
 }
 
 impl Package {
-    pub fn account(
+    pub(crate) fn account(
         mut self,
         ledger: &super::ledger::Ledger,
         owner: &str,
@@ -72,7 +72,7 @@ impl Package {
         Ok(self)
     }
 
-    pub fn from_zip(bytes: &[u8], provenance: Provenance<'_>) -> Result<Self, ErrorCode> {
+    pub(crate) fn from_zip(bytes: &[u8], provenance: Provenance<'_>) -> Result<Self, ErrorCode> {
         if bytes.len() > PACKAGE_LIMIT {
             return Err(ErrorCode::QuotaExceeded);
         }
@@ -137,7 +137,7 @@ impl Package {
         Self::from_files(files, provenance)
     }
 
-    pub fn read_zip(path: &Path, provenance: Provenance<'_>) -> Result<Self, ErrorCode> {
+    pub(crate) fn read_zip(path: &Path, provenance: Provenance<'_>) -> Result<Self, ErrorCode> {
         let file = std::fs::File::open(path).map_err(|_| ErrorCode::IoError)?;
         let bytes = read_bounded(file, PACKAGE_LIMIT)?;
         Self::from_zip(&bytes, provenance)
@@ -200,7 +200,7 @@ impl Package {
         })
     }
 
-    pub fn wasm(&self) -> Option<&[u8]> {
+    pub(crate) fn wasm(&self) -> Option<&[u8]> {
         (self.manifest.entry.as_deref() == Some("plugin.wasm"))
             .then(|| self.files.get("plugin.wasm").map(Vec::as_slice))
             .flatten()

@@ -13,9 +13,8 @@ use iris_base::net::http_client::HttpCancel;
 use std::{collections::BTreeSet, sync::Arc};
 
 #[derive(Clone)]
-pub struct WindowAccess {
+pub(crate) struct WindowAccess {
     pub instance: Id,
-    pub window: Id,
     pub generation: Generation,
     pub owner: String,
     pub capabilities: BTreeSet<Capability>,
@@ -35,12 +34,16 @@ impl<T> BackgroundResult<T> {
     }
 }
 impl WindowAccess {
-    pub fn request_cancel(&self, parent: &HttpCancel) -> Result<HttpCancel, ErrorCode> {
+    pub(crate) fn request_cancel(&self, parent: &HttpCancel) -> Result<HttpCancel, ErrorCode> {
         let child = self.cancel.child().map_err(|_| ErrorCode::Cancelled)?;
         parent.link(&child).map_err(|_| ErrorCode::Cancelled)?;
         Ok(child)
     }
-    pub fn check(&self, generation: Generation, capability: Capability) -> Result<(), ErrorCode> {
+    pub(crate) fn check(
+        &self,
+        generation: Generation,
+        capability: Capability,
+    ) -> Result<(), ErrorCode> {
         if self.cancel.is_cancelled() {
             return Err(ErrorCode::Cancelled);
         }
@@ -54,7 +57,7 @@ impl WindowAccess {
     }
     /// Bounded shared control-I/O workers. Reservations live through completion
     /// delivery, including if the receiving window has already disappeared.
-    pub fn background<T: Send + 'static>(
+    pub(crate) fn background<T: Send + 'static>(
         &self,
         work: impl FnOnce(Self) -> Result<T, ErrorCode> + Send + 'static,
     ) -> Result<oneshot::Receiver<Result<BackgroundResult<T>, ErrorCode>>, ErrorCode> {
@@ -98,15 +101,9 @@ impl WindowAccess {
         )
     }
 
-    /// Background worker only. The returned lease must live until mpv has
-    /// acknowledged removal, including cancelled/replaced pending additions.
-    pub fn prepare_attachment(&self, spec: AttachmentSpec) -> Result<Arc<Attachment>, ErrorCode> {
-        self.prepare_attachment_for(self.generation, spec)
-    }
-
     /// Validates `generation` against this window capability before preparing a
     /// sealed loopback attachment.
-    pub fn prepare_attachment_for(
+    pub(crate) fn prepare_attachment_for(
         &self,
         generation: Generation,
         spec: AttachmentSpec,
@@ -136,7 +133,6 @@ impl Control {
             .ok_or(ErrorCode::StaleHandle)?;
         Ok(WindowAccess {
             instance: self.control_id,
-            window,
             generation: state.generation,
             owner: self.installed.installation_id.clone(),
             capabilities: self.installed.grants.clone(),
@@ -146,5 +142,20 @@ impl Control {
             cancel: state.media.clone(),
             attachments: state.attachments.clone(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Attachment, AttachmentSpec, ErrorCode, WindowAccess};
+    use std::sync::Arc;
+
+    impl WindowAccess {
+        pub(crate) fn prepare_attachment(
+            &self,
+            spec: AttachmentSpec,
+        ) -> Result<Arc<Attachment>, ErrorCode> {
+            self.prepare_attachment_for(self.generation, spec)
+        }
     }
 }

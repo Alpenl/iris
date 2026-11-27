@@ -12,18 +12,18 @@ pub(crate) struct Fetched {
     pub bytes: Vec<u8>,
     _memory: Reservation,
 }
-pub struct Thumbnail {
+pub(crate) struct Thumbnail {
     data: Fetched,
 }
 impl Thumbnail {
-    pub fn bytes(&self) -> &[u8] {
+    pub(crate) fn bytes(&self) -> &[u8] {
         &self.data.bytes
     }
 }
 impl RemoteFactory {
     /// Background host image fetch. The same Origin/DNS/redirect/credential
     /// policy as playback is enforced; the caller must separately bound decode.
-    pub fn fetch_thumbnail(
+    pub(crate) fn fetch_thumbnail(
         &self,
         resource: &RemoteResource,
         cancel: &HttpCancel,
@@ -31,7 +31,7 @@ impl RemoteFactory {
         self.fetch(resource, cancel, 4 << 20)
             .map(|data| Thumbnail { data })
     }
-    pub fn reference(
+    pub(crate) fn reference(
         &self,
         parent: &RemoteResource,
         base: &Url,

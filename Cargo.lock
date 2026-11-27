@@ -2944,6 +2944,7 @@ dependencies = [
  "iris-api",
  "iris-base",
  "iris-core",
+ "iris-plugin-host",
  "libc",
  "log",
  "md-5",

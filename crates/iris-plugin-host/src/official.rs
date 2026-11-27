@@ -1,7 +1,7 @@
 //! Host-embedded official archives and pins. No installation-directory file can
 //! declare itself official. Bootstrap runs on the coordinator's disk worker.
 mod migration;
-pub mod smoke;
+pub(crate) mod smoke;
 use super::{
     installation::{Approval, InstallationEntry, Installed, Installer, Review},
     json_error,
@@ -60,14 +60,14 @@ pub(crate) struct BootstrapScan {
 }
 
 #[derive(Clone)]
-pub struct Bootstrap {
+pub(crate) struct Bootstrap {
     legacy_root: PathBuf,
     pins: BTreeMap<String, [u8; 32]>,
     entries: BTreeMap<String, Pin>,
 }
 impl Bootstrap {
     /// Only parses a small embedded index; no filesystem, hashing, or compilation.
-    pub fn embedded(legacy_root: PathBuf) -> Result<Self, ErrorCode> {
+    pub(crate) fn embedded(legacy_root: PathBuf) -> Result<Self, ErrorCode> {
         let index: Index = iris_core::bounded_json::decode(INDEX, 16 * 1024).map_err(json_error)?;
         if index.schema != 1 || index.packages.len() != 2 {
             return Err(ErrorCode::InvalidArgument);
@@ -104,7 +104,7 @@ impl Bootstrap {
             entries,
         })
     }
-    pub fn pins(&self) -> BTreeMap<String, [u8; 32]> {
+    pub(crate) fn pins(&self) -> BTreeMap<String, [u8; 32]> {
         self.pins.clone()
     }
     pub(crate) fn migrate_installed(
@@ -120,16 +120,6 @@ impl Bootstrap {
         } else {
             Ok(())
         }
-    }
-    /// A failed official migration disables that installation's load; unrelated
-    /// user packages can still load. No guest observes partially migrated state.
-    pub fn entries(
-        &self,
-        installer: Installer,
-        setup: &Setup,
-    ) -> Result<Vec<InstallationEntry>, ErrorCode> {
-        self.scan(installer, setup, &CancelToken::new())
-            .map(|scan| scan.entries)
     }
     pub(crate) fn scan(
         &self,

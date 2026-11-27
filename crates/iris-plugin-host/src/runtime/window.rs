@@ -18,14 +18,14 @@ pub(crate) struct WindowState {
 }
 
 /// Lightweight window-open plan; actual artifact directories are created lazily.
-pub struct WindowPreparation {
+pub(crate) struct WindowPreparation {
     control: Id,
     window: Id,
     generation: Generation,
     event: Vec<u8>,
     browser: BrowserOpen,
 }
-pub struct PreparedWindow {
+pub(crate) struct PreparedWindow {
     control: Id,
     window: Id,
     generation: Generation,
@@ -33,7 +33,7 @@ pub struct PreparedWindow {
     browser: BrowserOpen,
 }
 impl WindowPreparation {
-    pub fn prepare(self) -> Result<PreparedWindow, ErrorCode> {
+    pub(crate) fn prepare(self) -> Result<PreparedWindow, ErrorCode> {
         Ok(PreparedWindow {
             control: self.control,
             window: self.window,
@@ -44,7 +44,7 @@ impl WindowPreparation {
     }
 }
 impl Control {
-    pub fn window_preparation(
+    pub(crate) fn window_preparation(
         &self,
         window: Id,
         generation: Generation,
@@ -78,7 +78,7 @@ impl Control {
         })
     }
     /// No filesystem, compilation or network waits in this commit step.
-    pub fn attach_window(&mut self, prepared: PreparedWindow) -> Result<(), ErrorCode> {
+    pub(crate) fn attach_window(&mut self, prepared: PreparedWindow) -> Result<(), ErrorCode> {
         self.live()?;
         if prepared.control != self.control_id {
             return Err(ErrorCode::StaleHandle);

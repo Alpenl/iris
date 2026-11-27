@@ -3,17 +3,18 @@
 //! This is deterministic replay + bounded PRNG mutation, not coverage-guided fuzzing
 //! or a substitute for sanitizer campaigns.
 
+use crate::{
+    package::{self, Package, Provenance},
+    stream::{manifest, prepare, range::Range, remote_manifest},
+    url_resolver::{TransportKind, normalize_url, parse_consent_origin_url},
+    validation,
+};
 use iris_api::v2::{
     ErrorCode, HostCommand, MESSAGE_LIMIT, Manifest,
     stream::{ManifestFormat, TrackKind},
     task::Task,
 };
 use iris_core::bounded_json::decode_exact;
-use iris_plugin_host::{
-    package::{Package, Provenance},
-    stream::{manifest, prepare, remote_manifest},
-    validation,
-};
 use std::{
     collections::{BTreeMap, BTreeSet},
     io::Write,
@@ -201,16 +202,13 @@ fn discover_corpus() -> Vec<CorpusSeed> {
 
 fn exercise(input: &[u8]) {
     if let Ok(text) = std::str::from_utf8(input) {
-        let _ = iris_plugin_host::network::normalize_url(
-            text,
-            iris_plugin_host::network::TransportKind::Http,
-        );
-        let _ = iris_plugin_host::network::parse_consent_origin_url(text);
-        let _ = iris_plugin_host::package::validate_path(text);
+        let _ = normalize_url(text, TransportKind::Http);
+        let _ = parse_consent_origin_url(text);
+        let _ = package::validate_path(text);
         for size in [None, Some(0), Some(1024), Some(u64::MAX)] {
             let trimmed = text.trim();
             let base_range = iris_base::net::range::HttpRange::parse(Some(trimmed), size);
-            let host_range = iris_plugin_host::stream::range::Range::parse(Some(trimmed), size);
+            let host_range = Range::parse(Some(trimmed), size);
             assert_eq!(base_range.is_ok(), host_range.is_ok());
             if let Ok(range) = host_range {
                 let base = base_range.unwrap();
@@ -228,9 +226,9 @@ fn exercise(input: &[u8]) {
                 assert_eq!(range.content_range(), base.content_range());
             }
         }
-        let _ = remote_manifest::parse_hls_attributes(text);
+        let _ = remote_manifest::hls_parse::attributes(text);
         let mut bound = 0usize;
-        let _ = remote_manifest::parse_hls_media(text, TrackKind::Video, |_, _, _| {
+        let _ = remote_manifest::hls_parse::parse_media(text, TrackKind::Video, |_, _, _| {
             bound += 1;
             Ok(format!("seg_{bound}"))
         });
@@ -260,7 +258,7 @@ fn parse_host_hls_uris(input: &str, base_url: &str) -> Result<Vec<String>, Error
     let base = url::Url::parse(base_url).unwrap();
     let mut uris = Vec::new();
     let mut ids = BTreeMap::<(String, String), String>::new();
-    remote_manifest::parse_hls_media(input, TrackKind::Video, |raw_uri, kind, ext| {
+    remote_manifest::hls_parse::parse_media(input, TrackKind::Video, |raw_uri, kind, ext| {
         let resolved = base
             .join(raw_uri)
             .map(|u| u.to_string())
@@ -295,7 +293,7 @@ fn seeded_plugin_parser_mutations() {
     .expect("valid package seed");
     let hls_media_seed =
         std::fs::read_to_string(fuzz_corpus.join("hls/valid_fmp4_aes128.m3u8")).unwrap();
-    remote_manifest::parse_hls_media(&hls_media_seed, TrackKind::Video, |_, _, _| {
+    remote_manifest::hls_parse::parse_media(&hls_media_seed, TrackKind::Video, |_, _, _| {
         Ok("bound_res".into())
     })
     .expect("valid hls media seed");
@@ -324,8 +322,7 @@ fn seeded_plugin_parser_mutations() {
     iris_base::net::http_client::doh::parse_doh_response_bytes(&doh_resp).expect("valid doh seed");
     let open_range =
         std::fs::read_to_string(fuzz_corpus.join("range/valid_open_ended.txt")).unwrap();
-    iris_plugin_host::stream::range::Range::parse(Some(open_range.trim()), Some(8192))
-        .expect("valid range seed");
+    Range::parse(Some(open_range.trim()), Some(8192)).expect("valid range seed");
     iris_base::net::hls::parse_lines(
         &hls_media_seed,
         iris_base::net::hls::HlsLineOptions::CORE_REWRITE,
@@ -430,8 +427,6 @@ fn hls_corpus_differential_baseline_between_core_and_plugin_host() {
         Result<&'static [&'static str], ErrorCode>,
     );
 
-    // Locked R-01 differential table between `iris-core/src/player/relay/playlist.rs`
-    // and `iris-plugin-host/src/stream/remote_manifest/hls_parse.rs` for R-06 grammar unification.
     let entries: [(&str, Expected); 13] = [
         (
             "valid_fmp4_aes128.m3u8",
@@ -536,14 +531,12 @@ fn hls_corpus_differential_baseline_between_core_and_plugin_host() {
     ];
     let expected = BTreeMap::from(entries);
 
-    // Attribute-level divergence: `core` permits empty quoted non-URI values and unquoted
-    // punctuation such as `:`, whereas `hls_parse::attributes` rejects both.
     assert_eq!(
-        remote_manifest::parse_hls_attributes("ID=\"ad-1\",CLASS=\"\""),
+        remote_manifest::hls_parse::attributes("ID=\"ad-1\",CLASS=\"\""),
         Err(ErrorCode::InvalidArgument)
     );
     assert_eq!(
-        remote_manifest::parse_hls_attributes("CODECS=avc1:640028"),
+        remote_manifest::hls_parse::attributes("CODECS=avc1:640028"),
         Err(ErrorCode::InvalidArgument)
     );
 
@@ -591,7 +584,7 @@ fn watchdog_aborts_and_prints_case_id_on_simulated_hang() {
     let output = std::process::Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
-            "watchdog_aborts_and_prints_case_id_on_simulated_hang",
+            "tests::fuzz::watchdog_aborts_and_prints_case_id_on_simulated_hang",
             "--nocapture",
         ])
         .env("IRIS_FUZZ_HANG_CHILD", "1")

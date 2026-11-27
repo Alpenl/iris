@@ -1,4 +1,4 @@
-//! Bounded, zero-network parser entry points exercised by `tests/plugin_v2_fuzz.rs`.
+//! Bounded, zero-network parser entry points exercised by `iris-plugin-host`'s `src/tests/fuzz.rs`.
 
 use std::io::{Cursor, Read};
 

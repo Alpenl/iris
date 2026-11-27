@@ -12,7 +12,7 @@ use std::{collections::BTreeSet, path::Path, sync::Arc, time::Duration};
 
 /// A reviewed archive is immutable in memory. Compilation checks the module
 /// without executing start/init before the user authorizes installation.
-pub struct Review {
+pub(crate) struct Review {
     manifest: Manifest,
     digest: [u8; 32],
     previous: Option<Installed>,
@@ -25,7 +25,7 @@ pub struct Review {
 }
 impl Review {
     /// Background worker only. The coordinator bounds pending reviews to two.
-    pub fn read(
+    pub(crate) fn read(
         path: &Path,
         installer: &Installer,
         resources: &Resources,
@@ -90,16 +90,16 @@ impl Review {
             _lease: lease,
         })
     }
-    pub fn manifest(&self) -> &Manifest {
+    pub(crate) fn manifest(&self) -> &Manifest {
         &self.manifest
     }
-    pub fn digest(&self) -> [u8; 32] {
+    pub(crate) fn digest(&self) -> [u8; 32] {
         self.digest
     }
-    pub fn previous(&self) -> Option<&Installed> {
+    pub(crate) fn previous(&self) -> Option<&Installed> {
         self.previous.as_ref()
     }
-    pub fn archived(&self) -> Option<&ArchivedIdentity> {
+    pub(crate) fn archived(&self) -> Option<&ArchivedIdentity> {
         self.archived.as_ref()
     }
     pub(crate) fn is_bundled(&self) -> bool {

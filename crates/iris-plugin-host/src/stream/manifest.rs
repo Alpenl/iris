@@ -4,20 +4,20 @@ mod hls;
 use iris_api::v2::{ErrorCode, stream::*};
 use std::collections::{BTreeMap, BTreeSet};
 
-pub const RESOURCE_LIMIT: usize = 10_000;
-pub const INPUT_LIMIT: usize = 4 << 20;
-pub const OUTPUT_LIMIT: usize = 16 << 20;
-pub const ROOT: &str = "__iris_root";
+pub(crate) const RESOURCE_LIMIT: usize = 10_000;
+pub(crate) const INPUT_LIMIT: usize = 4 << 20;
+pub(crate) const OUTPUT_LIMIT: usize = 16 << 20;
+pub(crate) const ROOT: &str = "__iris_root";
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Profile {
+pub(crate) enum Profile {
     Hls,
 }
-pub struct Document {
+pub(crate) struct Document {
     pub id: String,
     pub bytes: Vec<u8>,
     pub profile: Profile,
 }
-pub struct Manifest {
+pub(crate) struct Manifest {
     pub resources: BTreeMap<String, ResourceBinding>,
     pub documents: Vec<Document>,
     pub profile: Profile,
@@ -25,7 +25,7 @@ pub struct Manifest {
 
 /// `local` receives only validated logical identifiers, including host-generated
 /// document IDs. It must return an absolute loopback URL in this session.
-pub fn compile(
+pub(crate) fn compile(
     format: ManifestFormat,
     bytes: &[u8],
     local: &dyn Fn(&str, ResourceExtension) -> Result<String, ErrorCode>,

@@ -2,11 +2,12 @@
 //! run on the host coordinator worker; send/poll/stop never wait on I/O or join.
 mod access;
 mod control;
-pub use access::{BackgroundResult, WindowAccess};
+pub use access::BackgroundResult;
+pub(crate) use access::WindowAccess;
 mod events;
 mod playback;
 mod window;
-pub use super::services::{Resources, Setup};
+pub(crate) use super::services::{Resources, Setup};
 use super::{
     actor::{Actor, Spawn},
     engine::CompiledModule,
@@ -22,10 +23,9 @@ use iris_api::v2::{
     ErrorCode, Generation, HostEvent, Id, Manifest, Role, source::SourceDescriptor,
 };
 use iris_base::rt::CancelToken;
-pub use playback::PlaybackPermit;
 use std::{collections::BTreeSet, sync::Arc};
+pub(crate) use window::PreparedWindow;
 pub(super) use window::WindowState;
-pub use window::{PreparedWindow, WindowPreparation};
 
 struct LogRateLimiter {
     window_start: std::time::Instant,
@@ -52,7 +52,7 @@ impl LogRateLimiter {
         true
     }
 }
-pub struct Control {
+pub(crate) struct Control {
     control_id: Id,
     installed: Installed,
     manifest: Arc<Manifest>,
@@ -72,7 +72,7 @@ pub struct Control {
 impl Control {
     /// Reads the current approved record again, verifies its exact package, then
     /// compiles and starts one control actor. Call only on a background worker.
-    pub fn load(
+    pub(crate) fn load(
         installer: &Installer,
         installed: Installed,
         setup: Setup,
@@ -189,25 +189,22 @@ impl Control {
             _lease: lease,
         })
     }
-    pub fn manifest(&self) -> &Manifest {
-        &self.manifest
-    }
-    pub fn shared_manifest(&self) -> Arc<Manifest> {
+    pub(crate) fn shared_manifest(&self) -> Arc<Manifest> {
         self.manifest.clone()
     }
-    pub fn installed(&self) -> &Installed {
+    pub(crate) fn installed(&self) -> &Installed {
         &self.installed
     }
-    pub fn sources(&self) -> &[SourceDescriptor] {
+    pub(crate) fn sources(&self) -> &[SourceDescriptor] {
         &self.sources
     }
-    pub fn network(&self) -> &NetworkGrant {
+    pub(crate) fn network(&self) -> &NetworkGrant {
         &self.network
     }
-    pub fn origins(&self) -> &OriginStore {
+    pub(crate) fn origins(&self) -> &OriginStore {
         &self.origins
     }
-    pub fn new_window_id() -> Result<Id, ErrorCode> {
+    pub(crate) fn new_window_id() -> Result<Id, ErrorCode> {
         next_id().map(Id)
     }
     fn live(&self) -> Result<(), ErrorCode> {

@@ -64,6 +64,7 @@ HOST_INTERNAL_MODULES = frozenset(
         "enhancement",
         "files",
         "hub",
+        "imports",
         "installation",
         "instance",
         "ledger",
@@ -80,6 +81,7 @@ HOST_INTERNAL_MODULES = frozenset(
         "services",
         "storage",
         "stream",
+        "test_support",
         "ui",
         "url_resolver",
         "validation",
@@ -89,9 +91,17 @@ APP_FORBIDDEN_HOST_MOD_RE = re.compile(
     r"\biris_plugin_host::(?:" + "|".join(sorted(HOST_INTERNAL_MODULES)) + r")\b"
 )
 IRIS_FORBIDDEN_HOST_INTERNAL_RE = re.compile(
-    r"\biris_plugin_host::(?:ledger|actor)\b|\bstream::prepare\b"
+    r"\biris_plugin_host::(?:" + "|".join(sorted(HOST_INTERNAL_MODULES)) + r")\b|\bstream::prepare\b"
 )
 IRIS_FORBIDDEN_HOST_COMMAND_RE = re.compile(r"\bHostCommand\b")
+HOST_REQUIRED_DENY_LINTS = (
+    "unreachable_pub",
+    "unnameable_types",
+    "private_interfaces",
+    "private_bounds",
+)
+HOST_PUB_MOD_RE = re.compile(r"\bpub(?:\s*\([^)]*\))?\s+mod\b")
+DOC_HIDDEN_ATTR_RE = re.compile(r"#\s*!?\s*\[\s*doc\s*\([^]]*\bhidden\b[^]]*\)\s*\]")
 DISALLOWED_LINT_SUPPRESSION_RE = re.compile(
     r"#\s*!?\s*\[\s*(?:allow|expect)\s*\([^]]*\b(?:clippy::)?disallowed_[A-Za-z0-9_]+[^]]*\)\s*\]"
     r"|\b(?:allow|expect)\s*\([^)]*\b(?:clippy::)?disallowed_[A-Za-z0-9_]+"
@@ -818,24 +828,56 @@ def check_disallowed_lint_suppressions(rel: Path, raw_text: str):
     )
 
 
+def check_plugin_host_lib_no_pub_mod(raw_text: str):
+    """Enforce that `crates/iris-plugin-host/src/lib.rs` has no `pub mod` and denies all 4 facade lints."""
+    sanitized = strip_comments_and_literals(raw_text)
+    offending = HOST_PUB_MOD_RE.search(sanitized)
+    _require(
+        offending is None,
+        f"crates/iris-plugin-host/src/lib.rs must not declare `{offending.group(0) if offending else 'pub mod'}`; "
+        "keep modules private and re-export facade items via root `pub use`",
+    )
+    deny_blocks = " ".join(
+        match.group(1)
+        for match in re.finditer(r"#\s*!\s*\[\s*deny\s*\(([^)]*)\)\s*\]", sanitized)
+    )
+    denied = {tok.strip() for tok in deny_blocks.split(",") if tok.strip()}
+    missing = [lint for lint in HOST_REQUIRED_DENY_LINTS if lint not in denied]
+    _require(
+        not missing,
+        "crates/iris-plugin-host/src/lib.rs missing required crate-level `#![deny(...)]` lints: "
+        + ", ".join(missing),
+    )
+
+
+def check_plugin_host_no_doc_hidden(rel: Path, raw_text: str):
+    """Reject `#[doc(hidden)]` in `crates/iris-plugin-host/src` as a substitute for module privacy."""
+    sanitized = strip_comments_and_literals(raw_text)
+    hit = DOC_HIDDEN_ATTR_RE.search(sanitized)
+    _require(
+        hit is None,
+        f"{rel} uses forbidden `#[doc(hidden)]` (`{hit.group(0) if hit else ''}`); "
+        "keep internals `pub(crate)` or gate test helpers behind `feature = \"test-support\"`",
+    )
+
+
 def check_iris_plugin_host_facade_imports(rel: Path, raw_text: str):
-    """Reject direct references from `crates/iris/src` into `iris_plugin_host::{ledger, actor}`, `stream::prepare`, or `HostCommand`."""
+    """Reject direct references from `crates/iris/src` into internal `iris_plugin_host` modules, `stream::prepare`, or `HostCommand`."""
     sanitized = strip_comments_and_literals(raw_text)
     for match in USE_STMT_RE.finditer(sanitized):
         for expanded in expand_use_tree(match.group(1)):
+            segs = [seg for seg in expanded.split("::") if seg]
+            is_internal_host_mod = (
+                len(segs) >= 2 and segs[0] == "iris_plugin_host" and segs[1] in HOST_INTERNAL_MODULES
+            )
             _require(
-                not (
-                    expanded.startswith("iris_plugin_host::ledger")
-                    or expanded.startswith("iris_plugin_host::actor")
-                    or expanded.startswith("iris_plugin_host::stream::prepare")
-                    or "::stream::prepare" in expanded
-                ),
-                f"{rel} imports forbidden plugin-host internal `{expanded}`; route through `WindowSession` / `PluginHost`",
+                not (is_internal_host_mod or "::stream::prepare" in expanded),
+                f"{rel} imports forbidden plugin-host internal `{expanded}`; route through `WindowSession` / `PluginHost` root facade",
             )
     hit = IRIS_FORBIDDEN_HOST_INTERNAL_RE.search(sanitized)
     _require(
         hit is None,
-        f"{rel} references forbidden plugin-host internal `{hit.group(0) if hit else ''}`; route through `WindowSession` / `PluginHost`",
+        f"{rel} references forbidden plugin-host internal `{hit.group(0) if hit else ''}`; route through `WindowSession` / `PluginHost` root facade",
     )
     cmd_hit = IRIS_FORBIDDEN_HOST_COMMAND_RE.search(sanitized)
     _require(
@@ -973,6 +1015,10 @@ def main():
 
     check_clippy_disallowed_configs(ROOT)
 
+    check_plugin_host_lib_no_pub_mod(
+        (ROOT / "crates/iris-plugin-host/src/lib.rs").read_text(encoding="utf-8")
+    )
+
     for crate_dir in sorted(p for p in (ROOT / "crates").iterdir() if p.is_dir()):
         for subdir_name in ("src", "tests"):
             subdir = crate_dir / subdir_name
@@ -984,6 +1030,8 @@ def main():
                 check_disallowed_lint_suppressions(rel, raw_text)
                 if crate_dir.name == "iris-app":
                     check_app_plugin_host_facade_only(rel, raw_text)
+                elif crate_dir.name == "iris-plugin-host" and subdir_name == "src":
+                    check_plugin_host_no_doc_hidden(rel, raw_text)
 
     for path in sorted(iris_src.rglob("*.rs")):
         rel = path.relative_to(ROOT)
@@ -1019,6 +1067,25 @@ def main():
     for crate_name in ("iris", "iris-core"):
         default_feats = pkgs[crate_name]["features"].get("default", [])
         _require("devtools" not in default_feats, f"{crate_name} enables devtools by default: {default_feats}")
+
+    host_default_feats = pkgs["iris-plugin-host"]["features"].get("default", [])
+    _require(
+        "test-support" not in host_default_feats,
+        f"iris-plugin-host enables test-support by default: {host_default_feats}",
+    )
+    for consumer in ("iris", "iris-app"):
+        for dep in pkgs[consumer]["dependencies"]:
+            if dep["name"] == "iris-plugin-host":
+                _require(
+                    "test-support" not in dep.get("features", []),
+                    f"{consumer} must not enable `iris-plugin-host/test-support`",
+                )
+    host_manifest = tomllib.loads((ROOT / "crates/iris-plugin-host/Cargo.toml").read_text(encoding="utf-8"))
+    for test_target in host_manifest.get("test", []):
+        _require(
+            "required-features" not in test_target,
+            "crates/iris-plugin-host/Cargo.toml must not use `required-features` on test targets",
+        )
 
     for gated_file in (
         ROOT / "crates/iris/src/debug.rs",

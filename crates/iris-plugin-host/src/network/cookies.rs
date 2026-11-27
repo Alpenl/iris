@@ -21,7 +21,7 @@ pub(crate) struct CookieJar {
     _memory: Reservation,
 }
 impl CookieJar {
-    pub fn new(owner: &str, ledger: &Ledger) -> Result<Self, ErrorCode> {
+    pub(crate) fn new(owner: &str, ledger: &Ledger) -> Result<Self, ErrorCode> {
         Ok(Self {
             jar: Mutex::new(BTreeMap::new()),
             _memory: ledger.reserve(owner, &[(Resource::HostBytes, 128 << 10)])?,

@@ -13,7 +13,7 @@ use crate::{
     actor::Spawn,
     engine::{CompiledModule, RuntimeEngine},
     instance::DetachedBlob,
-    ledger::Ledger,
+    ledger::{Ledger, Reservation},
     network::{NetworkExecutor, NetworkGrant},
     pool::IoPool,
 };
@@ -28,14 +28,14 @@ use std::{
     sync::Arc,
 };
 
-pub struct GuestFactory {
+pub(crate) struct GuestFactory {
     pub engine: RuntimeEngine,
     pub module: Arc<CompiledModule>,
     pub capabilities: BTreeSet<Capability>,
     pub io: IoPool,
     pub wake: Arc<dyn Fn() + Send + Sync>,
 }
-pub struct Preparation {
+pub(crate) struct Preparation {
     pub network: NetworkGrant,
     pub ledger: Ledger,
     pub generation: Generation,
@@ -51,9 +51,9 @@ pub struct AttachmentView {
     pub audio: bool,
 }
 pub struct Playback {
-    pub relay: Relay,
+    pub(crate) relay: Relay,
     pub url: String,
-    pub profile: Option<Profile>,
+    pub(crate) profile: Option<Profile>,
     pub kind: Kind,
     pub title: String,
     pub source_id: Option<String>,
@@ -62,6 +62,7 @@ pub struct Playback {
     pub attachments: Vec<AttachmentView>,
     pub variants: Vec<iris_api::StreamVariant>,
     pub active_variant: Option<String>,
+    pub(crate) notice_lease: Option<Reservation>,
 }
 
 impl iris_core::player::ScopedStream for Playback {
@@ -88,7 +89,7 @@ impl iris_core::player::ScopedStream for Playback {
 
 impl Playback {
     /// Adapts a prepared protocol-2 playback into a decoupled [`iris_core::player::ScopedPlayback`].
-    pub fn into_scoped(self: Arc<Self>) -> Arc<iris_core::player::ScopedPlayback> {
+    pub(crate) fn into_scoped(self: Arc<Self>) -> Arc<iris_core::player::ScopedPlayback> {
         let profile = self.profile.map(|p| match p {
             Profile::Hls => iris_core::player::StreamProfile::Hls,
         });
@@ -117,7 +118,7 @@ impl Playback {
 }
 
 impl Preparation {
-    pub fn prepare(
+    pub(crate) fn prepare(
         self,
         spec: &StreamSpec,
         blobs: &BTreeMap<Id, DetachedBlob>,
@@ -321,6 +322,7 @@ impl Preparation {
             attachments,
             variants: spec.variants.clone(),
             active_variant: spec.active_variant.clone(),
+            notice_lease: None,
         })
     }
 }
@@ -389,7 +391,7 @@ pub(crate) fn adaptive(bytes: &[u8]) -> bool {
 pub(crate) fn adaptive_undecided(bytes: &[u8]) -> bool {
     iris_base::net::loopback_http::is_adaptive_prefix_undecided(bytes)
 }
-pub fn subtitle_format(bytes: &[u8]) -> Result<&'static str, ErrorCode> {
+pub(crate) fn subtitle_format(bytes: &[u8]) -> Result<&'static str, ErrorCode> {
     if bytes.len() > 10 << 20 {
         return Err(ErrorCode::QuotaExceeded);
     }

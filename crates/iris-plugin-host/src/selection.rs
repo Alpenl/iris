@@ -22,7 +22,7 @@ pub fn annotation_error_code(error: AnnotationError) -> ErrorCode {
     }
 }
 
-pub fn error_code_to_annotation(code: ErrorCode) -> AnnotationError {
+pub(crate) fn error_code_to_annotation(code: ErrorCode) -> AnnotationError {
     match code {
         ErrorCode::InvalidArgument => AnnotationError::InvalidArgument,
         ErrorCode::Denied => AnnotationError::Denied,
@@ -58,7 +58,7 @@ fn color_to_api(c: store::ColorLabel) -> ColorLabel {
     }
 }
 
-pub fn edit_to_store(edit: &AnnotationEdit) -> store::AnnotationEdit {
+pub(crate) fn edit_to_store(edit: &AnnotationEdit) -> store::AnnotationEdit {
     match edit {
         AnnotationEdit::Rating { rating } => store::AnnotationEdit::Rating { rating: *rating },
         AnnotationEdit::Color { color } => store::AnnotationEdit::Color {
@@ -78,7 +78,7 @@ pub fn edit_to_store(edit: &AnnotationEdit) -> store::AnnotationEdit {
     }
 }
 
-pub fn page_to_api(page: store::AnnotationPage) -> AnnotationPage {
+pub(crate) fn page_to_api(page: store::AnnotationPage) -> AnnotationPage {
     AnnotationPage {
         index: page.index,
         rating: page.rating,
@@ -178,29 +178,29 @@ struct Selection {
     cancel: iris_base::net::http_client::HttpCancel,
     _lease: Reservation,
 }
-pub struct SelectionGrants {
+pub(crate) struct SelectionGrants {
     owner: String,
     allowed: bool,
     ledger: Ledger,
     values: BTreeMap<Id, Arc<Selection>>,
 }
 #[derive(Clone)]
-pub struct SelectionPermit(Arc<Selection>);
+pub(crate) struct SelectionPermit(Arc<Selection>);
 impl SelectionPermit {
-    pub fn check(&self) -> Result<(), ErrorCode> {
+    pub(crate) fn check(&self) -> Result<(), ErrorCode> {
         if self.0.cancel.is_cancelled() || self.0.expires <= Instant::now() {
             Err(ErrorCode::StaleHandle)
         } else {
             Ok(())
         }
     }
-    pub fn uris(&self) -> Result<&[MediaUri], ErrorCode> {
+    pub(crate) fn uris(&self) -> Result<&[MediaUri], ErrorCode> {
         self.check()?;
         Ok(&self.0.uris)
     }
 }
 impl SelectionGrants {
-    pub fn new(owner: String, capabilities: &BTreeSet<Capability>, ledger: Ledger) -> Self {
+    pub(crate) fn new(owner: String, capabilities: &BTreeSet<Capability>, ledger: Ledger) -> Self {
         Self {
             owner,
             allowed: capabilities.contains(&Capability::Annotations),
@@ -209,7 +209,7 @@ impl SelectionGrants {
         }
     }
     /// Only host selection actions call this. Guest fields cannot choose URIs.
-    pub fn approve(
+    pub(crate) fn approve(
         &mut self,
         instance: Id,
         generation: Id,
@@ -272,7 +272,7 @@ impl SelectionGrants {
         }
         Ok(value)
     }
-    pub fn permit(
+    pub(crate) fn permit(
         &self,
         owner: &str,
         instance: Id,
@@ -282,7 +282,7 @@ impl SelectionGrants {
         self.get(owner, instance, generation, id)?;
         Ok(SelectionPermit(self.values[&id].clone()))
     }
-    pub fn revoke(&mut self) {
+    pub(crate) fn revoke(&mut self) {
         for value in self.values.values() {
             value.cancel.cancel();
         }

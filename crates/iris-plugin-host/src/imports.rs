@@ -1,6 +1,5 @@
 mod context;
-pub use context::{Blob, DetachedBlob};
-pub(crate) use context::{HostCallbacks, State, checked_range};
+pub(crate) use context::{Blob, DetachedBlob, HostCallbacks, State, checked_range};
 
 use super::{json_error, ledger::Resource};
 use iris_api::v2::{CHUNK_LIMIT, ErrorCode, MESSAGE_LIMIT, Role, crypto::CryptoSpec, task::Task};

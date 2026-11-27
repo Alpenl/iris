@@ -1,13 +1,13 @@
 //! Session-scoped resources and strictly generated adaptive manifests.
-pub mod guest;
-pub mod manifest;
-pub mod prepare;
-pub mod range;
-pub mod reader;
-pub mod relay;
+pub(crate) mod guest;
+pub(crate) mod manifest;
+pub(crate) mod prepare;
+pub(crate) mod range;
+pub(crate) mod reader;
+pub(crate) mod relay;
 
-pub mod remote;
-pub mod remote_manifest;
-pub mod session;
+pub(crate) mod remote;
+pub(crate) mod remote_manifest;
+pub(crate) mod session;
 #[cfg(test)]
 mod tests;

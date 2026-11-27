@@ -13,6 +13,15 @@ use std::{
 };
 
 impl super::Bootstrap {
+    pub(crate) fn entries(
+        &self,
+        installer: Installer,
+        setup: &Setup,
+    ) -> Result<Vec<InstallationEntry>, ErrorCode> {
+        self.scan(installer, setup, &CancelToken::new())
+            .map(|scan| scan.entries)
+    }
+
     pub(crate) fn custom(
         legacy_root: PathBuf,
         packages: Vec<(String, String, Vec<u8>)>,

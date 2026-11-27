@@ -37,11 +37,11 @@ struct Granted {
 }
 
 #[derive(Clone)]
-pub struct NetworkGrant(Arc<Granted>);
+pub(crate) struct NetworkGrant(Arc<Granted>);
 
 impl NetworkGrant {
     /// Call only with capabilities confirmed by the host, not the raw manifest.
-    pub fn new(
+    pub(crate) fn new(
         owner: String,
         capabilities: BTreeSet<Capability>,
         mut declaration: NetworkDeclaration,
@@ -62,10 +62,10 @@ impl NetworkGrant {
         })))
     }
 
-    pub fn owner(&self) -> &str {
+    pub(crate) fn owner(&self) -> &str {
         &self.0.owner
     }
-    pub fn version(&self) -> Id {
+    pub(crate) fn version(&self) -> Id {
         Id(self.0.version)
     }
     /// Canonical bucket identity, available only for a still-active host grant.
@@ -81,7 +81,7 @@ impl NetworkGrant {
             .map(|origin| origin.origin.clone())
             .ok_or(ErrorCode::StaleHandle)
     }
-    pub fn validate_origins(&self, ids: &BTreeSet<Id>) -> Result<(), ErrorCode> {
+    pub(crate) fn validate_origins(&self, ids: &BTreeSet<Id>) -> Result<(), ErrorCode> {
         self.check_live()?;
         let origins = self.0.origins.lock().unwrap_or_else(|e| e.into_inner());
         if ids.iter().any(|id| {
@@ -93,7 +93,7 @@ impl NetworkGrant {
         }
         Ok(())
     }
-    pub fn revoke(&self) {
+    pub(crate) fn revoke(&self) {
         self.0.active.store(false, Ordering::Release);
         self.0.cancel.cancel();
         for origin in self
@@ -128,7 +128,7 @@ impl NetworkGrant {
 
     /// The UI supplies the exact displayed Origin and resolved address set after
     /// confirmation. No discovery/redirect/plugin-form code may call this.
-    pub fn confirm_origin(
+    pub(crate) fn confirm_origin(
         &self,
         raw: &str,
         kind: TransportKind,
@@ -175,16 +175,8 @@ impl NetworkGrant {
         Ok(Id(id))
     }
 
-    pub fn revoke_origin(&self, id: Id) -> Result<(), ErrorCode> {
-        let mut origins = self.0.origins.lock().unwrap_or_else(|e| e.into_inner());
-        let origin = origins.remove(&id.0).ok_or(ErrorCode::StaleHandle)?;
-        origin.active.store(false, Ordering::Release);
-        origin.cancel.cancel();
-        Ok(())
-    }
-
     /// A separate trusted-host confirmation for credentials over plaintext.
-    pub fn confirm_insecure_auth(&self, id: Id) -> Result<(), ErrorCode> {
+    pub(crate) fn confirm_insecure_auth(&self, id: Id) -> Result<(), ErrorCode> {
         self.check_live()?;
         let origins = self.0.origins.lock().unwrap_or_else(|e| e.into_inner());
         let origin = origins.get(&id.0).ok_or(ErrorCode::StaleHandle)?;
@@ -192,7 +184,7 @@ impl NetworkGrant {
         Ok(())
     }
 
-    pub fn request(
+    pub(crate) fn request(
         &self,
         raw: &str,
         kind: TransportKind,
@@ -235,9 +227,9 @@ impl NetworkGrant {
             None => self.0.cancel.child(),
         }
         .map_err(|_| ErrorCode::Cancelled)?;
+        Origin::of(&url)?;
         let request = Arc::new(RequestGrant {
             network: self.clone(),
-            initial: Origin::of(&url)?,
             kind,
             origin,
             cancel,
@@ -256,7 +248,7 @@ impl NetworkGrant {
 }
 
 impl NetworkGrant {
-    pub fn lookup_origin(
+    pub(crate) fn lookup_origin(
         &self,
         raw: &str,
         kind: TransportKind,
@@ -280,9 +272,8 @@ impl NetworkGrant {
     }
 }
 
-pub struct RequestGrant {
+pub(crate) struct RequestGrant {
     network: NetworkGrant,
-    pub initial: Origin,
     pub kind: TransportKind,
     origin: Option<Arc<ConfirmedOrigin>>,
     cancel: HttpCancel,
@@ -327,13 +318,13 @@ impl RequestGrant {
     pub(crate) fn background(&self) -> ActivityLease {
         self.activity.start()
     }
-    pub fn cancel(&self) -> &HttpCancel {
+    pub(crate) fn cancel(&self) -> &HttpCancel {
         &self.cancel
     }
-    pub fn owner(&self) -> &str {
+    pub(crate) fn owner(&self) -> &str {
         self.network.owner()
     }
-    pub fn check_live(&self) -> Result<(), ErrorCode> {
+    pub(crate) fn check_live(&self) -> Result<(), ErrorCode> {
         self.network.check_live()?;
         if self
             .origin
@@ -347,7 +338,7 @@ impl RequestGrant {
         }
         Ok(())
     }
-    pub fn check_url(&self, url: &Url) -> Result<(), ErrorCode> {
+    pub(crate) fn check_url(&self, url: &Url) -> Result<(), ErrorCode> {
         self.check_live()?;
         let url = normalize_url(url.as_str(), self.kind)?;
         let origin = Origin::of(&url)?;
@@ -401,7 +392,7 @@ impl RequestGrant {
             Err(ErrorCode::Denied)
         }
     }
-    pub fn check_address(&self, url: &Url, address: SocketAddr) -> Result<(), ErrorCode> {
+    pub(crate) fn check_address(&self, url: &Url, address: SocketAddr) -> Result<(), ErrorCode> {
         self.check_url(url)?;
         let origin = Origin::of(url)?;
         let http_origin = origin.http_equivalent();
@@ -425,7 +416,7 @@ impl RequestGrant {
             Err(ErrorCode::Denied)
         }
     }
-    pub fn check_redirect(&self, previous: &Url, next: &Url) -> Result<(), ErrorCode> {
+    pub(crate) fn check_redirect(&self, previous: &Url, next: &Url) -> Result<(), ErrorCode> {
         if matches!(previous.scheme(), "https" | "wss") && !matches!(next.scheme(), "https" | "wss")
         {
             return Err(ErrorCode::Denied);
@@ -485,4 +476,19 @@ pub(super) fn validate_pins(
         return Err(ErrorCode::Denied);
     }
     Ok((Origin::of(&url)?, ips))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ErrorCode, Id, NetworkGrant, Ordering};
+
+    impl NetworkGrant {
+        pub(crate) fn revoke_origin(&self, id: Id) -> Result<(), ErrorCode> {
+            let mut origins = self.0.origins.lock().unwrap_or_else(|e| e.into_inner());
+            let origin = origins.remove(&id.0).ok_or(ErrorCode::StaleHandle)?;
+            origin.active.store(false, Ordering::Release);
+            origin.cancel.cancel();
+            Ok(())
+        }
+    }
 }

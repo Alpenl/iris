@@ -1,22 +1,14 @@
-//! Executable authoring examples are exercised as untrusted user packages.
-use iris_api::v2::Generation;
+//! Executable authoring examples are exercised as untrusted user packages
+//! strictly through the public [`PluginHost`] and [`WindowSession`] facade.
 use iris_core::vault::CredentialVault;
-use iris_plugin_host::{
-    hub::{Config, Hub, Notice},
-    installation::{Approval, Installer},
-    ledger::Resource,
-    package::{Package, Provenance},
-    runtime::{Resources, Setup},
-    ui::WindowSession,
-};
+use iris_plugin_host::{Notice, PluginHost};
 use std::{
-    collections::BTreeSet,
     io::{Read, Write},
     net::TcpStream,
     path::PathBuf,
-    sync::Arc,
     time::{Duration, Instant},
 };
+
 #[track_caller]
 fn wait(mut ready: impl FnMut() -> bool) {
     let end = Instant::now() + Duration::from_secs(60);
@@ -25,7 +17,9 @@ fn wait(mut ready: impl FnMut() -> bool) {
         std::thread::sleep(Duration::from_millis(10));
     }
 }
+
 struct TestDir(PathBuf);
+
 impl Drop for TestDir {
     fn drop(&mut self) {
         if self.0.starts_with(std::env::temp_dir()) {
@@ -57,42 +51,43 @@ fn user_packages_provide_theme_timer_and_real_random_access_pcm() {
             name
         )));
         assert!(!root.0.exists(), "fixture root must be new");
-        let resources = Resources::new().unwrap();
-        let bytes = std::fs::read(input.join(format!("{id}.irisplugin"))).unwrap();
-        let package = Package::from_zip(&bytes, Provenance::User).unwrap();
-        let mut installer = Installer::new(root.0.join("packages"), resources.ledger.clone());
-        installer
-            .install(
-                &bytes,
-                Approval {
-                    digest: package.digest,
-                    grants: package.manifest.permissions.into_iter().collect(),
-                    network: package.manifest.network,
-                    previous: None,
-                },
-            )
-            .unwrap();
-        let hub = Hub::new(Config {
-            installer,
-            bootstrap: None,
-            disabled: BTreeSet::new(),
-            runtime: Setup {
-                resources: resources.clone(),
-                state_directory: root.0.join("state"),
-                temporary_directory: root.0.join("temp"),
-                vault: CredentialVault::in_memory(),
-                wake: Arc::new(|| {}),
-            },
-        })
-        .unwrap();
-        let (client, _) = hub.open_window(Generation::default(), None).unwrap();
-        let mut manager = WindowSession::new(client, Some(id.clone()));
+        std::fs::create_dir_all(&root.0).unwrap();
+
+        let host = PluginHost::open_in(&root.0, CredentialVault::in_memory(), &[], false).unwrap();
+        let (mut manager, _) = host.open_window(&[], &format!("plugin:{id}"));
+        let pkg_path = input.join(format!("{id}.irisplugin"));
+        let review_id = manager.review_package(pkg_path).unwrap();
+        let mut summary = None;
         wait(|| {
-            manager.poll();
-            manager.client().is_ready(&id)
+            for notice in manager.poll().notices {
+                match notice {
+                    Notice::Review(r) if r.id == review_id => summary = Some(r),
+                    Notice::Error { code, .. } => panic!("example review failed: {code:?}"),
+                    _ => {}
+                }
+            }
+            summary.is_some()
         });
+        let grants = summary
+            .unwrap()
+            .manifest
+            .permissions
+            .iter()
+            .copied()
+            .collect();
+        manager.approve_review(review_id, grants, false).unwrap();
+        wait(|| {
+            let ready = manager.is_ready(&id);
+            manager.poll();
+            ready
+                && manager
+                    .list()
+                    .iter()
+                    .any(|p| p.id == id && p.status == iris_plugin_host::PluginStatus::Ready)
+        });
+
         if name == "cinema-ui" {
-            assert_eq!(resources.ledger.used(None, Resource::ControlStore), 0);
+            assert_eq!(host.control_stores_used(), 0);
             assert!(manager.active_ui_overrides().0.is_some());
         } else if name == "watch-stats" {
             wait(|| {
@@ -122,13 +117,10 @@ fn user_packages_provide_theme_timer_and_real_random_access_pcm() {
             });
             assert_eq!(manager.media_sources().len(), 4);
         } else {
-            let request = manager
-                .client()
-                .resolve(&id, "audio", None, "tone", None)
-                .unwrap();
+            let request = manager.resolve(&id, "audio", None, "tone", None).unwrap();
             let mut playback = None;
             wait(|| {
-                for notice in manager.client().poll() {
+                for notice in manager.poll().notices {
                     match notice {
                         Notice::Playback {
                             ticket,
@@ -168,8 +160,10 @@ fn user_packages_provide_theme_timer_and_real_random_access_pcm() {
             assert!(bytes[44..].iter().any(|b| *b != 0));
             drop(playback);
         }
-        drop((manager, hub));
-        wait(|| resources.ledger.used(None, Resource::HostBytes) == 0);
-        assert_eq!(resources.ledger.used(None, Resource::WasmBytes), 0);
+        manager.shutdown();
+        drop(manager);
+        host.shutdown();
+        wait(|| host.host_bytes_used() == 0);
+        assert_eq!(host.wasm_bytes_used(), 0);
     }
 }

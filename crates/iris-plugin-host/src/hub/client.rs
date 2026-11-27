@@ -20,7 +20,7 @@ pub(super) enum ClientState {
     },
 }
 
-pub struct Client {
+pub(crate) struct Client {
     pub(super) state: ClientState,
 }
 
@@ -57,21 +57,21 @@ impl Client {
         }
     }
 
-    pub fn window_id(&self) -> Id {
+    pub(crate) fn window_id(&self) -> Id {
         match &self.state {
             ClientState::Connected { inbox, .. } => inbox.id,
             ClientState::Unavailable { .. } => Id(0),
         }
     }
 
-    pub fn generation(&self) -> Generation {
+    pub(crate) fn generation(&self) -> Generation {
         match &self.state {
             ClientState::Connected { inbox, .. } => inbox.generation(),
             ClientState::Unavailable { .. } => Generation::default(),
         }
     }
 
-    pub fn update_snapshot(&self, snapshot: PlaybackSnapshot) -> Result<(), ErrorCode> {
+    pub(crate) fn update_snapshot(&self, snapshot: PlaybackSnapshot) -> Result<(), ErrorCode> {
         let (_, inbox) = self.live()?;
         iris_core::bounded_json::encode(&snapshot, iris_api::v2::MESSAGE_LIMIT - 1024)
             .map_err(json_error)?;
@@ -81,14 +81,17 @@ impl Client {
         })
     }
 
-    pub fn catalog(&self) -> Arc<Catalog> {
+    pub(crate) fn catalog(&self) -> Arc<Catalog> {
         match &self.state {
             ClientState::Connected { hub, .. } => hub.catalog(),
             ClientState::Unavailable { catalog, .. } => catalog.clone(),
         }
     }
 
-    pub fn access(&self, plugin: &str) -> Result<super::super::runtime::WindowAccess, ErrorCode> {
+    pub(crate) fn access(
+        &self,
+        plugin: &str,
+    ) -> Result<super::super::runtime::WindowAccess, ErrorCode> {
         let (_, inbox) = match &self.state {
             ClientState::Connected { hub, inbox } => (hub, inbox),
             ClientState::Unavailable { .. } => return Err(ErrorCode::StaleHandle),
@@ -109,7 +112,7 @@ impl Client {
         Ok(access)
     }
 
-    pub fn is_ready(&self, plugin: &str) -> bool {
+    pub(crate) fn is_ready(&self, plugin: &str) -> bool {
         let ClientState::Connected { inbox, .. } = &self.state else {
             return false;
         };
@@ -152,10 +155,6 @@ impl Client {
             }
             ClientState::Unavailable { .. } => None,
         }
-    }
-
-    pub fn poll(&self) -> Vec<Notice> {
-        self.poll_bounded(usize::MAX, usize::MAX)
     }
 
     /// Drains up to `max_notices` live notices and `max_commands` live guest commands,
@@ -271,7 +270,11 @@ impl Client {
         out
     }
 
-    pub fn send(&self, plugin: &str, event: HostEvent<serde_json::Value>) -> Result<(), ErrorCode> {
+    pub(crate) fn send(
+        &self,
+        plugin: &str,
+        event: HostEvent<serde_json::Value>,
+    ) -> Result<(), ErrorCode> {
         if matches!(
             event,
             HostEvent::SourceBrowse { .. }
@@ -310,7 +313,7 @@ impl Client {
         })
     }
 
-    pub fn advance(&self, generation: Generation) -> Result<(), ErrorCode> {
+    pub(crate) fn advance(&self, generation: Generation) -> Result<(), ErrorCode> {
         let (hub, inbox) = self.live()?;
         let owners: Vec<_> = self
             .catalog()
@@ -393,7 +396,7 @@ impl Client {
             .ok_or(ErrorCode::StaleHandle)
     }
 
-    pub fn browse(&self, plugin: &str, target: BrowseTarget) -> Result<(Id, Id), ErrorCode> {
+    pub(crate) fn browse(&self, plugin: &str, target: BrowseTarget) -> Result<(Id, Id), ErrorCode> {
         let (_, inbox) = match &self.state {
             ClientState::Connected { hub, inbox } => (hub, inbox),
             ClientState::Unavailable { .. } => return Err(ErrorCode::StaleHandle),
@@ -430,7 +433,7 @@ impl Client {
         Ok((view, id))
     }
 
-    pub fn next_page(&self, plugin: &str, view: Id, cursor: &str) -> Result<Id, ErrorCode> {
+    pub(crate) fn next_page(&self, plugin: &str, view: Id, cursor: &str) -> Result<Id, ErrorCode> {
         let (_, inbox) = match &self.state {
             ClientState::Connected { hub, inbox } => (hub, inbox),
             ClientState::Unavailable { .. } => return Err(ErrorCode::StaleHandle),
@@ -462,7 +465,7 @@ impl Client {
         Ok(id)
     }
 
-    pub fn resolve(
+    pub(crate) fn resolve(
         &self,
         plugin: &str,
         source: &str,
@@ -487,7 +490,7 @@ impl Client {
         )
     }
 
-    pub fn resolve_url(&self, plugin: &str, url: &str) -> Result<Id, ErrorCode> {
+    pub(crate) fn resolve_url(&self, plugin: &str, url: &str) -> Result<Id, ErrorCode> {
         self.issue(plugin, RequestTarget::Url { url: url.into() }, |id| {
             HostEvent::ResolveUrl {
                 request_id: id,
@@ -537,7 +540,7 @@ impl Client {
         result
     }
 
-    pub fn close_view(&self, plugin: &str, view: Id) -> Result<(), ErrorCode> {
+    pub(crate) fn close_view(&self, plugin: &str, view: Id) -> Result<(), ErrorCode> {
         let (hub, inbox) = match &self.state {
             ClientState::Connected { hub, inbox } => (hub, inbox),
             ClientState::Unavailable { .. } => return Err(ErrorCode::StaleHandle),
@@ -551,7 +554,7 @@ impl Client {
         Ok(())
     }
 
-    pub fn cancel_request(&self, plugin: &str, request: Id) -> Result<(), ErrorCode> {
+    pub(crate) fn cancel_request(&self, plugin: &str, request: Id) -> Result<(), ErrorCode> {
         let (hub, inbox) = match &self.state {
             ClientState::Connected { hub, inbox } => (hub, inbox),
             ClientState::Unavailable { .. } => return Err(ErrorCode::StaleHandle),
@@ -562,20 +565,6 @@ impl Client {
             .requests
             .cancel_request(&binding.installed.installation_id, request)?;
         Self::cancel_notices(hub, inbox, plugin, vec![request]);
-        Ok(())
-    }
-
-    pub fn cancel_plugin_requests(&self, plugin: &str) -> Result<(), ErrorCode> {
-        let (hub, inbox) = match &self.state {
-            ClientState::Connected { hub, inbox } => (hub, inbox),
-            ClientState::Unavailable { .. } => return Err(ErrorCode::StaleHandle),
-        };
-        let binding = self.binding(plugin)?;
-        let ids = inbox
-            .lock()
-            .requests
-            .cancel_owner(&binding.installed.installation_id);
-        Self::cancel_notices(hub, inbox, plugin, ids);
         Ok(())
     }
 
@@ -595,7 +584,7 @@ impl Client {
         hub.0.0.signal();
     }
 
-    pub fn set_enabled(&self, plugin: &str, enabled: bool) -> Result<(), ErrorCode> {
+    pub(crate) fn set_enabled(&self, plugin: &str, enabled: bool) -> Result<(), ErrorCode> {
         super::super::validation::identifier(plugin)?;
         self.queue(Command::Enabled {
             plugin: plugin.into(),
@@ -603,7 +592,7 @@ impl Client {
         })
     }
 
-    pub fn uninstall(&self, plugin: &str, keep_data: bool) -> Result<(), ErrorCode> {
+    pub(crate) fn uninstall(&self, plugin: &str, keep_data: bool) -> Result<(), ErrorCode> {
         let (_, inbox) = self.live()?;
         super::super::validation::identifier(plugin)?;
         self.queue(Command::Uninstall {
@@ -613,17 +602,13 @@ impl Client {
         })
     }
 
-    pub fn reload(&self) -> Result<(), ErrorCode> {
-        self.queue(Command::Reload { disabled: None })
-    }
-
-    pub fn reload_with_disabled(&self, disabled: BTreeSet<String>) -> Result<(), ErrorCode> {
+    pub(crate) fn reload_with_disabled(&self, disabled: BTreeSet<String>) -> Result<(), ErrorCode> {
         self.queue(Command::Reload {
             disabled: Some(disabled),
         })
     }
 
-    pub fn review(&self, path: PathBuf) -> Result<Id, ErrorCode> {
+    pub(crate) fn review(&self, path: PathBuf) -> Result<Id, ErrorCode> {
         let (_, inbox) = self.live()?;
         if path.as_os_str().len() > 32_768 {
             return Err(ErrorCode::QuotaExceeded);
@@ -637,7 +622,7 @@ impl Client {
         Ok(id)
     }
 
-    pub fn approve(
+    pub(crate) fn approve(
         &self,
         id: Id,
         grants: BTreeSet<Capability>,
@@ -652,7 +637,7 @@ impl Client {
         })
     }
 
-    pub fn dismiss_review(&self, id: Id) -> Result<(), ErrorCode> {
+    pub(crate) fn dismiss_review(&self, id: Id) -> Result<(), ErrorCode> {
         let (_, inbox) = self.live()?;
         self.queue(Command::DismissReview {
             window: inbox.id,
@@ -661,7 +646,7 @@ impl Client {
     }
 
     /// Called by the host consent sheet, never by a plugin-defined widget.
-    pub fn confirm_origin(
+    pub(crate) fn confirm_origin(
         &self,
         id: Id,
         allow: bool,
@@ -684,7 +669,7 @@ impl Client {
         hub.0.0.enqueue(command)
     }
 
-    pub fn shutdown(&self) {
+    pub(crate) fn shutdown(&self) {
         match &self.state {
             ClientState::Connected { hub, inbox } => {
                 let first_close = {
@@ -714,5 +699,20 @@ impl Client {
 impl Drop for Client {
     fn drop(&mut self) {
         self.shutdown();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Client, Command, ErrorCode, Notice};
+
+    impl Client {
+        pub(crate) fn poll(&self) -> Vec<Notice> {
+            self.poll_bounded(usize::MAX, usize::MAX)
+        }
+
+        pub(crate) fn reload(&self) -> Result<(), ErrorCode> {
+            self.queue(Command::Reload { disabled: None })
+        }
     }
 }

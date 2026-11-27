@@ -9,7 +9,11 @@ use iris_base::net::http_client::HttpCancel;
 use iris_core::logging::{self, EventLevel};
 use std::sync::Arc;
 impl Control {
-    pub fn advance_window(&mut self, window: Id, generation: Generation) -> Result<(), ErrorCode> {
+    pub(crate) fn advance_window(
+        &mut self,
+        window: Id,
+        generation: Generation,
+    ) -> Result<(), ErrorCode> {
         self.live()?;
         let (_, state) = self
             .window
@@ -38,7 +42,7 @@ impl Control {
         state.generation = generation;
         Ok(())
     }
-    pub fn close_window(&mut self, window: Id) -> Result<(), ErrorCode> {
+    pub(crate) fn close_window(&mut self, window: Id) -> Result<(), ErrorCode> {
         if self.window.as_ref().is_none_or(|(id, _)| *id != window) {
             return Err(ErrorCode::StaleHandle);
         }
@@ -51,11 +55,15 @@ impl Control {
         }
         Ok(())
     }
-    pub fn send(&self, window: Id, event: HostEvent<serde_json::Value>) -> Result<(), ErrorCode> {
+    pub(crate) fn send(
+        &self,
+        window: Id,
+        event: HostEvent<serde_json::Value>,
+    ) -> Result<(), ErrorCode> {
         self.send_scoped(window, event, None)
     }
     /// SourceRequests owns this cancellation token independently of playback.
-    pub fn send_cancellable(
+    pub(crate) fn send_cancellable(
         &self,
         window: Id,
         event: HostEvent<serde_json::Value>,
@@ -91,7 +99,7 @@ impl Control {
             actor.send_window(window, state.generation, bytes)
         }
     }
-    pub fn status(&self) -> Status {
+    pub(crate) fn status(&self) -> Status {
         if let Some(error) = self.quarantined {
             return Status::Failed(error);
         }
@@ -109,7 +117,7 @@ impl Control {
                 status => status,
             })
     }
-    pub fn poll(&mut self) -> Option<Update> {
+    pub(crate) fn poll(&mut self) -> Option<Update> {
         if self.stopped {
             return None;
         }
@@ -162,7 +170,7 @@ impl Control {
         self.quarantined = Some(error);
         self.stop();
     }
-    pub fn stop(&mut self) {
+    pub(crate) fn stop(&mut self) {
         if self.stopped {
             return;
         }
@@ -178,7 +186,7 @@ impl Control {
         self.sources.clear();
         (self.setup.wake)();
     }
-    pub fn is_quiescent(&self) -> bool {
+    pub(crate) fn is_quiescent(&self) -> bool {
         self.actor.as_ref().is_none_or(Actor::is_quiescent) && self.services.is_quiescent()
     }
 }

@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 /// Streaming file hash. The caller holds a current-media authorization and the
 /// FileHash/HostBytes reservations through completion; progress is coalesced.
-pub fn hash_media(
+pub(crate) fn hash_media(
     file: &PinnedFile,
     algorithm: FileHash,
     cancel: &HttpCancel,

@@ -2,6 +2,34 @@ use super::*;
 use crate::url_resolver::normalize_url;
 use iris_api::v2::{Capability, NetworkDeclaration};
 
+impl OriginStore {
+    pub(crate) fn revoke(
+        &self,
+        grant: &NetworkGrant,
+        origin: &str,
+        cancel: &HttpCancel,
+    ) -> Result<(), ErrorCode> {
+        self.check(grant, cancel)?;
+        let origin = parse_consent_origin_url(origin)?.0.display();
+        let _lock = fs_util::lock_file_with_timeout(
+            &self.path.with_extension("lock"),
+            Duration::from_millis(250),
+        )
+        .map_err(|_| ErrorCode::Backpressure)?;
+        let mut record = self.read()?;
+        record.entries.remove(&origin);
+        self.check(grant, cancel)?;
+        let encoded = bounded_json::encode(&record, MAX_RECORD).map_err(json_error)?;
+        fs_util::atomic_write_private(&self.path, &encoded).map_err(|_| ErrorCode::IoError)?;
+        if let Ok(kind) = consent_transport(grant, &origin)
+            && let Ok(found) = grant.lookup_origin(&origin, kind)
+        {
+            grant.revoke_origin(found.origin_grant)?;
+        }
+        Ok(())
+    }
+}
+
 struct Fixture {
     root: PathBuf,
     store: OriginStore,

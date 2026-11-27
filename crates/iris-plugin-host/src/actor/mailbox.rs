@@ -48,7 +48,7 @@ pub(super) enum Message {
     },
 }
 impl Message {
-    pub fn request_cancel(&self) -> Option<HttpCancel> {
+    pub(crate) fn request_cancel(&self) -> Option<HttpCancel> {
         match self {
             Self::Event { request_cancel, .. } | Self::Completed { request_cancel, .. } => {
                 request_cancel.clone()
@@ -56,7 +56,7 @@ impl Message {
             _ => None,
         }
     }
-    pub fn window(&self) -> Option<Id> {
+    pub(crate) fn window(&self) -> Option<Id> {
         match self {
             Self::Event { window, .. } | Self::Completed { window, .. } => *window,
             _ => None,
@@ -126,7 +126,7 @@ pub(super) struct Mailbox {
 }
 
 impl Mailbox {
-    pub fn new(
+    pub(crate) fn new(
         owner: String,
         role: Role,
         generation: Generation,
@@ -167,17 +167,17 @@ impl Mailbox {
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
-    pub fn status(&self) -> Status {
+    pub(crate) fn status(&self) -> Status {
         self.lock().status
     }
-    pub fn set_status(&self, status: Status) {
+    pub(crate) fn set_status(&self, status: Status) {
         self.lock().status = status;
         (self.wake)();
     }
-    pub fn has_read(&self, id: Id) -> bool {
+    pub(crate) fn has_read(&self, id: Id) -> bool {
         self.lock().reads.contains_key(&id.0)
     }
-    pub fn deliver_read(&self, id: Id) -> bool {
+    pub(crate) fn deliver_read(&self, id: Id) -> bool {
         let mut state = self.lock();
         let Some(read) = state.reads.get_mut(&id.0) else {
             return false;
@@ -185,7 +185,11 @@ impl Mailbox {
         read.delivered = true;
         true
     }
-    pub fn io_context(&self, read: Option<Id>, window: Option<Id>) -> Result<IoContext, ErrorCode> {
+    pub(crate) fn io_context(
+        &self,
+        read: Option<Id>,
+        window: Option<Id>,
+    ) -> Result<IoContext, ErrorCode> {
         let state = self.lock();
         if self.cancel.is_cancelled() {
             return Err(ErrorCode::Cancelled);
@@ -222,7 +226,7 @@ impl Mailbox {
         })
     }
 
-    pub fn send(
+    pub(crate) fn send(
         &self,
         bytes: Vec<u8>,
         attachment: Option<(Id, DetachedBlob)>,
@@ -255,7 +259,7 @@ impl Mailbox {
         self.changed.notify_one();
         Ok(())
     }
-    pub fn refresh_context(
+    pub(crate) fn refresh_context(
         &self,
         expected: Generation,
         generation: Generation,
@@ -299,7 +303,7 @@ impl Mailbox {
         self.changed.notify_one();
         Ok(())
     }
-    pub fn next(&self) -> Option<Message> {
+    pub(crate) fn next(&self) -> Option<Message> {
         let mut state = self.lock();
         loop {
             if self.cancel.is_cancelled() {
@@ -329,7 +333,7 @@ impl Mailbox {
             state = self.changed.wait(state).unwrap_or_else(|e| e.into_inner());
         }
     }
-    pub fn complete(&self, message: Message) {
+    pub(crate) fn complete(&self, message: Message) {
         let mut state = self.lock();
         if self.cancel.is_cancelled() {
             return;
@@ -339,7 +343,7 @@ impl Mailbox {
         state.completions.push_back(message);
         self.changed.notify_one();
     }
-    pub fn advance(&self, generation: Generation) -> Result<(), ErrorCode> {
+    pub(crate) fn advance(&self, generation: Generation) -> Result<(), ErrorCode> {
         let (cancel, reads) = {
             let mut state = self.lock();
             if self.cancel.is_cancelled() {
@@ -377,7 +381,7 @@ impl Mailbox {
         self.changed.notify_one();
         Ok(())
     }
-    pub fn stop(&self) {
+    pub(crate) fn stop(&self) {
         if !self.cancel.cancel() {
             return;
         }
@@ -404,7 +408,7 @@ impl Mailbox {
         self.changed.notify_one();
         (self.wake)();
     }
-    pub fn read(
+    pub(crate) fn read(
         self: &Arc<Self>,
         resource: String,
         offset: u64,
@@ -482,7 +486,12 @@ impl Mailbox {
         self.changed.notify_one();
         Ok(ReadTicket::new(request, self.clone(), slot))
     }
-    pub fn reply(&self, request: u64, blob: Arc<Blob>, eof: bool) -> Result<usize, ErrorCode> {
+    pub(crate) fn reply(
+        &self,
+        request: u64,
+        blob: Arc<Blob>,
+        eof: bool,
+    ) -> Result<usize, ErrorCode> {
         let mut state = self.lock();
         let read = state.reads.get(&request).ok_or(ErrorCode::StaleHandle)?;
         let count = blob.bytes.len();
@@ -512,7 +521,7 @@ impl Mailbox {
         }
         Ok(count)
     }
-    pub fn fail(&self, request: u64, error: ErrorCode) -> Result<(), ErrorCode> {
+    pub(crate) fn fail(&self, request: u64, error: ErrorCode) -> Result<(), ErrorCode> {
         let read = self
             .lock()
             .reads
@@ -524,7 +533,7 @@ impl Mailbox {
         }
         Ok(())
     }
-    pub fn cancel_read(&self, request: u64) {
+    pub(crate) fn cancel_read(&self, request: u64) {
         let read = self.lock().reads.remove(&request);
         if let Some(read) = read {
             read.cancel.cancel();
@@ -538,7 +547,7 @@ impl Mailbox {
         }
     }
 
-    pub fn validate_commands(&self, commands: &[HostCommand]) -> Result<(), ErrorCode> {
+    pub(crate) fn validate_commands(&self, commands: &[HostCommand]) -> Result<(), ErrorCode> {
         if self.role != Role::Control {
             return Err(ErrorCode::Denied);
         }

@@ -18,7 +18,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-pub struct FileSetup {
+pub(crate) struct FileSetup {
     pub network: NetworkGrant,
     pub ledger: Ledger,
     pub capabilities: BTreeSet<Capability>,
@@ -63,24 +63,9 @@ struct Inner {
 }
 
 #[derive(Clone)]
-pub struct FileExecutor(Arc<Inner>);
+pub(crate) struct FileExecutor(Arc<Inner>);
 
 impl FileExecutor {
-    /// Lightweight constructor; `TempRoot` is created lazily on the first artifact write.
-    pub fn new(setup: FileSetup) -> Result<Self, ErrorCode> {
-        let cleaner = ArtifactCleaner::new();
-        let queue = cleaner.queue();
-        Ok(Self::from_shared(Arc::new(Shared {
-            network: setup.network,
-            ledger: setup.ledger,
-            capabilities: setup.capabilities,
-            temp_dir: setup.temporary_directory,
-            _standalone_cleaner: Some(cleaner),
-            cleaner: queue,
-            root: Mutex::new(None),
-        })))
-    }
-
     pub(crate) fn with_cleaner(setup: FileSetup, cleaner: CleanerQueue) -> Result<Self, ErrorCode> {
         Ok(Self::from_shared(Arc::new(Shared {
             network: setup.network,
@@ -141,7 +126,7 @@ impl FileExecutor {
 
     /// The native player supplies its current local path; it is never serialized
     /// to the guest. Opening, identity checks and hashing run on the I/O pool.
-    pub fn set_current_path(
+    pub(crate) fn set_current_path(
         &self,
         media: Id,
         generation: Generation,
@@ -192,7 +177,7 @@ impl FileExecutor {
         Ok(entry.artifact.clone())
     }
 
-    pub fn approved_artifact(
+    pub(crate) fn approved_artifact(
         &self,
         owner: &str,
         id: Id,
@@ -377,5 +362,27 @@ impl Executor for FileExecutor {
 
     fn is_quiescent(&self) -> bool {
         self.0.activity.is_idle()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ArtifactCleaner, ErrorCode, FileExecutor, FileSetup, Mutex, Shared};
+    use std::sync::Arc;
+
+    impl FileExecutor {
+        pub(crate) fn new(setup: FileSetup) -> Result<Self, ErrorCode> {
+            let cleaner = ArtifactCleaner::new();
+            let queue = cleaner.queue();
+            Ok(Self::from_shared(Arc::new(Shared {
+                network: setup.network,
+                ledger: setup.ledger,
+                capabilities: setup.capabilities,
+                temp_dir: setup.temporary_directory,
+                _standalone_cleaner: Some(cleaner),
+                cleaner: queue,
+                root: Mutex::new(None),
+            })))
+        }
     }
 }

@@ -55,14 +55,14 @@ pub struct AcceptedPage {
     pub page: SourcePage,
     _lease: Reservation,
 }
-pub struct SourceRequests {
+pub(crate) struct SourceRequests {
     ledger: Ledger,
     pending: BTreeMap<Id, Arc<RequestTicket>>,
     active: BTreeMap<Id, Weak<RequestTicket>>,
     views: BTreeMap<Id, View>,
 }
 impl SourceRequests {
-    pub fn new(ledger: Ledger) -> Self {
+    pub(crate) fn new(ledger: Ledger) -> Self {
         Self {
             ledger,
             pending: BTreeMap::new(),
@@ -72,7 +72,7 @@ impl SourceRequests {
     }
     /// One table belongs to a host window. Source membership is checked by the
     /// manager before this method; plugins never allocate their own request IDs.
-    pub fn open_view(
+    pub(crate) fn open_view(
         &mut self,
         owner: &str,
         generation: Id,
@@ -117,14 +117,14 @@ impl SourceRequests {
         );
         Ok((view, request))
     }
-    pub fn target(&self, owner: &str, view: Id) -> Result<&BrowseTarget, ErrorCode> {
+    pub(crate) fn target(&self, owner: &str, view: Id) -> Result<&BrowseTarget, ErrorCode> {
         let view = self.views.get(&view).ok_or(ErrorCode::StaleHandle)?;
         if view.owner != owner {
             return Err(ErrorCode::Denied);
         }
         Ok(&view.target)
     }
-    pub fn next_page(
+    pub(crate) fn next_page(
         &mut self,
         owner: &str,
         view: Id,
@@ -151,7 +151,7 @@ impl SourceRequests {
         self.views.get_mut(&view).unwrap().pending = Some(request.id);
         Ok(request)
     }
-    pub fn issue(
+    pub(crate) fn issue(
         &mut self,
         owner: &str,
         generation: Id,
@@ -217,7 +217,7 @@ impl SourceRequests {
         }
         Ok(request)
     }
-    pub fn accept_page(
+    pub(crate) fn accept_page(
         &mut self,
         owner: &str,
         id: Id,
@@ -284,7 +284,7 @@ impl SourceRequests {
     }
     /// The prepared playback job keeps the returned ticket through its
     /// actual terminal state; removing an index does not release a worker's quota.
-    pub fn take(
+    pub(crate) fn take(
         &mut self,
         owner: &str,
         id: Id,
@@ -296,12 +296,12 @@ impl SourceRequests {
         }
         Ok(self.pending.remove(&id).unwrap())
     }
-    pub fn fail(&mut self, owner: &str, id: Id, generation: Id) -> Result<(), ErrorCode> {
+    pub(crate) fn fail(&mut self, owner: &str, id: Id, generation: Id) -> Result<(), ErrorCode> {
         self.checked(owner, id, generation)?;
         self.cancel(id);
         Ok(())
     }
-    pub fn cancel_request(&mut self, owner: &str, id: Id) -> Result<(), ErrorCode> {
+    pub(crate) fn cancel_request(&mut self, owner: &str, id: Id) -> Result<(), ErrorCode> {
         let request = self
             .active
             .get(&id)
@@ -325,7 +325,7 @@ impl SourceRequests {
             }
         }
     }
-    pub fn close_view(&mut self, owner: &str, view: Id) -> Result<Vec<Id>, ErrorCode> {
+    pub(crate) fn close_view(&mut self, owner: &str, view: Id) -> Result<Vec<Id>, ErrorCode> {
         self.target(owner, view)?;
         let ids: Vec<_> = self
             .active
@@ -342,7 +342,7 @@ impl SourceRequests {
         self.views.remove(&view);
         Ok(ids)
     }
-    pub fn cancel_resolves(&mut self, owner: &str) -> Vec<Id> {
+    pub(crate) fn cancel_resolves(&mut self, owner: &str) -> Vec<Id> {
         let ids: Vec<_> = self
             .active
             .iter()
@@ -363,7 +363,7 @@ impl SourceRequests {
         }
         ids
     }
-    pub fn cancel_owner(&mut self, owner: &str) -> Vec<Id> {
+    pub(crate) fn cancel_owner(&mut self, owner: &str) -> Vec<Id> {
         let ids: Vec<_> = self
             .active
             .iter()

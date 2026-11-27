@@ -46,6 +46,8 @@ def main():
     env = configure_mpv_env(dict(os.environ))
     env["IRIS_V2_C_GUEST"] = str(target / "contract-c.wasm")
     env["IRIS_V2_RUST_GUEST"] = str(target / "rust/wasm32-unknown-unknown/release/iris_v2_contract_guest.wasm")
+    subprocess.run(["cargo", "test", "--locked", "-p", "iris-plugin-host", "--lib",
+                    "tests::guest_contracts::", "--", "--ignored", "--nocapture"], cwd=ROOT, env=env, check=True)
     subprocess.run(["cargo", "test", "--locked", "-p", "iris-plugin-host", "--test", "plugin_v2_contracts",
                     "--test", "plugin_v2_read_memory",
                     "--", "--include-ignored", "--nocapture"], cwd=ROOT, env=env, check=True)

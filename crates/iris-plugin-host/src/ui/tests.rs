@@ -26,6 +26,12 @@ use std::{
 
 struct TestDir(PathBuf);
 
+impl WindowSession {
+    pub(crate) fn client(&self) -> &crate::hub::Client {
+        &self.client
+    }
+}
+
 impl TestDir {
     fn new(label: &str) -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(1);
@@ -381,6 +387,7 @@ fn window_session_registers_and_clears_active_stream_on_open_failure_switch_stop
             attachments: Vec::new(),
             variants: Vec::new(),
             active_variant: None,
+            notice_lease: None,
         }
     };
 
@@ -504,7 +511,6 @@ fn attachment_preparation_enforces_format_owner_quota_and_holds_ledger_until_ext
     .unwrap();
     let access = WindowAccess {
         instance: Id(1),
-        window: Id(2),
         generation: Generation::default(),
         owner: "enhance-test".into(),
         capabilities: caps,
@@ -517,7 +523,7 @@ fn attachment_preparation_enforces_format_owner_quota_and_holds_ledger_until_ext
     let run = |task, blobs: &BTreeMap<u64, Arc<Blob>>| {
         let context = TaskContext {
             instance_id: access.instance,
-            window: Some(access.window),
+            window: Some(Id(2)),
             owner: access.owner.clone(),
             role: Role::Control,
             generation: access.generation,
@@ -695,6 +701,7 @@ fn monitor_lut_and_scoped_stream_ports_hold_ledger_until_consumer_releases_handl
         }],
         variants: Vec::new(),
         active_variant: None,
+        notice_lease: None,
     });
     let scoped: Arc<ScopedPlayback> = playback.clone().into_scoped();
     assert_eq!(scoped.title, "PortClip");

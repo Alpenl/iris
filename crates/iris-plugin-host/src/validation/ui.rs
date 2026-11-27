@@ -3,7 +3,7 @@ use iris_api::v2::ErrorCode;
 use iris_api::{OverlayNode, UiThemeSpec, Widget};
 use std::collections::BTreeSet;
 
-pub fn theme(value: &UiThemeSpec) -> Result<(), ErrorCode> {
+pub(crate) fn theme(value: &UiThemeSpec) -> Result<(), ErrorCode> {
     if let Some(name) = &value.name {
         text(name, 128)?;
     }
@@ -42,7 +42,7 @@ pub fn theme(value: &UiThemeSpec) -> Result<(), ErrorCode> {
     }
     Ok(())
 }
-pub fn widgets(values: &[Widget]) -> Result<(), ErrorCode> {
+pub(crate) fn widgets(values: &[Widget]) -> Result<(), ErrorCode> {
     if values.len() > 256 {
         return Err(ErrorCode::QuotaExceeded);
     }
@@ -163,10 +163,10 @@ fn numbers(values: &[f32], min: f64, max: f64) -> Result<(), ErrorCode> {
     }
     Ok(())
 }
-pub fn overlay(nodes: &[OverlayNode], interactive: bool) -> Result<(), ErrorCode> {
+pub(crate) fn overlay(nodes: &[OverlayNode], interactive: bool) -> Result<(), ErrorCode> {
     overlay_with_limit(nodes, interactive, 512)
 }
-pub fn overlay_with_limit(
+pub(crate) fn overlay_with_limit(
     nodes: &[OverlayNode],
     interactive: bool,
     limit: usize,

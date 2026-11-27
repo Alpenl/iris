@@ -57,7 +57,7 @@ pub(super) enum Work {
     },
 }
 impl Worker {
-    pub fn reserve_job_lease(&self) -> Result<Reservation, ErrorCode> {
+    pub(crate) fn reserve_job_lease(&self) -> Result<Reservation, ErrorCode> {
         if self.jobs >= 8 {
             return Err(ErrorCode::Backpressure);
         }
@@ -65,7 +65,7 @@ impl Worker {
             .ledger
             .reserve("host-coordinator", &[(Resource::HostBytes, 2 << 20)])
     }
-    pub fn submit_reserved(
+    pub(crate) fn submit_reserved(
         &mut self,
         compile: bool,
         owner: &str,
@@ -94,7 +94,7 @@ impl Worker {
         self.jobs += 1;
         Ok(())
     }
-    pub fn submit(
+    pub(crate) fn submit(
         &mut self,
         compile: bool,
         owner: &str,
@@ -105,7 +105,7 @@ impl Worker {
         let lease = self.reserve_job_lease()?;
         self.submit_reserved(compile, owner, lease, job)
     }
-    pub fn start_load(&mut self, id: &str) {
+    pub(crate) fn start_load(&mut self, id: &str) {
         let Ok(installed) = self.plugins[id].record.clone() else {
             return;
         };
@@ -133,7 +133,7 @@ impl Worker {
             self.dirty = true;
         }
     }
-    pub fn prepare_window(&mut self, plugin: &str, window: Id) {
+    pub(crate) fn prepare_window(&mut self, plugin: &str, window: Id) {
         let state = &self.plugins[plugin];
         if state.attached == Some(window) || state.preparing == Some(window) {
             return;
@@ -185,7 +185,7 @@ impl Worker {
             self.plugins.get_mut(plugin).unwrap().preparing = Some(window);
         }
     }
-    pub fn completed(&mut self, work: Work) {
+    pub(crate) fn completed(&mut self, work: Work) {
         match work {
             Work::OriginReviewed { id, result } => self.origin_reviewed(id, result.map(|r| *r)),
             Work::OriginApplied { id, result } => self.origin_applied(id, result),
@@ -438,7 +438,7 @@ impl Worker {
         self.surface_official_reviews();
         self.dirty = true;
     }
-    pub fn surface_official_reviews(&mut self) {
+    pub(crate) fn surface_official_reviews(&mut self) {
         let Some((window, inbox)) = self.window.as_ref().map(|w| (w.inbox.id, w.inbox.clone()))
         else {
             return;
@@ -493,7 +493,7 @@ impl Worker {
         let Some(state) = self.plugins.get_mut(id) else {
             return;
         };
-        if !state.loading.as_ref().is_some_and(|(t, _)| *t == ticket) {
+        if state.loading.as_ref().is_none_or(|(t, _)| *t != ticket) {
             return;
         }
         let (_, cancel) = state.loading.take().unwrap();
@@ -543,7 +543,7 @@ impl Worker {
         }
         self.dirty = true;
     }
-    pub fn review(&mut self, window: Id, id: Id, path: PathBuf) -> Result<(), ErrorCode> {
+    pub(crate) fn review(&mut self, window: Id, id: Id, path: PathBuf) -> Result<(), ErrorCode> {
         if self.review_slots.len() >= 2 {
             return Err(ErrorCode::Backpressure);
         }

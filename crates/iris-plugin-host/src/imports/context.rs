@@ -12,14 +12,14 @@ use std::{
 };
 use wasmtime::StoreLimits;
 
-pub struct Blob {
+pub(crate) struct Blob {
     pub bytes: Vec<u8>,
     pub(crate) owner: String,
     _reservation: Reservation,
 }
 
 impl Blob {
-    pub fn new(ledger: &Ledger, owner: &str, bytes: Vec<u8>) -> Result<Self, ErrorCode> {
+    pub(crate) fn new(ledger: &Ledger, owner: &str, bytes: Vec<u8>) -> Result<Self, ErrorCode> {
         if bytes.len() > CHUNK_LIMIT {
             return Err(ErrorCode::QuotaExceeded);
         }
@@ -32,7 +32,7 @@ impl Blob {
     }
 }
 
-pub struct DetachedBlob {
+pub(crate) struct DetachedBlob {
     pub data: Arc<Blob>,
     pub(crate) _handle: Reservation,
 }
@@ -81,7 +81,7 @@ pub(crate) struct State {
 }
 
 impl State {
-    pub fn check_live(&self) -> Result<(), ErrorCode> {
+    pub(crate) fn check_live(&self) -> Result<(), ErrorCode> {
         match self.cancel.check(Some(self.deadline)) {
             Ok(_) => Ok(()),
             Err(WaitError::Cancelled) => Err(ErrorCode::Cancelled),

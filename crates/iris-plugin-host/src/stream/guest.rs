@@ -16,14 +16,14 @@ struct State {
     generation: Generation,
     expires: Option<WireU64>,
 }
-pub struct StreamStore {
+pub(crate) struct StreamStore {
     state: Mutex<State>,
     session: Id,
     origins: BTreeSet<Id>,
     transports: BTreeSet<Capability>,
 }
 impl StreamStore {
-    pub fn spawn(
+    pub(crate) fn spawn(
         mut spawn: Spawn,
         session: Id,
         context: &StreamContext,
@@ -64,7 +64,7 @@ impl StreamStore {
             transports,
         })
     }
-    pub fn refresh(
+    pub(crate) fn refresh(
         &self,
         expected: Id,
         context: &StreamContext,
@@ -98,7 +98,7 @@ impl StreamStore {
         state.expires = context.expires_unix_ms;
         Ok(())
     }
-    pub fn advance_seek(&self, seek: Id) -> Result<(), ErrorCode> {
+    pub(crate) fn advance_seek(&self, seek: Id) -> Result<(), ErrorCode> {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let generation = Generation {
             seek,
@@ -108,27 +108,20 @@ impl StreamStore {
         state.generation = generation;
         Ok(())
     }
-    pub fn generation(&self) -> Generation {
+    pub(crate) fn generation(&self) -> Generation {
         self.state
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .generation
     }
-    pub fn stop(&self) {
+    pub(crate) fn stop(&self) {
         self.state
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .actor
             .stop();
     }
-    pub fn is_quiescent(&self) -> bool {
-        self.state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .actor
-            .is_quiescent()
-    }
-    pub fn reader(
+    pub(crate) fn reader(
         self: &Arc<Self>,
         resource: String,
         size: Option<u64>,
@@ -221,4 +214,19 @@ fn validate_context(context: &StreamContext) -> Result<(), ErrorCode> {
         return Err(ErrorCode::InvalidArgument);
     }
     check_expiry(context.expires_unix_ms)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::StreamStore;
+
+    impl StreamStore {
+        pub(crate) fn is_quiescent(&self) -> bool {
+            self.state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .actor
+                .is_quiescent()
+        }
+    }
 }

@@ -20,7 +20,7 @@ pub(super) struct Ticket {
     id: Id,
 }
 impl Serial {
-    pub fn enter(self: &Arc<Self>) -> Result<Ticket, ErrorCode> {
+    pub(crate) fn enter(self: &Arc<Self>) -> Result<Ticket, ErrorCode> {
         let mut queue = self.queue.lock().unwrap_or_else(|e| e.into_inner());
         if queue.len() >= 8 {
             return Err(ErrorCode::Backpressure);
@@ -34,7 +34,7 @@ impl Serial {
     }
 }
 impl Ticket {
-    pub fn wait(&self, cancel: &HttpCancel) -> Result<(), ErrorCode> {
+    pub(crate) fn wait(&self, cancel: &HttpCancel) -> Result<(), ErrorCode> {
         if cancel.is_cancelled() {
             return Err(ErrorCode::Cancelled);
         }

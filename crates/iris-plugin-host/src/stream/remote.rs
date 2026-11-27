@@ -14,7 +14,6 @@ use crate::{
     },
 };
 pub(crate) use document::Fetched;
-pub use document::Thumbnail;
 use iris_api::v2::{
     CHUNK_LIMIT, ErrorCode,
     stream::{ByteIdentity, RemoteResource},
@@ -29,14 +28,14 @@ use std::{
 };
 
 #[derive(Clone)]
-pub struct RemoteFactory {
+pub(crate) struct RemoteFactory {
     grant: NetworkGrant,
     ledger: Ledger,
     cookies: Arc<CookieJar>,
     activity: Activity,
 }
 impl RemoteFactory {
-    pub fn new(grant: NetworkGrant, ledger: Ledger) -> Result<Self, ErrorCode> {
+    pub(crate) fn new(grant: NetworkGrant, ledger: Ledger) -> Result<Self, ErrorCode> {
         let cookies = Arc::new(CookieJar::new(grant.owner(), &ledger)?);
         Ok(Self {
             grant,
@@ -45,16 +44,13 @@ impl RemoteFactory {
             activity: Activity::default(),
         })
     }
-    pub fn owner(&self) -> &str {
+    pub(crate) fn owner(&self) -> &str {
         self.grant.owner()
     }
-    pub fn ledger(&self) -> &Ledger {
+    pub(crate) fn ledger(&self) -> &Ledger {
         &self.ledger
     }
-    pub fn is_quiescent(&self) -> bool {
-        self.activity.is_idle()
-    }
-    pub fn reader(
+    pub(crate) fn reader(
         &self,
         resource: &RemoteResource,
         size: Option<u64>,
@@ -116,7 +112,7 @@ impl RemoteFactory {
             _memory: memory,
         }))
     }
-    pub fn direct(
+    pub(crate) fn direct(
         &self,
         primary: &RemoteResource,
         fallback: &[RemoteResource],
@@ -298,7 +294,7 @@ impl RemoteTarget {
         Ok(())
     }
 }
-pub struct RemoteReader {
+pub(crate) struct RemoteReader {
     target: Arc<RemoteTarget>,
     _memory: Reservation,
 }
@@ -615,4 +611,15 @@ fn content_range(value: &str) -> Result<(u64, u64, Option<u64>), ErrorCode> {
             .ok_or(ErrorCode::RangeInvalid)?,
         total,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RemoteFactory;
+
+    impl RemoteFactory {
+        pub(crate) fn is_quiescent(&self) -> bool {
+            self.activity.is_idle()
+        }
+    }
 }

@@ -1,20 +1,42 @@
-//! Default-enabled pure-WAT ABI v2 contract tests (no external Zig/wasm32 toolchain needed).
+//! Default-enabled pure-WAT white-box ABI v2 invariants exercising internal
+//! `Instance`, `Control`, and `StreamStore` state machines directly.
 
-use super::*;
-use iris_api::v2::{HostEvent, Id, MESSAGE_LIMIT, NetworkDeclaration};
+use crate::{
+    actor::{Executor, Operation, Spawn, Status, TaskContext},
+    engine::RuntimeEngine,
+    installation::{Approval, Installed, Installer},
+    instance::{Blob, Instance, InstanceConfig},
+    ledger::{Ledger, Resource},
+    package::{Package, Provenance},
+    pool::IoPool,
+    runtime::Control,
+    services::{Resources, Setup},
+    stream::{guest::StreamStore, session::new_session_id},
+};
+use iris_api::v2::{
+    Capability, ErrorCode, Generation, HostCommand, HostEvent, Id, MESSAGE_LIMIT,
+    NetworkDeclaration, Role, stream::StreamContext, task::Task,
+};
+use iris_base::net::http_client::HttpCancel;
+use iris_base::rt::CancelToken;
 use iris_core::logging::{self, TelemetryEvent, TelemetrySink};
 use iris_core::vault::CredentialVault;
-use iris_plugin_host::{
-    installation::{Approval, Installed, Installer},
-    package::{Package, Provenance},
-    runtime::{Control, Resources, Setup},
-};
 use std::{
+    collections::{BTreeMap, BTreeSet},
     io::{Cursor, Write},
     path::PathBuf,
-    sync::Mutex,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
 use zip::{ZipWriter, write::SimpleFileOptions};
+
+fn until(mut condition: impl FnMut() -> bool, timeout: Duration) {
+    let end = Instant::now() + timeout;
+    while !condition() {
+        assert!(Instant::now() < end, "condition timed out");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
 
 fn wat_reply_wasm(reply_json: &str, init_empty: bool) -> Vec<u8> {
     let empty = r#"{"ok":[]}"#;
@@ -165,7 +187,6 @@ fn wat_abi_v2_handshake_and_return_pointer_bounds() {
         })
     };
 
-    // Wrong ABI version must be rejected during handshake.
     let bad_abi = r#"(module
         (memory (export "memory") 1 2)
         (func (export "iris_abi_version") (result i32) i32.const 1)
@@ -174,7 +195,6 @@ fn wat_abi_v2_handshake_and_return_pointer_bounds() {
         (func (export "iris_on_event") (param i32 i32) (result i64) i64.const 0))"#;
     assert!(new_inst(bad_abi).is_err());
 
-    // Missing required export must be rejected during handshake.
     let missing_export = r#"(module
         (memory (export "memory") 1 2)
         (func (export "iris_abi_version") (result i32) i32.const 2)
@@ -182,7 +202,6 @@ fn wat_abi_v2_handshake_and_return_pointer_bounds() {
         (func (export "iris_dealloc") (param i32 i32)))"#;
     assert!(new_inst(missing_export).is_err());
 
-    // Out-of-bounds return pointer must fail and poison the instance.
     let oob_ptr = (999_999_u64 << 32) | 16_u64;
     let oob_wat = format!(
         r#"(module
@@ -196,7 +215,6 @@ fn wat_abi_v2_handshake_and_return_pointer_bounds() {
     assert!(inst.on_event(b"{}").is_err());
     assert!(matches!(inst.on_event(b"{}"), Err(ErrorCode::BadState)));
 
-    // Payload exceeding MESSAGE_LIMIT must fail and poison the instance.
     let huge_len = (MESSAGE_LIMIT as u64) + 1;
     let huge_packed = (1024_u64 << 32) | huge_len;
     let huge_wat = format!(
@@ -214,7 +232,6 @@ fn wat_abi_v2_handshake_and_return_pointer_bounds() {
 
 #[test]
 fn wat_capability_denial_and_unprivileged_host_log() {
-    // 1. ShowToast without Notifications grant must be denied and quarantine the control actor.
     let denied_fixture = WatFixture::new(
         "wat.cap.denied",
         r#"{"ok":[{"command":"show_toast","message":"unauthorized"}]}"#,
@@ -232,7 +249,6 @@ fn wat_capability_denial_and_unprivileged_host_log() {
     denied_ctrl.stop();
     until(|| denied_ctrl.is_quiescent(), Duration::from_secs(4));
 
-    // 2. HostCommand::Log requires no capability and is permitted as a global Init command.
     let log_fixture = WatFixture::new(
         "wat.cap.log",
         r#"{"ok":[{"command":"log","level":"warn","message":"init ok"}]}"#,
@@ -320,7 +336,6 @@ fn wat_pixel_grid_and_view_timer_validation_boundaries() {
     ok_ctrl.stop();
     until(|| ok_ctrl.is_quiescent(), Duration::from_secs(4));
 
-    // Invalid ViewTimer (< 1000ms, > 300_000ms) and malformed PixelGrid must fail with InvalidArgument.
     let invalid_cases = [
         encode_modal(PluginModal {
             id: "bad_fast".into(),
@@ -399,7 +414,6 @@ fn wat_pixel_grid_and_view_timer_validation_boundaries() {
         );
         let mut ctrl = fixture.load();
         let win = Control::new_window_id().unwrap();
-        // Send on a window if Init did not already trigger failure, or let Init fail directly.
         until(
             || {
                 let _ = ctrl.poll();
@@ -485,7 +499,6 @@ fn wat_host_log_redacts_secrets_and_enforces_rate_limit() {
     let win = Control::new_window_id().unwrap();
     fixture.open_window(&mut ctrl, win);
 
-    // Burst 28 rapid commands inside one 1-second rate-limit window (Init already used 1 slot).
     for _ in 0..28 {
         ctrl.send(
             win,
@@ -550,187 +563,7 @@ const WAT_FIND_FN: &str = r#"(func $find (param $hp i32) (param $hl i32) (param 
             (i32.const -1))"#;
 
 #[test]
-fn wat_ws_request_origin_returns_notice_without_quarantining_plugin() {
-    use iris_plugin_host::hub::{Config, Hub, Notice, PluginStatus};
-
-    let empty = r#"{"ok":[]}"#;
-    let trigger = r#""connect""#;
-    let esc = |s: &str| -> String { s.as_bytes().iter().map(|b| format!("\\{b:02x}")).collect() };
-    let empty_packed = (1024_u64 << 32) | empty.len() as u64;
-
-    let reply_json = r#"{"ok":[{"command":"request_origin","request_id":"1","origin":"ws://192.168.1.50:8080/chat"}]}"#;
-    let reply_packed = (2048_u64 << 32) | reply_json.len() as u64;
-
-    // Emit RequestOrigin only when the explicit "connect" command event arrives
-    // (not on Init, WindowOpened, or OriginGranted).
-    let wasm = wat::parse_str(format!(
-        r#"(module
-        (memory (export "memory") 4 8)
-        (data (i32.const 1024) "{empty_esc}")
-        (data (i32.const 1100) "{trigger_esc}")
-        (data (i32.const 2048) "{reply_esc}")
-        (func (export "iris_abi_version") (result i32) i32.const 2)
-        (func (export "iris_alloc") (param i32) (result i32) i32.const 32768)
-        (func (export "iris_dealloc") (param i32 i32))
-        {WAT_FIND_FN}
-        (func (export "iris_on_event") (param $ptr i32) (param $len i32) (result i64)
-            (if (result i64) (i32.ge_s (call $find (local.get $ptr) (local.get $len) (i32.const 1100) (i32.const {trigger_len})) (i32.const 0))
-                (then (i64.const {reply_packed}))
-                (else (i64.const {empty_packed})))))"#,
-        empty_esc = esc(empty),
-        trigger_esc = esc(trigger),
-        reply_esc = esc(reply_json),
-        trigger_len = trigger.len(),
-    ))
-    .unwrap();
-
-    let plugin_id = "wat.origin.ws";
-    let root = std::env::temp_dir().join(format!(
-        "iris-wat-ws-origin-{}-{}",
-        std::process::id(),
-        Control::new_window_id().unwrap().0
-    ));
-    struct DirGuard(PathBuf);
-    impl Drop for DirGuard {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-    let _guard = DirGuard(root.clone());
-
-    let resources = Resources::new().unwrap();
-    let setup = Setup {
-        resources: resources.clone(),
-        state_directory: root.join("state"),
-        temporary_directory: root.join("temp"),
-        vault: CredentialVault::in_memory(),
-        wake: Arc::new(|| {}),
-    };
-    let grants = vec![Capability::UiModal, Capability::NetWs];
-    let manifest = serde_json::json!({
-        "id": plugin_id,
-        "name": "WAT WS Origin Fixture",
-        "version": "1.0.0",
-        "protocol": 2,
-        "abi": 2,
-        "entry": "plugin.wasm",
-        "permissions": grants,
-    });
-    let mut zip = ZipWriter::new(Cursor::new(Vec::new()));
-    for (name, bytes) in [
-        ("plugin.json", serde_json::to_vec(&manifest).unwrap()),
-        ("plugin.wasm", wasm),
-    ] {
-        zip.start_file(name, SimpleFileOptions::default()).unwrap();
-        zip.write_all(&bytes).unwrap();
-    }
-    let bytes = zip.finish().unwrap().into_inner();
-    let digest = Package::from_zip(&bytes, Provenance::User).unwrap().digest;
-    let mut installer = Installer::new(root.join("installed"), resources.ledger.clone());
-    installer
-        .install(
-            &bytes,
-            Approval {
-                digest,
-                grants: grants.into_iter().collect(),
-                network: NetworkDeclaration::default(),
-                previous: None,
-            },
-        )
-        .unwrap();
-
-    let hub = Hub::new(Config {
-        bootstrap: None,
-        installer,
-        runtime: setup,
-        disabled: BTreeSet::new(),
-    })
-    .unwrap();
-    let (client, _) = hub.open_window(Generation::default(), None).unwrap();
-    until(
-        || {
-            let _ = client.poll();
-            client.is_ready(plugin_id)
-        },
-        Duration::from_secs(5),
-    );
-    client
-        .send(
-            plugin_id,
-            HostEvent::Command {
-                id: "connect".into(),
-                snapshot: None,
-            },
-        )
-        .unwrap();
-
-    let mut summary = None;
-    until(
-        || {
-            for notice in client.poll() {
-                match notice {
-                    Notice::Origin(s) => summary = Some(s),
-                    Notice::Error { code, .. } => {
-                        panic!("unexpected host error for ws:// RequestOrigin: {code:?}");
-                    }
-                    _ => {}
-                }
-            }
-            for plugin in &client.catalog().plugins {
-                if plugin.id == plugin_id {
-                    assert!(
-                        !matches!(plugin.status, PluginStatus::Failed(_)),
-                        "ws:// RequestOrigin quarantined plugin: {:?}",
-                        plugin.status
-                    );
-                }
-            }
-            summary.is_some()
-        },
-        Duration::from_secs(5),
-    );
-
-    let summary = summary.unwrap();
-    assert_eq!(summary.origin, "http://192.168.1.50:8080");
-    assert_eq!(
-        summary.ips,
-        vec!["192.168.1.50".parse::<std::net::IpAddr>().unwrap()]
-    );
-    assert!(summary.private && summary.plaintext);
-
-    let origin_id = summary.id;
-    drop(summary);
-    client.confirm_origin(origin_id, true, false).unwrap();
-    let mut closed = false;
-    until(
-        || {
-            for notice in client.poll() {
-                if let Notice::OriginClosed(id) = notice
-                    && id == origin_id
-                {
-                    closed = true;
-                }
-            }
-            closed
-        },
-        Duration::from_secs(5),
-    );
-    assert!(client.is_ready(plugin_id));
-
-    client.shutdown();
-    drop((client, hub));
-    until(
-        || resources.ledger.used(None, Resource::HostBytes) == 0,
-        Duration::from_secs(5),
-    );
-}
-
-#[test]
 fn wat_stream_role_abi_replies_and_fails_cleanly() {
-    use iris_api::v2::stream::StreamContext;
-    use iris_base::net::http_client::HttpCancel;
-    use iris_plugin_host::stream::{guest::StreamStore, session::new_session_id};
-
     let empty = r#"{"ok":[]}"#;
     let key_needle = r#""context_blob":""#;
     let req_needle = r#""request_id":""#;
@@ -880,7 +713,6 @@ fn wat_stream_role_abi_replies_and_fails_cleanly() {
     );
     drop(reply);
 
-    // Context refresh rotates the key blob and subsequent reads use the new key.
     let updated = StreamContext {
         version: Id(2),
         ..context
@@ -899,14 +731,12 @@ fn wat_stream_role_abi_replies_and_fails_cleanly() {
     );
     drop(refreshed);
 
-    // Failing stream read returns exact guest-supplied ErrorCode::IoError.
     let failing = store.reader("fail".into(), Some(8)).unwrap();
     assert_eq!(
         failing.read_at(0, 8, &cancel).err(),
         Some(ErrorCode::IoError)
     );
 
-    // Pending GuestReader read wakes immediately via Condvar on cancellation (no 20ms poll lag).
     let hanging = store.reader("hang".into(), Some(8)).unwrap();
     let hang_cancel = HttpCancel::default();
     let worker_cancel = hang_cancel.clone();

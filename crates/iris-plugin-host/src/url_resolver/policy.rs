@@ -6,7 +6,7 @@ use std::net::IpAddr;
 use url::{Host, Url};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TransportKind {
+pub(crate) enum TransportKind {
     Http,
     WebSocket,
     Tcp { tls: bool },
@@ -31,14 +31,14 @@ impl TransportKind {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct Origin {
+pub(crate) struct Origin {
     pub scheme: String,
     pub host: String,
     pub port: u16,
 }
 
 impl Origin {
-    pub fn of(url: &Url) -> Result<Self, ErrorCode> {
+    pub(crate) fn of(url: &Url) -> Result<Self, ErrorCode> {
         Ok(Self {
             scheme: url.scheme().into(),
             host: normalize_host(url.host_str().ok_or(ErrorCode::InvalidArgument)?)?,
@@ -48,7 +48,7 @@ impl Origin {
         })
     }
 
-    pub fn display(&self) -> String {
+    pub(crate) fn display(&self) -> String {
         let host = if self.host.contains(':') {
             format!("[{}]", self.host)
         } else {
@@ -57,7 +57,7 @@ impl Origin {
         format!("{}://{}:{}", self.scheme, host, self.port)
     }
 
-    pub fn http_equivalent(&self) -> Self {
+    pub(crate) fn http_equivalent(&self) -> Self {
         let scheme = match self.scheme.as_str() {
             "ws" => "http",
             "wss" => "https",
@@ -71,7 +71,7 @@ impl Origin {
     }
 }
 
-pub fn normalize_url(raw: &str, kind: TransportKind) -> Result<Url, ErrorCode> {
+pub(crate) fn normalize_url(raw: &str, kind: TransportKind) -> Result<Url, ErrorCode> {
     if raw.len() > 8192
         || raw.trim() != raw
         || raw.bytes().any(|c| c <= 0x20 || c == 0x7f || c == b'\\')
@@ -125,7 +125,7 @@ pub fn normalize_url(raw: &str, kind: TransportKind) -> Result<Url, ErrorCode> {
     Ok(url)
 }
 
-pub fn parse_consent_origin_url(raw: &str) -> Result<(Origin, TransportKind), ErrorCode> {
+pub(crate) fn parse_consent_origin_url(raw: &str) -> Result<(Origin, TransportKind), ErrorCode> {
     for kind in [
         TransportKind::Http,
         TransportKind::WebSocket,

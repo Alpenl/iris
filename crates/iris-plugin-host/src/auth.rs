@@ -27,7 +27,8 @@ use url::Url;
 
 /// The UI hook only queues a bounded, user-visible browser-open request and wakes
 /// the UI loop. It must not open a browser or wait on the calling Store thread.
-pub type BrowserOpen = Arc<dyn Fn(Id, Generation, &str) -> Result<(), ErrorCode> + Send + Sync>;
+pub(crate) type BrowserOpen =
+    Arc<dyn Fn(Id, Generation, &str) -> Result<(), ErrorCode> + Send + Sync>;
 struct WindowScope {
     generation: Option<Generation>,
     browser: BrowserOpen,
@@ -66,9 +67,9 @@ struct Transaction {
     _reservation: Reservation,
 }
 #[derive(Clone)]
-pub struct AuthExecutor(Arc<Inner>);
+pub(crate) struct AuthExecutor(Arc<Inner>);
 impl AuthExecutor {
-    pub fn new(network: NetworkGrant, ledger: Ledger, browser: BrowserOpen) -> Self {
+    pub(crate) fn new(network: NetworkGrant, ledger: Ledger, browser: BrowserOpen) -> Self {
         Self(Arc::new(Inner {
             network,
             ledger,

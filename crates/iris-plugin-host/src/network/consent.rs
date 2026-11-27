@@ -1,7 +1,7 @@
 //! Host-owned Origin consent. DNS resolution produces a review only; it never
 //! grants access. Persisted pins cannot be modified through Guest state APIs.
 use super::{AddressKind, NetworkGrant, Origin, TransportKind, address_kind, grant::validate_pins};
-pub use crate::url_resolver::parse_consent_origin_url;
+pub(crate) use crate::url_resolver::parse_consent_origin_url;
 use crate::{
     crypto::valid_identity,
     json_error,
@@ -38,12 +38,12 @@ struct Record {
     entries: BTreeMap<String, SavedOrigin>,
 }
 #[derive(Clone)]
-pub struct OriginStore {
+pub(crate) struct OriginStore {
     owner: String,
     path: PathBuf,
     ledger: Ledger,
 }
-pub struct OriginReview {
+pub(crate) struct OriginReview {
     owner: String,
     version: Id,
     origin: String,
@@ -53,26 +53,26 @@ pub struct OriginReview {
     _memory: Reservation,
 }
 impl OriginReview {
-    pub fn origin(&self) -> &str {
+    pub(crate) fn origin(&self) -> &str {
         &self.origin
     }
-    pub fn ips(&self) -> &[IpAddr] {
+    pub(crate) fn ips(&self) -> &[IpAddr] {
         &self.ips
     }
-    pub fn previous(&self) -> Option<&SavedOrigin> {
+    pub(crate) fn previous(&self) -> Option<&SavedOrigin> {
         self.previous.as_ref()
     }
-    pub fn private(&self) -> bool {
+    pub(crate) fn private(&self) -> bool {
         self.ips
             .iter()
             .any(|ip| address_kind(*ip) != AddressKind::Public)
     }
-    pub fn plaintext(&self) -> bool {
+    pub(crate) fn plaintext(&self) -> bool {
         self.origin.starts_with("http:")
     }
 }
 impl OriginStore {
-    pub fn new(root: PathBuf, owner: String, ledger: Ledger) -> Result<Self, ErrorCode> {
+    pub(crate) fn new(root: PathBuf, owner: String, ledger: Ledger) -> Result<Self, ErrorCode> {
         if !valid_identity(&owner) {
             return Err(ErrorCode::InvalidArgument);
         }
@@ -126,7 +126,11 @@ impl OriginStore {
     }
     /// Startup worker only. Restore exact persisted pins without re-resolving or
     /// widening them; a changed private address requires another user review.
-    pub fn restore(&self, grant: &NetworkGrant, cancel: &HttpCancel) -> Result<(), ErrorCode> {
+    pub(crate) fn restore(
+        &self,
+        grant: &NetworkGrant,
+        cancel: &HttpCancel,
+    ) -> Result<(), ErrorCode> {
         self.check(grant, cancel)?;
         let _memory = self
             .ledger
@@ -143,7 +147,7 @@ impl OriginStore {
         Ok(())
     }
     /// Background-only; the returned object is private immutable review data.
-    pub fn review(
+    pub(crate) fn review(
         &self,
         grant: &NetworkGrant,
         raw: &str,
@@ -173,7 +177,7 @@ impl OriginStore {
     /// The trusted host supplies the separate plaintext-credential checkbox.
     /// The install/Origin identity and exact previously displayed pins are CAS
     /// checked under the file lock; another window cannot silently replace them.
-    pub fn approve(
+    pub(crate) fn approve(
         &self,
         grant: &NetworkGrant,
         review: OriginReview,
@@ -228,31 +232,6 @@ impl OriginStore {
             grant.confirm_insecure_auth(id)?;
         }
         grant.lookup_origin(&review.origin, kind)
-    }
-    pub fn revoke(
-        &self,
-        grant: &NetworkGrant,
-        origin: &str,
-        cancel: &HttpCancel,
-    ) -> Result<(), ErrorCode> {
-        self.check(grant, cancel)?;
-        let origin = parse_consent_origin_url(origin)?.0.display();
-        let _lock = fs_util::lock_file_with_timeout(
-            &self.path.with_extension("lock"),
-            Duration::from_millis(250),
-        )
-        .map_err(|_| ErrorCode::Backpressure)?;
-        let mut record = self.read()?;
-        record.entries.remove(&origin);
-        self.check(grant, cancel)?;
-        let encoded = bounded_json::encode(&record, MAX_RECORD).map_err(json_error)?;
-        fs_util::atomic_write_private(&self.path, &encoded).map_err(|_| ErrorCode::IoError)?;
-        if let Ok(kind) = consent_transport(grant, &origin)
-            && let Ok(found) = grant.lookup_origin(&origin, kind)
-        {
-            grant.revoke_origin(found.origin_grant)?;
-        }
-        Ok(())
     }
 }
 fn consent_transport(grant: &NetworkGrant, origin: &str) -> Result<TransportKind, ErrorCode> {
