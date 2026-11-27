@@ -43,6 +43,8 @@ pub use model::{
 };
 pub use prepare::{Prepared, PreparedQueue, prepare, prepare_queue};
 pub use recovery::{ActiveVideoTrack, VideoRecoveryHandle};
+#[doc(hidden)]
+pub use relay::fuzz_hls;
 pub use scoped::{ScopedAttachment, ScopedPlayback, ScopedStream, StreamProfile};
 
 /// Validated CPU preview LUT filter provider (decoupled from plugin file/artifact internals).

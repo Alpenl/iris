@@ -19,6 +19,15 @@ pub(super) fn is_hls(prefix: &[u8]) -> bool {
 }
 
 pub(super) fn rewrite_playlist(input: &str, base: &Url, routes: &Routes) -> Result<String> {
+    rewrite_playlist_inner(input, base, routes, None)
+}
+
+fn rewrite_playlist_inner(
+    input: &str,
+    base: &Url,
+    routes: &Routes,
+    mut extracted: Option<&mut Vec<String>>,
+) -> Result<String> {
     let mut out = String::with_capacity(input.len());
     let lines = input.trim_start_matches('\u{feff}');
     ensure!(
@@ -80,7 +89,15 @@ pub(super) fn rewrite_playlist(input: &str, base: &Url, routes: &Routes) -> Resu
                     | "#EXT-X-RENDITION-REPORT" => {
                         out.push_str(tag);
                         out.push(':');
-                        rewrite_attributes(tag, attrs, base, routes, &mut rewritten, &mut out)?;
+                        rewrite_attributes(
+                            tag,
+                            attrs,
+                            base,
+                            routes,
+                            &mut rewritten,
+                            &mut out,
+                            extracted.as_deref_mut(),
+                        )?;
                     }
                     // Preserve compatibility with private scalar extensions by
                     // skipping unrecognized tags before they reach the demuxer.
@@ -91,6 +108,9 @@ pub(super) fn rewrite_playlist(input: &str, base: &Url, routes: &Routes) -> Resu
             }
         } else if !line.is_empty() {
             let url = validate_stream_url(base.join(line)?.as_str())?;
+            if let Some(sink) = extracted.as_deref_mut() {
+                sink.push(url.as_str().to_owned());
+            }
             let (kind, ext) = if variant {
                 (RouteKind::Playlist, "m3u8")
             } else {
@@ -110,6 +130,25 @@ pub(super) fn rewrite_playlist(input: &str, base: &Url, routes: &Routes) -> Resu
         );
     }
     Ok(out)
+}
+
+/// Bounded, zero-network HLS playlist parser entry point for differential fuzz tests.
+#[doc(hidden)]
+pub mod fuzz_hls {
+    use anyhow::Result;
+    use url::Url;
+
+    use super::super::Routes;
+
+    /// Parses `input` against `base_url` via `iris-core`'s playlist rewriter and returns
+    /// all extracted and validated upstream URIs in encounter order.
+    pub fn parse_and_extract_uris(input: &str, base_url: &str) -> Result<Vec<String>> {
+        let base = Url::parse(base_url)?;
+        let routes = Routes::new("127.0.0.1:9898".parse().unwrap())?;
+        let mut uris = Vec::new();
+        let _ = super::rewrite_playlist_inner(input, &base, &routes, Some(&mut uris))?;
+        Ok(uris)
+    }
 }
 
 type RewrittenUris = BTreeMap<(Url, &'static str, &'static str), String>;
@@ -143,6 +182,7 @@ fn rewrite_attributes(
     routes: &Routes,
     rewritten: &mut RewrittenUris,
     out: &mut String,
+    mut extracted: Option<&mut Vec<String>>,
 ) -> Result<()> {
     // Accept an unambiguous subset of RFC 8216 §4.2. In particular, do not
     // pass whitespace-delimited attributes or quotes interpreted by libavformat.
@@ -193,6 +233,9 @@ fn rewrite_attributes(
         if key == "URI" || key.ends_with("-URI") {
             ensure!(quoted && !raw.is_empty(), "invalid HLS URI attribute");
             let url = validate_stream_url(base.join(raw)?.as_str())?;
+            if let Some(sink) = extracted.as_deref_mut() {
+                sink.push(url.as_str().to_owned());
+            }
             let (kind, fallback) = match tag {
                 "#EXT-X-MEDIA"
                 | "#EXT-X-I-FRAME-STREAM-INF"

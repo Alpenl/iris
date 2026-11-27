@@ -1,0 +1,5 @@
+#EXTM3U
+  #EXT-X-TARGETDURATION:4  
+  #EXTINF:2.0,  
+	seg_ws.ts  
+#EXT-X-ENDLIST
