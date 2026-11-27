@@ -22,7 +22,7 @@ pub(super) fn render_titlebar(
 ) -> impl IntoElement {
     let m = model.read(cx);
     let t = ThemeTokens::of(cx);
-    let session = &m.active().session;
+    let session = m.session();
     let file = session
         .current()
         .and_then(|p| p.file_name())
@@ -203,8 +203,13 @@ pub(super) fn render_titlebar(
             .gap(px(6.))
             .pl(px(10.))
             .child(
-                win_btn("win-close", Icon::Close, "关闭", true)
-                    .on_click(|_, window, _| window.remove_window()),
+                win_btn("win-close", Icon::Close, "关闭", true).on_click(model_listener(
+                    model,
+                    |this, _, window, _| {
+                        this.shutdown();
+                        window.remove_window();
+                    },
+                )),
             )
             .child(
                 win_btn("win-min", Icon::Minimize, "最小化", false)
@@ -231,14 +236,19 @@ pub(super) fn render_titlebar(
                     .on_click(|_, window, _| platform::toggle_maximize(window)),
             )
             .child(
-                win_btn("win-close", Icon::Close, "关闭", true)
-                    .on_click(|_, window, _| window.remove_window()),
+                win_btn("win-close", Icon::Close, "关闭", true).on_click(model_listener(
+                    model,
+                    |this, _, window, _| {
+                        this.shutdown();
+                        window.remove_window();
+                    },
+                )),
             )
     };
 
     let meta_info = m
         .effective_show_titlebar_meta()
-        .then(|| m.media_info())
+        .then(|| m.playback.media_info())
         .flatten();
 
     let drag_area = div()

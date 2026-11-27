@@ -65,7 +65,7 @@ impl AppModel {
                 );
             }
             "state" => {
-                let session = &self.active().session;
+                let session = self.session();
                 let state = session.state();
                 let fav = session
                     .current_media_uri()
@@ -133,13 +133,13 @@ impl AppModel {
                     self.chrome.toast,
                 );
             }
-            "get" => match self.active().session.debug_property(arg) {
+            "get" => match self.session().debug_property(arg) {
                 Ok(v) => eprintln!("[iris/control] get {arg} = {v}"),
                 Err(e) => eprintln!("[iris/control] get {arg} failed: {e}"),
             },
             "mpv" => {
                 let args: Vec<&str> = arg.split_whitespace().collect();
-                match self.active().session.debug_command(&args) {
+                match self.session().debug_command(&args) {
                     Ok(()) => eprintln!("[iris/control] mpv {arg} ok"),
                     Err(e) => eprintln!("[iris/control] mpv {arg} failed: {e}"),
                 }

@@ -22,8 +22,8 @@ pub(super) fn render_info_overlay(
 ) -> impl IntoElement {
     let m = model.read(cx);
     let t = ThemeTokens::of(cx);
-    let stats = m.active().cached_stats.clone().unwrap_or_default();
-    let kind = m.active().session.kind();
+    let stats = m.playback.cached_stats().cloned().unwrap_or_default();
+    let kind = m.session().kind();
     let mut rows: Vec<(&'static str, String)> = Vec::new();
 
     if !stats.file_name.is_empty() {
@@ -35,7 +35,7 @@ pub(super) fn render_info_overlay(
     if !stats.file_format.is_empty() {
         rows.push(("容器", stats.file_format));
     }
-    let (w, h) = m.active().session.display_size();
+    let (w, h) = m.session().display_size();
     if w > 0 && h > 0 && kind != Some(Kind::Audio) {
         rows.push(("分辨率", format!("{w} × {h}")));
     }
@@ -74,7 +74,7 @@ pub(super) fn render_info_overlay(
                 }
                 rows.push(("音频", audio));
             }
-            let chapters = m.active().session.state().chapters.len();
+            let chapters = m.session().state().chapters.len();
             if chapters > 0 {
                 rows.push(("章节", format!("{chapters} 个")));
             }

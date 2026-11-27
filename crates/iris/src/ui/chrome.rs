@@ -180,14 +180,13 @@ pub(super) fn render_top_pill(
     cx: &App,
 ) -> Option<impl IntoElement> {
     let m = model.read(cx);
-    let vp = m.active();
     let (msg, is_toast, is_error) = if let Some(msg) = m.chrome.toast.clone() {
         (msg, true, m.chrome.toast_is_error)
     } else if let Some(msg) = m.chrome.osd.clone() {
         (msg, false, false)
-    } else if vp.session.state().buffering {
+    } else if m.session().state().buffering {
         (SharedString::from("缓冲中…"), false, false)
-    } else if vp.loading_visible {
+    } else if m.playback.loading_visible() {
         (SharedString::from("加载中…"), false, false)
     } else {
         return None;
@@ -484,7 +483,7 @@ impl AppModel {
         let Some(b) = self.chrome.probes.progress_bounds.get() else {
             return;
         };
-        if self.active().session.state().duration <= 0. || b.size.width <= px(0.) {
+        if self.session().state().duration <= 0. || b.size.width <= px(0.) {
             return;
         }
         let pct = (((x - b.origin.x) / b.size.width).clamp(0., 1.) as f64) * 100.;
@@ -493,7 +492,7 @@ impl AppModel {
         } else {
             Command::SeekPercentFast(pct)
         };
-        if let Err(e) = self.active_mut().session.execute(cmd) {
+        if let Err(e) = self.session_mut().execute(cmd) {
             log::error!("seek: {e}");
         }
     }
@@ -748,20 +747,18 @@ impl AppModel {
         {
             self.chrome.scrub.click_seq += 1;
             let seq = self.chrome.scrub.click_seq;
-            let generation = self.active().load_generation;
+            let generation = self.playback.load_generation();
             cx.spawn(async move |this, cx| {
                 cx.background_executor()
                     .timer(Duration::from_millis(200))
                     .await;
                 let _ = this.update(cx, |this, cx| {
                     if this.chrome.scrub.click_seq == seq
-                        && this.active().load_generation == generation
+                        && this.playback.load_generation() == generation
                         && !this.input_context().overlay
                     {
-                        let state = this.active().session.state();
-                        let pause = !state.paused && !state.ended;
-                        this.command(Command::TogglePlayback, cx);
-                        this.show_osd(if pause { "暂停" } else { "播放" }, cx);
+                        let out = this.playback.toggle_pause();
+                        this.apply_playback_action(out, cx);
                         this.notify_dock(cx);
                     }
                 });

@@ -4,7 +4,8 @@
 
 use anyhow::Result;
 use futures::channel::mpsc::UnboundedReceiver;
-use iris_core::player::{Session, VideoRecoveryHandle};
+use iris_app::VideoAttachSlot;
+use iris_core::player::VideoRecoveryHandle;
 use iris_mpv::RenderHandle;
 
 /// Notification emitted after a GPU surface reset and rebuild completes.
@@ -80,8 +81,9 @@ impl VideoSurface {
 
 pub(crate) fn attach(
     window: &gpui::Window,
-    session: &Session,
+    slot: VideoAttachSlot<'_>,
 ) -> Result<(VideoSurface, UnboundedReceiver<VideoReset>)> {
+    let session = slot.session();
     let (backend, rx) =
         PlatformVideoSurface::attach(window, session.render_handle(), session.video_recovery())?;
     Ok((VideoSurface(SurfaceAdapter(backend)), rx))

@@ -54,7 +54,7 @@ const ASPECT_OPTIONS: &[(&str, AspectMode)] = &[
 impl AppModel {
     fn adjust_video_eq(&mut self, ch: EqChannel, next_val: i64, cx: &mut Context<Self>) {
         let clamped = next_val.clamp(-100, 100);
-        let s = self.active().session.state();
+        let s = self.session().state();
         let (mut b, mut c, mut sat, mut g) =
             (s.eq_brightness, s.eq_contrast, s.eq_saturation, s.eq_gamma);
         match ch {
@@ -77,7 +77,7 @@ impl AppModel {
     }
 
     fn step_video_eq(&mut self, ch: EqChannel, delta: i64, cx: &mut Context<Self>) {
-        let st = self.active().session.state();
+        let st = self.session().state();
         let cur = match ch {
             EqChannel::Brightness => st.eq_brightness,
             EqChannel::Contrast => st.eq_contrast,
@@ -222,7 +222,7 @@ pub(super) fn render_more_popover(
     cx: &App,
 ) -> impl IntoElement {
     let m = model.read(cx);
-    let session = &m.active().session;
+    let session = m.session();
     let state = session.state();
     let aspect = state.aspect;
     let (hflip, vflip) = session.display_flips();

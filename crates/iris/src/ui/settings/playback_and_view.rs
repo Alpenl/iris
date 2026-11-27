@@ -41,7 +41,7 @@ pub(super) fn settings_playback(
                 |this, val, _, cx| {
                     this.settings.on_eof = val;
                     this.preset_rt.record_user_edit(&this.settings);
-                    this.active_mut().session.set_on_eof_loop(val);
+                    this.session_mut().set_on_eof_loop(val);
                     this.notify_regions(
                         DirtyRegions {
                             settings: true,
@@ -98,7 +98,7 @@ pub(super) fn settings_playback(
                 |this, val, _, cx| {
                     this.settings.hwdec = val;
                     this.preset_rt.record_user_edit(&this.settings);
-                    this.active_mut().session.set_hwdec(val);
+                    this.session_mut().set_hwdec(val);
                     this.notify_settings(cx);
                 },
             ),
@@ -158,7 +158,7 @@ pub(super) fn settings_tracks(
 ) -> impl IntoElement {
     let m = model.read(cx);
     let s = &m.settings;
-    let mut devices = m.active().session.audio_devices();
+    let mut devices = m.session().audio_devices();
     if !devices.iter().any(|d| d.name == "auto") {
         devices.insert(
             0,
@@ -195,7 +195,7 @@ pub(super) fn settings_tracks(
                 |this, val, _, cx| {
                     this.settings.sub_lang = val;
                     this.preset_rt.record_user_edit(&this.settings);
-                    this.active_mut().session.set_sub_lang(val);
+                    this.session_mut().set_sub_lang(val);
                     this.notify_settings(cx);
                 },
             ),
@@ -214,7 +214,7 @@ pub(super) fn settings_tracks(
                         (((this.settings.sub_scale - 0.1) * 100.).round() / 100.).clamp(0.5, 2.5);
                     this.settings.sub_scale = scale;
                     this.preset_rt.record_user_edit(&this.settings);
-                    this.active_mut().session.set_sub_scale(scale);
+                    this.session_mut().set_sub_scale(scale);
                     this.notify_settings(cx);
                 }),
                 model_listener(model, |this, _, _, cx| {
@@ -222,13 +222,13 @@ pub(super) fn settings_tracks(
                         (((this.settings.sub_scale + 0.1) * 100.).round() / 100.).clamp(0.5, 2.5);
                     this.settings.sub_scale = scale;
                     this.preset_rt.record_user_edit(&this.settings);
-                    this.active_mut().session.set_sub_scale(scale);
+                    this.session_mut().set_sub_scale(scale);
                     this.notify_settings(cx);
                 }),
                 model_listener(model, |this, _, _, cx| {
                     this.settings.sub_scale = 1.0;
                     this.preset_rt.record_user_edit(&this.settings);
-                    this.active_mut().session.set_sub_scale(1.0);
+                    this.session_mut().set_sub_scale(1.0);
                     this.notify_settings(cx);
                 }),
             ),

@@ -39,7 +39,9 @@ use gpui::{
     InteractiveElement, IntoElement, KeyContext, ParentElement, Point, Render, Styled,
     Subscription, Task, Window, div, prelude::FluentBuilder, px,
 };
-use iris_app::PluginController;
+use iris_app::{
+    MediaKeyInput, MediaKeyOutcome, PlaybackController, PluginController, WindowShutdownCoordinator,
+};
 use iris_core::bookmarks::LocationStore;
 use iris_core::catalog::PlayQueue;
 use iris_core::input::{self, PointerCommand, PointerInput};
@@ -60,10 +62,10 @@ pub(crate) use actions::{
 use chrome::WindowChromeState;
 use kit::text_field::TextInputHub;
 use state::{CatalogState, OverlayState, PopoverKind};
-use viewport::{Viewport, should_recover_after_gpu_reset};
+use viewport::Viewport;
 use views::{
-    DirtyRegions, DockView, PluginPanel, SettingsPanel, Sidebar, ViewHandles, ViewportView,
-    model_listener,
+    DirtyRegions, DockView, PluginPanel, SettingsPanel, Sidebar, UiVisibility, ViewHandles,
+    ViewportView, model_listener,
 };
 
 use crate::platform::{self, MediaKey, MediaKeyBridge, PinchMonitor, SleepPreventer};
@@ -71,6 +73,7 @@ use crate::theme::{FONT_UI, ThemeTokens};
 
 pub(in crate::ui) struct AppModel {
     focus: FocusHandle,
+    playback: PlaybackController,
     viewport: Viewport,
     catalog: CatalogState,
     queue: PlayQueue,
@@ -87,8 +90,7 @@ pub(in crate::ui) struct AppModel {
     store: Store,
     store_flush: Option<Task<()>>,
     last_save: Instant,
-    last_now_playing: Instant,
-    shutdown_done: bool,
+    shutdown: WindowShutdownCoordinator,
     sleep_preventer: SleepPreventer,
     _pinch_monitor: Option<PinchMonitor>,
     media_keys: Option<MediaKeyBridge>,
@@ -111,7 +113,13 @@ impl AppModel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let (video, video_reset_rx) = match crate::video::attach(window, &session) {
+        let now = Instant::now();
+        let (mut playback, mut rx) =
+            PlaybackController::open_window(session, now).expect("new session event receiver");
+        let attach_slot = playback
+            .take_video_attach_slot()
+            .expect("initial window video attach slot");
+        let (video, video_reset_rx) = match crate::video::attach(window, attach_slot) {
             Ok((v, rx)) => (Some(v), Some(rx)),
             Err(e) => {
                 log::error!("video surface failed: {e:#}");
@@ -123,8 +131,10 @@ impl AppModel {
             cx.spawn(async move |this, cx| {
                 while let Some(reset) = reset_rx.next().await {
                     let Ok((is_photo, load_gen)) = this.update(cx, |this, _| {
-                        let vp = this.active();
-                        (vp.session.kind() == Some(Kind::Photo), vp.load_generation)
+                        (
+                            this.session().kind() == Some(Kind::Photo),
+                            this.playback.load_generation(),
+                        )
                     }) else {
                         break;
                     };
@@ -135,22 +145,17 @@ impl AppModel {
                     }
                     if this
                         .update(cx, |this, cx| {
-                            let vp = this.active();
-                            if !should_recover_after_gpu_reset(
-                                load_gen,
-                                vp.load_generation,
-                                vp.session.kind(),
-                                vp.session.state().loaded,
-                                reset.restored_vid,
-                            ) {
-                                return;
-                            }
-                            let (zoom, pan) = (vp.image.zoom, vp.image.pan);
+                            let (zoom, pan) = (this.active().image.zoom, this.active().image.pan);
                             let settings = this.settings.clone();
-                            this.active_mut()
-                                .session
-                                .recover_unloaded_after_gpu_reset(&settings, zoom, pan);
-                            this.notify_viewport_and_dock(cx);
+                            if this.playback.recover_after_gpu_reset(
+                                load_gen,
+                                reset.restored_vid,
+                                &settings,
+                                zoom,
+                                pan,
+                            ) {
+                                this.notify_viewport_and_dock(cx);
+                            }
                         })
                         .is_err()
                     {
@@ -167,6 +172,12 @@ impl AppModel {
         let focus = cx.focus_handle();
         let text_inputs = TextInputHub::new(cx);
         focus.focus(window);
+
+        let weak_for_close = cx.weak_entity();
+        window.on_window_should_close(cx, move |_, cx| {
+            let _ = weak_for_close.update(cx, |this, _| this.shutdown());
+            true
+        });
 
         let subscriptions = vec![
             cx.on_app_quit(|this, _| {
@@ -197,7 +208,6 @@ impl AppModel {
             }),
         ];
 
-        let mut rx = session.events().expect("new session event receiver");
         let events = cx.spawn(async move |this, cx| {
             while let Some(first) = rx.next().await {
                 let mut batch = vec![first];
@@ -216,7 +226,6 @@ impl AppModel {
             }
         });
 
-        let now = Instant::now();
         let (plugins, mut plugin_wake_rx) = PluginController::open_window(
             plugin_host,
             &settings.disabled_plugins,
@@ -260,21 +269,21 @@ impl AppModel {
             cx.spawn(async move |this, cx| {
                 while let Some(key) = mk_rx.next().await {
                     let ok = this.update(cx, |this, cx| {
-                        let state = this.active().session.state();
-                        match key {
-                            MediaKey::Play if state.paused || state.ended => {
-                                this.command(Command::TogglePlayback, cx);
+                        let input = match key {
+                            MediaKey::Play => MediaKeyInput::Play,
+                            MediaKey::Pause => MediaKeyInput::Pause,
+                            MediaKey::Toggle => MediaKeyInput::Toggle,
+                            MediaKey::Next => MediaKeyInput::Next,
+                            MediaKey::Prev => MediaKeyInput::Prev,
+                            MediaKey::Seek(seconds) => MediaKeyInput::Seek(seconds),
+                        };
+                        match this.playback.handle_media_key(input) {
+                            MediaKeyOutcome::Ignored | MediaKeyOutcome::Executed => {}
+                            MediaKeyOutcome::StepQueue { delta } => this.step(delta, true, cx),
+                            MediaKeyOutcome::Failed(e) => {
+                                log::warn!("media key command failed: {e:#}");
+                                this.show_error_toast(strings::errors::player_action_error(&e), cx);
                             }
-                            MediaKey::Pause if !state.paused && !state.ended => {
-                                this.command(Command::TogglePlayback, cx);
-                            }
-                            MediaKey::Toggle => this.command(Command::TogglePlayback, cx),
-                            MediaKey::Next => this.step(1, true, cx),
-                            MediaKey::Prev => this.step(-1, true, cx),
-                            MediaKey::Seek(seconds) => {
-                                this.command(Command::SeekAbsolute(seconds), cx)
-                            }
-                            _ => {}
                         }
                     });
                     if ok.is_err() {
@@ -333,7 +342,8 @@ impl AppModel {
 
         Self {
             focus,
-            viewport: Viewport::new(session, video, now),
+            playback,
+            viewport: Viewport::new(video),
             catalog,
             queue: PlayQueue::new(),
             overlays: OverlayState::default(),
@@ -349,8 +359,7 @@ impl AppModel {
             store: Store::load(),
             store_flush: None,
             last_save: now,
-            last_now_playing: now - Duration::from_secs(10),
-            shutdown_done: false,
+            shutdown: WindowShutdownCoordinator::default(),
             sleep_preventer: SleepPreventer::new(),
             _pinch_monitor: pinch_monitor,
             media_keys,
@@ -373,7 +382,7 @@ impl AppModel {
         self.sync_plugin_modal_focus(window);
         self.sync_theme_tokens(cx);
         self.rebuild_directory_rows();
-        self.viewport.session.apply_settings(&self.settings);
+        self.playback.session_mut().apply_settings(&self.settings);
         if self.settings.audio_device != "auto" && !self.settings.audio_device.is_empty() {
             self.command(
                 Command::SetAudioDevice(self.settings.audio_device.clone()),
@@ -394,6 +403,16 @@ impl AppModel {
     }
 
     #[inline]
+    pub(in crate::ui) fn session(&self) -> &Session {
+        self.playback.session()
+    }
+
+    #[inline]
+    pub(in crate::ui) fn session_mut(&mut self) -> &mut Session {
+        self.playback.session_mut()
+    }
+
+    #[inline]
     pub(in crate::ui) fn active(&self) -> &Viewport {
         &self.viewport
     }
@@ -401,6 +420,17 @@ impl AppModel {
     #[inline]
     pub(in crate::ui) fn active_mut(&mut self) -> &mut Viewport {
         &mut self.viewport
+    }
+
+    pub(in crate::ui) fn ui_visibility(&self) -> UiVisibility {
+        UiVisibility {
+            dock_visible: self.chrome_shown(),
+            sidebar_plugins_visible: self.sidebar_is_visible()
+                && self.catalog.sidebar_mode == iris_core::preset::SidebarMode::Plugins,
+            settings_open: self.overlays.settings_open,
+            palette_open: self.overlays.palette_open,
+            popover_open: self.overlays.popover.is_some(),
+        }
     }
 
     #[inline]
@@ -456,18 +486,17 @@ impl AppModel {
     }
 
     pub(in crate::ui) fn sync_viewport_effects(&mut self, cx: &mut Context<Self>) {
-        if self.active().pending_photo_actual
-            && self.active().session.kind() == Some(Kind::Photo)
+        if self.session().kind() == Some(Kind::Photo)
             && self.image_geometry_ready()
+            && self.playback.take_pending_photo_actual()
         {
-            self.active_mut().pending_photo_actual = false;
             let (viewport, media) = self.image_geometry();
             let scale = self.chrome.last_scale;
             self.active_mut()
                 .image
                 .toggle_actual_size(viewport, media, scale);
             let (zoom, pan) = (self.active().image.zoom, self.active().image.pan);
-            let _ = self.active_mut().session.transform(zoom, pan);
+            let _ = self.session_mut().transform(zoom, pan);
             self.notify_viewport_and_dock(cx);
         }
         let t = ThemeTokens::of(cx);
@@ -483,7 +512,7 @@ impl AppModel {
         } else {
             rect_h
         };
-        self.active_mut().session.subtitle_inset(inset, height);
+        self.session_mut().subtitle_inset(inset, height);
     }
 
     pub(in crate::ui) fn sync_window_and_viewport(
@@ -511,43 +540,66 @@ impl AppModel {
     }
 
     pub(super) fn command(&mut self, command: Command, cx: &mut Context<Self>) {
-        if let Err(e) = self.active_mut().session.execute(command) {
+        if let Err(e) = self.session_mut().execute(command) {
             log::warn!("player command failed: {e:#}");
             self.show_error_toast(strings::errors::player_action_error(&e), cx);
         }
     }
 
-    fn shutdown(&mut self) {
-        if self.shutdown_done {
-            return;
-        }
-        self.shutdown_done = true;
-        self.sleep_preventer.set_active(false);
-        self.media_keys.take();
-        self.plugins.shutdown();
-        self.store_flush.take();
-        self.save_progress_sync();
-        let (vol, spd) = {
-            let st = self.active().session.state();
-            (
-                st.volume.clamp(0., 100.),
-                st.speed.clamp(MIN_SPEED, MAX_SPEED),
-            )
-        };
-        self.settings.volume = Some(vol);
-        if self.settings.remember_speed {
-            self.settings.speed = Some(spd);
-        }
-        if self.settings.remember_window_size
-            && self.chrome.pending_window_size.is_none()
-            && let Some((w, h)) = self.chrome.last_window_size
-        {
-            self.settings.window_width = Some(w);
-            self.settings.window_height = Some(h);
-        }
-        self.persist_user_settings();
-        drop(self.active().video.borrow_mut().take());
-        self.active().session.shutdown();
+    /// Single explicit window shutdown coordinator used by window close, `on_app_quit`,
+    /// and `Drop` fallback. Destroys `VideoSurface` strictly before `Session::shutdown()`.
+    pub(super) fn shutdown(&mut self) {
+        let sleep_preventer = &mut self.sleep_preventer;
+        let media_keys = &mut self.media_keys;
+        let plugins = &self.plugins;
+        let store_flush = &mut self.store_flush;
+        let store = &mut self.store;
+        let last_save = &mut self.last_save;
+        let settings = &mut self.settings;
+        let chrome = &self.chrome;
+        let viewport = &self.viewport;
+        let playback = &self.playback;
+        let scoped_released = plugins.scoped_released();
+
+        let _ = self.shutdown.run_once(
+            || sleep_preventer.set_active(false),
+            || {
+                media_keys.take();
+            },
+            || plugins.shutdown(),
+            || {
+                store_flush.take();
+                if iris_app::should_record_progress(settings.resume_playback, scoped_released) {
+                    if let Some((path, pos, dur, eof)) = playback.session().progress() {
+                        let path = path.to_path_buf();
+                        store.remember_path(&path, pos, dur, eof);
+                    } else if let Some((uri_str, pos, dur, eof)) = playback.session().uri_progress()
+                    {
+                        let uri = iris_core::media_uri::MediaUri::parse(uri_str);
+                        store.remember(&uri, pos, dur, eof);
+                    }
+                }
+                if store.is_dirty() {
+                    store.save();
+                }
+                *last_save = Instant::now();
+                let st = playback.session().state();
+                settings.volume = Some(st.volume.clamp(0., 100.));
+                if settings.remember_speed {
+                    settings.speed = Some(st.speed.clamp(MIN_SPEED, MAX_SPEED));
+                }
+                if settings.remember_window_size
+                    && chrome.pending_window_size.is_none()
+                    && let Some((w, h)) = chrome.last_window_size
+                {
+                    settings.window_width = Some(w);
+                    settings.window_height = Some(h);
+                }
+                settings.save();
+            },
+            || drop(viewport.take_video_surface()),
+            || playback.shutdown(),
+        );
     }
 }
 

@@ -1,10 +1,9 @@
-//! Viewport: per-session state, native video surface bounds probe, pointer
-//! zoom/pan & frameless drag, HUD overlays, and floating chrome slots.
+//! Viewport: pure UI surface state (`VideoSurface`, `VideoRect` bounds probe,
+//! `ImageView`, pointer zoom/pan & frameless drag origins), HUD overlays, and
+//! floating chrome slots.
 
 use std::cell::{Cell, RefCell};
-use std::path::PathBuf;
 use std::rc::Rc;
-use std::time::Instant;
 
 use gpui::{
     Context, CursorStyle, InteractiveElement, IntoElement, KeyContext, MouseButton, MouseDownEvent,
@@ -13,7 +12,6 @@ use gpui::{
 use iris_core::geometry::ImageView;
 use iris_core::input::{self, InputContext, PointerCommand, PointerInput};
 use iris_core::library::Kind;
-use iris_core::player::{MediaStats, Session};
 use iris_core::settings::{Side, VideoWheel};
 
 use super::AppModel;
@@ -26,95 +24,41 @@ use crate::video::VideoSurface;
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub(super) struct VideoRect(pub(super) [f64; 4]);
 
-pub(in crate::ui) fn should_recover_after_gpu_reset(
-    reset_gen: u64,
-    current_gen: u64,
-    kind: Option<Kind>,
-    loaded: bool,
-    restored_vid: bool,
-) -> bool {
-    if reset_gen != current_gen {
-        return false;
-    }
-    match kind {
-        Some(Kind::Photo) => true,
-        Some(Kind::Video) if restored_vid && loaded => false,
-        _ => true,
-    }
-}
-
+/// Window-owned native surface, pixel bounds probe, and pointer gesture origins.
+///
+/// Playback session state and `load_generation` belong exclusively to [`iris_app::PlaybackController`],
+/// and native teardown order (`VideoSurface` dropped BEFORE `Session::shutdown()`) is enforced by
+/// [`AppModel::shutdown`].
 pub(in crate::ui) struct Viewport {
-    pub(super) session: Session,
     pub(super) video: Rc<RefCell<Option<VideoSurface>>>,
     pub(super) rect: Rc<Cell<Option<VideoRect>>>,
     pub(super) image: ImageView,
     pub(super) drag_origin: Option<Point<Pixels>>,
     pub(super) pending_win_drag_origin: Option<Point<Pixels>>,
     pub(super) pending_click_origin: Option<Point<Pixels>>,
-    pub(super) load_generation: u64,
-    pub(super) pending_path: Option<PathBuf>,
-    pub(super) pending_subtitles: super::events::PendingSubtitles,
-    pub(super) loading_visible: bool,
-    pub(super) pending_photo_actual: bool,
-    pub(super) cached_stats: Option<MediaStats>,
-    pub(super) last_stats_refresh: Instant,
-    pub(super) announce_audio: bool,
-    pub(super) announce_volume: Option<Instant>,
-    pub(super) announce_sub: bool,
 }
 
 impl Viewport {
-    pub(super) fn new(session: Session, video: Option<VideoSurface>, now: Instant) -> Self {
+    pub(super) fn new(video: Option<VideoSurface>) -> Self {
         Self {
-            session,
             video: Rc::new(RefCell::new(video)),
             rect: Rc::new(Cell::new(None)),
             image: ImageView::default(),
             drag_origin: None,
             pending_win_drag_origin: None,
-            load_generation: 0,
             pending_click_origin: None,
-            pending_path: None,
-            pending_subtitles: Default::default(),
-            loading_visible: false,
-            pending_photo_actual: false,
-            cached_stats: None,
-            last_stats_refresh: now,
-            announce_audio: false,
-            announce_volume: None,
-            announce_sub: false,
         }
     }
 
-    pub(super) fn commit_media_open_generation(&mut self) -> u64 {
-        let prev = self.load_generation;
-        self.load_generation += 1;
-        self.pending_subtitles.advance(prev, self.load_generation);
-        self.loading_visible = false;
-        self.load_generation
-    }
-
-    pub(super) fn refresh_cached_stats(&mut self, full: bool) {
-        if full || self.cached_stats.is_none() {
-            self.cached_stats = Some(self.session.media_stats());
-        } else if let Some(stats) = &mut self.cached_stats {
-            self.session.refresh_dynamic_stats(stats);
-        }
-        self.last_stats_refresh = Instant::now();
-    }
-}
-
-impl Drop for Viewport {
-    fn drop(&mut self) {
-        drop(self.video.borrow_mut().take());
-        self.session.shutdown();
+    pub(super) fn take_video_surface(&self) -> Option<VideoSurface> {
+        self.video.borrow_mut().take()
     }
 }
 
 impl AppModel {
     pub(super) fn image_geometry(&self) -> ([f64; 2], [f64; 2]) {
         let rect = self.active().rect.get().map(|r| r.0).unwrap_or([0.; 4]);
-        let (w, h) = self.active().session.display_size();
+        let (w, h) = self.session().display_size();
         ([rect[2], rect[3]], [w as f64, h as f64])
     }
 
@@ -134,7 +78,7 @@ impl AppModel {
 
     pub(super) fn apply_image_view(&mut self, cx: &mut Context<Self>) {
         let (zoom, pan) = (self.active().image.zoom, self.active().image.pan);
-        if let Err(e) = self.active_mut().session.transform(zoom, pan) {
+        if let Err(e) = self.session_mut().transform(zoom, pan) {
             log::warn!("image transform failed: {e:#}");
             self.show_error_toast("画面缩放或平移失败", cx);
         }
@@ -166,41 +110,13 @@ impl AppModel {
 
     pub(super) fn input_context(&self) -> InputContext {
         InputContext {
-            media: self.active().session.kind(),
+            media: self.session().kind(),
             zoomed: self.image_can_pan(),
             overlay: self.has_blocking_overlay() || self.overlays.dir_popup.is_open(),
             video_wheel_volume: self.settings.video_wheel == VideoWheel::Volume,
             single_click_pause: self.settings.single_click_pause,
             photo_double_click_actual: self.settings.photo_double_click_actual,
         }
-    }
-
-    pub(super) fn media_info(&self) -> Option<String> {
-        let session = &self.active().session;
-        let kind = session.kind()?;
-        let st = session.state();
-        let (w, h) = session.display_size();
-        let mut parts = Vec::new();
-        if st.is_live {
-            parts.push("LIVE".into());
-        }
-        if w > 0 && h > 0 && kind != Kind::Audio {
-            parts.push(format!("{w}×{h}"));
-        }
-        match kind {
-            Kind::Video => parts.push(if st.hwdec.is_empty() || st.hwdec == "no" {
-                "软解".into()
-            } else {
-                format!("硬解 {}", st.hwdec)
-            }),
-            Kind::Photo => {
-                if let Some(colour) = st.photo_colour {
-                    parts.push(colour.to_string());
-                }
-            }
-            Kind::Audio => parts.push("音频".into()),
-        }
-        (!parts.is_empty()).then(|| parts.join(" · "))
     }
 }
 
@@ -265,7 +181,7 @@ impl ViewportView {
         .absolute()
         .size_full();
 
-        let session = &vp.session;
+        let session = m.session();
         let kind = session.kind();
         let fullscreen = m.chrome.fullscreen;
         let chrome_visible = m.chrome.chrome_visible;
@@ -277,7 +193,8 @@ impl ViewportView {
             has_media && session.state().loaded && matches!(kind, Some(Kind::Video | Kind::Photo));
         let is_photo_zoomed = kind == Some(Kind::Photo) && m.image_can_pan();
         let panning = vp.drag_origin.is_some();
-        let show_empty = !has_media && vp.pending_path.is_none() && !vp.loading_visible;
+        let show_empty =
+            !has_media && m.playback.pending_path().is_none() && !m.playback.loading_visible();
         let show_filmstrip = kind == Some(Kind::Photo)
             && m.settings.photo_filmstrip
             && (!fullscreen || chrome_visible)
@@ -315,7 +232,7 @@ impl ViewportView {
                     .and_then(|p| p.file_name())
                     .map(|n| n.to_string_lossy().into_owned())
                     .or_else(|| session.current_title().map(str::to_string))?;
-                Some((name, m.media_info()))
+                Some((name, m.playback.media_info()))
             })
             .flatten();
         let dock_bounds_slot = m.chrome.probes.dock_bounds.clone();

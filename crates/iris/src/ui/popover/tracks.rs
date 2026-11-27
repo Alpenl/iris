@@ -20,7 +20,7 @@ pub(super) fn render_sub_popover(
     cx: &App,
 ) -> impl IntoElement {
     let m = model.read(cx);
-    let session = &m.active().session;
+    let session = m.session();
     let state = session.state();
     let visible = state.subs_visible;
     let delay = state.sub_delay;
@@ -150,7 +150,7 @@ pub(super) fn render_audio_popover(
     cx: &App,
 ) -> impl IntoElement {
     let m = model.read(cx);
-    let session = &m.active().session;
+    let session = m.session();
     let tracks = session.tracks_of(TrackKind::Audio);
     let has_tracks = !tracks.is_empty();
     let audio_hint = m.key_hint("cycle_audio");

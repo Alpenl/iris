@@ -28,13 +28,9 @@ impl AppModel {
             self.plugin_ui.resolve_timeout = None;
         }
         let was_remote = self.catalog.remote_load.take().is_some();
-        let was_local = self.active_mut().pending_path.take().is_some();
-        if was_remote || was_resolving || was_local {
-            let vp = self.active_mut();
-            vp.load_generation += 1;
-            vp.loading_visible = false;
-            vp.pending_subtitles.clear();
-        }
+        let _ = self
+            .playback
+            .cancel_in_flight_load(was_remote || was_resolving);
     }
 
     pub(super) fn browse_local_source(&mut self, cx: &mut Context<Self>) {
@@ -265,14 +261,8 @@ impl AppModel {
         variant: Option<String>,
         cx: &mut Context<Self>,
     ) {
-        if self.catalog.remote_load.take().is_some()
-            || self.active_mut().pending_path.take().is_some()
-        {
-            let vp = self.active_mut();
-            vp.load_generation += 1;
-            vp.loading_visible = false;
-            vp.pending_subtitles.clear();
-        }
+        let had_remote = self.catalog.remote_load.take().is_some();
+        let _ = self.playback.cancel_in_flight_load(had_remote);
         let out = self.with_plugin_ctx(|ctrl, ctx| {
             ctrl.resolve_entry(
                 ctx,
@@ -359,13 +349,7 @@ impl AppModel {
             return;
         }
         self.overlays.close_menus();
-        let generation = {
-            let vp = self.active_mut();
-            vp.load_generation += 1;
-            vp.pending_path = None;
-            vp.loading_visible = true;
-            vp.load_generation
-        };
+        let generation = self.playback.begin_remote_load();
         self.notify_all(cx);
 
         let cancel = HttpCancel::default();
@@ -392,11 +376,10 @@ impl AppModel {
         let completion = cx.spawn(async move |this, cx| {
             let Some(req) = task.await else { return };
             let _ = this.update(cx, |this, cx| {
-                if this.active().load_generation != generation {
+                if !this.playback.accept_prepared_load(generation) {
                     return;
                 }
                 this.catalog.remote_load = None;
-                this.active_mut().commit_media_open_generation();
                 let resume =
                     this.settings.resume_playback && !req.is_live && req.kind == Kind::Video;
                 let resume = if resume {
@@ -405,18 +388,15 @@ impl AppModel {
                     0.
                 };
                 let settings = this.settings.clone();
-                match this
-                    .active_mut()
-                    .session
-                    .open_remote(req, &settings, resume)
-                {
+                match this.session_mut().open_remote(req, &settings, resume) {
                     Ok(()) => {
                         this.finish_media_open(cx);
                     }
                     Err(e) => {
                         log::warn!("open_remote failed: {e:#}");
-                        this.active_mut().pending_subtitles.clear();
-                        this.sync_now_playing(true);
+                        if let Some(np) = this.playback.on_media_open_failed(Instant::now()) {
+                            this.apply_now_playing_snapshot(np);
+                        }
                         this.show_error_toast("无法打开远程流，请检查地址与网络状态", cx);
                     }
                 }
@@ -435,11 +415,11 @@ impl AppModel {
     /// otherwise steps through the active `CatalogItem` list.
     pub(super) fn step(&mut self, delta: isize, wrap: bool, cx: &mut Context<Self>) {
         let cur = self
-            .active()
-            .pending_path
-            .clone()
+            .playback
+            .pending_path()
+            .map(Path::to_path_buf)
             .map(MediaUri::Local)
-            .or_else(|| self.active().session.current_media_uri());
+            .or_else(|| self.session().current_media_uri());
 
         if !self.queue.is_empty() {
             let next_q = if let Some(u) = cur.as_ref() {

@@ -12,10 +12,9 @@ use iris_core::store::{AnnotationEdit as StoreAnnotationEdit, ColorLabel, TimeMa
 
 impl AppModel {
     pub(super) fn annotation_uri(&self) -> Option<MediaUri> {
-        self.active()
-            .session
+        self.session()
             .may_share_current_identity()
-            .then(|| self.active().session.current_media_uri())
+            .then(|| self.session().current_media_uri())
             .flatten()
     }
 
@@ -25,9 +24,9 @@ impl AppModel {
 
     fn native_annotation(&mut self, edit: Option<StoreAnnotationEdit>, cx: &mut Context<Self>) {
         let saving = edit.is_some();
-        let started = self
-            .plugins
-            .begin_host_annotation(&self.viewport.session, &self.store, edit);
+        let started =
+            self.plugins
+                .begin_host_annotation(self.playback.session(), &self.store, edit);
         let (target, uri, edit, cancel, host_job) = match started {
             Ok(Some(args)) => args,
             Ok(None) => return,
@@ -165,8 +164,7 @@ pub(in crate::ui) fn render_personal_annotations(
                 chip_button("add-time-marker", "标记当前时间", false, t).on_click(model_listener(
                     model,
                     |this, _, _, cx| {
-                        let position =
-                            (this.active().session.state().time_pos.max(0.) * 1000.) as u64;
+                        let position = (this.session().state().time_pos.max(0.) * 1000.) as u64;
                         this.native_annotation(
                             Some(StoreAnnotationEdit::UpsertMarker {
                                 marker: TimeMarker {

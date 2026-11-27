@@ -256,7 +256,7 @@ impl AppModel {
 
 fn render_speed_popover(model: &Entity<AppModel>, t: ThemeTokens, cx: &App) -> impl IntoElement {
     let m = model.read(cx);
-    let current = m.active().session.state().speed;
+    let current = m.session().state().speed;
     let focused_ix = m.overlays.popover_index;
     let speed_hint = m.key_hint("speed_up");
     let rows = SPEED_STEPS.iter().copied().enumerate().map(|(i, speed)| {

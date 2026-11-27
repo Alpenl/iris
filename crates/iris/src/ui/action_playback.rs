@@ -1,28 +1,51 @@
-//! Playback, seek, volume, speed, track, chapter, and queue-step action handlers.
+//! Playback, seek, volume, speed, track, chapter, and queue-step GPUI action
+//! adapters delegating all orchestration to [`iris_app::PlaybackController`].
+
+use std::time::Instant;
 
 use gpui::{Context, Window};
-use iris_core::player::{self, Command, TrackKind};
+use iris_app::PlaybackActionOutcome;
 
 use super::AppModel;
-use super::actions::{ClearAbLoop, CycleAbLoop};
 use super::actions::{
-    CycleAudio, CycleSub, FrameBack, FrameForward, NextChapter, OpenNextMedia, OpenPreviousMedia,
-    PrevChapter, ResetSpeed, SeekBackwardExact, SeekBackwardLarge, SeekForwardExact,
-    SeekForwardLarge, SpeedDown, SpeedUp, SubDelayBack, SubDelayForward, SubDelayReset,
-    SubSeekNext, SubSeekPrev, ToggleLoop, ToggleMute, TogglePause, ToggleSubs, VolumeDown,
-    VolumeUp,
+    ClearAbLoop, CycleAbLoop, CycleAudio, CycleSub, FrameBack, FrameForward, NextChapter,
+    OpenNextMedia, OpenPreviousMedia, PrevChapter, ResetSpeed, SeekBackwardExact,
+    SeekBackwardLarge, SeekForwardExact, SeekForwardLarge, SpeedDown, SpeedUp, SubDelayBack,
+    SubDelayForward, SubDelayReset, SubSeekNext, SubSeekPrev, ToggleLoop, ToggleMute, TogglePause,
+    ToggleSubs, VolumeDown, VolumeUp,
 };
 
 impl AppModel {
+    pub(in crate::ui) fn apply_playback_action(
+        &mut self,
+        outcome: PlaybackActionOutcome,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(error) = outcome.error {
+            log::warn!("player command failed: {error:#}");
+            self.show_error_toast(super::strings::errors::player_action_error(&error), cx);
+            return;
+        }
+        if outcome.reset_image_view {
+            self.active_mut().image.reset();
+            self.apply_image_view(cx);
+        } else if let Some(axis) = outcome.flip_pan_axis {
+            self.active_mut().image.pan[axis] *= -1.;
+            self.apply_image_view(cx);
+        }
+        if let Some(osd) = outcome.osd {
+            self.show_osd(osd, cx);
+        }
+    }
+
     pub(super) fn cycle_ab_loop(
         &mut self,
         _: &CycleAbLoop,
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // Native mpv owns both endpoints and looping. State observations drive
-        // the readout; a UI timer never performs the repeat seek.
-        self.command(Command::CycleAbLoop, cx);
+        let out = self.playback.cycle_ab_loop();
+        self.apply_playback_action(out, cx);
     }
 
     pub(super) fn clear_ab_loop(
@@ -31,14 +54,13 @@ impl AppModel {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.command(Command::ClearAbLoop, cx);
+        let out = self.playback.clear_ab_loop();
+        self.apply_playback_action(out, cx);
     }
 
     pub(super) fn toggle_pause(&mut self, _: &TogglePause, _: &mut Window, cx: &mut Context<Self>) {
-        let st = self.active().session.state();
-        let next_paused = !st.paused && !st.ended;
-        self.command(Command::TogglePlayback, cx);
-        self.show_osd(if next_paused { "暂停" } else { "播放" }, cx);
+        let out = self.playback.toggle_pause();
+        self.apply_playback_action(out, cx);
     }
 
     pub(super) fn seek_back(
@@ -47,10 +69,10 @@ impl AppModel {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let step = self.settings.seek_step;
-        let target = (self.active().session.state().time_pos - step).max(0.);
-        self.command(Command::SeekRelative(-step), cx);
-        self.show_osd(format!("-{step:.0}s · {}", player::format_time(target)), cx);
+        let out = self
+            .playback
+            .seek_relative_step(self.settings.seek_step, false);
+        self.apply_playback_action(out, cx);
     }
 
     pub(super) fn seek_forward(
@@ -59,15 +81,10 @@ impl AppModel {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let step = self.settings.seek_step;
-        let st = self.active().session.state();
-        let target = if st.duration > 0. {
-            (st.time_pos + step).min(st.duration)
-        } else {
-            st.time_pos + step
-        };
-        self.command(Command::SeekRelative(step), cx);
-        self.show_osd(format!("+{step:.0}s · {}", player::format_time(target)), cx);
+        let out = self
+            .playback
+            .seek_relative_step(self.settings.seek_step, true);
+        self.apply_playback_action(out, cx);
     }
 
     pub(super) fn seek_back_large(
@@ -76,10 +93,10 @@ impl AppModel {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let step = (self.settings.seek_step * 6.).clamp(15., 120.);
-        let target = (self.active().session.state().time_pos - step).max(0.);
-        self.command(Command::SeekRelative(-step), cx);
-        self.show_osd(format!("-{step:.0}s · {}", player::format_time(target)), cx);
+        let out = self
+            .playback
+            .seek_relative_large(self.settings.seek_step, false);
+        self.apply_playback_action(out, cx);
     }
 
     pub(super) fn seek_forward_large(
@@ -88,20 +105,15 @@ impl AppModel {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let step = (self.settings.seek_step * 6.).clamp(15., 120.);
-        let st = self.active().session.state();
-        let target = if st.duration > 0. {
-            (st.time_pos + step).min(st.duration)
-        } else {
-            st.time_pos + step
-        };
-        self.command(Command::SeekRelative(step), cx);
-        self.show_osd(format!("+{step:.0}s · {}", player::format_time(target)), cx);
+        let out = self
+            .playback
+            .seek_relative_large(self.settings.seek_step, true);
+        self.apply_playback_action(out, cx);
     }
 
     pub(super) fn frame_back(&mut self, _: &FrameBack, _: &mut Window, cx: &mut Context<Self>) {
-        self.command(Command::FrameBackStep, cx);
-        self.show_osd("上一帧", cx);
+        let out = self.playback.frame_step(false);
+        self.apply_playback_action(out, cx);
     }
 
     pub(super) fn frame_forward(
@@ -110,8 +122,8 @@ impl AppModel {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.command(Command::FrameStep, cx);
-        self.show_osd("下一帧", cx);
+        let out = self.playback.frame_step(true);
+        self.apply_playback_action(out, cx);
     }
 
     pub(super) fn volume_up(&mut self, _: &VolumeUp, _: &mut Window, cx: &mut Context<Self>) {
@@ -123,68 +135,44 @@ impl AppModel {
     }
 
     pub(super) fn adjust_volume_by(&mut self, delta: f64, cx: &mut Context<Self>) {
-        match self.active_mut().session.execute(Command::VolumeBy(delta)) {
-            Ok(()) => self.active_mut().announce_volume = Some(std::time::Instant::now()),
-            Err(error) => self.show_toast(format!("操作失败 · {error}"), cx),
+        if let Err(error) = self.playback.adjust_volume_by(delta, Instant::now()) {
+            self.show_toast(format!("操作失败 · {error}"), cx);
         }
     }
 
     pub(super) fn toggle_mute(&mut self, _: &ToggleMute, _: &mut Window, cx: &mut Context<Self>) {
-        let next = !self.active().session.state().muted;
-        self.command(Command::ToggleMute, cx);
-        self.show_osd(if next { "已静音" } else { "已取消静音" }, cx);
+        let out = self.playback.toggle_mute();
+        self.apply_playback_action(out, cx);
     }
 
     pub(super) fn speed_down(&mut self, _: &SpeedDown, _: &mut Window, cx: &mut Context<Self>) {
-        let next = player::step_speed(self.active().session.state().speed, -1);
-        self.command(Command::SetSpeed(next), cx);
-        self.show_osd(format!("倍速 · {next:.2}×"), cx);
+        let out = self.playback.step_speed(-1);
+        self.apply_playback_action(out, cx);
     }
 
     pub(super) fn speed_up(&mut self, _: &SpeedUp, _: &mut Window, cx: &mut Context<Self>) {
-        let next = player::step_speed(self.active().session.state().speed, 1);
-        self.command(Command::SetSpeed(next), cx);
-        self.show_osd(format!("倍速 · {next:.2}×"), cx);
+        let out = self.playback.step_speed(1);
+        self.apply_playback_action(out, cx);
     }
 
     pub(super) fn reset_speed(&mut self, _: &ResetSpeed, _: &mut Window, cx: &mut Context<Self>) {
-        self.command(Command::SetSpeed(1.), cx);
-        self.show_osd("倍速 · 1.00×", cx);
+        let out = self.playback.reset_speed();
+        self.apply_playback_action(out, cx);
     }
 
     pub(super) fn toggle_loop(&mut self, _: &ToggleLoop, _: &mut Window, cx: &mut Context<Self>) {
-        let next = !self.active().session.state().loop_file;
-        self.command(Command::SetLoop(next), cx);
-        self.show_osd(
-            if next {
-                "单曲循环已开启"
-            } else {
-                "单曲循环已关闭"
-            },
-            cx,
-        );
+        let out = self.playback.toggle_loop();
+        self.apply_playback_action(out, cx);
     }
 
     pub(super) fn toggle_subs(&mut self, _: &ToggleSubs, _: &mut Window, cx: &mut Context<Self>) {
-        let next = !self.active().session.state().subs_visible;
-        self.command(Command::ToggleSubtitles, cx);
-        self.show_osd(
-            if next {
-                "字幕已显示"
-            } else {
-                "字幕已隐藏"
-            },
-            cx,
-        );
+        let out = self.playback.toggle_subtitles();
+        self.apply_playback_action(out, cx);
     }
 
     pub(super) fn cycle_sub(&mut self, _: &CycleSub, _: &mut Window, cx: &mut Context<Self>) {
-        if self.active().session.tracks_of(TrackKind::Sub).is_empty() {
-            self.show_osd("当前视频没有字幕轨", cx);
-            return;
-        }
-        self.active_mut().announce_sub = true;
-        self.command(Command::NextSubtitle, cx);
+        let out = self.playback.cycle_subtitle_track();
+        self.apply_playback_action(out, cx);
     }
 
     pub(super) fn sub_seek_prev(
@@ -193,7 +181,8 @@ impl AppModel {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.seek_subtitle_cue(Command::SubSeekPrev, cx);
+        let out = self.playback.seek_subtitle_cue(false);
+        self.apply_playback_action(out, cx);
     }
 
     pub(super) fn sub_seek_next(
@@ -202,20 +191,8 @@ impl AppModel {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.seek_subtitle_cue(Command::SubSeekNext, cx);
-    }
-
-    fn seek_subtitle_cue(&mut self, command: Command, cx: &mut Context<Self>) {
-        if self
-            .active()
-            .session
-            .selected_track(TrackKind::Sub)
-            .is_none()
-        {
-            self.show_osd("请先选择字幕轨道", cx);
-            return;
-        }
-        self.command(command, cx);
+        let out = self.playback.seek_subtitle_cue(true);
+        self.apply_playback_action(out, cx);
     }
 
     pub(super) fn sub_delay_back(
@@ -224,9 +201,8 @@ impl AppModel {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let next = ((self.active().session.state().sub_delay - 0.1) * 100.).round() / 100.;
-        self.command(Command::SetSubDelay(next), cx);
-        self.show_osd(format!("字幕偏移 · {next:+.1}s"), cx);
+        let out = self.playback.adjust_sub_delay(-0.1);
+        self.apply_playback_action(out, cx);
     }
 
     pub(super) fn sub_delay_forward(
@@ -235,9 +211,8 @@ impl AppModel {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let next = ((self.active().session.state().sub_delay + 0.1) * 100.).round() / 100.;
-        self.command(Command::SetSubDelay(next), cx);
-        self.show_osd(format!("字幕偏移 · {next:+.1}s"), cx);
+        let out = self.playback.adjust_sub_delay(0.1);
+        self.apply_playback_action(out, cx);
     }
 
     pub(super) fn sub_delay_reset(
@@ -246,35 +221,23 @@ impl AppModel {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.command(Command::SetSubDelay(0.), cx);
-        self.show_osd("字幕偏移 · 0.0s", cx);
+        let out = self.playback.reset_sub_delay();
+        self.apply_playback_action(out, cx);
     }
 
     pub(super) fn cycle_audio(&mut self, _: &CycleAudio, _: &mut Window, cx: &mut Context<Self>) {
-        if self.active().session.tracks_of(TrackKind::Audio).len() <= 1 {
-            self.show_osd("当前视频没有其他音轨", cx);
-            return;
-        }
-        self.active_mut().announce_audio = true;
-        self.command(Command::NextAudio, cx);
+        let out = self.playback.cycle_audio_track();
+        self.apply_playback_action(out, cx);
     }
 
     pub(super) fn prev_chapter(&mut self, _: &PrevChapter, _: &mut Window, cx: &mut Context<Self>) {
-        if self.active().session.state().chapters.is_empty() {
-            self.show_osd("当前视频没有章节", cx);
-            return;
-        }
-        self.command(Command::PrevChapter, cx);
-        self.show_osd("上一章节", cx);
+        let out = self.playback.step_chapter(false);
+        self.apply_playback_action(out, cx);
     }
 
     pub(super) fn next_chapter(&mut self, _: &NextChapter, _: &mut Window, cx: &mut Context<Self>) {
-        if self.active().session.state().chapters.is_empty() {
-            self.show_osd("当前视频没有章节", cx);
-            return;
-        }
-        self.command(Command::NextChapter, cx);
-        self.show_osd("下一章节", cx);
+        let out = self.playback.step_chapter(true);
+        self.apply_playback_action(out, cx);
     }
 
     pub(super) fn next_item(&mut self, _: &OpenNextMedia, _: &mut Window, cx: &mut Context<Self>) {

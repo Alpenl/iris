@@ -49,8 +49,8 @@ impl AppModel {
             let _ = this.update(cx, |this, cx| {
                 let first = items.first().cloned();
                 let added = this.queue.extend(items);
-                let idle = this.active().session.current_media_uri().is_none()
-                    && !this.media_load_pending();
+                let idle =
+                    this.session().current_media_uri().is_none() && !this.media_load_pending();
                 if idle && let Some(q) = first {
                     this.open_media_uri(&q.uri, Some(q.title), cx);
                 }
@@ -131,7 +131,7 @@ impl Sidebar {
                     cx.processor(|sidebar, range: Range<usize>, _, cx| {
                         let model = sidebar.model.clone();
                         let m = model.read(cx);
-                        let cur_uri = m.active().session.current_media_uri();
+                        let cur_uri = m.session().current_media_uri();
                         let t = ThemeTokens::of(cx);
                         range
                             .filter_map(|ix| {

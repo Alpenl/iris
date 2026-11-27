@@ -20,7 +20,7 @@ use crate::assets::Icon;
 use crate::theme::{FONT_MONO, ThemeTokens};
 
 pub(super) fn render_audio_card(m: &AppModel, t: ThemeTokens) -> impl IntoElement {
-    let session = &m.active().session;
+    let session = m.session();
     let st = session.state();
     let name = session
         .current()
@@ -334,7 +334,7 @@ pub(super) fn render_photo_filmstrip(
     if photos.len() < 2 {
         return None;
     }
-    let current = m.active().session.current();
+    let current = m.session().current();
     let cur_ix = m.catalog.filmstrip_index;
     const WINDOW: usize = 11;
     let start = cur_ix
