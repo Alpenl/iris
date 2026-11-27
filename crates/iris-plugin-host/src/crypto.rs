@@ -8,7 +8,10 @@ use iris_api::v2::{
     crypto::{Cipher, CryptoSpec, Hash},
 };
 use md5::Digest;
-use ring::{aead, digest, hmac};
+use ring::{
+    aead, digest, hmac,
+    rand::{SecureRandom, SystemRandom},
+};
 
 pub fn compute(
     spec: &CryptoSpec,
@@ -159,6 +162,21 @@ where
         }
     }
     Ok(output)
+}
+
+pub(crate) fn random_identity() -> Result<String, ErrorCode> {
+    let mut bytes = [0; 16];
+    SystemRandom::new()
+        .fill(&mut bytes)
+        .map_err(|_| ErrorCode::Internal)?;
+    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+pub(crate) fn valid_identity(id: &str) -> bool {
+    id.len() == 32
+        && id
+            .bytes()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
 }
 
 #[cfg(test)]

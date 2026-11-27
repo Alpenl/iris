@@ -7,6 +7,7 @@ const OWNER: &str = "0123456789abcdef0123456789abcdef";
 struct Fixture {
     root: PathBuf,
     ledger: Ledger,
+    _cleaner: ArtifactCleaner,
     services: ControlServices,
 }
 
@@ -19,6 +20,7 @@ impl Fixture {
         ));
         std::fs::create_dir_all(&root).unwrap();
         let ledger = Ledger::default();
+        let cleaner = ArtifactCleaner::new();
         let caps = BTreeSet::from([Capability::MediaEnhance]);
         let grant = NetworkGrant::new(
             OWNER.into(),
@@ -43,11 +45,13 @@ impl Fixture {
             storage,
             caps,
             root.join("temp"),
+            cleaner.queue(),
         )
         .unwrap();
         Self {
             root,
             ledger,
+            _cleaner: cleaner,
             services,
         }
     }

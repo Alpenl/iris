@@ -1,4 +1,5 @@
 use super::*;
+use crate::url_resolver::normalize_url;
 use iris_api::v2::{Capability, NetworkDeclaration};
 
 struct Fixture {

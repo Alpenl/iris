@@ -1,15 +1,15 @@
+pub use super::imports::{Blob, DetachedBlob};
 use super::{
-    actor::Bridge,
     engine::{CompiledModule, RuntimeEngine},
+    imports::{HostCallbacks, State, checked_range},
     json_error,
     ledger::{Ledger, Reservation, Resource},
 };
 use iris_api::v2::{
-    CHUNK_LIMIT, COMMAND_LIMIT, Capability, ErrorCode, HostCommand, Id, MESSAGE_LIMIT, Reply, Role,
-    unpack,
+    COMMAND_LIMIT, Capability, ErrorCode, HostCommand, Id, MESSAGE_LIMIT, Reply, Role, unpack,
 };
 use iris_base::net::http_client::HttpCancel;
-use iris_base::rt::{CancelToken, Deadline, WaitError};
+use iris_base::rt::{CancelToken, Deadline};
 use iris_core::bounded_json::{decode, decode_exact};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -19,9 +19,15 @@ use std::{
     },
     time::{Duration, Instant},
 };
-use wasmtime::{Memory, Store, StoreLimits, StoreLimitsBuilder, TypedFunc, UpdateDeadline};
+use wasmtime::{Memory, Store, StoreLimitsBuilder, TypedFunc, UpdateDeadline};
 mod contexts;
 
+/// Sole process-wide static in `iris-plugin-host`: a stateless monotonic counter
+/// allocating non-reused `1..=i64::MAX` handle/operation/session IDs across the
+/// process lifetime so numeric handles can never collide across retired or
+/// concurrent `PluginHost` / `Store` instances. It holds zero host, quota, or
+/// authorization state; every lookup validates ownership, `Binding`, and
+/// `Generation` against the owning `Store` / `PluginHost` instance.
 static NEXT_HANDLE: AtomicU64 = AtomicU64::new(1);
 pub(crate) fn next_id() -> Result<u64, ErrorCode> {
     NEXT_HANDLE
@@ -29,70 +35,6 @@ pub(crate) fn next_id() -> Result<u64, ErrorCode> {
             (n <= i64::MAX as u64).then(|| n + 1)
         })
         .map_err(|_| ErrorCode::QuotaExceeded)
-}
-
-pub struct Blob {
-    pub bytes: Vec<u8>,
-    pub(crate) owner: String,
-    _reservation: Reservation,
-}
-pub struct DetachedBlob {
-    pub data: Arc<Blob>,
-    _handle: Reservation,
-}
-impl DetachedBlob {
-    pub(crate) fn reserve(
-        ledger: &Ledger,
-        owner: &str,
-        data: Arc<Blob>,
-    ) -> Result<Self, ErrorCode> {
-        if data.owner != owner {
-            return Err(ErrorCode::Denied);
-        }
-        Ok(Self {
-            data,
-            _handle: ledger.reserve(owner, &[(Resource::Handle, 1)])?,
-        })
-    }
-}
-impl Blob {
-    pub fn new(ledger: &Ledger, owner: &str, bytes: Vec<u8>) -> Result<Self, ErrorCode> {
-        if bytes.len() > CHUNK_LIMIT {
-            return Err(ErrorCode::QuotaExceeded);
-        }
-        let reservation = ledger.reserve(owner, &[(Resource::HostBytes, bytes.len() as u64)])?;
-        Ok(Self {
-            bytes,
-            owner: owner.to_owned(),
-            _reservation: reservation,
-        })
-    }
-}
-
-pub(crate) struct State {
-    pub role: Role,
-    pub grants: BTreeSet<Capability>,
-    pub owner: String,
-    pub ledger: Ledger,
-    pub blobs: BTreeMap<u64, Arc<Blob>>,
-    pub blob_handles: BTreeMap<u64, Reservation>,
-    pub services: Option<Bridge>,
-    pub cancel: CancelToken,
-    pub started: Instant,
-    pub deadline: Deadline,
-    pub ready: bool,
-    limits: StoreLimits,
-    _memory: Reservation,
-}
-
-impl State {
-    pub fn check_live(&self) -> Result<(), ErrorCode> {
-        match self.cancel.check(Some(self.deadline)) {
-            Ok(_) => Ok(()),
-            Err(WaitError::Cancelled) => Err(ErrorCode::Cancelled),
-            Err(WaitError::TimedOut) => Err(ErrorCode::Timeout),
-        }
-    }
 }
 
 pub struct InstanceConfig {
@@ -179,7 +121,7 @@ impl Instance {
 
     pub(crate) fn with_reservation(
         config: InstanceConfig,
-        services: Option<Bridge>,
+        services: Option<Box<dyn HostCallbacks>>,
         reservation: Reservation,
     ) -> Result<Self, ErrorCode> {
         let InstanceConfig {
@@ -204,6 +146,7 @@ impl Instance {
             ledger,
             blobs: BTreeMap::new(),
             blob_handles: BTreeMap::new(),
+            alloc_handle: next_id,
             services,
             cancel,
             started: now,
@@ -426,24 +369,6 @@ impl Instance {
             .err()
             .unwrap_or(ErrorCode::InvalidArgument)
     }
-}
-
-pub(crate) fn checked_range(
-    ptr: u32,
-    len: u32,
-    memory_len: usize,
-    allow_empty: bool,
-) -> Result<std::ops::Range<usize>, ErrorCode> {
-    if (!allow_empty && (ptr == 0 || len == 0)) || (len != 0 && ptr == 0) {
-        return Err(ErrorCode::InvalidArgument);
-    }
-    let end = (ptr as usize)
-        .checked_add(len as usize)
-        .ok_or(ErrorCode::RangeInvalid)?;
-    if end > memory_len {
-        return Err(ErrorCode::RangeInvalid);
-    }
-    Ok(ptr as usize..end)
 }
 
 #[cfg(test)]

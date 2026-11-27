@@ -2,10 +2,10 @@
 //! grant, and native decoders receive only sealed loopback resource URLs.
 use super::{
     actor::ReadResult,
-    files::Artifact,
+    files::{Artifact, FileExecutor},
     instance::{Blob, next_id},
     ledger::{Ledger, Reservation, Resource},
-    runtime::WindowAccess,
+    network::NetworkGrant,
     stream::{
         prepare::subtitle_format,
         reader::{MemoryReader, Reader, check_read},
@@ -15,7 +15,7 @@ use super::{
     },
 };
 use iris_api::v2::{
-    Capability, ErrorCode, Generation, Id,
+    ErrorCode, Generation, Id,
     enhance::{EnhancementResource, SubtitleFormat},
 };
 use iris_base::net::http_client::HttpCancel;
@@ -85,123 +85,116 @@ pub struct AttachmentSpec {
     pub subtitle: Option<SubtitleFormat>,
     pub resource: EnhancementResource,
 }
-impl WindowAccess {
-    /// Background worker only. The returned lease must live until mpv has
-    /// acknowledged removal, including cancelled/replaced pending additions.
-    pub fn prepare_attachment(&self, spec: AttachmentSpec) -> Result<Arc<Attachment>, ErrorCode> {
-        self.prepare_attachment_for(self.generation, spec)
-    }
+pub(crate) struct AttachmentContext<'a> {
+    pub owner: &'a str,
+    pub generation: Generation,
+    pub network: &'a NetworkGrant,
+    pub files: &'a FileExecutor,
+    pub ledger: &'a Ledger,
+    pub cancel: &'a HttpCancel,
+    pub attachments: &'a Arc<AttachmentRegistry>,
+}
 
-    /// Validates `generation` against this window capability before preparing a
-    /// sealed loopback attachment.
-    pub fn prepare_attachment_for(
-        &self,
-        generation: Generation,
-        spec: AttachmentSpec,
-    ) -> Result<Arc<Attachment>, ErrorCode> {
-        self.check(generation, Capability::MediaEnhance)?;
-        super::validation::identifier(&spec.id)?;
-        super::validation::text(&spec.label, 256)?;
-        if let Some(lang) = &spec.lang {
-            super::validation::text(lang, 64)?;
-        }
-        let lease = self.resources.ledger.reserve(
-            &self.owner,
-            &[
-                (Resource::EnhancementTrack, 1),
-                (Resource::HostBytes, 16384),
-            ],
-        )?;
-        let factory = RemoteFactory::new(self.network.clone(), self.resources.ledger.clone())?;
-        let mut reader: Arc<dyn Reader> = match &spec.resource {
-            EnhancementResource::Remote { request } => factory.reader(request, None)?,
-            EnhancementResource::Artifact { handle } => Arc::new(ArtifactReader {
-                artifact: self
-                    .files
-                    .approved_artifact(&self.owner, *handle, generation)?,
-                ledger: self.resources.ledger.clone(),
-            }),
-        };
-        let extension = if let Some(format) = spec.subtitle {
-            let _scratch = self
-                .resources
-                .ledger
-                .reserve(&self.owner, &[(Resource::HostBytes, 24 << 20)])?;
-            let bytes = match &spec.resource {
-                EnhancementResource::Remote { request } => {
-                    factory.fetch(request, &self.cancel, 10 << 20)?.bytes
-                }
-                _ => read_document(&reader, &self.cancel)?,
-            };
-            let extension = subtitle_format(&bytes)?;
-            let expected = match format {
-                SubtitleFormat::SubRip => "srt",
-                SubtitleFormat::WebVtt => "vtt",
-                SubtitleFormat::Ass => "ass",
-            };
-            if extension != expected {
-                return Err(ErrorCode::InvalidArgument);
-            }
-            reader = Arc::new(MemoryReader::new(
-                bytes,
-                &self.owner,
-                &self.resources.ledger,
-            )?);
-            extension
-        } else {
-            let prefix = super::stream::prepare::probe_prefix(&reader, 4096, &self.cancel)?;
-            if super::stream::prepare::adaptive(&prefix) {
-                return Err(ErrorCode::Unsupported);
-            }
-            "bin"
-        };
-        let mut registry = self
-            .attachments
-            .relay
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        if self.cancel.is_cancelled() {
-            return Err(ErrorCode::Cancelled);
-        }
-        let relay = if let Some(relay) = registry.as_ref() {
-            relay.clone()
-        } else {
-            let bound = BoundRelay::bind()?;
-            let session = StreamSession::new(
-                Id(next_id()?),
-                generation,
-                bound.authority()?,
-                factory,
-                None,
-            )?;
-            session.commit(session.prepare_reader(Arc::new(MemoryReader::new(
-                Vec::new(),
-                &self.owner,
-                &self.resources.ledger,
-            )?))?)?;
-            self.cancel
-                .link(session.cancellation())
-                .map_err(|_| ErrorCode::Cancelled)?;
-            let relay = Arc::new(bound.start(session)?);
-            *registry = Some(relay.clone());
-            relay
-        };
-        let route = format!("enh_{}", next_id()?);
-        let url = relay.session().add_attachment(&route, extension, reader)?;
-        Ok(Arc::new(Attachment {
-            owner: self.owner.clone(),
-            id: spec.id,
-            label: spec.label,
-            lang: spec.lang,
-            audio: spec.subtitle.is_none(),
-            generation,
-            url,
-            route,
-            registry: self.attachments.clone(),
-            relay,
-            _lease: lease,
-        }))
+pub(crate) fn prepare_attachment(
+    ctx: AttachmentContext<'_>,
+    spec: AttachmentSpec,
+) -> Result<Arc<Attachment>, ErrorCode> {
+    super::validation::identifier(&spec.id)?;
+    super::validation::text(&spec.label, 256)?;
+    if let Some(lang) = &spec.lang {
+        super::validation::text(lang, 64)?;
     }
+    let lease = ctx.ledger.reserve(
+        ctx.owner,
+        &[
+            (Resource::EnhancementTrack, 1),
+            (Resource::HostBytes, 16384),
+        ],
+    )?;
+    let factory = RemoteFactory::new(ctx.network.clone(), ctx.ledger.clone())?;
+    let mut reader: Arc<dyn Reader> = match &spec.resource {
+        EnhancementResource::Remote { request } => factory.reader(request, None)?,
+        EnhancementResource::Artifact { handle } => Arc::new(ArtifactReader {
+            artifact: ctx
+                .files
+                .approved_artifact(ctx.owner, *handle, ctx.generation)?,
+            ledger: ctx.ledger.clone(),
+        }),
+    };
+    let extension = if let Some(format) = spec.subtitle {
+        let _scratch = ctx
+            .ledger
+            .reserve(ctx.owner, &[(Resource::HostBytes, 24 << 20)])?;
+        let bytes = match &spec.resource {
+            EnhancementResource::Remote { request } => {
+                factory.fetch(request, ctx.cancel, 10 << 20)?.bytes
+            }
+            _ => read_document(&reader, ctx.cancel)?,
+        };
+        let extension = subtitle_format(&bytes)?;
+        let expected = match format {
+            SubtitleFormat::SubRip => "srt",
+            SubtitleFormat::WebVtt => "vtt",
+            SubtitleFormat::Ass => "ass",
+        };
+        if extension != expected {
+            return Err(ErrorCode::InvalidArgument);
+        }
+        reader = Arc::new(MemoryReader::new(bytes, ctx.owner, ctx.ledger)?);
+        extension
+    } else {
+        let prefix = super::stream::prepare::probe_prefix(&reader, 4096, ctx.cancel)?;
+        if super::stream::prepare::adaptive(&prefix) {
+            return Err(ErrorCode::Unsupported);
+        }
+        "bin"
+    };
+    let mut registry = ctx
+        .attachments
+        .relay
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if ctx.cancel.is_cancelled() {
+        return Err(ErrorCode::Cancelled);
+    }
+    let relay = if let Some(relay) = registry.as_ref() {
+        relay.clone()
+    } else {
+        let bound = BoundRelay::bind()?;
+        let session = StreamSession::new(
+            Id(next_id()?),
+            ctx.generation,
+            bound.authority()?,
+            factory,
+            None,
+        )?;
+        session.commit(session.prepare_reader(Arc::new(MemoryReader::new(
+            Vec::new(),
+            ctx.owner,
+            ctx.ledger,
+        )?))?)?;
+        ctx.cancel
+            .link(session.cancellation())
+            .map_err(|_| ErrorCode::Cancelled)?;
+        let relay = Arc::new(bound.start(session)?);
+        *registry = Some(relay.clone());
+        relay
+    };
+    let route = format!("enh_{}", next_id()?);
+    let url = relay.session().add_attachment(&route, extension, reader)?;
+    Ok(Arc::new(Attachment {
+        owner: ctx.owner.to_owned(),
+        id: spec.id,
+        label: spec.label,
+        lang: spec.lang,
+        audio: spec.subtitle.is_none(),
+        generation: ctx.generation,
+        url,
+        route,
+        registry: ctx.attachments.clone(),
+        relay,
+        _lease: lease,
+    }))
 }
 struct ArtifactReader {
     artifact: Arc<Artifact>,

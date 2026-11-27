@@ -3,9 +3,11 @@ use crate::actor::Status;
 use crate::installation::Approval;
 use crate::package::{Package, Provenance};
 use iris_api::v2::{Capability, NetworkDeclaration, source::PlaybackSnapshot};
+use iris_core::vault::CredentialVault;
 use std::{
     collections::BTreeMap,
     io::{Cursor, Write},
+    path::PathBuf,
     time::{Duration, Instant},
 };
 use zip::{ZipWriter, write::SimpleFileOptions};

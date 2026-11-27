@@ -1,6 +1,7 @@
 //! Content-addressed packages plus a single atomic installation record. Grant
 //! confirmation is supplied by trusted host interaction, never by a guest form.
 mod review;
+pub(crate) use super::crypto::{random_identity, valid_identity};
 use super::{
     json_error,
     ledger::{Ledger, Resource},
@@ -9,7 +10,6 @@ use super::{
 use iris_api::v2::{Capability, ErrorCode, MESSAGE_LIMIT, Manifest, NetworkDeclaration};
 use iris_core::bounded_json::decode;
 pub use review::Review;
-use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -462,19 +462,6 @@ fn validate_approval(manifest: &Manifest, approval: &Approval) -> Result<(), Err
         return Err(ErrorCode::Denied);
     }
     Ok(())
-}
-pub(crate) fn random_identity() -> Result<String, ErrorCode> {
-    let mut bytes = [0; 16];
-    SystemRandom::new()
-        .fill(&mut bytes)
-        .map_err(|_| ErrorCode::Internal)?;
-    Ok(hex(&bytes))
-}
-pub(crate) fn valid_identity(id: &str) -> bool {
-    id.len() == 32
-        && id
-            .bytes()
-            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
 }
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()

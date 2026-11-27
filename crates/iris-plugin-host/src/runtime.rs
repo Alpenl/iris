@@ -6,15 +6,15 @@ pub use access::{BackgroundResult, WindowAccess};
 mod events;
 mod playback;
 mod window;
+pub use super::services::{Resources, Setup};
 use super::{
     actor::{Actor, Spawn},
-    engine::{CompiledModule, RuntimeEngine},
+    engine::CompiledModule,
     installation::{Installed, Installer},
     instance::next_id,
     json_error,
-    ledger::{Ledger, Reservation, Resource},
+    ledger::{Reservation, Resource},
     network::{NetworkGrant, consent::OriginStore},
-    pool::IoPool,
     services::ControlServices,
     storage::Storage,
 };
@@ -22,35 +22,11 @@ use iris_api::v2::{
     ErrorCode, Generation, HostEvent, Id, Manifest, Role, source::SourceDescriptor,
 };
 use iris_base::rt::CancelToken;
-use iris_core::vault::CredentialVault;
 pub use playback::PlaybackPermit;
-use std::{collections::BTreeSet, path::PathBuf, sync::Arc};
+use std::{collections::BTreeSet, sync::Arc};
 pub(super) use window::WindowState;
 pub use window::{PreparedWindow, WindowPreparation};
 
-#[derive(Clone)]
-pub struct Resources {
-    pub engine: RuntimeEngine,
-    pub io: IoPool,
-    pub ledger: Ledger,
-}
-impl Resources {
-    pub fn new() -> Result<Self, ErrorCode> {
-        Ok(Self {
-            engine: RuntimeEngine::new()?,
-            io: IoPool::new()?,
-            ledger: Ledger::default(),
-        })
-    }
-}
-#[derive(Clone)]
-pub struct Setup {
-    pub resources: Resources,
-    pub state_directory: PathBuf,
-    pub temporary_directory: PathBuf,
-    pub vault: CredentialVault,
-    pub wake: Arc<dyn Fn() + Send + Sync>,
-}
 struct LogRateLimiter {
     window_start: std::time::Instant,
     count: u32,
@@ -149,6 +125,7 @@ impl Control {
             storage,
             installed.grants.clone(),
             setup.temporary_directory.join(&installed.installation_id),
+            setup.resources.cleaner.queue(),
         )?);
         let actor = module
             .as_ref()

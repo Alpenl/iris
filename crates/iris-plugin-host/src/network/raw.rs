@@ -3,10 +3,11 @@
 mod response;
 
 use super::{Origin, RequestGrant, TransportKind, normalize_url};
+pub(crate) use crate::url_resolver::validate_headers;
 use iris_api::v2::ErrorCode;
 use iris_base::net::http_client::{
-    HeaderValidationError, HttpBody, HttpCancel, HttpClientError, NetworkScope, SocketRegistration,
-    Transport, connect_transport, is_tchar, validate_header_pairs,
+    HttpBody, HttpCancel, HttpClientError, NetworkScope, SocketRegistration, Transport,
+    connect_transport, is_tchar,
 };
 use std::{
     io::{self, Read, Write},
@@ -55,18 +56,6 @@ pub(crate) enum RawState {
     Upload(Upload),
     Response(Response),
     Closed,
-}
-
-pub(crate) fn validate_headers(headers: &[(String, String)]) -> Result<(), ErrorCode> {
-    validate_header_pairs(headers.iter().map(|(k, v)| (k.as_str(), v.as_str()))).map_err(
-        |(_name, kind)| match kind {
-            HeaderValidationError::QuotaExceeded => ErrorCode::QuotaExceeded,
-            HeaderValidationError::InvalidName | HeaderValidationError::InvalidValue => {
-                ErrorCode::InvalidArgument
-            }
-            HeaderValidationError::ForbiddenHeader => ErrorCode::Denied,
-        },
-    )
 }
 
 pub(crate) fn open(

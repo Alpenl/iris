@@ -6,7 +6,7 @@ use super::{
     installation::{Approval, InstallationEntry, Installed, Installer, Review},
     json_error,
     package::{Package, Provenance},
-    runtime::Setup,
+    services::Setup,
 };
 use iris_api::v2::ErrorCode;
 use iris_base::rt::CancelToken;

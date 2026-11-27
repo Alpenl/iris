@@ -1289,7 +1289,7 @@ class CheckProjectHelperTests(unittest.TestCase):
             self.assertIn("Resolved cycle edges", str(ctx_resolved.exception))
 
         # Repository baseline counts match reviewed audit numbers.
-        self.assertEqual(len(check_project.KNOWN_MODULE_CYCLE_EDGES["iris-plugin-host"]), 56)
+        self.assertEqual(len(check_project.KNOWN_MODULE_CYCLE_EDGES["iris-plugin-host"]), 0)
         self.assertEqual(len(check_project.KNOWN_MODULE_CYCLE_EDGES["iris-core"]), 0)
         self.assertEqual(len(check_project.KNOWN_MODULE_CYCLE_EDGES["iris-app"]), 0)
 

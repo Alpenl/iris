@@ -3,6 +3,7 @@ use super::{
     mailbox::{self, Mailbox, Message},
 };
 use crate::{
+    imports::HostCallbacks,
     instance::{Blob, next_id},
     ledger::Resource,
     pool::IoPool,
@@ -162,5 +163,35 @@ impl Bridge {
 
     pub(crate) fn fail(&mut self, request: u64, error: ErrorCode) -> Result<(), ErrorCode> {
         self.shared.fail(request, error)
+    }
+}
+
+impl HostCallbacks for Bridge {
+    fn on_request(&mut self, cancel: Option<HttpCancel>) {
+        Self::on_request(self, cancel);
+    }
+
+    fn on_window(&mut self, window: Option<Id>) {
+        Self::on_window(self, window);
+    }
+
+    fn on_event(&mut self, generation: Generation, read: Option<Id>) {
+        Self::on_event(self, generation, read);
+    }
+
+    fn submit(&mut self, task: Task, blobs: &BTreeMap<u64, Arc<Blob>>) -> Result<u64, ErrorCode> {
+        Self::submit(self, task, blobs)
+    }
+
+    fn close(&mut self, handle: u64) -> Result<(), ErrorCode> {
+        Self::close(self, handle)
+    }
+
+    fn reply(&mut self, request: u64, blob: Arc<Blob>, eof: bool) -> Result<usize, ErrorCode> {
+        Self::reply(self, request, blob, eof)
+    }
+
+    fn fail(&mut self, request: u64, error: ErrorCode) -> Result<(), ErrorCode> {
+        Self::fail(self, request, error)
     }
 }

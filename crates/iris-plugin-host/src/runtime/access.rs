@@ -2,7 +2,7 @@
 //! authority is promoted through this interface; callers retain Binding checks.
 use super::{Control, Resources};
 use crate::{
-    enhancement::AttachmentRegistry,
+    enhancement::{Attachment, AttachmentContext, AttachmentRegistry, AttachmentSpec},
     files::FileExecutor,
     ledger::{Reservation, Resource},
     network::NetworkGrant,
@@ -95,6 +95,34 @@ impl WindowAccess {
                     _lease: lease,
                 }));
             }),
+        )
+    }
+
+    /// Background worker only. The returned lease must live until mpv has
+    /// acknowledged removal, including cancelled/replaced pending additions.
+    pub fn prepare_attachment(&self, spec: AttachmentSpec) -> Result<Arc<Attachment>, ErrorCode> {
+        self.prepare_attachment_for(self.generation, spec)
+    }
+
+    /// Validates `generation` against this window capability before preparing a
+    /// sealed loopback attachment.
+    pub fn prepare_attachment_for(
+        &self,
+        generation: Generation,
+        spec: AttachmentSpec,
+    ) -> Result<Arc<Attachment>, ErrorCode> {
+        self.check(generation, Capability::MediaEnhance)?;
+        crate::enhancement::prepare_attachment(
+            AttachmentContext {
+                owner: &self.owner,
+                generation,
+                network: &self.network,
+                files: &self.files,
+                ledger: &self.resources.ledger,
+                cancel: &self.cancel,
+                attachments: &self.attachments,
+            },
+            spec,
         )
     }
 }

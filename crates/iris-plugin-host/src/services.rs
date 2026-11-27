@@ -3,18 +3,55 @@
 use super::{
     actor::{Executor, Operation, TaskContext},
     auth::{AuthExecutor, BrowserOpen},
-    files::{FileExecutor, FileSetup},
+    engine::RuntimeEngine,
+    files::{ArtifactCleaner, CleanerQueue, FileExecutor, FileSetup},
     instance::Blob,
     ledger::{Ledger, Reservation, Resource},
     network::{NetworkExecutor, NetworkGrant},
+    pool::IoPool,
     storage::{Storage, StorageExecutor},
 };
 use iris_api::v2::{Capability, ErrorCode, Generation, Id, Role, task::Task};
+use iris_core::vault::CredentialVault;
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::PathBuf,
     sync::{Arc, Mutex},
 };
+
+#[derive(Clone)]
+pub struct Resources {
+    pub engine: RuntimeEngine,
+    pub io: IoPool,
+    pub ledger: Ledger,
+    pub(crate) cleaner: ArtifactCleaner,
+}
+
+impl Resources {
+    pub fn new() -> Result<Self, ErrorCode> {
+        Ok(Self {
+            engine: RuntimeEngine::new()?,
+            io: IoPool::new()?,
+            ledger: Ledger::default(),
+            cleaner: ArtifactCleaner::new(),
+        })
+    }
+
+    /// Drains pending artifact deletions within bounded retries/time and joins
+    /// this host's cleanup worker within bounded timeout.
+    pub fn shutdown(&self) {
+        self.cleaner.shutdown();
+    }
+}
+
+#[derive(Clone)]
+pub struct Setup {
+    pub resources: Resources,
+    pub state_directory: PathBuf,
+    pub temporary_directory: PathBuf,
+    pub vault: CredentialVault,
+    pub wake: Arc<dyn Fn() + Send + Sync>,
+}
 
 struct WindowScope {
     generation: Generation,
@@ -48,15 +85,19 @@ impl ControlServices {
         storage: Arc<Storage>,
         capabilities: BTreeSet<Capability>,
         temporary_directory: PathBuf,
+        cleaner: CleanerQueue,
     ) -> Result<Self, ErrorCode> {
         let global_network =
             NetworkExecutor::new(network_grant.clone(), ledger.clone(), BTreeSet::new())?;
-        let global_files = FileExecutor::new(FileSetup {
-            network: network_grant.clone(),
-            ledger: ledger.clone(),
-            capabilities: capabilities.clone(),
-            temporary_directory,
-        })?;
+        let global_files = FileExecutor::with_cleaner(
+            FileSetup {
+                network: network_grant.clone(),
+                ledger: ledger.clone(),
+                capabilities: capabilities.clone(),
+                temporary_directory,
+            },
+            cleaner,
+        )?;
         let auth = AuthExecutor::new(
             network_grant.clone(),
             ledger.clone(),

@@ -3,7 +3,7 @@ mod bridge;
 mod mailbox;
 mod operation;
 mod read;
-pub(crate) use bridge::Bridge;
+use bridge::Bridge;
 pub use operation::{Completion, Operation};
 use read::ReadSlot;
 pub use read::{ReadResult, ReadTicket};
@@ -186,7 +186,7 @@ impl Actor {
                             ledger: config.ledger,
                             cancel: thread_shared.cancel.clone(),
                         },
-                        Some(bridge),
+                        Some(Box::new(bridge)),
                         reservation,
                     )?;
                     thread_shared.set_status(Status::Ready);

@@ -4,7 +4,7 @@ use crate::{
     instance::next_id,
     ledger::{Reservation, Resource},
     package::{Package, Provenance},
-    runtime::Resources,
+    services::Resources,
 };
 use iris_api::v2::{Capability, ErrorCode, Manifest};
 use iris_base::rt::{CancelToken, Deadline};

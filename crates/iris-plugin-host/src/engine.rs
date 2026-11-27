@@ -1,5 +1,8 @@
 //! In-memory compilation only. Active modules are part of the cache budget.
-use super::{imports, instance::State, package::WASM_LIMIT};
+use super::{
+    imports::{self, State},
+    package::WASM_LIMIT,
+};
 use iris_api::v2::ErrorCode;
 use iris_base::rt::{CancelToken, ThreadRole, spawn_thread};
 use ring::digest::{SHA256, digest};
