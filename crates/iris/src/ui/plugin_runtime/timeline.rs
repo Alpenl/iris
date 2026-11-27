@@ -4,25 +4,8 @@ use gpui::{
     AnyElement, App, Entity, InteractiveElement, IntoElement, MouseButton,
     StatefulInteractiveElement, Styled, div, px, relative,
 };
-use iris_api::v2::{
-    Generation,
-    enhance::{HeatRange, SkipRange},
-};
+use iris_app::can_seek_skip_range;
 use iris_core::player::Command;
-
-fn can_seek_skip_range(
-    rendered_generation: Generation,
-    current_generation: Generation,
-    has_timeline_ranges: bool,
-) -> bool {
-    current_generation == rendered_generation && has_timeline_ranges
-}
-
-impl AppModel {
-    fn timeline_ranges(&self) -> Option<(&[HeatRange], &[SkipRange])> {
-        self.plugins.timeline_ranges()
-    }
-}
 
 pub(in crate::ui) fn plugin_timeline_ranges(
     model: &Entity<AppModel>,
@@ -34,7 +17,7 @@ pub(in crate::ui) fn plugin_timeline_ranges(
         return Vec::new();
     }
     let m = model.read(cx);
-    let Some((heat, skip)) = m.timeline_ranges() else {
+    let Some((heat, skip)) = m.plugins.timeline_ranges() else {
         return Vec::new();
     };
     let ratio = |ms: u64| ((ms as f64 / 1000.) / duration).clamp(0., 1.) as f32;
@@ -82,7 +65,7 @@ pub(in crate::ui) fn plugin_timeline_ranges(
                         if can_seek_skip_range(
                             generation,
                             this.plugins.generation(),
-                            this.timeline_ranges().is_some(),
+                            this.plugins.timeline_ranges().is_some(),
                         ) {
                             this.command(Command::SeekAbsolute(target), cx);
                         }
@@ -92,27 +75,4 @@ pub(in crate::ui) fn plugin_timeline_ranges(
         );
     }
     marks
-}
-
-#[cfg(test)]
-mod tests {
-    use super::can_seek_skip_range;
-    use iris_api::v2::{Generation, Id};
-
-    #[test]
-    fn skip_range_remains_clickable_within_generation_and_rejects_stale_media() {
-        let cur = Generation {
-            media: Id(4),
-            seek: Id(0),
-            context: Id(2),
-        };
-        let next_media = Generation {
-            media: Id(5),
-            seek: Id(0),
-            context: Id(2),
-        };
-        assert!(can_seek_skip_range(cur, cur, true));
-        assert!(!can_seek_skip_range(cur, cur, false));
-        assert!(!can_seek_skip_range(cur, next_media, true));
-    }
 }

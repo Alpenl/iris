@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use gpui::Context;
-use iris_api::v2::HostEvent;
+pub(in crate::ui) use iris_app::{should_record_progress, should_suppress_playback_error_toast};
 use iris_core::library::{self, Kind, ScanResult};
 use iris_core::player::{self, Command, SessionEvent, SessionUpdate, TrackKind};
 use iris_core::settings::{OnEof, PhotoDefault};
@@ -62,17 +62,6 @@ fn split_open_paths(mut paths: Vec<PathBuf>) -> (Vec<PathBuf>, Vec<PathBuf>) {
         .extract_if(.., |path| library::is_subtitle(path))
         .collect();
     (paths, subtitles)
-}
-
-pub(in crate::ui) fn should_suppress_playback_error_toast(
-    media_load_pending: bool,
-    scoped_released: bool,
-) -> bool {
-    media_load_pending || scoped_released
-}
-
-pub(in crate::ui) fn should_record_progress(resume_playback: bool, scoped_released: bool) -> bool {
-    resume_playback && !scoped_released
 }
 
 impl AppModel {
@@ -240,18 +229,9 @@ impl AppModel {
                     tick_dirty = true;
                 }
             }
-            if self.plugins.has_state_listeners()
-                && self.last_plugin_tick.elapsed() >= Duration::from_millis(200)
-            {
-                self.last_plugin_tick = Instant::now();
-                let st = self.active().session.state();
-                let ev = HostEvent::Tick {
-                    generation: self.plugins.generation(),
-                    position: st.time_pos,
-                    duration: st.duration,
-                    paused: st.paused,
-                };
-                plugin_dirty = plugin_dirty.union(self.broadcast_plugin_event(ev, None, cx));
+            if self.plugins.has_state_listeners() {
+                let out = self.with_plugin_ctx(|ctrl, ctx| ctrl.maybe_tick(ctx, Instant::now()));
+                plugin_dirty = plugin_dirty.union(self.apply_plugin_outcome(out, None, cx));
             }
         }
         let (duration, paused, ended, cache_end) = {
@@ -295,21 +275,15 @@ impl AppModel {
         }
 
         if saw_pause_or_speed {
-            let snap = self.plugin_snapshot();
-            plugin_dirty = plugin_dirty.union(self.broadcast_plugin_event(
-                HostEvent::StateChanged {
-                    generation: self.plugins.generation(),
-                    snapshot: snap,
-                },
-                None,
-                cx,
-            ));
+            let out =
+                self.with_plugin_ctx(|ctrl, ctx| ctrl.broadcast_state_changed(ctx, Instant::now()));
+            plugin_dirty = plugin_dirty.union(self.apply_plugin_outcome(out, None, cx));
         }
 
         if saw_ended_now
             && !was_ended
             && !self.media_load_pending()
-            && !self.plugin_view.scoped_released
+            && !self.plugins.scoped_released()
             && self.active().session.state().ended
         {
             self.save_progress_sync();
@@ -364,7 +338,7 @@ impl AppModel {
         if let Some(code) = last_error
             && !should_suppress_playback_error_toast(
                 self.media_load_pending(),
-                self.plugin_view.scoped_released,
+                self.plugins.scoped_released(),
             )
         {
             self.active_mut().pending_subtitles.clear();
@@ -405,7 +379,7 @@ impl AppModel {
     pub(super) fn record_progress_memory(&mut self) {
         if !should_record_progress(
             self.settings.resume_playback,
-            self.plugin_view.scoped_released,
+            self.plugins.scoped_released(),
         ) {
             return;
         }
@@ -447,14 +421,7 @@ impl AppModel {
     }
 
     pub(super) fn finish_media_open(&mut self, cx: &mut Context<Self>) {
-        self.plugin_view.scoped_released = false;
-        if self.active().session.scoped_stream().is_none() {
-            self.plugins.clear_active_stream();
-            self.plugin_view.stream_plugin = None;
-            self.plugin_view.playlist.clear();
-            self.plugin_view.playlist_binding = None;
-            self.plugin_view.playlist_current = None;
-        }
+        self.plugins.sync_media_open_state(&self.viewport.session);
         self.refresh_annotations(cx);
         if let Some(uri) = self.active().session.current_media_uri() {
             if self.active().session.may_share_current_identity() {
@@ -535,7 +502,7 @@ impl AppModel {
     pub(super) fn media_load_pending(&self) -> bool {
         self.active().pending_path.is_some()
             || self.catalog.remote_load.is_some()
-            || self.catalog.pending_resolve.is_some()
+            || self.plugins.has_pending_resolve()
     }
 
     fn flush_pending_subtitles(&mut self, cx: &mut Context<Self>) {
@@ -606,7 +573,7 @@ impl AppModel {
         }
         self.overlays.close_menus();
         self.catalog.active_source = ActiveSource::Local;
-        self.catalog.active_stream_meta = None;
+        self.plugins.clear_active_stream_meta();
         let cached = {
             let local_dir = &self.catalog.local_dir;
             local_dir
@@ -688,7 +655,7 @@ impl AppModel {
         }
         self.overlays.close_menus();
         self.catalog.active_source = ActiveSource::Local;
-        self.catalog.active_stream_meta = None;
+        self.plugins.clear_active_stream_meta();
         let generation = {
             let vp = self.active_mut();
             vp.load_generation += 1;

@@ -9,10 +9,7 @@ use gpui::{
 use iris_api::SourceManageAction;
 use iris_api::v2::{Capability, source::SourceDescriptor};
 use iris_core::preset::{PresetCaptureScope, WorkspacePreset};
-use iris_plugin_host::{
-    hub::{PluginInfo, PluginStatus},
-    product::plugins_dir,
-};
+use iris_plugin_host::{PluginInfo, PluginStatus, plugins_dir};
 
 use super::super::AppModel;
 use super::super::kit::form::{chip_button, toggle};
@@ -330,10 +327,7 @@ fn render_plugin_card(
         PluginStatus::Stopping => ("正在停止".to_owned(), false),
         PluginStatus::Disabled => ("已禁用".to_owned(), false),
         PluginStatus::Failed(error) => (
-            format!(
-                "异常：{}",
-                super::super::plugin_runtime::describe_error_code(*error)
-            ),
+            format!("异常：{}", iris_app::error_code_label(*error)),
             true,
         ),
     };

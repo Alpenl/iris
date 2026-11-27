@@ -109,7 +109,7 @@ fn render_variant_selector(
     cx: &App,
 ) -> Option<impl IntoElement> {
     let m = model.read(cx);
-    let meta = m.catalog.active_stream_meta.as_ref()?;
+    let meta = m.plugins.active_stream_meta()?;
     if meta
         .plugin_id
         .as_deref()

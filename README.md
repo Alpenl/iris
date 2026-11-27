@@ -185,6 +185,8 @@ Iris never writes to your local or remote media. All personal data lives in the 
 ```text
 crates/
 ├── iris/                  GPUI desktop application: UI, native video compositing, platform integration
+├── iris-app/              Headless application orchestration (no GPUI, no direct iris-mpv):
+│                          PluginController, source/consent/modal/overlay workflows
 ├── iris-plugin-host/      Wasm plugin host (Wasmtime): plugin lifecycle, capability grants,
 │                          bounded network and file access, stream relay, media enhancements
 ├── iris-core/             Headless core (no GPUI): player state machine, catalog and play queue,
@@ -201,7 +203,7 @@ docs/                      Architecture, decisions and plugin specifications
 scripts/                   Project checks and build tooling
 ```
 
-Dependencies point one way: `iris` → `iris-plugin-host` → `iris-core` → `iris-base`, plus `iris-core` → `iris-mpv`. Only `iris` uses GPUI, and no host crate depends on the guest SDK. `scripts/check-project.py` checks the dependency graph in CI. See [ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full rules.
+Dependencies point one way: `iris` → `iris-app` → `iris-plugin-host` → `iris-core` → `iris-base`, plus `iris-core` → `iris-mpv`. Only `iris` uses GPUI, and no host crate depends on the guest SDK. `scripts/check-project.py` checks the dependency graph in CI. See [ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full rules.
 
 ## Documentation
 

@@ -1,0 +1,16 @@
+# Headless application orchestration must go through iris_core::player::Session and never touch iris_mpv or video render handles.
+disallowed-types = [
+    { path = "iris_mpv::Mpv", reason = "Application layer must go through iris_core::player::Session" },
+    { path = "iris_mpv::Error", reason = "Application layer must go through iris_core::player::Session" },
+    { path = "iris_mpv::Event", reason = "Application layer must go through iris_core::player::Session" },
+    { path = "iris_mpv::Format", reason = "Application layer must go through iris_core::player::Session" },
+    { path = "iris_mpv::Value", reason = "Application layer must go through iris_core::player::Session" },
+    { path = "iris_mpv::RenderHandle", reason = "RenderHandle is restricted to crates/iris/src/video/" },
+    { path = "iris_mpv::render::RenderContext", reason = "RenderContext is restricted to crates/iris/src/video/" },
+]
+
+disallowed-methods = [
+    { path = "iris_mpv::RenderHandle::new", reason = "RenderHandle may only be constructed for the video surface" },
+    { path = "iris_core::player::Session::render_handle", reason = "Session::render_handle may only be called in crates/iris/src/video/" },
+    { path = "iris_core::player::Session::video_recovery", reason = "Session::video_recovery may only be called in crates/iris/src/video/" },
+]

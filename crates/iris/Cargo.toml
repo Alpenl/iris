@@ -17,6 +17,7 @@ iris-api = { path = "../iris-api" }
 iris-base = { path = "../iris-base" }
 iris-core = { path = "../iris-core" }
 iris-plugin-host = { path = "../iris-plugin-host" }
+iris-app = { path = "../iris-app" }
 futures.workspace = true
 unicode-segmentation = "1.12"
 raw-window-handle = "0.6"

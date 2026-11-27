@@ -95,6 +95,7 @@ cargo clippy --locked --workspace --all-targets -- -D warnings
 ```text
 crates/
 ├── iris/                  GPUI 桌面应用：界面、原生视频合成、平台集成
+├── iris-app/              无头应用编排层（零 GPUI、不直接依赖 iris-mpv）：PluginController 与跨层领域编排
 ├── iris-plugin-host/      Wasm 插件宿主（Wasmtime）：插件生命周期、能力授权、有界网络与文件访问、
 │                          流中继、媒体增强
 ├── iris-core/             无头内核（不依赖 GPUI）：播放器状态机、目录与播放队列、工作区预设、键位、
@@ -116,7 +117,7 @@ docs/                      架构、决策与插件规范
 scripts/                   项目检查与构建工具
 ```
 
-依赖方向单向：`iris` → `iris-plugin-host` → `iris-core` → `iris-base`，另有 `iris-core` → `iris-mpv`。只有 `iris` 使用 GPUI，宿主侧 crate 都不依赖 Guest SDK；`scripts/check-project.py` 在 CI 中检查依赖图。模块级职责与完整规则见 [架构文档](docs/ARCHITECTURE.md)。
+依赖方向单向：`iris` → `iris-app` → `iris-plugin-host` → `iris-core` → `iris-base`，另有 `iris-core` → `iris-mpv`。只有 `iris` 使用 GPUI，宿主侧 crate 都不依赖 Guest SDK；`scripts/check-project.py` 在 CI 中检查依赖图。模块级职责与完整规则见 [架构文档](docs/ARCHITECTURE.md)。
 
 ## 许可
 

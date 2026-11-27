@@ -1291,9 +1291,10 @@ class CheckProjectHelperTests(unittest.TestCase):
         # Repository baseline counts match reviewed audit numbers.
         self.assertEqual(len(check_project.KNOWN_MODULE_CYCLE_EDGES["iris-plugin-host"]), 56)
         self.assertEqual(len(check_project.KNOWN_MODULE_CYCLE_EDGES["iris-core"]), 0)
+        self.assertEqual(len(check_project.KNOWN_MODULE_CYCLE_EDGES["iris-app"]), 0)
 
     def test_clippy_and_docs_sync_gates_enforce_exact_exemptions_and_crate_lists(self):
-        # 1. Disallowed lint suppression scan.
+        # 1. Disallowed lint suppression scan (R-08 temporary `player_scoped_plugin` exemption removed in R-09).
         check_project.check_disallowed_lint_suppressions(
             Path("crates/iris/src/video/mod.rs"),
             "#![allow(clippy::disallowed_types, clippy::disallowed_methods)]\n",
@@ -1307,16 +1308,6 @@ class CheckProjectHelperTests(unittest.TestCase):
             "}\n"
         )
         check_project.check_disallowed_lint_suppressions(Path("crates/iris-core/src/player/mod.rs"), valid_player_mod)
-        # Narrow R-08 test exemption allows `disallowed_types` ONLY on `player_scoped_plugin.rs` (+ subdir),
-        # while still rejecting `disallowed_methods` there and rejecting `disallowed_types` in `src/` or other tests.
-        check_project.check_disallowed_lint_suppressions(
-            Path("crates/iris-plugin-host/tests/player_scoped_plugin.rs"),
-            "#![allow(clippy::disallowed_types)]\n",
-        )
-        check_project.check_disallowed_lint_suppressions(
-            Path("crates/iris-plugin-host/tests/player_scoped_plugin/live.rs"),
-            "#[allow(clippy::disallowed_types)]\nfn helper() {}\n",
-        )
         for bad_rel, bad_src in (
             (
                 Path("crates/iris-core/src/player/mod.rs"),
@@ -1328,7 +1319,15 @@ class CheckProjectHelperTests(unittest.TestCase):
             ),
             (
                 Path("crates/iris-plugin-host/tests/player_scoped_plugin.rs"),
-                "#[allow(clippy::disallowed_methods)]\nfn t() {}\n",
+                "#![allow(clippy::disallowed_types)]\n",
+            ),
+            (
+                Path("crates/iris-app/tests/player_scoped_plugin.rs"),
+                "#![allow(clippy::disallowed_types)]\n",
+            ),
+            (
+                Path("crates/iris-app/src/lib.rs"),
+                "#[allow(clippy::disallowed_methods)]\npub fn bad() {}\n",
             ),
             (
                 Path("crates/iris-plugin-host/src/ui.rs"),
@@ -1346,22 +1345,31 @@ class CheckProjectHelperTests(unittest.TestCase):
             with self.subTest(rel=bad_rel), self.assertRaisesRegex(AssertionError, "disallowed_"):
                 check_project.check_disallowed_lint_suppressions(bad_rel, bad_src)
 
-        # 2. `crates/iris-plugin-host/clippy.toml` verification (`Session` type + `Session::render_handle` method).
+        # 2. `clippy.toml` verification across `iris`, `iris-app`, `iris-core`, and `iris-plugin-host`.
         with tempfile.TemporaryDirectory() as directory:
             fake_root = Path(directory)
-            for rel_dir in ("crates/iris", "crates/iris-core", "crates/iris-plugin-host"):
+            for rel_dir in ("crates/iris", "crates/iris-app", "crates/iris-core", "crates/iris-plugin-host"):
                 (fake_root / rel_dir).mkdir(parents=True)
             (fake_root / "Cargo.toml").write_text(
                 '[workspace.lints.clippy]\ndisallowed_methods = "deny"\ndisallowed_types = "deny"\n',
                 encoding="utf-8",
             )
-            shutil.copy2(check_project.ROOT / "crates/iris/clippy.toml", fake_root / "crates/iris/clippy.toml")
-            shutil.copy2(check_project.ROOT / "crates/iris-core/clippy.toml", fake_root / "crates/iris-core/clippy.toml")
-            shutil.copy2(
-                check_project.ROOT / "crates/iris-plugin-host/clippy.toml",
-                fake_root / "crates/iris-plugin-host/clippy.toml",
-            )
+            for rel_toml in (
+                "crates/iris/clippy.toml",
+                "crates/iris-app/clippy.toml",
+                "crates/iris-core/clippy.toml",
+                "crates/iris-plugin-host/clippy.toml",
+            ):
+                shutil.copy2(check_project.ROOT / rel_toml, fake_root / rel_toml)
             check_project.check_clippy_disallowed_configs(fake_root)
+
+            (fake_root / "crates/iris-app/clippy.toml").write_text(
+                'disallowed-types = [{ path = "iris_mpv::Mpv" }]\ndisallowed-methods = []\n',
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(AssertionError, "iris-app/clippy.toml"):
+                check_project.check_clippy_disallowed_configs(fake_root)
+            shutil.copy2(check_project.ROOT / "crates/iris-app/clippy.toml", fake_root / "crates/iris-app/clippy.toml")
 
             for bad_host_toml in (
                 'disallowed-types = []\ndisallowed-methods = [{ path = "iris_core::player::Session::render_handle" }]\n',
@@ -1371,19 +1379,37 @@ class CheckProjectHelperTests(unittest.TestCase):
                 with self.assertRaisesRegex(AssertionError, "iris-plugin-host/clippy.toml"):
                     check_project.check_clippy_disallowed_configs(fake_root)
 
-        # 2b. `crates/iris/src` facade boundary gate (`ledger`, `actor`, `stream::prepare` forbidden).
+        # 2b. `crates/iris/src` & `crates/iris-app` facade boundary gates + transitive gpui ban.
         iris_ui_rel = Path("crates/iris/src/ui/plugin_ctrl.rs")
         check_project.check_iris_plugin_host_facade_imports(
             iris_ui_rel,
-            "use iris_plugin_host::{PluginHost, WindowSession, ui::PollReport};\n",
+            "use iris_plugin_host::{PluginHost, WindowSession, PollReport};\n",
         )
         for bad_import in (
             "use iris_plugin_host::{ui::PollReport, ledger::Ledger};\n",
             "use iris_plugin_host::actor::Update;\n",
             "fn f() { let _ = iris_plugin_host::stream::prepare::subtitle_format(b\"\"); }\n",
+            "fn f(cmd: iris_api::v2::HostCommand) { match cmd { _ => {} } }\n",
         ):
-            with self.assertRaisesRegex(AssertionError, "forbidden plugin-host internal"):
+            with self.assertRaisesRegex(AssertionError, "forbidden plugin-host internal|HostCommand"):
                 check_project.check_iris_plugin_host_facade_imports(iris_ui_rel, bad_import)
+
+        app_test_rel = Path("crates/iris-app/tests/player_scoped_plugin.rs")
+        check_project.check_app_plugin_host_facade_only(
+            app_test_rel,
+            "use iris_plugin_host::{Notice, PluginHost, WindowSession};\n",
+        )
+        for bad_app_import in (
+            "use iris_plugin_host::{WindowSession, ledger::Ledger};\n",
+            "use iris_plugin_host::ui::WindowSession;\n",
+            "fn f() { let _ = iris_plugin_host::stream::session::new_session_id(); }\n",
+        ):
+            with self.assertRaisesRegex(AssertionError, "internal `iris-plugin-host` module"):
+                check_project.check_app_plugin_host_facade_only(app_test_rel, bad_app_import)
+
+        check_project.check_no_transitive_gpui("iris-app v0.0.2\n├── iris-core v0.0.2\n└── iris-plugin-host v0.0.2\n")
+        with self.assertRaisesRegex(AssertionError, "gpui"):
+            check_project.check_no_transitive_gpui("iris-app v0.0.2\n└── gpui v0.2.2\n")
 
         # 3. Docs sync gate: strict two-way on ARCHITECTURE.md, token-bounded substring on bilingual READMEs.
         expected = {"iris", "iris-api", "iris-core"}
@@ -1476,6 +1502,82 @@ class CheckProjectHelperTests(unittest.TestCase):
         check_project.check_thread_inventory_docs(sample_concurrency, "Threads: `iris-alpha`, `iris-beta-Control`.")
         with self.assertRaisesRegex(AssertionError, "iris-beta-"):
             check_project.check_thread_inventory_docs(sample_concurrency, "Threads: `iris-alpha` only.")
+
+    def test_run_cargo_tree_falls_back_when_offline_cache_is_empty(self):
+        extra = ["-p", "iris-app", "-e", "normal,build,dev", "--target", "all"]
+        fake_cwd = Path("/tmp/fake-iris-root")
+
+        with patch.object(
+            check_project.subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess(
+                ["cargo", "tree", "--offline", "--locked", *extra],
+                0,
+                stdout="iris-app v0.0.2\n",
+                stderr="",
+            ),
+        ) as mocked:
+            out = check_project.run_cargo_tree(extra, cwd=fake_cwd)
+            self.assertEqual(out, "iris-app v0.0.2\n")
+            self.assertEqual(mocked.call_count, 1)
+            self.assertEqual(
+                mocked.call_args.args[0],
+                ["cargo", "tree", "--offline", "--locked", *extra],
+            )
+            self.assertEqual(mocked.call_args.kwargs["cwd"], fake_cwd)
+
+        with patch.object(
+            check_project.subprocess,
+            "run",
+            side_effect=[
+                subprocess.CompletedProcess(
+                    ["cargo", "tree", "--offline", "--locked", *extra],
+                    101,
+                    stdout="",
+                    stderr="error: attempting to make an HTTP request, but --offline was specified\n",
+                ),
+                subprocess.CompletedProcess(
+                    ["cargo", "tree", "--locked", *extra],
+                    0,
+                    stdout="iris-app v0.0.2\n└── iris-core v0.0.2\n",
+                    stderr="    Updating crates.io index\n",
+                ),
+            ],
+        ) as mocked:
+            out = check_project.run_cargo_tree(extra, cwd=fake_cwd)
+            self.assertEqual(out, "iris-app v0.0.2\n└── iris-core v0.0.2\n")
+            self.assertEqual(mocked.call_count, 2)
+            self.assertEqual(
+                [call.args[0] for call in mocked.call_args_list],
+                [
+                    ["cargo", "tree", "--offline", "--locked", *extra],
+                    ["cargo", "tree", "--locked", *extra],
+                ],
+            )
+
+        with patch.object(
+            check_project.subprocess,
+            "run",
+            side_effect=[
+                subprocess.CompletedProcess(
+                    ["cargo", "tree", "--offline", "--locked", *extra],
+                    101,
+                    stdout="",
+                    stderr="offline failure",
+                ),
+                subprocess.CompletedProcess(
+                    ["cargo", "tree", "--locked", *extra],
+                    101,
+                    stdout="",
+                    stderr="error: the lock file Cargo.lock needs to be updated but --locked was passed\n",
+                ),
+            ],
+        ):
+            with self.assertRaises(subprocess.CalledProcessError) as ctx:
+                check_project.run_cargo_tree(extra, cwd=fake_cwd)
+            self.assertEqual(ctx.exception.returncode, 101)
+            self.assertEqual(ctx.exception.cmd, ["cargo", "tree", "--locked", *extra])
+            self.assertIn("--locked", ctx.exception.stderr)
 
 
 class MediaFixtureScriptTests(unittest.TestCase):

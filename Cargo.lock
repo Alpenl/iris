@@ -2796,6 +2796,7 @@ dependencies = [
  "gpui",
  "image",
  "iris-api",
+ "iris-app",
  "iris-base",
  "iris-core",
  "iris-mpv",
@@ -2816,6 +2817,25 @@ version = "0.0.2"
 dependencies = [
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "iris-app"
+version = "0.0.2"
+dependencies = [
+ "anyhow",
+ "futures",
+ "iris-api",
+ "iris-base",
+ "iris-core",
+ "iris-plugin-host",
+ "log",
+ "ring",
+ "serde",
+ "serde_json",
+ "url",
+ "wat",
+ "zip",
 ]
 
 [[package]]

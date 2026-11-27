@@ -3,11 +3,10 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
-use std::time::Duration;
+use std::time::Instant;
 
 use gpui::{Context, Window};
 use iris_api::SourceManageAction;
-use iris_api::v2::{HostEvent, Id};
 use iris_base::net::http_client::{HttpCancel, validate_stream_url};
 use iris_core::bookmarks::PinnedBookmark;
 use iris_core::catalog::{CatalogItem, CatalogItemKind};
@@ -16,24 +15,18 @@ use iris_core::media_uri::MediaUri;
 use iris_core::photo;
 use iris_core::player::RemoteMediaRequest;
 use iris_core::preset::SidebarMode;
-use iris_plugin_host::requests::BrowseTarget;
 
 use super::AppModel;
-use super::state::{ActiveSource, PendingBrowse, PendingResolve, PluginSourceView, RemoteLoad};
+use super::state::{ActiveSource, RemoteLoad};
 use super::views::DirtyRegions;
-
-const SOURCE_TIMEOUT: Duration = Duration::from_secs(30);
 
 impl AppModel {
     /// Cancels in-flight remote/plugin media loads without interrupting directory browsing.
     pub(super) fn cancel_media_loads(&mut self) {
-        let pending = self.catalog.cancel_resolve();
-        if let Some(request) = &pending
-            && let Ok(id) = request.req_id.parse()
-        {
-            let _ = self.plugins.cancel_request(&request.plugin_id, Id(id));
+        let was_resolving = self.plugins.cancel_resolve_load();
+        if was_resolving {
+            self.plugin_ui.resolve_timeout = None;
         }
-        let was_resolving = pending.is_some();
         let was_remote = self.catalog.remote_load.take().is_some();
         let was_local = self.active_mut().pending_path.take().is_some();
         if was_remote || was_resolving || was_local {
@@ -42,87 +35,6 @@ impl AppModel {
             vp.loading_visible = false;
             vp.pending_subtitles.clear();
         }
-    }
-
-    pub(super) fn cancel_plugin_requests(&mut self, pid: Option<&str>, sid: Option<&str>) {
-        if self.catalog.has_browse_for(pid, sid)
-            || matches!(&self.catalog.active_source,
-            ActiveSource::Plugin(view) if pid.is_none_or(|id| id == view.plugin_id)
-                && sid.is_none_or(|id| id == view.source_id))
-        {
-            self.close_plugin_browse();
-        }
-        if self.catalog.has_media_load_for(pid, sid) {
-            self.cancel_media_loads();
-        }
-    }
-
-    fn spawn_source_timeout(
-        &self,
-        plugin_id: &str,
-        request_id: &str,
-        cx: &mut Context<Self>,
-    ) -> gpui::Task<()> {
-        let id = request_id.to_owned();
-        let pid = plugin_id.to_owned();
-        let timer = cx.background_executor().timer(SOURCE_TIMEOUT);
-        cx.spawn(async move |this, cx| {
-            timer.await;
-            let _ = this.update(cx, |this, cx| {
-                if let Ok(id) = id.parse() {
-                    let _ = this.plugins.cancel_request(&pid, Id(id));
-                }
-                let _ = this.handle_source_error(&pid, &id, "数据源请求超时".into(), cx);
-            });
-        })
-    }
-
-    fn begin_browse_request(
-        &mut self,
-        plugin_id: &str,
-        source_id: &str,
-        append: bool,
-        id: Id,
-        cx: &mut Context<Self>,
-    ) {
-        self.catalog.cancel_browse();
-        let request_id = id.0.to_string();
-        let timeout = self.spawn_source_timeout(plugin_id, &request_id, cx);
-        self.catalog.pending_browse = Some(PendingBrowse {
-            req_id: request_id.clone(),
-            deadline: std::time::Instant::now() + SOURCE_TIMEOUT,
-            plugin_id: plugin_id.to_owned(),
-            source_id: source_id.to_owned(),
-            append,
-            _timeout: Some(timeout),
-        });
-    }
-
-    pub(super) fn begin_resolve_request(
-        &mut self,
-        plugin_id: &str,
-        source_id: &str,
-        entry_id: String,
-        title: Option<String>,
-        id: Id,
-        cx: &mut Context<Self>,
-    ) {
-        let vp = self.active_mut();
-        vp.load_generation += 1;
-        vp.pending_path = None;
-        vp.loading_visible = true;
-        vp.pending_subtitles.clear();
-        let request_id = id.0.to_string();
-        let timeout = self.spawn_source_timeout(plugin_id, &request_id, cx);
-        self.catalog.pending_resolve = Some(PendingResolve {
-            req_id: request_id.clone(),
-            deadline: std::time::Instant::now() + SOURCE_TIMEOUT,
-            plugin_id: plugin_id.to_owned(),
-            source_id: source_id.to_owned(),
-            entry_id,
-            title,
-            _timeout: Some(timeout),
-        });
     }
 
     pub(super) fn browse_local_source(&mut self, cx: &mut Context<Self>) {
@@ -301,120 +213,23 @@ impl AppModel {
         query: Option<String>,
         cx: &mut Context<Self>,
     ) {
-        let Some((pid, pname, s)) = self
-            .plugins
-            .media_sources()
-            .into_iter()
-            .find(|(pid, _, s)| *pid == plugin_id && s.id == source_id)
-        else {
-            self.cancel_plugin_requests(Some(plugin_id), Some(source_id));
-            self.show_toast("该插件数据源未启用或不可用", cx);
-            return;
-        };
-        let (pid, pname, sname, supports_search, auth_cmd) = (
-            pid.to_string(),
-            pname.to_string(),
-            s.name.clone(),
-            s.supports_search,
-            s.auth_command_id.clone(),
+        let is_new_view = page.is_none();
+        let (started, out) = self.plugins.browse_source(
+            &mut self.catalog.active_source,
+            plugin_id,
+            source_id,
+            folder_id,
+            page,
+            query,
+            Instant::now(),
         );
-        let same_location = matches!(
-            &self.catalog.active_source,
-            ActiveSource::Plugin(ps)
-                if ps.plugin_id == pid && ps.source_id == source_id && ps.folder_id == folder_id
-        );
-        let append = page.is_some() && same_location;
-        let (preserved_filters, filters) = if same_location {
-            (
-                self.plugin_view.source_filters.clone(),
-                self.plugin_view.filter_values.clone(),
-            )
-        } else {
-            (Vec::new(), BTreeMap::new())
-        };
-        let query =
-            query.and_then(|q| super::plugin_runtime::remote_search_query(supports_search, &q));
-        let issued = if append {
-            self.plugin_view
-                .view
-                .as_ref()
-                .filter(|(owner, _)| owner == &pid)
-                .ok_or(iris_api::v2::ErrorCode::StaleHandle)
-                .and_then(|(_, view)| {
-                    self.plugins
-                        .next_page(&pid, *view, page.as_deref().unwrap_or(""))
-                })
-        } else {
-            self.close_plugin_browse();
-            self.plugin_view.source_filters = preserved_filters;
-            self.plugin_view.filter_values = filters.clone();
-            self.plugins
-                .browse(
-                    &pid,
-                    BrowseTarget {
-                        source: source_id.to_owned(),
-                        folder: folder_id.clone(),
-                        query,
-                        filters,
-                    },
-                )
-                .map(|(view, request)| {
-                    self.plugin_view.view = Some((pid.clone(), view));
-                    request
-                })
-        };
-        let req_id = match issued {
-            Ok(id) => id,
-            Err(error) => {
-                log::warn!("browse request rejected for {pid}: {error:?}");
-                self.rebuild_directory_rows();
-                self.notify_sidebar(cx);
-                self.show_error_toast(
-                    format!(
-                        "目录请求未能提交 · {}",
-                        super::plugin_runtime::describe_error_code(error)
-                    ),
-                    cx,
-                );
-                return;
-            }
-        };
-        self.begin_browse_request(&pid, source_id, append, req_id, cx);
-        if append && let ActiveSource::Plugin(ps) = &mut self.catalog.active_source {
-            ps.loading = true;
-            ps.error = None;
-        } else {
+        if started && is_new_view {
             self.catalog.sidebar_mode = SidebarMode::Files;
-            self.sync_view_timer(cx);
-            self.catalog.active_source = ActiveSource::Plugin(Box::new(PluginSourceView {
-                plugin_id: pid.clone(),
-                plugin_name: pname,
-                source_id: source_id.to_string(),
-                source_name: sname.clone(),
-                supports_search,
-                auth_command_id: auth_cmd,
-                folder_id: folder_id.clone(),
-                parent_id: None,
-                title: sname,
-                next_page: None,
-                authenticated: true,
-                auth_hint: None,
-                loading: true,
-                error: None,
-            }));
         }
-        self.rebuild_directory_rows();
-        self.ensure_filmstrip_thumbnails(cx);
-        self.notify_regions(
-            DirtyRegions {
-                root: true,
-                sidebar: true,
-                viewport: true,
-                dock: true,
-                ..DirtyRegions::NONE
-            },
-            cx,
-        );
+        let regions = self.apply_plugin_outcome(out, None, cx);
+        if regions.any() {
+            self.notify_regions(regions, cx);
+        }
     }
 
     pub(super) fn manage_plugin_source(
@@ -425,25 +240,11 @@ impl AppModel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if action == SourceManageAction::Remove {
-            self.cleanup_plugin_playback(Some(plugin_id), Some(source_id));
-            if matches!(
-                &self.catalog.active_source,
-                ActiveSource::Plugin(ps) if ps.plugin_id == plugin_id && ps.source_id == source_id
-            ) {
-                self.catalog.active_source = ActiveSource::Local;
-                self.rebuild_directory_rows();
-            }
-        }
-        let report = self.plugins.send_to(
-            plugin_id,
-            HostEvent::SourceManage {
-                source_id: source_id.to_string(),
-                action,
-            },
-        );
+        let out = self.with_plugin_ctx(|ctrl, ctx| {
+            ctrl.manage_source(ctx, plugin_id, source_id, action, Instant::now())
+        });
         let regions = self
-            .apply_poll_report(report, Some(window), cx)
+            .apply_plugin_outcome(out, Some(window), cx)
             .union(DirtyRegions {
                 root: true,
                 sidebar: true,
@@ -464,85 +265,42 @@ impl AppModel {
         variant: Option<String>,
         cx: &mut Context<Self>,
     ) {
-        let valid_args = iris_api::is_valid_id(source_id)
-            && !entry_id.is_empty()
-            && entry_id.len() <= 4096
-            && !entry_id.chars().any(char::is_control)
-            && variant.as_deref().is_none_or(|v| {
-                !v.is_empty() && v.len() <= 256 && !v.chars().any(char::is_control)
-            });
-        let precheck = if !valid_args {
-            Err(iris_api::v2::ErrorCode::InvalidArgument)
-        } else {
-            self.precheck_plugin_capability(plugin_id, iris_api::v2::Capability::MediaSource)
-        };
-        if let Err(error) = precheck {
-            log::warn!("resolve precheck rejected for {plugin_id}: {error:?}");
-            self.show_error_toast(
-                format!(
-                    "解析请求未能提交 · {}",
-                    super::plugin_runtime::describe_error_code(error)
-                ),
-                cx,
-            );
-            return;
-        }
-        self.cancel_media_loads();
-        self.save_progress_sync();
-        if !self.advance_plugin_media(cx) {
-            return;
-        }
-        let folder_id = match &self.catalog.active_source {
-            ActiveSource::Plugin(ps) if ps.plugin_id == plugin_id && ps.source_id == source_id => {
-                ps.folder_id.clone()
-            }
-            _ => None,
-        };
-        match self
-            .plugins
-            .resolve(plugin_id, source_id, folder_id, entry_id, variant)
+        if self.catalog.remote_load.take().is_some()
+            || self.active_mut().pending_path.take().is_some()
         {
-            Ok(request) => self.begin_resolve_request(
+            let vp = self.active_mut();
+            vp.load_generation += 1;
+            vp.loading_visible = false;
+            vp.pending_subtitles.clear();
+        }
+        let out = self.with_plugin_ctx(|ctrl, ctx| {
+            ctrl.resolve_entry(
+                ctx,
                 plugin_id,
                 source_id,
-                entry_id.to_owned(),
+                entry_id,
                 title,
-                request,
-                cx,
-            ),
-            Err(error) => {
-                log::warn!("resolve request rejected for {plugin_id}: {error:?}");
-                self.show_error_toast(
-                    format!(
-                        "解析请求未能提交 · {}",
-                        super::plugin_runtime::describe_error_code(error)
-                    ),
-                    cx,
-                );
-            }
+                variant,
+                Instant::now(),
+            )
+        });
+        let regions = self.apply_plugin_outcome(out, None, cx);
+        if regions.any() {
+            self.notify_regions(regions, cx);
         }
-        self.notify_regions(
-            DirtyRegions {
-                root: true,
-                viewport: true,
-                dock: true,
-                ..DirtyRegions::NONE
-            },
-            cx,
-        );
     }
 
     pub(super) fn switch_stream_variant(&mut self, variant_id: &str, cx: &mut Context<Self>) {
-        let Some(meta) = self.catalog.active_stream_meta.clone() else {
-            return;
-        };
-        let (Some(pid), Some(sid), Some(eid)) = (meta.plugin_id, meta.source_id, meta.entry_id)
-        else {
-            return;
-        };
-        let title = self.active().session.current_title().map(str::to_string);
         self.overlays.popover = None;
-        self.resolve_plugin_entry(&pid, &sid, &eid, title, Some(variant_id.to_string()), cx);
+        let Some(out) = self.with_plugin_ctx(|ctrl, ctx| {
+            ctrl.switch_stream_variant(ctx, variant_id, Instant::now())
+        }) else {
+            return;
+        };
+        let regions = self.apply_plugin_outcome(out, None, cx);
+        if regions.any() {
+            self.notify_regions(regions, cx);
+        }
     }
 
     pub(super) fn open_direct_stream_url(
@@ -576,7 +334,8 @@ impl AppModel {
         let kind = library::kind_of(Path::new(&name)).unwrap_or(Kind::Video);
         self.close_plugin_browse();
         self.catalog.active_source = ActiveSource::Local;
-        self.catalog.active_stream_meta = None;
+        self.plugins.clear_active_stream_meta();
+        self.overlays.close_variants_popover();
         self.rebuild_directory_rows();
         self.open_remote_media(
             RemoteMediaRequest {

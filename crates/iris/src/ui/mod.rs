@@ -39,6 +39,7 @@ use gpui::{
     InteractiveElement, IntoElement, KeyContext, ParentElement, Point, Render, Styled,
     Subscription, Task, Window, div, prelude::FluentBuilder, px,
 };
+use iris_app::PluginController;
 use iris_core::bookmarks::LocationStore;
 use iris_core::catalog::PlayQueue;
 use iris_core::input::{self, PointerCommand, PointerInput};
@@ -48,7 +49,6 @@ use iris_core::player::{Command, Session};
 use iris_core::preset::{PresetManager, PresetRuntime};
 use iris_core::settings::{MAX_SPEED, MIN_SPEED, Settings, Side};
 use iris_core::store::Store;
-use iris_plugin_host::WindowSession;
 
 pub(crate) use actions::{
     CycleAspect, CyclePreset, NextChapter, OpenCommandPalette, OpenFile, OpenNextMedia,
@@ -81,13 +81,11 @@ pub(in crate::ui) struct AppModel {
     presets: PresetManager,
     preset_rt: PresetRuntime,
     keymap: Keymap,
-    plugin_host: iris_plugin_host::PluginHost,
-    plugins: WindowSession,
-    plugin_view: plugin_runtime::PluginView,
+    plugins: PluginController,
+    plugin_ui: plugin_runtime::PluginUiState,
     locations: LocationStore,
     store: Store,
     store_flush: Option<Task<()>>,
-    last_plugin_tick: Instant,
     last_save: Instant,
     last_now_playing: Instant,
     shutdown_done: bool,
@@ -218,8 +216,14 @@ impl AppModel {
             }
         });
 
-        let (plugins, mut plugin_wake_rx) =
-            plugin_host.open_window(&settings.disabled_plugins, &settings.theme_id);
+        let now = Instant::now();
+        let (plugins, mut plugin_wake_rx) = PluginController::open_window(
+            plugin_host,
+            &settings.disabled_plugins,
+            &settings.theme_id,
+            init_plugin_cmds,
+            now,
+        );
         let plugin_events = cx.spawn_in(window, async move |this, cx| {
             while plugin_wake_rx.next().await.is_some() {
                 if this
@@ -318,7 +322,6 @@ impl AppModel {
             .detach();
         }
 
-        let now = Instant::now();
         let initial_scale = window.scale_factor() as f64;
         let mut catalog = CatalogState::default();
         if let Some(p) = presets.get(&settings.active_preset)
@@ -340,13 +343,11 @@ impl AppModel {
             presets,
             preset_rt,
             keymap,
-            plugin_host,
             plugins,
-            plugin_view: plugin_runtime::PluginView::new(init_plugin_cmds),
+            plugin_ui: plugin_runtime::PluginUiState::default(),
             locations: LocationStore::load(),
             store: Store::load(),
             store_flush: None,
-            last_plugin_tick: now,
             last_save: now,
             last_now_playing: now - Duration::from_secs(10),
             shutdown_done: false,
@@ -366,7 +367,9 @@ impl AppModel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.plugin_view.modal.focus_pending = self.plugins.active_modal().is_some();
+        if self.plugins.active_modal().is_some() {
+            self.plugins.modal_mut().mark_focus_pending();
+        }
         self.sync_plugin_modal_focus(window);
         self.sync_theme_tokens(cx);
         self.rebuild_directory_rows();
@@ -489,7 +492,7 @@ impl AppModel {
         cx: &mut Context<Self>,
     ) {
         self.sync_fullscreen(window, cx);
-        if self.plugin_view.modal.focus_pending {
+        if self.plugins.modal().focus_pending() {
             self.sync_plugin_modal_focus(window);
         }
         let sz = window.viewport_size();
@@ -522,7 +525,6 @@ impl AppModel {
         self.sleep_preventer.set_active(false);
         self.media_keys.take();
         self.plugins.shutdown();
-        self.plugin_host.shutdown();
         self.store_flush.take();
         self.save_progress_sync();
         let (vol, spd) = {
