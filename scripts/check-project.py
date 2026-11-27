@@ -48,12 +48,7 @@ FUTURE_INCOMPAT_WARNING_RE = re.compile(r"(?m)^> warning(?:\[([^]]+)\])?: ([^\r\
 # refactoring scope. Adding any new cycle edge fails; resolving an existing edge requires removing
 # it here so the baseline only shrinks (R-05 clears `iris-core`; R-13 clears `iris-plugin-host`).
 KNOWN_MODULE_CYCLE_EDGES: dict[str, frozenset[tuple[str, str]]] = {
-    "iris-core": frozenset(
-        {
-            ("player", "settings"),
-            ("settings", "player"),
-        }
-    ),
+    "iris-core": frozenset(),
     "iris-plugin-host": frozenset(
         {
             ("actor", "engine"),

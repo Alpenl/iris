@@ -2,7 +2,7 @@ use super::super::{installation::Installed, runtime::Setup, storage::Storage};
 use iris_api::v2::ErrorCode;
 use iris_base::net::http_client::HttpCancel;
 use iris_core::fs_util;
-use iris_core::media_uri::MediaUri;
+use iris_core::media_uri::{MediaUri, WEBDAV_PLUGIN_ID};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -24,7 +24,10 @@ struct Complete {
 }
 
 pub(super) fn migrate(root: &Path, installed: &Installed, setup: &Setup) -> Result<(), ErrorCode> {
-    if !matches!(installed.plugin_id.as_str(), "iris.guides" | "iris.webdav") {
+    if !matches!(
+        installed.plugin_id.as_str(),
+        "iris.guides" | WEBDAV_PLUGIN_ID
+    ) {
         return Err(ErrorCode::Denied);
     }
     let directory = root
@@ -427,7 +430,7 @@ fn remap_media_uri(uri: &MediaUri, remapped: &BTreeMap<String, String>) -> Optio
             plugin_id,
             source_id,
             entry_id,
-        } if plugin_id == "iris.webdav" => {
+        } if plugin_id == WEBDAV_PLUGIN_ID => {
             remapped.get(source_id).map(|next_id| MediaUri::Plugin {
                 plugin_id: plugin_id.clone(),
                 source_id: next_id.clone(),
@@ -519,7 +522,8 @@ fn remap_persisted_webdav_references(
 ) -> Result<(), ErrorCode> {
     let locations_path = root.join("locations.json");
     if let Some(bytes) = read_bounded(&locations_path, 4 << 20)?
-        && let Ok(mut locations) = serde_json::from_slice::<iris_core::vfs::LocationStore>(&bytes)
+        && let Ok(mut locations) =
+            serde_json::from_slice::<iris_core::bookmarks::LocationStore>(&bytes)
     {
         let mut changed = false;
         for bookmark in &mut locations.bookmarks {

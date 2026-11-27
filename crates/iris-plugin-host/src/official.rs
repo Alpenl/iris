@@ -10,6 +10,7 @@ use super::{
 };
 use iris_api::v2::ErrorCode;
 use iris_base::rt::CancelToken;
+use iris_core::media_uri::WEBDAV_PLUGIN_ID;
 use serde::Deserialize;
 use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
 
@@ -76,7 +77,7 @@ impl Bootstrap {
         for entry in index.packages {
             let raw: &[u8] = match entry.id.as_str() {
                 "iris.guides" => GUIDES,
-                "iris.webdav" => WEBDAV,
+                WEBDAV_PLUGIN_ID => WEBDAV,
                 _ => return Err(ErrorCode::InvalidArgument),
             };
             if entry.file != format!("{}.irisplugin", entry.id) || entry.version.is_empty() {
@@ -111,7 +112,10 @@ impl Bootstrap {
         installed: &Installed,
         setup: &Setup,
     ) -> Result<(), ErrorCode> {
-        if matches!(installed.plugin_id.as_str(), "iris.guides" | "iris.webdav") {
+        if matches!(
+            installed.plugin_id.as_str(),
+            "iris.guides" | WEBDAV_PLUGIN_ID
+        ) {
             migration::migrate(&self.legacy_root, installed, setup)
         } else {
             Ok(())

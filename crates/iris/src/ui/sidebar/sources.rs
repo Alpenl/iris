@@ -8,8 +8,8 @@ use gpui::{
 };
 use iris_api::SourceManageAction;
 use iris_api::v2::source::SourceDescriptor;
+use iris_core::bookmarks::PinnedBookmark;
 use iris_core::media_uri::MediaUri;
-use iris_core::vfs::PinnedBookmark;
 
 use super::super::AppModel;
 use super::super::actions::OpenFile;

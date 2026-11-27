@@ -47,7 +47,7 @@ crates/
   - `preset.rs` + `preset/runtime.rs`：`1B+` 稀疏工作区预设（`Option<T>` 补丁 + 显式插件启停差量与退出指令），`settings.conf` 始终只存纯净个人基线，运行期通过内存 `PresetRevert` 自动回正（全局字号 `ui_font_scale` 属个人偏好不进预设）。
 - `crates/iris-plugin-host/src/`：显式 `PluginHost` 实例（零全局单例，支持同进程多宿主并行测试）、有界 Wasmtime Pulley64 字节码运行时、单窗口会话生命周期、安装/能力授权、网络、三模流（`DirectHttp` / `RandomAccess` / `VirtualHls`）、轻量私有文件产物与哈希（`FileExecutor`）及媒体增强；`iris-plugin-sdk` 和两个官方插件 crate 使用同一套公开 Guest 入口。
 - `crates/iris-core/src/photo/{mod,containers,heif,exif,icc}.rs`：魔数优先单遍照片头解析（JPEG/PNG/WebP/HEIF/TIFF 尺寸、方向、EXIF 摘要与内嵌 ICC 原色匹配）。
-- `crates/iris-core/src/{keymap/,vfs/,logging/,input,geometry,library,settings,fs_util}.rs`：三方案键位目录与结构化 `ConflictTarget`、常驻位置书签、单一集中脱敏日志与结构化事件流（`iris.log` + `events.jsonl`）、指针手势策略、几何变换与慢速共享盘优化扫描。
+- `crates/iris-core/src/{keymap/,bookmarks,legacy/,logging/,input,geometry,library,settings,fs_util}.rs`：三方案键位目录与结构化 `ConflictTarget`、常驻位置书签与旧版数据兼容、单一集中脱敏日志与结构化事件流（`iris.log` + `events.jsonl`）、指针手势策略、几何变换与慢速共享盘优化扫描。
 - `crates/iris/src/video/{mod,mac,windows}.rs`：跨平台共享的 `VideoSurfaceBackend` trait（`attach`、`set_bounds`、`set_scale`、`set_visible`），在 macOS（`MacVideoSurface`）与 Windows（`WinVideoSurface`）上由编译器验证统一签名，并通过 `VideoSurface` 新类型对窗口层隐藏平台差异。
 - `crates/iris/src/theme.rs` + `ui/`：GPUI `Global` `ThemeTokens` 引擎、与根视图彻底解耦的通用控件库（`ui/kit/`，通过泛型 `Entity<V>` 与 `TextFieldHost` 组合，零 `IrisWindow`/`AppModel` 依赖）、按领域归集的中文文案表（`ui/strings/`），以及围绕 `AppModel` 领域宿主与 5 个独立区域 `Render` 实体（`Sidebar`、`PluginPanel`、`SettingsPanel`、`ViewportView`、`DockView`）构建的零副作用渲染树——窗口尺寸/焦点观察与字幕内边距同步均挂在观察器及帧后回调中，1–4Hz 播放进度与插件槽位变更经 `DirtyRegions` 局部通知对应子视图。
 - `crates/iris/src/instance.rs`：Windows 单实例，见第 9 节。macOS 由系统把打开请求发给已运行进程，经 GPUI `on_open_urls` 进来，只接受 `file://`。

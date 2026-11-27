@@ -484,9 +484,9 @@ fn expanded_official_upgrade_surfaces_review_and_upgrades_in_place() {
 
 #[test]
 fn legacy_overlong_webdav_ids_remap_deterministically_across_servers_secrets_and_uris() {
+    use iris_core::bookmarks::LocationStore;
     use iris_core::media_uri::MediaUri;
     use iris_core::store::{AnnotationEdit, Store};
-    use iris_core::vfs::LocationStore;
 
     let fixture = Fixture::new();
     let long_60 = "legacy-nas-connection-identifier-exceeding-forty-eight-bytes";
@@ -635,9 +635,9 @@ fn legacy_overlong_webdav_ids_remap_deterministically_across_servers_secrets_and
 #[test]
 fn migration_retry_after_interrupted_reference_remap_recovers_and_preserves_canonical_annotations()
 {
+    use iris_core::bookmarks::LocationStore;
     use iris_core::media_uri::MediaUri;
     use iris_core::store::Store;
-    use iris_core::vfs::LocationStore;
 
     let fixture = Fixture::new();
     let long_60 = "legacy-nas-connection-identifier-exceeding-forty-eight-bytes";

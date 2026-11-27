@@ -3,8 +3,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
-use crate::player::{AspectMode, MAX_SPEED, MIN_SPEED};
-use crate::settings::{self, MAX_DIRECTORY_WIDTH, MIN_DIRECTORY_WIDTH, Settings};
+use crate::player::AspectMode;
+use crate::settings::{
+    self, MAX_DIRECTORY_WIDTH, MAX_SPEED, MIN_DIRECTORY_WIDTH, MIN_SPEED, Settings,
+};
 
 use super::{
     ALL_BITS, DEFAULT_WINDOW_SIZE, PluginPatch, PresetLayout, PresetManager, PresetTransition,

@@ -37,9 +37,9 @@ use iris_base::net::http_client::{origin_headers, validate_stream_url};
 pub use enhance::ExternalTrack;
 pub use machine::coalesce_updates;
 pub use model::{
-    AspectMode, AudioDevice, BackendDiagnostics, Chapter, Command, MAX_SPEED, MIN_SPEED,
-    MediaStats, PlaybackState, PlayerActionError, RemoteMediaRequest, RemoteSubtitle, SPEED_STEPS,
-    SessionEvent, SessionUpdate, Track, TrackKind, format_time, step_speed,
+    AspectMode, AudioDevice, BackendDiagnostics, Chapter, Command, MediaStats, PlaybackState,
+    PlayerActionError, RemoteMediaRequest, RemoteSubtitle, SPEED_STEPS, SessionEvent,
+    SessionUpdate, Track, TrackKind, format_time, step_speed,
 };
 pub use prepare::{Prepared, PreparedQueue, prepare, prepare_queue};
 pub use recovery::{ActiveVideoTrack, VideoRecoveryHandle};

@@ -8,10 +8,10 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::fs_util;
-use crate::player::{AspectMode, MAX_SPEED, MIN_SPEED};
+use crate::player::AspectMode;
 use crate::settings::{
-    DEFAULT_DIRECTORY_WIDTH, MAX_DIRECTORY_WIDTH, MIN_DIRECTORY_WIDTH, OnEof, PhotoDefault,
-    Settings, Side,
+    DEFAULT_DIRECTORY_WIDTH, MAX_DIRECTORY_WIDTH, MAX_SPEED, MIN_DIRECTORY_WIDTH, MIN_SPEED, OnEof,
+    PhotoDefault, Settings, Side,
 };
 
 pub use runtime::PresetRuntime;

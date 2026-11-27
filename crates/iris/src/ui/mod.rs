@@ -39,15 +39,15 @@ use gpui::{
     InteractiveElement, IntoElement, KeyContext, ParentElement, Point, Render, Styled,
     Subscription, Task, Window, div, prelude::FluentBuilder, px,
 };
+use iris_core::bookmarks::LocationStore;
 use iris_core::catalog::PlayQueue;
 use iris_core::input::{self, PointerCommand, PointerInput};
 use iris_core::keymap::Keymap;
 use iris_core::library::Kind;
-use iris_core::player::{Command, MAX_SPEED, MIN_SPEED, Session};
+use iris_core::player::{Command, Session};
 use iris_core::preset::{PresetManager, PresetRuntime};
-use iris_core::settings::{Settings, Side};
+use iris_core::settings::{MAX_SPEED, MIN_SPEED, Settings, Side};
 use iris_core::store::Store;
-use iris_core::vfs::LocationStore;
 use iris_plugin_host::ui::PluginManager;
 
 pub(crate) use actions::{

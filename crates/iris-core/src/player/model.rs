@@ -9,9 +9,8 @@ use serde::{Deserialize, Serialize};
 use crate::library::Kind;
 use crate::media_uri::MediaUri;
 use crate::photo::{ExifSummary, Photo};
+use crate::settings::{MAX_SPEED, MIN_SPEED};
 
-pub const MIN_SPEED: f64 = 0.25;
-pub const MAX_SPEED: f64 = 4.0;
 pub const SPEED_STEPS: &[f64] = &[
     MIN_SPEED, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0, MAX_SPEED,
 ];
