@@ -2,19 +2,22 @@
 //! other parallel tests. Count live Rust allocations, including the actor thread,
 //! because the resource ledger alone cannot detect unaccounted read history.
 use iris_api::v2::{ErrorCode, Generation, Role, task::Task};
-use iris_core::plugin_v2::{
-    actor::{Actor, Executor, Operation, Spawn, Status, TaskContext},
-    engine::RuntimeEngine,
-    instance::Blob,
-    ledger::{Ledger, Resource},
-    pool::IoPool,
+use iris_core::{
+    concurrency::CancelToken,
+    plugin_v2::{
+        actor::{Actor, Executor, Operation, Spawn, Status, TaskContext},
+        engine::RuntimeEngine,
+        instance::Blob,
+        ledger::{Ledger, Resource},
+        pool::IoPool,
+    },
 };
 use std::{
     alloc::{GlobalAlloc, Layout, System},
     collections::{BTreeMap, BTreeSet},
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicIsize, Ordering},
+        atomic::{AtomicIsize, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -91,7 +94,7 @@ fn completed_wasm_reads_do_not_accumulate_unaccounted_host_memory() {
     let engine = RuntimeEngine::new().unwrap();
     let wasm =
         std::fs::read(std::env::var_os("IRIS_V2_RUST_GUEST").expect("Rust guest fixture")).unwrap();
-    let module = engine.compile(&wasm, &AtomicBool::new(false)).unwrap();
+    let module = engine.compile(&wasm, &CancelToken::new()).unwrap();
     let ledger = Ledger::default();
     let actor = Actor::spawn(Spawn {
         engine,

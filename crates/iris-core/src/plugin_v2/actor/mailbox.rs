@@ -2,7 +2,7 @@ use super::{
     Blob, DetachedBlob, Executor, IoOutcome, Ledger, PendingOperation, ReadResult, ReadSlot,
     ReadTicket, Reservation, Resource, Status, TaskLease, next_id,
 };
-use crate::{plugin_v2::json_error, vfs::http_client::HttpCancel};
+use crate::{concurrency::CancelToken, plugin_v2::json_error, vfs::http_client::HttpCancel};
 use iris_api::v2::{
     CHUNK_LIMIT, Capability, ErrorCode, Generation, HostCommand, Id, MESSAGE_LIMIT, Role,
 };
@@ -111,7 +111,7 @@ pub(super) struct Mailbox {
     pub role: Role,
     pub ledger: Ledger,
     pub executor: Arc<dyn Executor>,
-    pub cancel: Arc<AtomicBool>,
+    pub cancel: CancelToken,
     pub done: AtomicBool,
     pub initialized: AtomicBool,
     pub outstanding: Arc<AtomicUsize>,
@@ -141,7 +141,7 @@ impl Mailbox {
             executor,
             wake,
             grants,
-            cancel: Arc::new(AtomicBool::new(false)),
+            cancel: CancelToken::new(),
             done: AtomicBool::new(false),
             initialized: AtomicBool::new(false),
             outstanding: Arc::new(AtomicUsize::new(0)),
@@ -185,7 +185,7 @@ impl Mailbox {
     }
     pub fn io_context(&self, read: Option<Id>, window: Option<Id>) -> Result<IoContext, ErrorCode> {
         let state = self.lock();
-        if self.cancel.load(Ordering::Acquire) {
+        if self.cancel.is_cancelled() {
             return Err(ErrorCode::Cancelled);
         }
         if let Some(window) = window {
@@ -229,7 +229,7 @@ impl Mailbox {
             crate::bounded_json::decode(&bytes, MESSAGE_LIMIT).map_err(json_error)?;
         let initialization = value.get("event").and_then(|v| v.as_str()) == Some("init");
         let mut state = self.lock();
-        if self.cancel.load(Ordering::Acquire) {
+        if self.cancel.is_cancelled() {
             return Err(ErrorCode::Cancelled);
         }
         if state.events.len() >= 32 {
@@ -261,7 +261,7 @@ impl Mailbox {
             &[(Resource::HostBytes, (MESSAGE_LIMIT * 32) as u64)],
         )?;
         let mut state = self.lock();
-        if self.cancel.load(Ordering::Acquire) {
+        if self.cancel.is_cancelled() {
             return Err(ErrorCode::Cancelled);
         }
         if state.generation.media != expected.media
@@ -296,7 +296,7 @@ impl Mailbox {
     pub fn next(&self) -> Option<Message> {
         let mut state = self.lock();
         loop {
-            if self.cancel.load(Ordering::Acquire) {
+            if self.cancel.is_cancelled() {
                 return None;
             }
             if std::mem::take(&mut state.sweep) {
@@ -325,7 +325,7 @@ impl Mailbox {
     }
     pub fn complete(&self, message: Message) {
         let mut state = self.lock();
-        if self.cancel.load(Ordering::Acquire) {
+        if self.cancel.is_cancelled() {
             return;
         }
         // Every accepted task already owns one of 32 per-plugin task slots;
@@ -336,7 +336,7 @@ impl Mailbox {
     pub fn advance(&self, generation: Generation) -> Result<(), ErrorCode> {
         let (cancel, reads) = {
             let mut state = self.lock();
-            if self.cancel.load(Ordering::Acquire) {
+            if self.cancel.is_cancelled() {
                 return Err(ErrorCode::Cancelled);
             }
             let old = state.generation;
@@ -372,7 +372,7 @@ impl Mailbox {
         Ok(())
     }
     pub fn stop(&self) {
-        if self.cancel.swap(true, Ordering::AcqRel) {
+        if !self.cancel.cancel() {
             return;
         }
         let (cancel, reads, windows) = {
@@ -435,7 +435,7 @@ impl Mailbox {
             &[(Resource::HostBytes, (MESSAGE_LIMIT * 32) as u64)],
         )?;
         let mut state = self.lock();
-        if self.cancel.load(Ordering::Acquire) {
+        if self.cancel.is_cancelled() {
             return Err(ErrorCode::Cancelled);
         }
         if state.reads.len() >= 4 || state.events.len() >= 32 {

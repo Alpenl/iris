@@ -1,15 +1,15 @@
 use super::{Bootstrap, GUIDES, WEBDAV};
-use crate::plugin_v2::{
-    engine::RuntimeEngine,
-    instance::{Instance, InstanceConfig},
-    ledger::{Ledger, Resource},
-    package::{Package, Provenance},
+use crate::{
+    concurrency::CancelToken,
+    plugin_v2::{
+        engine::RuntimeEngine,
+        instance::{Instance, InstanceConfig},
+        ledger::{Ledger, Resource},
+        package::{Package, Provenance},
+    },
 };
 use iris_api::v2::{ErrorCode, Reply, Role};
-use std::{
-    sync::{Arc, atomic::AtomicBool},
-    time::Instant,
-};
+use std::{sync::Arc, time::Instant};
 
 /// Executes embedded, digest-verified Wasm in the actual host process. No UI,
 /// installed packages, profile writes, network, credentials or native tools.
@@ -20,7 +20,7 @@ pub fn check() -> Result<serde_json::Value, ErrorCode> {
     let mut rows = Vec::new();
     for bytes in [GUIDES, WEBDAV] {
         let package = Package::from_zip(bytes, Provenance::Bundled(&pins))?;
-        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel = CancelToken::new();
         let start = Instant::now();
         let module = engine.compile(package.wasm().ok_or(ErrorCode::Unsupported)?, &cancel)?;
         let compile = start.elapsed();

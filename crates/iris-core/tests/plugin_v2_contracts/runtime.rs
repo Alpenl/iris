@@ -70,7 +70,7 @@ impl Fixture {
             &self.installer,
             self.installed.clone(),
             self.setup.clone(),
-            &AtomicBool::new(false),
+            &CancelToken::new(),
         )
         .unwrap();
         until(

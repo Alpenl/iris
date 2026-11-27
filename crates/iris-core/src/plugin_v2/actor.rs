@@ -15,7 +15,10 @@ use super::{
     ledger::{Ledger, Reservation, Resource},
     pool::IoPool,
 };
-use crate::vfs::http_client::HttpCancel;
+use crate::{
+    concurrency::{Deadline, ThreadRole, spawn_thread_named},
+    vfs::http_client::HttpCancel,
+};
 use iris_api::v2::{
     Capability, ErrorCode, Generation, HostCommand, Id, MESSAGE_LIMIT, Reply, Role, task::Task,
 };
@@ -26,7 +29,7 @@ use std::{
         Arc, Condvar, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 pub struct TaskContext {
@@ -162,9 +165,10 @@ impl Actor {
         let updates: SharedUpdates = Arc::new((Mutex::new(UpdateQueue::default()), Condvar::new()));
         let thread_updates = updates.clone();
         let thread_shared = shared.clone();
-        std::thread::Builder::new()
-            .name(format!("iris-v2-{:?}", config.role))
-            .spawn(move || {
+        spawn_thread_named(
+            ThreadRole::PluginStoreActor,
+            &format!("{:?}", config.role),
+            move || {
                 let bridge = Bridge {
                     shared: thread_shared.clone(),
                     io: config.io,
@@ -198,8 +202,9 @@ impl Actor {
                 });
                 thread_shared.done.store(true, Ordering::Release);
                 (thread_shared.wake)();
-            })
-            .map_err(|_| ErrorCode::Internal)?;
+            },
+        )
+        .map_err(|_| ErrorCode::Internal)?;
         Ok(Self { shared, updates })
     }
 
@@ -263,7 +268,7 @@ impl Actor {
         let mut queue = lock.lock().unwrap_or_else(|e| e.into_inner());
         while let Some(update) = queue.items.pop_front() {
             cv.notify_one();
-            if !self.shared.cancel.load(Ordering::Acquire)
+            if !self.shared.cancel.is_cancelled()
                 && self.shared.is_current(update.window, update.generation)
                 && !update.is_cancelled()
             {
@@ -307,7 +312,7 @@ impl Actor {
         cv.notify_all();
     }
     pub fn is_quiescent(&self) -> bool {
-        if self.shared.cancel.load(Ordering::Acquire) {
+        if self.shared.cancel.is_cancelled() {
             let (lock, cv) = &*self.updates;
             let mut queue = lock.lock().unwrap_or_else(|e| e.into_inner());
             queue.items.clear();
@@ -399,7 +404,7 @@ fn run(
             window.is_none() && matches!(&message, Message::Event { read: None, .. });
         // Terminal `Message::Closed` is only gated on actor cancellation, never global generation.
         let generation = if is_closed {
-            if shared.cancel.load(Ordering::Acquire) {
+            if shared.cancel.is_cancelled() {
                 continue;
             }
             global
@@ -585,19 +590,19 @@ fn push_update(
     generation: Generation,
 ) -> Result<bool, ErrorCode> {
     let (lock, cv) = &**updates;
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Deadline::after(Duration::from_secs(5));
     let mut woke = false;
     let mut queue = lock.lock().unwrap_or_else(|e| e.into_inner());
     while queue.items.len() >= 32 {
-        if queue.closed || shared.cancel.load(Ordering::Acquire) {
+        if queue.closed || shared.cancel.is_cancelled() {
             return Err(ErrorCode::Cancelled);
         }
         if !shared.is_current(window, generation) || update.is_cancelled() {
             return Ok(false);
         }
-        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-            return Err(ErrorCode::Backpressure);
-        };
+        let remaining = deadline
+            .remaining_capped(Duration::from_millis(50))
+            .map_err(|_| ErrorCode::Backpressure)?;
         if !woke {
             woke = true;
             drop(queue);
@@ -606,11 +611,11 @@ fn push_update(
             continue;
         }
         queue = cv
-            .wait_timeout(queue, remaining.min(Duration::from_millis(50)))
+            .wait_timeout(queue, remaining)
             .unwrap_or_else(|e| e.into_inner())
             .0;
     }
-    if queue.closed || shared.cancel.load(Ordering::Acquire) {
+    if queue.closed || shared.cancel.is_cancelled() {
         return Err(ErrorCode::Cancelled);
     }
     queue.items.push_back(update);

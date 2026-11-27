@@ -1,11 +1,15 @@
 //! Installation-wide submission order across windows. Waiting happens only in
 //! the bounded control I/O lane, never in a Store callback or the UI thread.
-use crate::{plugin_v2::instance::next_id, vfs::HttpCancel};
+use crate::{
+    concurrency::{Deadline, WaitError},
+    plugin_v2::instance::next_id,
+    vfs::HttpCancel,
+};
 use iris_api::v2::{ErrorCode, Id};
 use std::{
     collections::VecDeque,
     sync::{Arc, Condvar, Mutex},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 #[derive(Default)]
@@ -43,18 +47,18 @@ impl Ticket {
                 wake_serial.changed.notify_all();
             }))
             .map_err(|_| ErrorCode::Cancelled)?;
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let deadline = Deadline::after(Duration::from_secs(30));
         let mut queue = self.serial.queue.lock().unwrap_or_else(|e| e.into_inner());
         loop {
-            if cancel.is_cancelled() {
-                return Err(ErrorCode::Cancelled);
-            }
+            let remaining = match cancel.check(Some(deadline)) {
+                Ok(Some(rem)) => rem,
+                Ok(None) => Duration::from_secs(30),
+                Err(WaitError::Cancelled) => return Err(ErrorCode::Cancelled),
+                Err(WaitError::TimedOut) => return Err(ErrorCode::Timeout),
+            };
             if queue.front() == Some(&self.id) {
                 return Ok(());
             }
-            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-                return Err(ErrorCode::Timeout);
-            };
             queue = self
                 .serial
                 .changed

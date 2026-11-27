@@ -5,7 +5,7 @@ use std::{
     io::{Read, Write},
     net::TcpStream,
     sync::atomic::Ordering,
-    time::{Duration, Instant},
+    time::Duration,
 };
 use url::Url;
 
@@ -54,10 +54,8 @@ pub(super) fn listen(
         }
         let left = transaction
             .expires
-            .saturating_duration_since(Instant::now());
-        if left.is_zero() {
-            return Err(ErrorCode::Timeout);
-        }
+            .remaining()
+            .map_err(|_| ErrorCode::Timeout)?;
         match poll.poll(&mut events, Some(left)) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
@@ -110,13 +108,10 @@ pub(super) fn listen(
 }
 fn receive(stream: &mut TcpStream, t: &Transaction) -> Result<IoOutcome, ErrorCode> {
     const HEADER_CAP: usize = 32768;
-    let end = t.expires.min(Instant::now() + Duration::from_secs(2));
+    let end = t.expires.min_duration(Duration::from_secs(2));
     let mut bytes = Vec::with_capacity(8192);
     loop {
-        let remaining = end.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Err(ErrorCode::Timeout);
-        }
+        let remaining = end.remaining().map_err(|_| ErrorCode::Timeout)?;
         stream
             .set_read_timeout(Some(remaining))
             .map_err(|_| ErrorCode::IoError)?;

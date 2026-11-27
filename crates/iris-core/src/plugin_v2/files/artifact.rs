@@ -29,9 +29,9 @@ fn cleanup_queue() -> Result<&'static mpsc::Sender<Cleanup>, ErrorCode> {
             // Every queued job retains a global Handle reservation; the ledger
             // bounds both this channel and the retry list, without blocking Drop.
             let (tx, rx) = mpsc::channel::<Cleanup>();
-            std::thread::Builder::new()
-                .name("iris-artifact-cleanup".into())
-                .spawn(move || {
+            crate::concurrency::spawn_thread(
+                crate::concurrency::ThreadRole::ArtifactCleanup,
+                move || {
                     let mut pending = Vec::<Cleanup>::new();
                     loop {
                         match rx.recv_timeout(Duration::from_millis(250)) {
@@ -50,9 +50,10 @@ fn cleanup_queue() -> Result<&'static mpsc::Sender<Cleanup>, ErrorCode> {
                                 .is_err_and(|e| e.kind() != std::io::ErrorKind::NotFound)
                         });
                     }
-                })
-                .map(|_| tx)
-                .map_err(|_| ())
+                },
+            )
+            .map(|_| tx)
+            .map_err(|_| ())
         })
         .as_ref()
         .map_err(|_| ErrorCode::Internal)

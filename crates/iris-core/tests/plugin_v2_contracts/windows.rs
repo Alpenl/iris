@@ -31,7 +31,7 @@ impl Executor for WindowIo {
 fn two_windows_share_one_store_with_independent_cancellation_and_updates() {
     let engine = RuntimeEngine::new().unwrap();
     let module = engine
-        .compile(&guest("IRIS_V2_RUST_GUEST"), &AtomicBool::new(false))
+        .compile(&guest("IRIS_V2_RUST_GUEST"), &CancelToken::new())
         .unwrap();
     let ledger = Ledger::default();
     let pending = Pending::default();
@@ -157,7 +157,7 @@ fn individual_source_request_cancel_survives_async_callbacks_without_cancelling_
     use iris_core::vfs::HttpCancel;
     let engine = RuntimeEngine::new().unwrap();
     let module = engine
-        .compile(&guest("IRIS_V2_RUST_GUEST"), &AtomicBool::new(false))
+        .compile(&guest("IRIS_V2_RUST_GUEST"), &CancelToken::new())
         .unwrap();
     let ledger = Ledger::default();
     let pending = PendingRequests::default();

@@ -4,8 +4,8 @@ mod response;
 
 use super::{Origin, RequestGrant, TransportKind, normalize_url};
 use crate::vfs::http_client::{
-    HttpBody, HttpCancel, HttpClientError, NetworkScope, SocketRegistration, Transport,
-    connect_transport, is_tchar,
+    HeaderValidationError, HttpBody, HttpCancel, HttpClientError, NetworkScope, SocketRegistration,
+    Transport, connect_transport, is_tchar, validate_header_pairs,
 };
 use iris_api::v2::ErrorCode;
 use std::{
@@ -58,39 +58,15 @@ pub(crate) enum RawState {
 }
 
 pub(crate) fn validate_headers(headers: &[(String, String)]) -> Result<(), ErrorCode> {
-    let mut total = 0usize;
-    if headers.len() > 128 {
-        return Err(ErrorCode::QuotaExceeded);
-    }
-    for (name, value) in headers {
-        total = total.saturating_add(name.len() + value.len() + 4);
-        if name.is_empty()
-            || !name.bytes().all(is_tchar)
-            || value.bytes().any(|b| b == 0x7f || (b < 0x20 && b != b'\t'))
-            || value.chars().any(|c| u32::from(c) > 255)
-        {
-            return Err(ErrorCode::InvalidArgument);
-        }
-        if matches!(
-            name.to_ascii_lowercase().as_str(),
-            "host"
-                | "connection"
-                | "content-length"
-                | "transfer-encoding"
-                | "proxy-authorization"
-                | "proxy-connection"
-                | "upgrade"
-                | "te"
-                | "trailer"
-                | "expect"
-        ) {
-            return Err(ErrorCode::Denied);
-        }
-    }
-    if total > 65536 {
-        return Err(ErrorCode::QuotaExceeded);
-    }
-    Ok(())
+    validate_header_pairs(headers.iter().map(|(k, v)| (k.as_str(), v.as_str()))).map_err(
+        |(_name, kind)| match kind {
+            HeaderValidationError::QuotaExceeded => ErrorCode::QuotaExceeded,
+            HeaderValidationError::InvalidName | HeaderValidationError::InvalidValue => {
+                ErrorCode::InvalidArgument
+            }
+            HeaderValidationError::ForbiddenHeader => ErrorCode::Denied,
+        },
+    )
 }
 
 pub(crate) fn open(

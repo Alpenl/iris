@@ -19,12 +19,12 @@ fn review_compiles_without_executing_and_approval_uses_the_reviewed_bytes() {
     let mut installer = Installer::new(root.join("packages"), resources.ledger.clone());
     let path = root.join("candidate.irisplugin");
     std::fs::write(&path, package(b"invalid-module", "Invalid")).unwrap();
-    assert!(Review::read(&path, &installer, &resources, &AtomicBool::new(false)).is_err());
+    assert!(Review::read(&path, &installer, &resources, &CancelToken::new()).is_err());
     assert!(installer.entries().unwrap().is_empty());
     // The start trap proves review never instantiates or executes unapproved code.
     let wasm = wat::parse_str(r#"(module (memory (export "memory") 1) (func $start unreachable) (start $start) (func (export "iris_abi_version") (result i32) i32.const 2) (func (export "iris_alloc") (param i32) (result i32) i32.const 1) (func (export "iris_dealloc") (param i32 i32)) (func (export "iris_on_event") (param i32 i32) (result i64) i64.const 0))"#).unwrap();
     std::fs::write(&path, package(&wasm, "Reviewed")).unwrap();
-    let review = Review::read(&path, &installer, &resources, &AtomicBool::new(false)).unwrap();
+    let review = Review::read(&path, &installer, &resources, &CancelToken::new()).unwrap();
     let digest = review.digest();
     std::fs::write(&path, package(&wasm, "Replaced after review")).unwrap();
     let (installed, _) = review
@@ -35,8 +35,8 @@ fn review_compiles_without_executing_and_approval_uses_the_reviewed_bytes() {
         installer.load(&installed).unwrap().manifest.name,
         "Reviewed"
     );
-    let review = Review::read(&path, &installer, &resources, &AtomicBool::new(false)).unwrap();
-    let other = Review::read(&path, &installer, &resources, &AtomicBool::new(false)).unwrap();
+    let review = Review::read(&path, &installer, &resources, &CancelToken::new()).unwrap();
+    let other = Review::read(&path, &installer, &resources, &CancelToken::new()).unwrap();
     other
         .approve_with_cleanup(&mut installer, BTreeSet::new(), false)
         .unwrap();
@@ -44,15 +44,14 @@ fn review_compiles_without_executing_and_approval_uses_the_reviewed_bytes() {
         review.approve_with_cleanup(&mut installer, BTreeSet::new(), true),
         Err(ErrorCode::StaleHandle)
     );
-    let mut expired = Review::read(&path, &installer, &resources, &AtomicBool::new(false)).unwrap();
-    expired.expires = Instant::now() - Duration::from_secs(1);
+    let mut expired = Review::read(&path, &installer, &resources, &CancelToken::new()).unwrap();
+    expired.expires = Deadline::at(std::time::Instant::now() - Duration::from_secs(1));
     assert_eq!(
         expired.approve_with_cleanup(&mut installer, BTreeSet::new(), false),
         Err(ErrorCode::StaleHandle)
     );
-    let mut refreshed =
-        Review::read(&path, &installer, &resources, &AtomicBool::new(false)).unwrap();
-    refreshed.expires = Instant::now() - Duration::from_secs(1);
+    let mut refreshed = Review::read(&path, &installer, &resources, &CancelToken::new()).unwrap();
+    refreshed.expires = Deadline::at(std::time::Instant::now() - Duration::from_secs(1));
     refreshed.refresh_expiry();
     assert!(
         refreshed

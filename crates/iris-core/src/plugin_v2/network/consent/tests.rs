@@ -372,7 +372,7 @@ fn review_and_approve_reject_grants_without_network_capabilities_before_dns_or_d
         origin: "http://192.168.1.99:8080".into(),
         ips: vec!["192.168.1.99".parse().unwrap()],
         previous: None,
-        expires: Instant::now() + Duration::from_secs(60),
+        expires: Deadline::after(Duration::from_secs(60)),
         _memory: ledger
             .reserve(&owner, &[(Resource::HostBytes, 1024)])
             .unwrap(),

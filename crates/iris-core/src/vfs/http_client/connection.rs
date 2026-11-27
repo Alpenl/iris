@@ -3,16 +3,19 @@ mod dns;
 pub(crate) mod doh;
 
 use std::any::Any;
-use std::collections::BTreeMap;
 use std::io::{self, Read, Write};
-use std::net::{IpAddr, Shutdown, SocketAddr, TcpStream};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::net::{IpAddr, SocketAddr, TcpStream};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use mio::{Events, Interest, Poll, Token, Waker};
 use rustls_pki_types::ServerName;
 use url::{Host, Url};
+
+pub(crate) use crate::concurrency::SocketRegistration;
+use crate::concurrency::{CancelToken, Deadline, WaitError};
+pub type HttpCancel = CancelToken;
 
 use super::address::{AddressKind, address_kind};
 use super::{CONNECT_TIMEOUT, IO_TIMEOUT};
@@ -92,162 +95,6 @@ impl NetworkScope {
                         .is_none_or(|peers| peers.contains(&ip))
             }
         }
-    }
-}
-
-/// Cancels active HTTP operations, including blocked socket reads and TLS handshakes.
-#[derive(Default, Clone)]
-pub struct HttpCancel(Arc<Mutex<CancelState>>);
-
-#[derive(Default)]
-struct CancelState {
-    cancelled: bool,
-    next_id: u64,
-    sockets: BTreeMap<u64, TcpStream>,
-    connects: BTreeMap<u64, Arc<Waker>>,
-    callbacks: BTreeMap<u64, Arc<dyn Fn() + Send + Sync>>,
-    children: Vec<std::sync::Weak<Mutex<CancelState>>>,
-}
-
-impl HttpCancel {
-    /// Link an operation to a second cancellation authority without transferring
-    /// ownership. Used for instance lifetime AND network-grant revocation.
-    pub(crate) fn link(&self, child: &HttpCancel) -> Result<()> {
-        if Arc::ptr_eq(&self.0, &child.0) {
-            return Ok(());
-        }
-        let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        if state.cancelled {
-            drop(state);
-            child.cancel();
-            bail!("operation cancelled");
-        }
-        state.children.retain(|w| w.strong_count() > 0);
-        if !state
-            .children
-            .iter()
-            .any(|w| w.ptr_eq(&Arc::downgrade(&child.0)))
-        {
-            state.children.push(Arc::downgrade(&child.0));
-        }
-        Ok(())
-    }
-    pub fn cancel(&self) {
-        let (callbacks, children) = {
-            let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
-            state.cancelled = true;
-            for socket in state.sockets.values() {
-                let _ = socket.shutdown(Shutdown::Both);
-            }
-            for wake in state.connects.values() {
-                let _ = wake.wake();
-            }
-            (
-                std::mem::take(&mut state.callbacks),
-                std::mem::take(&mut state.children),
-            )
-        };
-        for wake in callbacks.into_values() {
-            wake();
-        }
-        for child in children {
-            if let Some(arc) = child.upgrade() {
-                Self(arc).cancel();
-            }
-        }
-    }
-
-    pub(crate) fn child(&self) -> Result<Self> {
-        let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        if state.cancelled {
-            bail!("HTTP request cancelled");
-        }
-        state.children.retain(|w| w.strong_count() > 0);
-        let child = Self::default();
-        state.children.push(Arc::downgrade(&child.0));
-        Ok(child)
-    }
-
-    pub fn is_cancelled(&self) -> bool {
-        self.0.lock().unwrap_or_else(|e| e.into_inner()).cancelled
-    }
-
-    pub(crate) fn register(&self, socket: &TcpStream) -> Result<SocketRegistration> {
-        let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        if state.cancelled {
-            bail!("HTTP request cancelled");
-        }
-        state.next_id += 1;
-        let id = state.next_id;
-        state.sockets.insert(id, socket.try_clone()?);
-        Ok(SocketRegistration(self.clone(), id))
-    }
-    fn register_connect(&self, wake: Waker) -> Result<ConnectRegistration> {
-        self.register_shared_wake(Arc::new(wake))
-    }
-    pub(crate) fn register_shared_wake(&self, wake: Arc<Waker>) -> Result<ConnectRegistration> {
-        let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        if state.cancelled {
-            bail!("HTTP request cancelled");
-        }
-        state.next_id += 1;
-        let id = state.next_id;
-        state.connects.insert(id, wake);
-        Ok(ConnectRegistration(self.clone(), id))
-    }
-    /// Registers a wakeup callback invoked after `CancelState`'s lock is released
-    /// when `cancel()` runs. Fails immediately if already cancelled.
-    pub(crate) fn register_callback(
-        &self,
-        wake: Arc<dyn Fn() + Send + Sync>,
-    ) -> Result<CancelCallbackRegistration> {
-        let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        if state.cancelled {
-            bail!("HTTP request cancelled");
-        }
-        state.next_id += 1;
-        let id = state.next_id;
-        state.callbacks.insert(id, wake);
-        Ok(CancelCallbackRegistration(self.clone(), id))
-    }
-}
-
-pub(crate) struct SocketRegistration(HttpCancel, u64);
-
-impl Drop for SocketRegistration {
-    fn drop(&mut self) {
-        self.0
-            .0
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .sockets
-            .remove(&self.1);
-    }
-}
-
-pub(crate) struct ConnectRegistration(HttpCancel, u64);
-
-impl Drop for ConnectRegistration {
-    fn drop(&mut self) {
-        self.0
-            .0
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .connects
-            .remove(&self.1);
-    }
-}
-
-pub(crate) struct CancelCallbackRegistration(HttpCancel, u64);
-
-impl Drop for CancelCallbackRegistration {
-    fn drop(&mut self) {
-        self.0
-            .0
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .callbacks
-            .remove(&self.1);
     }
 }
 
@@ -412,20 +259,15 @@ pub(super) fn remaining_timeout(
     deadline: Option<Instant>,
     limit: Duration,
 ) -> Result<Duration> {
-    if cancel.is_cancelled() {
-        return Err(
-            anyhow::Error::new(HttpClientError::Cancelled).context("HTTP request cancelled")
-        );
-    }
-    let left = deadline.map_or(limit, |d| {
-        d.saturating_duration_since(Instant::now()).min(limit)
-    });
-    if left.is_zero() {
-        return Err(
-            anyhow::Error::new(HttpClientError::Timeout).context("HTTP request deadline exceeded")
-        );
-    }
-    Ok(left)
+    cancel
+        .remaining_timeout(Deadline::from_optional(deadline), limit)
+        .map_err(|err| match err {
+            WaitError::Cancelled => {
+                anyhow::Error::new(HttpClientError::Cancelled).context("HTTP request cancelled")
+            }
+            WaitError::TimedOut => anyhow::Error::new(HttpClientError::Timeout)
+                .context("HTTP request deadline exceeded"),
+        })
 }
 
 fn connect_tcp(

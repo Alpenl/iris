@@ -1,21 +1,16 @@
 use super::{Approval, ArchivedIdentity, Installed, Installer};
-use crate::plugin_v2::{
-    engine::CompiledModule,
-    instance::next_id,
-    ledger::{Reservation, Resource},
-    package::{Package, Provenance},
-    runtime::Resources,
+use crate::{
+    concurrency::{CancelToken, Deadline},
+    plugin_v2::{
+        engine::CompiledModule,
+        instance::next_id,
+        ledger::{Reservation, Resource},
+        package::{Package, Provenance},
+        runtime::Resources,
+    },
 };
 use iris_api::v2::{Capability, ErrorCode, Manifest};
-use std::{
-    collections::BTreeSet,
-    path::Path,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
-    time::{Duration, Instant},
-};
+use std::{collections::BTreeSet, path::Path, sync::Arc, time::Duration};
 
 /// A reviewed archive is immutable in memory. Compilation checks the module
 /// without executing start/init before the user authorizes installation.
@@ -27,7 +22,7 @@ pub struct Review {
     bytes: Vec<u8>,
     bundled: bool,
     _module: Option<Arc<CompiledModule>>,
-    expires: Instant,
+    expires: Deadline,
     _lease: Reservation,
 }
 impl Review {
@@ -36,9 +31,9 @@ impl Review {
         path: &Path,
         installer: &Installer,
         resources: &Resources,
-        cancel: &AtomicBool,
+        cancel: &CancelToken,
     ) -> Result<Self, ErrorCode> {
-        if cancel.load(Ordering::Acquire) {
+        if cancel.is_cancelled() {
             return Err(ErrorCode::Cancelled);
         }
         let bytes = Installer::read_candidate(path)?;
@@ -48,7 +43,7 @@ impl Review {
         bytes: Vec<u8>,
         installer: &Installer,
         resources: &Resources,
-        cancel: &AtomicBool,
+        cancel: &CancelToken,
     ) -> Result<Self, ErrorCode> {
         Self::from_bytes(bytes, installer, resources, cancel, true)
     }
@@ -56,10 +51,10 @@ impl Review {
         bytes: Vec<u8>,
         installer: &Installer,
         resources: &Resources,
-        cancel: &AtomicBool,
+        cancel: &CancelToken,
         bundled: bool,
     ) -> Result<Self, ErrorCode> {
-        if cancel.load(Ordering::Acquire) {
+        if cancel.is_cancelled() {
             return Err(ErrorCode::Cancelled);
         }
         let owner = format!("package-review-{}", next_id()?);
@@ -76,7 +71,7 @@ impl Review {
             .wasm()
             .map(|wasm| resources.engine.compile(wasm, cancel))
             .transpose()?;
-        if cancel.load(Ordering::Acquire) {
+        if cancel.is_cancelled() {
             return Err(ErrorCode::Cancelled);
         }
         let previous = installer.record(&package.manifest.id)?;
@@ -93,7 +88,7 @@ impl Review {
             bytes,
             bundled,
             _module: module,
-            expires: Instant::now() + Duration::from_secs(300),
+            expires: Deadline::after(Duration::from_secs(300)),
             _lease: lease,
         })
     }
@@ -113,7 +108,7 @@ impl Review {
         self.bundled
     }
     pub(crate) fn refresh_expiry(&mut self) {
-        self.expires = Instant::now() + Duration::from_secs(300);
+        self.expires = Deadline::after(Duration::from_secs(300));
     }
     /// Keep identity only after the UI explicitly offers that choice alongside
     /// both content digests and the requested grants. Reinstall gets a new scope
@@ -124,7 +119,7 @@ impl Review {
         grants: BTreeSet<Capability>,
         keep_identity: bool,
     ) -> Result<(Installed, Vec<String>), ErrorCode> {
-        if Instant::now() >= self.expires {
+        if self.expires.is_expired() {
             return Err(ErrorCode::StaleHandle);
         }
         let previous = if keep_identity {

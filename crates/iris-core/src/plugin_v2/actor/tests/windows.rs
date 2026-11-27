@@ -181,7 +181,9 @@ fn window_closed_is_delivered_even_after_global_generation_advances() {
     .unwrap();
 
     let engine = RuntimeEngine::new().unwrap();
-    let module = engine.compile(&wasm, &AtomicBool::new(false)).unwrap();
+    let module = engine
+        .compile(&wasm, &crate::concurrency::CancelToken::new())
+        .unwrap();
     let ledger = Ledger::default();
     let actor = Actor::spawn(Spawn {
         engine,
@@ -197,9 +199,9 @@ fn window_closed_is_delivered_even_after_global_generation_advances() {
     })
     .unwrap();
     actor.send(br#"{"event":"init"}"#.to_vec()).unwrap();
-    let deadline = Instant::now() + Duration::from_secs(3);
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
     while !actor.initialized() {
-        assert!(Instant::now() < deadline);
+        assert!(std::time::Instant::now() < deadline);
         std::thread::sleep(Duration::from_millis(5));
     }
     actor.open_window(Id(1), Generation::default()).unwrap();
@@ -214,8 +216,8 @@ fn window_closed_is_delivered_even_after_global_generation_advances() {
         .unwrap();
     actor.send(br#"{"event":"probe"}"#.to_vec()).unwrap();
     let mut saw_closed = false;
-    let deadline = Instant::now() + Duration::from_secs(3);
-    while !saw_closed && Instant::now() < deadline {
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while !saw_closed && std::time::Instant::now() < deadline {
         if let Some(update) = actor.poll()
             && update.commands.iter().any(|c| {
                 matches!(
@@ -234,9 +236,9 @@ fn window_closed_is_delivered_even_after_global_generation_advances() {
         "terminal window_closed must not be dropped when global generation advances"
     );
     actor.stop();
-    let deadline = Instant::now() + Duration::from_secs(3);
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
     while !actor.is_quiescent() {
-        assert!(Instant::now() < deadline);
+        assert!(std::time::Instant::now() < deadline);
         std::thread::sleep(Duration::from_millis(5));
     }
 }

@@ -1,11 +1,14 @@
 //! Run with scripts/test-plugin-v2.py, which builds both real guest languages.
 use iris_api::v2::{Capability, ErrorCode, Generation, HostCommand, Reply, Role, task::Task};
-use iris_core::plugin_v2::{
-    actor::{Actor, Executor, IoOutcome, Operation, Spawn, Status, TaskContext},
-    engine::RuntimeEngine,
-    instance::{Blob, Instance, InstanceConfig},
-    ledger::{Ledger, Resource},
-    pool::IoPool,
+use iris_core::{
+    concurrency::CancelToken,
+    plugin_v2::{
+        actor::{Actor, Executor, IoOutcome, Operation, Spawn, Status, TaskContext},
+        engine::RuntimeEngine,
+        instance::{Blob, Instance, InstanceConfig},
+        ledger::{Ledger, Resource},
+        pool::IoPool,
+    },
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -34,7 +37,7 @@ fn guest(name: &str) -> Vec<u8> {
 fn rust_and_c_share_decimal_and_ownership_vectors() {
     let engine = RuntimeEngine::new().unwrap();
     for name in ["IRIS_V2_RUST_GUEST", "IRIS_V2_C_GUEST"] {
-        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel = CancelToken::new();
         let module = engine.compile(&guest(name), &cancel).unwrap();
         let mut instance = Instance::new(InstanceConfig {
             engine: engine.clone(),
@@ -121,7 +124,7 @@ fn until(mut condition: impl FnMut() -> bool, timeout: Duration) {
 fn control_io_and_dead_loop_do_not_block_four_stream_reads() {
     let engine = RuntimeEngine::new().unwrap();
     let module = engine
-        .compile(&guest("IRIS_V2_RUST_GUEST"), &AtomicBool::new(false))
+        .compile(&guest("IRIS_V2_RUST_GUEST"), &CancelToken::new())
         .unwrap();
     let ledger = Ledger::default();
     let io = IoPool::new().unwrap();
@@ -208,7 +211,7 @@ fn control_io_and_dead_loop_do_not_block_four_stream_reads() {
 fn cancelling_does_not_release_running_io_quota_early() {
     let engine = RuntimeEngine::new().unwrap();
     let module = engine
-        .compile(&guest("IRIS_V2_RUST_GUEST"), &AtomicBool::new(false))
+        .compile(&guest("IRIS_V2_RUST_GUEST"), &CancelToken::new())
         .unwrap();
     let ledger = Ledger::default();
     let started = Arc::new(AtomicBool::new(false));
@@ -262,7 +265,7 @@ fn random_access_relay_refresh_preserves_inflight_context_and_cancellation() {
     };
     let engine = RuntimeEngine::new().unwrap();
     let module = engine
-        .compile(&guest("IRIS_V2_RUST_GUEST"), &AtomicBool::new(false))
+        .compile(&guest("IRIS_V2_RUST_GUEST"), &CancelToken::new())
         .unwrap();
     let ledger = Ledger::default();
     let started = Arc::new(AtomicBool::new(false));

@@ -237,6 +237,12 @@ def is_under(path: Path, parent: Path) -> bool:
 
 
 POISON_UNWRAP_RE = re.compile(r"\.(?:lock|read|write)\(\)\s*\.(?:unwrap|expect)\(")
+RAW_THREAD_SPAWN_RE = re.compile(
+    r"\bthread::(?:spawn|Builder)\b"
+    r"|\buse\s+std::thread::(?:\{[^}]*\b(?:spawn|Builder)\b|(?:spawn|Builder)\b|\*)"
+)
+THREAD_ROLE_COUNT_RE = re.compile(r"\bpub\s+const\s+COUNT\s*:\s*usize\s*=\s*([0-9]+)\s*;")
+THREAD_ROLE_NAME_RE = re.compile(r'Self::([A-Za-z0-9_]+)\s*=>\s*"([^"]+)"')
 
 
 def check_lock_poisoning(rel: Path, text: str):
@@ -245,6 +251,36 @@ def check_lock_poisoning(rel: Path, text: str):
     _require(
         match is None,
         f"{rel} unwraps a lock result in production code; use `.unwrap_or_else(PoisonError::into_inner)`",
+    )
+
+
+def check_thread_spawns(rel: Path, text: str):
+    """Production code must spawn OS threads only via `iris_core::concurrency::{spawn_thread, spawn_thread_named}`."""
+    if rel.as_posix() == "crates/iris-core/src/concurrency.rs":
+        return
+    match = RAW_THREAD_SPAWN_RE.search(prod_prefix(text))
+    _require(
+        match is None,
+        f"{rel} spawns an unregistered OS thread via `{match.group(0) if match else ''}`; "
+        "use `iris_core::concurrency::{spawn_thread, spawn_thread_named}`",
+    )
+
+
+def check_thread_inventory_docs(concurrency_src: str, arch_doc: str):
+    """Every `ThreadRole::base_name` in `concurrency.rs` must be documented in `docs/ARCHITECTURE.md`."""
+    stripped = prod_prefix(concurrency_src)
+    count_match = THREAD_ROLE_COUNT_RE.search(stripped)
+    _require(count_match is not None, "concurrency.rs missing `ThreadRole::COUNT`")
+    expected_count = int(count_match.group(1))
+    entries = THREAD_ROLE_NAME_RE.findall(stripped)
+    _require(
+        len(entries) == expected_count,
+        f"ThreadRole::base_name arms ({len(entries)}) must match ThreadRole::COUNT ({expected_count})",
+    )
+    missing = sorted({name for _, name in entries if f"`{name}" not in arch_doc})
+    _require(
+        not missing,
+        f"docs/ARCHITECTURE.md missing documented ThreadRole names: {', '.join(missing)}",
     )
 
 
@@ -411,6 +447,7 @@ def main():
     isolated_core_domains = {
         "bounded_json",
         "catalog",
+        "concurrency",
         "fs_util",
         "geometry",
         "input",
@@ -459,7 +496,7 @@ def main():
                 prod_code = prod_prefix(path.read_text(encoding="utf-8"))
                 _require("use super::*;" not in prod_code, f"{rel} uses forbidden wildcard `use super::*;`")
 
-    # 4. File line-count budgets (prevent monolith regressions)
+    # 4. File line-count budgets, lock poisoning & registered OS thread spawns
     soft_warnings = []
     for path in sorted([*(ROOT / "crates").rglob("*.rs"), *(ROOT / "examples/plugins").rglob("*.rs")]):
         rel = path.relative_to(ROOT)
@@ -469,6 +506,13 @@ def main():
             soft_warnings.append(f"{rel} ({prod_lines} prod lines)")
         if not is_standalone_test_file(path, rel):
             check_lock_poisoning(rel, text)
+            if is_under(path, ROOT / "crates"):
+                check_thread_spawns(rel, text)
+
+    check_thread_inventory_docs(
+        (ROOT / "crates/iris-core/src/concurrency.rs").read_text(encoding="utf-8"),
+        (ROOT / "docs/ARCHITECTURE.md").read_text(encoding="utf-8"),
+    )
 
     # 5. Bidirectional SVG icon registry & zero-reference check
     icons_on_disk = {p.name for p in (ROOT / "Resources/Icons").glob("*.svg")}

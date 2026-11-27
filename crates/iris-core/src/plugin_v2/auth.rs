@@ -6,7 +6,10 @@ use super::{
     ledger::{Activity, Ledger, Reservation, Resource},
     network::{NetworkGrant, TransportKind, normalize_url},
 };
-use crate::vfs::HttpCancel;
+use crate::{
+    concurrency::{Deadline, ThreadRole, spawn_thread},
+    vfs::HttpCancel,
+};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use iris_api::v2::{ErrorCode, Generation, Id, Role, task::Task};
 use mio::{Interest, Poll, Token, Waker};
@@ -20,7 +23,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
 use url::Url;
 
@@ -56,7 +59,7 @@ struct Transaction {
     verifier: String,
     challenge: String,
     issuer: Option<String>,
-    expires: Instant,
+    expires: Deadline,
     cancel: HttpCancel,
     wake: Arc<Waker>,
     opened: AtomicBool,
@@ -193,7 +196,7 @@ impl AuthExecutor {
                 verifier,
                 challenge,
                 issuer,
-                expires: Instant::now() + this.0.ttl,
+                expires: Deadline::after(this.0.ttl),
                 cancel: context.cancel,
                 wake,
                 opened: AtomicBool::new(false),
@@ -226,27 +229,25 @@ impl AuthExecutor {
             }
             let weak = Arc::downgrade(&this.0);
             let activity = this.0.activity.start();
-            if std::thread::Builder::new()
-                .name("iris-v2-auth".into())
-                .spawn(move || {
-                    let _activity = activity;
-                    let _cancel_wake = cancel_wake;
-                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        callback::listen(listener, poll, &transaction)
-                    }))
-                    .unwrap_or(Err(ErrorCode::Internal));
-                    transaction.finish(result);
-                    if let Some(inner) = weak.upgrade() {
-                        inner
-                            .state
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .transactions
-                            .remove(&id);
-                    }
-                    drop(transaction);
-                })
-                .is_err()
+            if spawn_thread(ThreadRole::PluginAuthCallback, move || {
+                let _activity = activity;
+                let _cancel_wake = cancel_wake;
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    callback::listen(listener, poll, &transaction)
+                }))
+                .unwrap_or(Err(ErrorCode::Internal));
+                transaction.finish(result);
+                if let Some(inner) = weak.upgrade() {
+                    inner
+                        .state
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .transactions
+                        .remove(&id);
+                }
+                drop(transaction);
+            })
+            .is_err()
             {
                 this.close_in(context.window, id)?;
                 return Err(ErrorCode::Internal);
@@ -320,7 +321,7 @@ impl AuthExecutor {
             if transaction.finished.load(Ordering::Acquire) || transaction.cancel.is_cancelled() {
                 return Err(ErrorCode::Cancelled);
             }
-            if Instant::now() >= transaction.expires {
+            if transaction.expires.is_expired() {
                 return Err(ErrorCode::Timeout);
             }
             if transaction.opened.swap(true, Ordering::AcqRel) {

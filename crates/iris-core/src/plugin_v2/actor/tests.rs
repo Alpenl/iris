@@ -152,7 +152,9 @@ fn store_slots_are_reserved_before_spawning_threads() {
         (func (export "iris_on_event") (param i32 i32) (result i64) i64.const 0))"#,
     )
     .unwrap();
-    let module = engine.compile(&wasm, &AtomicBool::new(false)).unwrap();
+    let module = engine
+        .compile(&wasm, &crate::concurrency::CancelToken::new())
+        .unwrap();
     let ledger = Ledger::default();
     let io = IoPool::new().unwrap();
     let config = || Spawn {

@@ -8,13 +8,10 @@ use super::{
     package::{Package, Provenance},
     runtime::Setup,
 };
+use crate::concurrency::CancelToken;
 use iris_api::v2::ErrorCode;
 use serde::Deserialize;
-use std::{
-    collections::BTreeMap,
-    path::PathBuf,
-    sync::{Arc, atomic::AtomicBool},
-};
+use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
 
 const GUIDES: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -127,14 +124,14 @@ impl Bootstrap {
         installer: Installer,
         setup: &Setup,
     ) -> Result<Vec<InstallationEntry>, ErrorCode> {
-        self.scan(installer, setup, &AtomicBool::new(false))
+        self.scan(installer, setup, &CancelToken::new())
             .map(|scan| scan.entries)
     }
     pub(crate) fn scan(
         &self,
         mut installer: Installer,
         setup: &Setup,
-        cancel: &AtomicBool,
+        cancel: &CancelToken,
     ) -> Result<BootstrapScan, ErrorCode> {
         let mut failures = BTreeMap::new();
         let mut pending_reviews = Vec::new();
@@ -174,7 +171,7 @@ impl Bootstrap {
         setup: &Setup,
         id: &str,
         bytes: &[u8],
-        cancel: &AtomicBool,
+        cancel: &CancelToken,
     ) -> Result<Option<OfficialUpgrade>, ErrorCode> {
         let _memory = setup.resources.ledger.reserve(
             "official-bootstrap",

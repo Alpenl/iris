@@ -19,7 +19,7 @@ use super::{
     services::ControlServices,
     storage::Storage,
 };
-use crate::{vault::CredentialVault, vfs::HttpCancel};
+use crate::{concurrency::CancelToken, vault::CredentialVault, vfs::HttpCancel};
 use iris_api::v2::{
     ErrorCode, Generation, HostEvent, Id, Manifest, Role, source::SourceDescriptor,
 };
@@ -27,10 +27,7 @@ pub use playback::PlaybackPermit;
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::PathBuf,
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::{Arc, Mutex},
 };
 pub use window::{PreparedWindow, WindowPreparation};
 
@@ -124,10 +121,10 @@ impl Control {
         installer: &Installer,
         installed: Installed,
         setup: Setup,
-        cancel: &AtomicBool,
+        cancel: &CancelToken,
     ) -> Result<Self, ErrorCode> {
         let package = installer.load(&installed)?;
-        if cancel.load(Ordering::Acquire) {
+        if cancel.is_cancelled() {
             return Err(ErrorCode::Cancelled);
         }
         let module = package
@@ -158,7 +155,7 @@ impl Control {
                     | iris_api::v2::Capability::NetTcp
             )
         }) {
-            origins.restore(&network, &HttpCancel::default())?;
+            origins.restore(&network, cancel)?;
         }
         let storage = Arc::new(Storage::new(
             setup.state_directory.clone(),
@@ -207,7 +204,7 @@ impl Control {
                     .map_err(json_error)?,
             )?;
         }
-        if cancel.load(Ordering::Acquire) {
+        if cancel.is_cancelled() {
             return Err(ErrorCode::Cancelled);
         }
         let sources = if installed

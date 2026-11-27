@@ -25,6 +25,7 @@ use ring::aead::{Aad, CHACHA20_POLY1305, LessSafeKey, Nonce, UnboundKey};
 use ring::rand::{SecureRandom, SystemRandom};
 use url::Url;
 
+use crate::concurrency::{ThreadRole, budget, spawn_thread};
 use crate::loopback_http::{
     ClientHub, HttpMethod, HttpRequestError, is_adaptive_manifest, is_adaptive_prefix_undecided,
     parse_http_request, read_request,
@@ -41,8 +42,8 @@ const MAX_REQUEST: usize = 24 * 1024;
 const MAX_PLAYLIST: usize = 4 * 1024 * 1024;
 const MAX_ADAPTIVE_SNIFF: usize = 4096;
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(10);
-const RELAY_WORKERS: usize = 8;
-const GLOBAL_WORKERS: usize = 32;
+const RELAY_WORKERS: usize = budget::MEDIA_RELAY_WORKERS_PER_RELAY;
+const GLOBAL_WORKERS: usize = budget::MEDIA_RELAY_WORKERS_GLOBAL;
 const SLOT_WAIT: Duration = Duration::from_secs(1);
 static ACTIVE_WORKERS: Mutex<usize> = Mutex::new(0);
 
@@ -203,94 +204,92 @@ impl PlaybackRelay {
             wake,
         });
         let server = Arc::clone(&service);
-        let listener = thread::Builder::new()
-            .name("iris-media-relay".into())
-            .spawn(move || {
-                let mut events = Events::with_capacity(16);
-                let mut workers: Vec<thread::JoinHandle<()>> = Vec::new();
-                let mut waiting: Option<(TcpStream, Instant)> = None;
-                let mut accept_ready = false;
-                while !server.cancel.is_cancelled() {
-                    if let Some((socket, deadline)) = waiting.take() {
-                        if let Some(worker) = server.try_reserve_worker() {
-                            workers.retain(|w| !w.is_finished());
-                            if let Some(handle) = server.spawn_worker(worker, socket) {
-                                workers.push(handle);
-                            }
-                        } else if Instant::now() >= deadline {
-                            reject_busy(socket, MAX_REQUEST);
-                        } else {
-                            waiting = Some((socket, deadline));
+        let listener = spawn_thread(ThreadRole::MediaRelayListener, move || {
+            let mut events = Events::with_capacity(16);
+            let mut workers: Vec<thread::JoinHandle<()>> = Vec::new();
+            let mut waiting: Option<(TcpStream, Instant)> = None;
+            let mut accept_ready = false;
+            while !server.cancel.is_cancelled() {
+                if let Some((socket, deadline)) = waiting.take() {
+                    if let Some(worker) = server.try_reserve_worker() {
+                        workers.retain(|w| !w.is_finished());
+                        if let Some(handle) = server.spawn_worker(worker, socket) {
+                            workers.push(handle);
                         }
-                    }
-                    if waiting.is_none() && accept_ready {
-                        while !server.cancel.is_cancelled() {
-                            match listener.accept() {
-                                Ok((socket, _)) => {
-                                    let socket = TcpStream::from(socket);
-                                    workers.retain(|w| !w.is_finished());
-                                    if let Some(worker) = server.try_reserve_worker() {
-                                        if let Some(handle) = server.spawn_worker(worker, socket) {
-                                            workers.push(handle);
-                                        }
-                                    } else {
-                                        waiting = Some((socket, Instant::now() + SLOT_WAIT));
-                                        break;
-                                    }
-                                }
-                                Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
-                                    accept_ready = false;
-                                    break;
-                                }
-                                Err(err)
-                                    if matches!(
-                                        err.kind(),
-                                        io::ErrorKind::Interrupted
-                                            | io::ErrorKind::ConnectionReset
-                                            | io::ErrorKind::ConnectionAborted
-                                    ) =>
-                                {
-                                    continue;
-                                }
-                                Err(err) => {
-                                    log::warn!("relay accept failed: {err}");
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    let timeout = if let Some((_, deadline)) = waiting {
-                        Some(
-                            deadline
-                                .saturating_duration_since(Instant::now())
-                                .min(Duration::from_millis(10)),
-                        )
-                    } else if accept_ready {
-                        Some(Duration::from_millis(20))
+                    } else if Instant::now() >= deadline {
+                        reject_busy(socket, MAX_REQUEST);
                     } else {
-                        None
-                    };
-                    match poll.poll(&mut events, timeout) {
-                        Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
-                        Err(_) => break,
-                        Ok(()) => (),
+                        waiting = Some((socket, deadline));
                     }
-                    for event in &events {
-                        match event.token() {
-                            LISTENER => accept_ready = true,
-                            WAKE => (),
-                            _ => server.hub.dispatch_event(event),
+                }
+                if waiting.is_none() && accept_ready {
+                    while !server.cancel.is_cancelled() {
+                        match listener.accept() {
+                            Ok((socket, _)) => {
+                                let socket = TcpStream::from(socket);
+                                workers.retain(|w| !w.is_finished());
+                                if let Some(worker) = server.try_reserve_worker() {
+                                    if let Some(handle) = server.spawn_worker(worker, socket) {
+                                        workers.push(handle);
+                                    }
+                                } else {
+                                    waiting = Some((socket, Instant::now() + SLOT_WAIT));
+                                    break;
+                                }
+                            }
+                            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                                accept_ready = false;
+                                break;
+                            }
+                            Err(err)
+                                if matches!(
+                                    err.kind(),
+                                    io::ErrorKind::Interrupted
+                                        | io::ErrorKind::ConnectionReset
+                                        | io::ErrorKind::ConnectionAborted
+                                ) =>
+                            {
+                                continue;
+                            }
+                            Err(err) => {
+                                log::warn!("relay accept failed: {err}");
+                                break;
+                            }
                         }
                     }
                 }
-                server.cancel.cancel();
-                if let Some((socket, _)) = waiting {
-                    drop(socket);
+                let timeout = if let Some((_, deadline)) = waiting {
+                    Some(
+                        deadline
+                            .saturating_duration_since(Instant::now())
+                            .min(Duration::from_millis(10)),
+                    )
+                } else if accept_ready {
+                    Some(Duration::from_millis(20))
+                } else {
+                    None
+                };
+                match poll.poll(&mut events, timeout) {
+                    Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(_) => break,
+                    Ok(()) => (),
                 }
-                for worker in workers {
-                    let _ = worker.join();
+                for event in &events {
+                    match event.token() {
+                        LISTENER => accept_ready = true,
+                        WAKE => (),
+                        _ => server.hub.dispatch_event(event),
+                    }
                 }
-            })?;
+            }
+            server.cancel.cancel();
+            if let Some((socket, _)) = waiting {
+                drop(socket);
+            }
+            for worker in workers {
+                let _ = worker.join();
+            }
+        })?;
         Ok(Self {
             service,
             listener: Some(listener),
@@ -326,14 +325,12 @@ impl Drop for PlaybackRelay {
             } else {
                 let handle = Arc::new(Mutex::new(Some(listener)));
                 let bg = Arc::clone(&handle);
-                if thread::Builder::new()
-                    .name("iris-relay-reap".into())
-                    .spawn(move || {
-                        if let Some(h) = bg.lock().unwrap_or_else(PoisonError::into_inner).take() {
-                            let _ = h.join();
-                        }
-                    })
-                    .is_err()
+                if spawn_thread(ThreadRole::MediaRelayReaper, move || {
+                    if let Some(h) = bg.lock().unwrap_or_else(PoisonError::into_inner).take() {
+                        let _ = h.join();
+                    }
+                })
+                .is_err()
                     && let Some(h) = handle.lock().unwrap_or_else(PoisonError::into_inner).take()
                 {
                     let _ = h.join();
@@ -374,21 +371,28 @@ impl Service {
         worker: Worker,
         mut socket: TcpStream,
     ) -> Option<thread::JoinHandle<()>> {
-        thread::Builder::new()
-            .name("iris-media-request".into())
-            .spawn(move || {
-                let service = &worker.0;
-                let Ok(_registration) = service.cancel.register(&socket) else {
-                    return;
-                };
-                let mut committed = false;
-                if let Err(err) = service.serve(&mut socket, &mut committed)
-                    && !committed
-                {
-                    write_error_response(&mut socket, err);
+        let fallback = socket.try_clone();
+        match spawn_thread(ThreadRole::MediaRelayWorker, move || {
+            let service = &worker.0;
+            let Ok(_registration) = service.cancel.register(&socket) else {
+                return;
+            };
+            let mut committed = false;
+            if let Err(err) = service.serve(&mut socket, &mut committed)
+                && !committed
+            {
+                write_error_response(&mut socket, err);
+            }
+        }) {
+            Ok(handle) => Some(handle),
+            Err(err) => {
+                log::warn!("media relay worker spawn failed: {err}");
+                if let Ok(fallback_sock) = fallback {
+                    reject_busy(fallback_sock, MAX_REQUEST);
                 }
-            })
-            .ok()
+                None
+            }
+        }
     }
 
     fn serve(

@@ -415,7 +415,7 @@ fn expanded_official_upgrade_surfaces_review_and_upgrades_in_place() {
         b1.pins(),
     );
     let scan1 = b1
-        .scan(i1.clone(), &fixture.setup, &AtomicBool::new(false))
+        .scan(i1.clone(), &fixture.setup, &CancelToken::new())
         .unwrap();
     assert!(scan1.pending_reviews.is_empty());
     let installed_v1 = i1.record("iris.expand").unwrap().unwrap();
@@ -442,7 +442,7 @@ fn expanded_official_upgrade_surfaces_review_and_upgrades_in_place() {
         b2.pins(),
     );
     let mut scan2 = b2
-        .scan(i2.clone(), &fixture.setup, &AtomicBool::new(false))
+        .scan(i2.clone(), &fixture.setup, &CancelToken::new())
         .unwrap();
     assert_eq!(scan2.pending_reviews.len(), 1);
     assert!(
@@ -472,9 +472,7 @@ fn expanded_official_upgrade_surfaces_review_and_upgrades_in_place() {
     assert!(superseded.is_empty());
     assert!(!v1_obj.exists());
 
-    let scan3 = b2
-        .scan(i2, &fixture.setup, &AtomicBool::new(false))
-        .unwrap();
+    let scan3 = b2.scan(i2, &fixture.setup, &CancelToken::new()).unwrap();
     assert!(scan3.pending_reviews.is_empty());
     assert!(
         scan3

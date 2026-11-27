@@ -85,14 +85,8 @@ impl Pump {
                     self.started = false;
                 }
             }
-            if self
-                .read
-                .as_ref()
-                .is_some_and(|p| p.deadline <= Instant::now())
-                || self
-                    .write
-                    .as_ref()
-                    .is_some_and(|p| p.deadline <= Instant::now())
+            if self.read.as_ref().is_some_and(|p| p.deadline.is_expired())
+                || self.write.as_ref().is_some_and(|p| p.deadline.is_expired())
             {
                 return Err(ErrorCode::Timeout);
             }
@@ -130,7 +124,7 @@ impl Pump {
                     .chain(self.write.iter())
                     .map(|p| p.deadline)
                     .min();
-                deadline.map(|d| d.saturating_duration_since(Instant::now()))
+                deadline.map(|d| d.instant().saturating_duration_since(Instant::now()))
             };
             match poll.poll(&mut events, timeout) {
                 Ok(()) => {}

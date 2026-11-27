@@ -173,10 +173,10 @@ mod imp {
                 return Claim::Rejected;
             }
         };
-        if let Err(e) = std::thread::Builder::new()
-            .name("iris-open-files".into())
-            .spawn(move || serve(pipe, session, opened))
-        {
+        if let Err(e) = iris_core::concurrency::spawn_thread(
+            iris_core::concurrency::ThreadRole::SingleInstanceIpc,
+            move || serve(pipe, session, opened),
+        ) {
             log::error!("starting file-open listener: {e}");
             return Claim::Rejected;
         }

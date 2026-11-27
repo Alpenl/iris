@@ -2,6 +2,7 @@ mod protocol;
 mod pump;
 use super::{RequestGrant, duplex};
 use crate::{
+    concurrency::{Deadline, ThreadRole, spawn_thread},
     plugin_v2::{
         actor::{Completion, IoOutcome, Operation, TaskContext},
         instance::Blob,
@@ -17,7 +18,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
 use url::Url;
 
@@ -29,7 +30,7 @@ pub(super) struct Pending {
     action: Action,
     context: TaskContext,
     done: Completion,
-    deadline: Instant,
+    deadline: Deadline,
 }
 struct Queue {
     requests: VecDeque<Pending>,
@@ -101,14 +102,12 @@ impl Socket {
         });
         let worker = inner.clone();
         let activity = grant.background();
-        std::thread::Builder::new()
-            .name("iris-v2-socket".into())
-            .spawn(move || {
-                let _activity = activity;
-                let _cancel_wake = cancel_wake;
-                pump::run(protocol, poll, worker, grant);
-            })
-            .map_err(|_| ErrorCode::Internal)?;
+        spawn_thread(ThreadRole::PluginSocketPump, move || {
+            let _activity = activity;
+            let _cancel_wake = cancel_wake;
+            pump::run(protocol, poll, worker, grant);
+        })
+        .map_err(|_| ErrorCode::Internal)?;
         Ok(Self(inner))
     }
     pub(super) fn operation(
@@ -162,7 +161,7 @@ impl Socket {
             queue.requests.push_back(Pending {
                 action,
                 context,
-                deadline: Instant::now() + Duration::from_secs(30),
+                deadline: Deadline::after(Duration::from_secs(30)),
                 done: Box::new(move |result| match result {
                     Ok(mut outcome) => {
                         outcome.pending = Some(Box::new(busy));

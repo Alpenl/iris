@@ -5,6 +5,7 @@
 
 pub mod bounded_json;
 pub mod catalog;
+pub mod concurrency;
 pub(crate) mod fs_util;
 pub mod geometry;
 pub mod input;

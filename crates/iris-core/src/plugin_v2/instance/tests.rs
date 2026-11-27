@@ -14,7 +14,7 @@ fn fixture(body: &str, alloc: &str, free: &str) -> Vec<u8> {
 }
 fn instance(bytes: &[u8]) -> Instance {
     let engine = RuntimeEngine::new().unwrap();
-    let cancel = Arc::new(AtomicBool::new(false));
+    let cancel = CancelToken::new();
     let module = engine.compile(bytes, &cancel).unwrap();
     Instance::new(InstanceConfig {
         engine,
@@ -102,7 +102,7 @@ fn epoch_interrupts_dead_loop_and_cancel_is_observed() {
     ));
     assert!(start.elapsed() < Duration::from_secs(2));
     let mut guest = instance(&fixture("i64.const 0", "i32.const 100", ""));
-    guest.store.data().cancel.store(true, Ordering::Release);
+    guest.store.data().cancel.cancel();
     assert!(matches!(guest.on_event(b"{}"), Err(ErrorCode::Cancelled)));
 }
 
@@ -117,7 +117,7 @@ fn rejects_wasi_shared_memory_and_bad_imports() {
     ] {
         assert!(
             engine
-                .compile(&wat::parse_str(source).unwrap(), &AtomicBool::new(false))
+                .compile(&wat::parse_str(source).unwrap(), &CancelToken::new())
                 .is_err()
         );
     }
@@ -127,7 +127,7 @@ fn rejects_wasi_shared_memory_and_bad_imports() {
 fn cache_keeps_active_modules_and_instance_reservation_until_drop() {
     let engine = RuntimeEngine::new().unwrap();
     let bytes = fixture("i64.const 0", "i32.const 100", "");
-    let cancel = Arc::new(AtomicBool::new(false));
+    let cancel = CancelToken::new();
     let first = engine.compile(&bytes, &cancel).unwrap();
     let second = engine.compile(&bytes, &cancel).unwrap();
     assert!(Arc::ptr_eq(&first, &second));
@@ -155,7 +155,7 @@ fn cache_keeps_active_modules_and_instance_reservation_until_drop() {
         })
         .is_err()
     );
-    cancel.store(true, Ordering::Release);
+    cancel.cancel();
     assert_eq!(ledger.used(Some("p"), Resource::ControlStore), 1);
     drop(guest);
     assert_eq!(ledger.used(None, Resource::WasmBytes), 0);

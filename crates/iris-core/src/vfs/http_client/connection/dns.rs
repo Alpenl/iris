@@ -3,10 +3,12 @@
 use std::collections::BTreeMap;
 use std::net::{IpAddr, ToSocketAddrs};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::Instant;
 
 use anyhow::{Result, anyhow, bail};
+
+use crate::concurrency::{ThreadRole, budget, spawn_thread};
 
 use super::super::CONNECT_TIMEOUT;
 use super::{HttpCancel, NetworkScope, doh, remaining_timeout};
@@ -83,15 +85,15 @@ pub(super) fn resolve_system(
     // Share one active lookup per host, prune abandoned stalled lookups so
     // hung OS getaddrinfo calls cannot wedge the 16-slot active cap, and link
     // DoH fallback cancellation/deadlines to waiting callers.
-    const MAX_ACTIVE_LOOKUPS: usize = 16;
-    const MAX_DNS_THREADS: usize = 64;
+    const MAX_ACTIVE_LOOKUPS: usize = budget::SYSTEM_DNS_ACTIVE_LOOKUPS;
+    const MAX_DNS_THREADS: usize = budget::SYSTEM_DNS_WORKERS_GLOBAL;
     static LOOKUPS: Mutex<BTreeMap<String, Arc<Lookup>>> = Mutex::new(BTreeMap::new());
 
     let end = Instant::now() + remaining_timeout(cancel, deadline, CONNECT_TIMEOUT)?;
-    let mut pending = LOOKUPS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut pending = LOOKUPS.lock().unwrap_or_else(PoisonError::into_inner);
     let now = Instant::now();
     pending.retain(|_, entry| {
-        let s = entry.state.lock().unwrap_or_else(|e| e.into_inner());
+        let s = entry.state.lock().unwrap_or_else(PoisonError::into_inner);
         s.result.is_none()
             && (s.waiters > 0
                 || (!s.abandoned && !entry.worker_cancel.is_cancelled() && now < s.deadline))
@@ -128,11 +130,14 @@ pub(super) fn resolve_system(
     let _waiter = LookupWaiter(lookup.clone());
     let wake_lookup = lookup.clone();
     let _cancel_reg = cancel.register_callback(Arc::new(move || {
-        let _guard = wake_lookup.state.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = wake_lookup
+            .state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         wake_lookup.ready.notify_all();
     }))?;
 
-    let mut state = lookup.state.lock().unwrap_or_else(|e| e.into_inner());
+    let mut state = lookup.state.lock().unwrap_or_else(PoisonError::into_inner);
     loop {
         if let Some(result) = state.result.as_ref() {
             return result
@@ -143,7 +148,7 @@ pub(super) fn resolve_system(
         state = lookup
             .ready
             .wait_timeout(state, left)
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(PoisonError::into_inner)
             .0;
     }
 }
@@ -179,37 +184,35 @@ fn spawn_dns_lookup(
     });
     let worker = lookup.clone();
     let hostname = host.to_owned();
-    std::thread::Builder::new()
-        .name("iris-http-dns".into())
-        .spawn(move || {
-            let _thread_guard = thread_guard;
-            let _dns_reservation = dns_reservation;
-            let result = (hostname.as_str(), 0)
-                .to_socket_addrs()
-                .map_err(|err| err.to_string())
-                .and_then(|addrs| {
-                    let ips: Vec<_> = addrs.take(65).map(|addr| addr.ip()).collect();
-                    if ips.len() > 64 {
-                        Err("system DNS result exceeds address limit".into())
-                    } else if doh::use_fallback(&hostname, &ips) {
-                        doh::resolve_a_records(&hostname, &worker.worker_cancel, || {
-                            worker.current_deadline()
-                        })
-                        .map_err(|err| format!("DoH fallback failed: {err}"))
-                    } else {
-                        Ok(ips)
-                    }
-                });
-            {
-                let mut state = worker.state.lock().unwrap_or_else(|e| e.into_inner());
-                state.result = Some(result);
-            }
-            worker.ready.notify_all();
-            let mut map = lookups.lock().unwrap_or_else(|e| e.into_inner());
-            if map.get(&hostname).is_some_and(|e| Arc::ptr_eq(e, &worker)) {
-                map.remove(&hostname);
-            }
-        })?;
+    spawn_thread(ThreadRole::SystemDnsWorker, move || {
+        let _thread_guard = thread_guard;
+        let _dns_reservation = dns_reservation;
+        let result = (hostname.as_str(), 0)
+            .to_socket_addrs()
+            .map_err(|err| err.to_string())
+            .and_then(|addrs| {
+                let ips: Vec<_> = addrs.take(65).map(|addr| addr.ip()).collect();
+                if ips.len() > 64 {
+                    Err("system DNS result exceeds address limit".into())
+                } else if doh::use_fallback(&hostname, &ips) {
+                    doh::resolve_a_records(&hostname, &worker.worker_cancel, || {
+                        worker.current_deadline()
+                    })
+                    .map_err(|err| format!("DoH fallback failed: {err}"))
+                } else {
+                    Ok(ips)
+                }
+            });
+        {
+            let mut state = worker.state.lock().unwrap_or_else(PoisonError::into_inner);
+            state.result = Some(result);
+        }
+        worker.ready.notify_all();
+        let mut map = lookups.lock().unwrap_or_else(PoisonError::into_inner);
+        if map.get(&hostname).is_some_and(|e| Arc::ptr_eq(e, &worker)) {
+            map.remove(&hostname);
+        }
+    })?;
     pending.insert(host.to_owned(), lookup.clone());
     Ok(lookup)
 }
