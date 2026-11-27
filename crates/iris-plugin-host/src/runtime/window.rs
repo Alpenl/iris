@@ -1,10 +1,21 @@
-use super::{Control, WindowState};
+use super::Control;
 use crate::actor::Executor;
 use crate::auth::BrowserOpen;
+use crate::enhancement::AttachmentRegistry;
+use crate::files::FileExecutor;
 use crate::json_error;
 use iris_api::v2::{ErrorCode, Generation, HostEvent, Id, source::PlaybackSnapshot};
 use iris_base::net::http_client::HttpCancel;
 use std::sync::Arc;
+
+/// Per-plugin attached window state owned by [`Control`]; UI-facing presentation
+/// and stream session lifecycles converge through [`crate::WindowSession`].
+pub(crate) struct WindowState {
+    pub generation: Generation,
+    pub files: FileExecutor,
+    pub media: HttpCancel,
+    pub attachments: Arc<AttachmentRegistry>,
+}
 
 /// Lightweight window-open plan; actual artifact directories are created lazily.
 pub struct WindowPreparation {
@@ -99,7 +110,7 @@ impl Control {
                 generation,
                 files,
                 media: HttpCancel::default(),
-                attachments: Arc::new(super::super::enhancement::AttachmentRegistry::default()),
+                attachments: Arc::new(AttachmentRegistry::default()),
             },
         ));
         Ok(())

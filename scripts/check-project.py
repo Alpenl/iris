@@ -113,6 +113,20 @@ KNOWN_MODULE_CYCLE_EDGES: dict[str, frozenset[tuple[str, str]]] = {
 
 # Exact file/directory exemptions for `allow/expect(clippy::disallowed_*)` across `crates/*/{src,tests}`.
 DISALLOWED_LINT_EXEMPT_PREFIXES = ("crates/iris/src/video/",)
+# Temporary R-08 cross-layer integration test exemption for `disallowed_types` (`Session`) only,
+# until R-09 (#35) migrates `player_scoped_plugin` into `crates/iris-app/tests/`.
+HOST_SCOPED_TEST_DISALLOWED_TYPES_EXEMPT_FILES = frozenset(
+    {"crates/iris-plugin-host/tests/player_scoped_plugin.rs"}
+)
+HOST_SCOPED_TEST_DISALLOWED_TYPES_EXEMPT_PREFIXES = (
+    "crates/iris-plugin-host/tests/player_scoped_plugin/",
+)
+HOST_SCOPED_TEST_TYPES_ONLY_ALLOW_RE = re.compile(
+    r"#\s*!?\s*\[\s*(?:allow|expect)\s*\(\s*clippy::disallowed_types\s*\)\s*\]"
+)
+IRIS_FORBIDDEN_HOST_INTERNAL_RE = re.compile(
+    r"\biris_plugin_host::(?:ledger|actor)\b|\bstream::prepare\b"
+)
 DISALLOWED_LINT_SUPPRESSION_RE = re.compile(
     r"#\s*!?\s*\[\s*(?:allow|expect)\s*\([^]]*\b(?:clippy::)?disallowed_[A-Za-z0-9_]+[^]]*\)\s*\]"
     r"|\b(?:allow|expect)\s*\([^)]*\b(?:clippy::)?disallowed_[A-Za-z0-9_]+"
@@ -758,16 +772,20 @@ def check_clippy_disallowed_configs(root: Path):
             f"Workspace Cargo.toml must deny `clippy::{lint}`",
         )
 
-    def configured_paths(rel_toml: str) -> set[str]:
+    def configured_section_paths(rel_toml: str, key: str) -> set[str]:
         data = tomllib.loads((root / rel_toml).read_text(encoding="utf-8"))
         paths: set[str] = set()
-        for key in ("disallowed-types", "disallowed-methods"):
-            for entry in data.get(key, []):
-                if isinstance(entry, str):
-                    paths.add(entry)
-                elif isinstance(entry, dict) and isinstance(entry.get("path"), str):
-                    paths.add(entry["path"])
+        for entry in data.get(key, []):
+            if isinstance(entry, str):
+                paths.add(entry)
+            elif isinstance(entry, dict) and isinstance(entry.get("path"), str):
+                paths.add(entry["path"])
         return paths
+
+    def configured_paths(rel_toml: str) -> set[str]:
+        return configured_section_paths(rel_toml, "disallowed-types") | configured_section_paths(
+            rel_toml, "disallowed-methods"
+        )
 
     iris_paths = configured_paths("crates/iris/clippy.toml")
     for required_rule in (
@@ -784,9 +802,14 @@ def check_clippy_disallowed_configs(root: Path):
         "crates/iris-core/clippy.toml must disallow `iris_mpv::RenderHandle::new`",
     )
 
-    host_paths = configured_paths("crates/iris-plugin-host/clippy.toml")
+    host_types = configured_section_paths("crates/iris-plugin-host/clippy.toml", "disallowed-types")
+    host_methods = configured_section_paths("crates/iris-plugin-host/clippy.toml", "disallowed-methods")
     _require(
-        "iris_core::player::Session::render_handle" in host_paths,
+        "iris_core::player::Session" in host_types,
+        "crates/iris-plugin-host/clippy.toml must disallow type `iris_core::player::Session`",
+    )
+    _require(
+        "iris_core::player::Session::render_handle" in host_methods,
         "crates/iris-plugin-host/clippy.toml must disallow `iris_core::player::Session::render_handle`",
     )
 
@@ -797,6 +820,11 @@ def check_disallowed_lint_suppressions(rel: Path, raw_text: str):
     if any(posix == prefix or posix.startswith(prefix) for prefix in DISALLOWED_LINT_EXEMPT_PREFIXES):
         return
     sanitized = strip_comments_and_literals(raw_text)
+    if (
+        posix in HOST_SCOPED_TEST_DISALLOWED_TYPES_EXEMPT_FILES
+        or any(posix.startswith(p) for p in HOST_SCOPED_TEST_DISALLOWED_TYPES_EXEMPT_PREFIXES)
+    ):
+        sanitized = HOST_SCOPED_TEST_TYPES_ONLY_ALLOW_RE.sub("", sanitized)
     if posix == "crates/iris-core/src/player/mod.rs":
         seen_fns: list[str] = []
 
@@ -814,6 +842,27 @@ def check_disallowed_lint_suppressions(rel: Path, raw_text: str):
     _require(
         offending is None,
         f"{rel} suppresses `clippy::disallowed_*` without authorization: `{offending.group(0) if offending else ''}`",
+    )
+
+
+def check_iris_plugin_host_facade_imports(rel: Path, raw_text: str):
+    """Reject direct references from `crates/iris/src` into `iris_plugin_host::{ledger, actor}` or `stream::prepare`."""
+    sanitized = strip_comments_and_literals(raw_text)
+    for match in USE_STMT_RE.finditer(sanitized):
+        for expanded in expand_use_tree(match.group(1)):
+            _require(
+                not (
+                    expanded.startswith("iris_plugin_host::ledger")
+                    or expanded.startswith("iris_plugin_host::actor")
+                    or expanded.startswith("iris_plugin_host::stream::prepare")
+                    or "::stream::prepare" in expanded
+                ),
+                f"{rel} imports forbidden plugin-host internal `{expanded}`; route through `WindowSession` / `PluginHost`",
+            )
+    hit = IRIS_FORBIDDEN_HOST_INTERNAL_RE.search(sanitized)
+    _require(
+        hit is None,
+        f"{rel} references forbidden plugin-host internal `{hit.group(0) if hit else ''}`; route through `WindowSession` / `PluginHost`",
     )
 
 
@@ -901,6 +950,7 @@ def main():
     for path in sorted(iris_src.rglob("*.rs")):
         rel = path.relative_to(ROOT)
         raw = path.read_text(encoding="utf-8")
+        check_iris_plugin_host_facade_imports(rel, raw)
         code = strip_comments(raw)
         if not is_standalone_test_file(path, rel):
             prod_code = prod_prefix(raw)

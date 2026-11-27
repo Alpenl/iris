@@ -48,7 +48,7 @@ use iris_core::player::{Command, Session};
 use iris_core::preset::{PresetManager, PresetRuntime};
 use iris_core::settings::{MAX_SPEED, MIN_SPEED, Settings, Side};
 use iris_core::store::Store;
-use iris_plugin_host::ui::PluginManager;
+use iris_plugin_host::WindowSession;
 
 pub(crate) use actions::{
     CycleAspect, CyclePreset, NextChapter, OpenCommandPalette, OpenFile, OpenNextMedia,
@@ -82,7 +82,7 @@ pub(in crate::ui) struct AppModel {
     preset_rt: PresetRuntime,
     keymap: Keymap,
     plugin_host: iris_plugin_host::PluginHost,
-    plugins: PluginManager,
+    plugins: WindowSession,
     plugin_view: plugin_runtime::PluginView,
     locations: LocationStore,
     store: Store,
@@ -219,7 +219,7 @@ impl AppModel {
         });
 
         let (plugins, mut plugin_wake_rx) =
-            plugin_host.open_manager(&settings.disabled_plugins, &settings.theme_id);
+            plugin_host.open_window(&settings.disabled_plugins, &settings.theme_id);
         let plugin_events = cx.spawn_in(window, async move |this, cx| {
             while plugin_wake_rx.next().await.is_some() {
                 if this

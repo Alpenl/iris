@@ -1,6 +1,7 @@
 //! Cross-layer integration tests exercising `iris_core::player` together with
 //! `iris_plugin_host` and `iris_api` (kept outside `src/player/` to preserve
 //! strict core-domain dependency isolation).
+#![allow(clippy::disallowed_types)]
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
@@ -48,7 +49,7 @@ use iris_plugin_host::{
         remote::RemoteFactory,
         session::{StreamSession, new_session_id},
     },
-    ui::PluginManager,
+    ui::WindowSession,
 };
 use ring::digest::{self, Context, SHA256};
 

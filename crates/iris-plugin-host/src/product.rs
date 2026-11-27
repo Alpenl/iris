@@ -5,7 +5,8 @@ use super::{
     hub::{Client, Config, Hub},
     installation::Installer,
     runtime::{Resources, Setup},
-    ui::PluginManager,
+    selection::HostAnnotationJob,
+    ui::WindowSession,
 };
 use futures::channel::mpsc::UnboundedReceiver;
 use iris_api::v2::{ErrorCode, Generation};
@@ -53,11 +54,11 @@ impl PluginHost {
         self.resources.clone()
     }
 
-    pub fn open_manager(
+    pub fn open_window(
         &self,
         disabled: &[String],
         theme: &str,
-    ) -> (PluginManager, UnboundedReceiver<()>) {
+    ) -> (WindowSession, UnboundedReceiver<()>) {
         let disabled_set: BTreeSet<String> = disabled.iter().cloned().collect();
         let opened = match &self.resources {
             Ok(resources) => {
@@ -86,9 +87,15 @@ impl PluginHost {
         };
         let (client, wake) = opened.unwrap_or_else(Client::unavailable);
         (
-            PluginManager::new(client, theme.strip_prefix("plugin:").map(str::to_owned)),
+            WindowSession::new(client, theme.strip_prefix("plugin:").map(str::to_owned)),
             wake,
         )
+    }
+
+    /// Reserves a bounded host annotation task against this host's `Ledger`.
+    pub fn begin_host_annotation(&self) -> Result<HostAnnotationJob, ErrorCode> {
+        let resources = self.resources()?;
+        HostAnnotationJob::new(resources.ledger)
     }
 
     /// Signals coordinator shutdown and releases the host connection handle.

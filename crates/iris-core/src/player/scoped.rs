@@ -1,6 +1,5 @@
 //! Ready externally-scoped media admission. No plugin arguments become mpv options.
 
-use std::any::Any;
 use std::sync::Arc;
 
 use anyhow::{Result, ensure};
@@ -35,7 +34,6 @@ pub trait ScopedStream: Send + Sync {
     fn is_cancelled(&self) -> bool;
     fn advance_seek(&self) -> Result<()>;
     fn stop(&self);
-    fn as_any(&self) -> &(dyn Any + Send + Sync);
 }
 
 struct EmptyScoped;
@@ -50,9 +48,6 @@ impl ScopedStream for EmptyScoped {
         Ok(())
     }
     fn stop(&self) {}
-    fn as_any(&self) -> &(dyn Any + Send + Sync) {
-        self
-    }
 }
 
 pub(super) fn empty_scoped() -> std::sync::Weak<dyn ScopedStream> {

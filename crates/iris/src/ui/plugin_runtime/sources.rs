@@ -350,7 +350,7 @@ impl AppModel {
             if !self.advance_plugin_media(cx) {
                 return false;
             }
-            match self.plugins.client().resolve_url(&plugin, parsed.as_str()) {
+            match self.plugins.resolve_url(&plugin, parsed.as_str()) {
                 Ok(request) => {
                     self.begin_resolve_request(&plugin, "", String::new(), None, request, cx);
                     self.notify_all(cx);

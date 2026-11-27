@@ -31,10 +31,7 @@ impl AppModel {
         if let Some(request) = &pending
             && let Ok(id) = request.req_id.parse()
         {
-            let _ = self
-                .plugins
-                .client()
-                .cancel_request(&request.plugin_id, Id(id));
+            let _ = self.plugins.cancel_request(&request.plugin_id, Id(id));
         }
         let was_resolving = pending.is_some();
         let was_remote = self.catalog.remote_load.take().is_some();
@@ -73,7 +70,7 @@ impl AppModel {
             timer.await;
             let _ = this.update(cx, |this, cx| {
                 if let Ok(id) = id.parse() {
-                    let _ = this.plugins.client().cancel_request(&pid, Id(id));
+                    let _ = this.plugins.cancel_request(&pid, Id(id));
                 }
                 let _ = this.handle_source_error(&pid, &id, "数据源请求超时".into(), cx);
             });
@@ -345,7 +342,6 @@ impl AppModel {
                 .ok_or(iris_api::v2::ErrorCode::StaleHandle)
                 .and_then(|(_, view)| {
                     self.plugins
-                        .client()
                         .next_page(&pid, *view, page.as_deref().unwrap_or(""))
                 })
         } else {
@@ -353,7 +349,6 @@ impl AppModel {
             self.plugin_view.source_filters = preserved_filters;
             self.plugin_view.filter_values = filters.clone();
             self.plugins
-                .client()
                 .browse(
                     &pid,
                     BrowseTarget {
@@ -505,7 +500,6 @@ impl AppModel {
         };
         match self
             .plugins
-            .client()
             .resolve(plugin_id, source_id, folder_id, entry_id, variant)
         {
             Ok(request) => self.begin_resolve_request(

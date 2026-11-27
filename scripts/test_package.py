@@ -1307,6 +1307,16 @@ class CheckProjectHelperTests(unittest.TestCase):
             "}\n"
         )
         check_project.check_disallowed_lint_suppressions(Path("crates/iris-core/src/player/mod.rs"), valid_player_mod)
+        # Narrow R-08 test exemption allows `disallowed_types` ONLY on `player_scoped_plugin.rs` (+ subdir),
+        # while still rejecting `disallowed_methods` there and rejecting `disallowed_types` in `src/` or other tests.
+        check_project.check_disallowed_lint_suppressions(
+            Path("crates/iris-plugin-host/tests/player_scoped_plugin.rs"),
+            "#![allow(clippy::disallowed_types)]\n",
+        )
+        check_project.check_disallowed_lint_suppressions(
+            Path("crates/iris-plugin-host/tests/player_scoped_plugin/live.rs"),
+            "#[allow(clippy::disallowed_types)]\nfn helper() {}\n",
+        )
         for bad_rel, bad_src in (
             (
                 Path("crates/iris-core/src/player/mod.rs"),
@@ -1315,6 +1325,14 @@ class CheckProjectHelperTests(unittest.TestCase):
             (
                 Path("crates/iris-core/src/player/mod.rs"),
                 "#[allow(clippy::disallowed_types)]\npub fn render_handle(&self) {}\n",
+            ),
+            (
+                Path("crates/iris-plugin-host/tests/player_scoped_plugin.rs"),
+                "#[allow(clippy::disallowed_methods)]\nfn t() {}\n",
+            ),
+            (
+                Path("crates/iris-plugin-host/src/ui.rs"),
+                "#[allow(clippy::disallowed_types)]\nstruct S;\n",
             ),
             (
                 Path("crates/iris-plugin-host/tests/plugin_v2_contracts.rs"),
@@ -1328,7 +1346,7 @@ class CheckProjectHelperTests(unittest.TestCase):
             with self.subTest(rel=bad_rel), self.assertRaisesRegex(AssertionError, "disallowed_"):
                 check_project.check_disallowed_lint_suppressions(bad_rel, bad_src)
 
-        # 2. `crates/iris-plugin-host/clippy.toml` verification.
+        # 2. `crates/iris-plugin-host/clippy.toml` verification (`Session` type + `Session::render_handle` method).
         with tempfile.TemporaryDirectory() as directory:
             fake_root = Path(directory)
             for rel_dir in ("crates/iris", "crates/iris-core", "crates/iris-plugin-host"):
@@ -1339,9 +1357,33 @@ class CheckProjectHelperTests(unittest.TestCase):
             )
             shutil.copy2(check_project.ROOT / "crates/iris/clippy.toml", fake_root / "crates/iris/clippy.toml")
             shutil.copy2(check_project.ROOT / "crates/iris-core/clippy.toml", fake_root / "crates/iris-core/clippy.toml")
-            (fake_root / "crates/iris-plugin-host/clippy.toml").write_text("disallowed-methods = []\n", encoding="utf-8")
-            with self.assertRaisesRegex(AssertionError, "iris-plugin-host/clippy.toml"):
-                check_project.check_clippy_disallowed_configs(fake_root)
+            shutil.copy2(
+                check_project.ROOT / "crates/iris-plugin-host/clippy.toml",
+                fake_root / "crates/iris-plugin-host/clippy.toml",
+            )
+            check_project.check_clippy_disallowed_configs(fake_root)
+
+            for bad_host_toml in (
+                'disallowed-types = []\ndisallowed-methods = [{ path = "iris_core::player::Session::render_handle" }]\n',
+                'disallowed-types = [{ path = "iris_core::player::Session" }]\ndisallowed-methods = []\n',
+            ):
+                (fake_root / "crates/iris-plugin-host/clippy.toml").write_text(bad_host_toml, encoding="utf-8")
+                with self.assertRaisesRegex(AssertionError, "iris-plugin-host/clippy.toml"):
+                    check_project.check_clippy_disallowed_configs(fake_root)
+
+        # 2b. `crates/iris/src` facade boundary gate (`ledger`, `actor`, `stream::prepare` forbidden).
+        iris_ui_rel = Path("crates/iris/src/ui/plugin_ctrl.rs")
+        check_project.check_iris_plugin_host_facade_imports(
+            iris_ui_rel,
+            "use iris_plugin_host::{PluginHost, WindowSession, ui::PollReport};\n",
+        )
+        for bad_import in (
+            "use iris_plugin_host::{ui::PollReport, ledger::Ledger};\n",
+            "use iris_plugin_host::actor::Update;\n",
+            "fn f() { let _ = iris_plugin_host::stream::prepare::subtitle_format(b\"\"); }\n",
+        ):
+            with self.assertRaisesRegex(AssertionError, "forbidden plugin-host internal"):
+                check_project.check_iris_plugin_host_facade_imports(iris_ui_rel, bad_import)
 
         # 3. Docs sync gate: strict two-way on ARCHITECTURE.md, token-bounded substring on bilingual READMEs.
         expected = {"iris", "iris-api", "iris-core"}

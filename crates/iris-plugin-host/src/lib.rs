@@ -28,6 +28,7 @@ pub mod url_resolver;
 pub mod validation;
 
 pub use product::PluginHost;
+pub use ui::WindowSession;
 
 /// Maps a [`iris_core::bounded_json::BoundedJsonError`] to a protocol-2 [`iris_api::v2::ErrorCode`].
 pub(crate) const fn json_error(

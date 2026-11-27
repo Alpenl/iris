@@ -1,12 +1,11 @@
 //! Plugin `PollReport` application, regional `DirtyRegions` redraw routing, modal async
-//! validation & focus synchronization, and `HostCommand` execution.
+//! validation & focus synchronization, and `WindowAction` / `ReadyEffect` execution.
 
 use gpui::{Context, Window};
-use iris_api::v2::{HostCommand, HostEvent, source::PlaybackSnapshot};
+use iris_api::v2::{HostEvent, source::PlaybackSnapshot};
 use iris_core::media_uri::MediaUri;
-use iris_core::player::Command;
 use iris_core::preset::SidebarMode;
-use iris_plugin_host::ui::{self as plugin, PollReport};
+use iris_plugin_host::ui::{ActionKind, Event as PluginEvent, PollReport, WindowAction};
 
 use super::AppModel;
 use super::state::{ActiveSource, PopoverKind, SourceErrorKind};
@@ -50,7 +49,8 @@ impl AppModel {
         let fav = session
             .current_media_uri()
             .is_some_and(|u| self.store.is_favorite(&u));
-        plugin::snapshot_from_session(session, fav, self.plugin_media_id())
+        self.plugins
+            .playback_snapshot(&session.playback_snapshot_input(), fav)
     }
 
     pub(super) fn sidebar_is_visible(&self) -> bool {
@@ -76,7 +76,7 @@ impl AppModel {
 
     pub(super) fn broadcast_plugin_event(
         &mut self,
-        event: plugin::Event,
+        event: PluginEvent,
         window: Option<&mut Window>,
         cx: &mut Context<Self>,
     ) -> DirtyRegions {
@@ -85,8 +85,8 @@ impl AppModel {
         self.apply_poll_report(report, window, cx)
     }
 
-    /// Applies `PollReport`: executes `HostCommand`s, updates `ThemeTokens` only when
-    /// `dirty.theme`, syncs modal inputs, and returns the exact regional `DirtyRegions`.
+    /// Applies `PollReport`: executes `WindowAction`s and `ReadyEffect`s, updates `ThemeTokens`
+    /// only when `dirty.theme`, syncs modal inputs, and returns the exact regional `DirtyRegions`.
     pub(super) fn apply_poll_report(
         &mut self,
         report: PollReport,
@@ -104,6 +104,7 @@ impl AppModel {
         );
         let PollReport {
             actions,
+            effects,
             notices,
             dirty,
             status_changed,
@@ -115,8 +116,11 @@ impl AppModel {
 
         for action in actions {
             if action.is_live(self.plugins.generation()) {
-                regions = regions.union(self.execute_one_host_command(&action, cx));
+                regions = regions.union(self.execute_window_action(action, cx));
             }
+        }
+        for effect in effects {
+            regions = regions.union(self.apply_ready_effect(effect, cx));
         }
         for notice in notices {
             regions = regions.union(self.apply_plugin_notice(notice, cx));
@@ -173,46 +177,22 @@ impl AppModel {
         }
     }
 
-    fn execute_one_host_command(
+    fn execute_window_action(
         &mut self,
-        action: &iris_plugin_host::ui::Action,
+        action: WindowAction,
         cx: &mut Context<Self>,
     ) -> DirtyRegions {
-        let pid = &action.binding.installed.plugin_id;
-        match action.command().clone() {
-            HostCommand::TogglePlayback => {
-                self.command(Command::TogglePlayback, cx);
+        let pid = action.plugin_id().to_owned();
+        match action.kind {
+            ActionKind::Player(cmd) => {
+                self.command(cmd, cx);
                 DirtyRegions::dock_only()
             }
-            HostCommand::SeekRelative { seconds } => {
-                self.command(Command::SeekRelative(seconds), cx);
-                DirtyRegions::dock_only()
-            }
-            HostCommand::SeekAbsolute { seconds } => {
-                self.command(Command::SeekAbsolute(seconds), cx);
-                DirtyRegions::dock_only()
-            }
-            HostCommand::SetSpeed { speed } => {
-                self.command(Command::SetSpeed(speed), cx);
-                DirtyRegions::dock_only()
-            }
-            HostCommand::SetVolume { volume } => {
-                self.command(Command::SetVolume(volume), cx);
-                DirtyRegions::dock_only()
-            }
-            HostCommand::ToggleMute => {
-                self.command(Command::ToggleMute, cx);
-                DirtyRegions::dock_only()
-            }
-            HostCommand::OpenNext => {
-                self.step(1, true, cx);
+            ActionKind::StepQueue { delta } => {
+                self.step(delta, true, cx);
                 DirtyRegions::ALL
             }
-            HostCommand::OpenPrevious => {
-                self.step(-1, true, cx);
-                DirtyRegions::ALL
-            }
-            HostCommand::ToggleFavorite => {
+            ActionKind::ToggleFavorite => {
                 if self.active().session.may_share_current_identity()
                     && let Some(uri) = self.active().session.current_media_uri()
                 {
@@ -228,8 +208,8 @@ impl AppModel {
                 }
                 DirtyRegions::NONE
             }
-            HostCommand::ShowToast { message } => {
-                if self.plugin_view.modal.clear_submitting_for(pid)
+            ActionKind::ShowToast { message } => {
+                if self.plugin_view.modal.clear_submitting_for(&pid)
                     && self.plugins.active_modal().is_some_and(|(p, _)| p == pid)
                 {
                     self.plugin_view.modal.error = Some(message.into());
@@ -238,35 +218,11 @@ impl AppModel {
                 }
                 DirtyRegions::root_only()
             }
-            HostCommand::SetAbLoop { start, end } => {
-                self.command(Command::SetAbLoop { start, end }, cx);
-                DirtyRegions::dock_only()
-            }
-            HostCommand::ClearAbLoop => {
-                self.command(Command::ClearAbLoop, cx);
-                DirtyRegions::dock_only()
-            }
-            HostCommand::RefreshSource { source_id } => {
-                self.refresh_plugin_source(pid, &source_id, cx);
+            ActionKind::RefreshSource { source_id } => {
+                self.refresh_plugin_source(&pid, &source_id, cx);
                 DirtyRegions::sidebar_only()
             }
-            HostCommand::SetSidebar { .. }
-            | HostCommand::SetStatus { .. }
-            | HostCommand::SetOverlay { .. }
-            | HostCommand::SetToolbar { .. }
-            | HostCommand::OpenModal { .. }
-            | HostCommand::CloseModal { .. }
-            | HostCommand::SetTheme { .. }
-            | HostCommand::SetSources { .. }
-            | HostCommand::Log { .. } => DirtyRegions::NONE,
-            _ => {
-                self.apply_plugin_enhancement(action, cx);
-                DirtyRegions {
-                    viewport: true,
-                    dock: true,
-                    ..DirtyRegions::NONE
-                }
-            }
+            ActionKind::Enhancement(request) => self.apply_plugin_enhancement(request, cx),
         }
     }
 
@@ -407,27 +363,16 @@ impl AppModel {
             .as_ref()
             .is_some_and(|m| m.matches_source(pid, sid));
         let owner_matches = sid.is_none()
-            && iris_plugin_host::stream::prepare::stream_session(&self.active().session)
-                .is_some_and(|session| match pid {
-                    None => true,
-                    Some(target) => {
+            && (self.plugins.has_active_stream_for(pid)
+                || (self.plugins.has_active_stream_for(None)
+                    && pid.is_some_and(|target| {
                         self.plugin_view.stream_plugin.as_deref() == Some(target)
                             || self
                                 .plugin_view
                                 .playlist_binding
                                 .as_ref()
                                 .is_some_and(|b| b.installed.plugin_id == target)
-                            || self
-                                .plugins
-                                .list()
-                                .iter()
-                                .find(|p| p.id == target)
-                                .and_then(|p| p.binding.as_ref())
-                                .is_some_and(|b| {
-                                    b.installed.installation_id == session.factory.owner()
-                                })
-                    }
-                });
+                    })));
         let playlist_matches = sid.is_some_and(|target_sid| {
             self.plugin_view
                 .playlist_binding
@@ -441,6 +386,7 @@ impl AppModel {
         });
         if uri_matches || meta_matches || owner_matches || playlist_matches {
             self.save_progress_sync();
+            self.plugins.clear_active_stream();
             let _ = self.active_mut().session.stop();
             self.active_mut().session.release_scoped();
             self.plugin_view.scoped_released = false;

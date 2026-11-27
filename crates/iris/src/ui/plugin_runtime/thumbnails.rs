@@ -1,12 +1,9 @@
 use super::super::AppModel;
 use gpui::{Context, RenderImage};
-use iris_api::v2::{Capability, ErrorCode};
+use iris_api::v2::ErrorCode;
 use iris_base::net::http_client::HttpCancel;
 use iris_core::media_uri::MediaUri;
-use iris_plugin_host::{
-    ledger::{Reservation, Resource},
-    stream::remote::RemoteFactory,
-};
+use iris_plugin_host::ui::RetainedThumbnail;
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     sync::Arc,
@@ -14,30 +11,13 @@ use std::{
 };
 
 const MAX_REMOTE_THUMB_CONCURRENT: usize = 3;
-const REMOTE_THUMB_SCRATCH_BYTES: u64 = 4 << 20;
-const REMOTE_THUMB_LEASE_BYTES: u64 = 128 << 10;
 const QUOTA_RETRY_COOLDOWN: Duration = Duration::from_secs(2);
 
 type Key = (String, String);
 
-struct Cached {
-    image: Option<Arc<RenderImage>>,
-    _lease: Option<Reservation>,
-}
-
-impl Cached {
-    fn new(image: Option<Arc<RenderImage>>, lease: Reservation) -> Self {
-        let lease = image.is_some().then_some(lease);
-        Self {
-            image,
-            _lease: lease,
-        }
-    }
-}
-
 #[derive(Default)]
 pub(super) struct Thumbnails {
-    cache: BTreeMap<Key, Cached>,
+    cache: BTreeMap<Key, RetainedThumbnail<Arc<RenderImage>>>,
     order: VecDeque<Key>,
     pending: BTreeSet<Key>,
     cooldown: BTreeMap<Key, Instant>,
@@ -177,43 +157,15 @@ impl AppModel {
         else {
             return;
         };
-        let Ok(access) = self.plugins.client().access(plugin_id) else {
-            return;
-        };
-        let generation = access.generation;
-        if access.check(generation, Capability::MediaSource).is_err() {
-            return;
-        }
-        let Ok(cancel) = access.request_cancel(&self.plugin_view.thumbnails.cancel) else {
-            return;
-        };
-        let live = binding.clone();
-        let result = match access.background(move |access| {
-            if !live.is_live() {
-                return Err(ErrorCode::Cancelled);
-            }
-            let scratch = access.resources.ledger.reserve(
-                &access.owner,
-                &[(Resource::HostBytes, REMOTE_THUMB_SCRATCH_BYTES)],
-            )?;
-            let lease = access.resources.ledger.reserve(
-                &access.owner,
-                &[(Resource::HostBytes, REMOTE_THUMB_LEASE_BYTES)],
-            )?;
-            let fetched =
-                RemoteFactory::new(access.network.clone(), access.resources.ledger.clone())?
-                    .fetch_thumbnail(&resource, &cancel);
-            let image = fetched
-                .ok()
-                .and_then(|data| crate::platform::decode_remote_thumbnail(data.bytes()));
-            drop(scratch);
-            let cached = Cached::new(image, lease);
-            if cancel.is_cancelled() || !live.is_live() {
-                return Err(ErrorCode::Cancelled);
-            }
-            Ok(cached)
-        }) {
-            Ok(rx) => rx,
+        let (generation, rx) = match self.plugins.spawn_thumbnail_fetch(
+            plugin_id,
+            binding.clone(),
+            resource,
+            &self.plugin_view.thumbnails.cancel,
+            crate::platform::decode_remote_thumbnail,
+        ) {
+            Ok(Some(started)) => started,
+            Ok(None) => return,
             Err(ErrorCode::QuotaExceeded | ErrorCode::Backpressure) => {
                 self.plugin_view.thumbnails.record_cooldown(key, now);
                 return;
@@ -222,7 +174,7 @@ impl AppModel {
         };
         self.plugin_view.thumbnails.pending.insert(key.clone());
         cx.spawn(async move |this, cx| {
-            let result = result.await;
+            let result = rx.await;
             let _ = this.update(cx, |this, cx| {
                 if !binding.is_live()
                     || this.plugins.generation().context != generation.context
@@ -263,17 +215,12 @@ impl AppModel {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        Cached, MAX_REMOTE_THUMB_CONCURRENT, QUOTA_RETRY_COOLDOWN, REMOTE_THUMB_LEASE_BYTES,
-        REMOTE_THUMB_SCRATCH_BYTES, Thumbnails,
-    };
-    use gpui::RenderImage;
-    use image::{Frame, RgbaImage};
-    use iris_plugin_host::ledger::{Ledger, Resource};
-    use std::{sync::Arc, time::Instant};
+    use super::{MAX_REMOTE_THUMB_CONCURRENT, QUOTA_RETRY_COOLDOWN, Thumbnails};
+    use iris_plugin_host::ui::{REMOTE_THUMB_LEASE_BYTES, REMOTE_THUMB_SCRATCH_BYTES};
+    use std::time::Instant;
 
     #[test]
-    fn thumbnails_allow_bounded_concurrency_and_release_lease_on_none() {
+    fn thumbnails_allow_bounded_concurrency_and_respect_quota_cooldown() {
         assert_eq!(REMOTE_THUMB_SCRATCH_BYTES, 4 << 20);
         assert_eq!(REMOTE_THUMB_LEASE_BYTES, 128 << 10);
 
@@ -294,25 +241,5 @@ mod tests {
         thumbs.record_cooldown(keys[0].clone(), now);
         assert!(!thumbs.can_start(&keys[0], now));
         assert!(thumbs.can_start(&keys[0], now + QUOTA_RETRY_COOLDOWN));
-
-        let ledger = Ledger::default();
-        let lease_none = ledger
-            .reserve("owner", &[(Resource::HostBytes, REMOTE_THUMB_LEASE_BYTES)])
-            .unwrap();
-        let neg = Cached::new(None, lease_none);
-        assert!(neg.image.is_none());
-        assert_eq!(ledger.used(Some("owner"), Resource::HostBytes), 0);
-
-        let lease_some = ledger
-            .reserve("owner", &[(Resource::HostBytes, REMOTE_THUMB_LEASE_BYTES)])
-            .unwrap();
-        let img = Arc::new(RenderImage::new([Frame::new(RgbaImage::new(1, 1))]));
-        let pos = Cached::new(Some(img), lease_some);
-        assert_eq!(
-            ledger.used(Some("owner"), Resource::HostBytes),
-            REMOTE_THUMB_LEASE_BYTES
-        );
-        drop(pos);
-        assert_eq!(ledger.used(Some("owner"), Resource::HostBytes), 0);
     }
 }

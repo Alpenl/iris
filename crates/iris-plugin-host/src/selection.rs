@@ -96,6 +96,75 @@ pub fn page_to_api(page: store::AnnotationPage) -> AnnotationPage {
         next_marker: page.next_marker,
     }
 }
+
+pub(crate) fn transact_annotations(
+    target: &store::AnnotationTarget,
+    edit: Option<(&[MediaUri], &store::AnnotationEdit)>,
+    owner: &str,
+    ledger: &Ledger,
+    check_live: impl Fn() -> Result<(), AnnotationError>,
+) -> Result<store::AnnotationSnapshot, ErrorCode> {
+    target
+        .transact(
+            edit,
+            owner,
+            |owner, bytes| {
+                ledger
+                    .reserve(owner, &[(Resource::HostBytes, bytes)])
+                    .map(|lease| Arc::new(lease) as Arc<dyn std::any::Any + Send + Sync>)
+                    .map_err(error_code_to_annotation)
+            },
+            check_live,
+        )
+        .map_err(annotation_error_code)
+}
+
+/// Ownership lease keeping a host-initiated annotation task reservation alive until completion.
+pub struct HostAnnotationLease {
+    _lease: Reservation,
+}
+
+/// Admitted host-initiated personal annotation transaction.
+pub struct HostAnnotationJob {
+    ledger: Ledger,
+    lease: HostAnnotationLease,
+}
+
+impl HostAnnotationJob {
+    pub(crate) fn new(ledger: Ledger) -> Result<Self, ErrorCode> {
+        let lease = ledger.reserve("host.annotation-job", &[(Resource::Task, 1)])?;
+        Ok(Self {
+            ledger,
+            lease: HostAnnotationLease { _lease: lease },
+        })
+    }
+
+    pub fn run(
+        self,
+        target: &store::AnnotationTarget,
+        uri: &MediaUri,
+        edit: Option<&store::AnnotationEdit>,
+        cancel: &iris_base::net::http_client::HttpCancel,
+    ) -> (
+        Result<store::AnnotationSnapshot, ErrorCode>,
+        HostAnnotationLease,
+    ) {
+        let result = transact_annotations(
+            target,
+            edit.map(|e| (std::slice::from_ref(uri), e)),
+            "host.annotation-job",
+            &self.ledger,
+            || {
+                if cancel.is_cancelled() {
+                    Err(AnnotationError::Cancelled)
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        (result, self.lease)
+    }
+}
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::Arc,

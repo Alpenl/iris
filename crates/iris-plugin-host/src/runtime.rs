@@ -9,7 +9,6 @@ mod window;
 use super::{
     actor::{Actor, Spawn},
     engine::{CompiledModule, RuntimeEngine},
-    files::FileExecutor,
     installation::{Installed, Installer},
     instance::next_id,
     json_error,
@@ -22,11 +21,11 @@ use super::{
 use iris_api::v2::{
     ErrorCode, Generation, HostEvent, Id, Manifest, Role, source::SourceDescriptor,
 };
-use iris_base::net::http_client::HttpCancel;
 use iris_base::rt::CancelToken;
 use iris_core::vault::CredentialVault;
 pub use playback::PlaybackPermit;
 use std::{collections::BTreeSet, path::PathBuf, sync::Arc};
+pub(super) use window::WindowState;
 pub use window::{PreparedWindow, WindowPreparation};
 
 #[derive(Clone)]
@@ -51,12 +50,6 @@ pub struct Setup {
     pub temporary_directory: PathBuf,
     pub vault: CredentialVault,
     pub wake: Arc<dyn Fn() + Send + Sync>,
-}
-struct WindowState {
-    generation: Generation,
-    files: FileExecutor,
-    media: HttpCancel,
-    attachments: Arc<super::enhancement::AttachmentRegistry>,
 }
 struct LogRateLimiter {
     window_start: std::time::Instant,

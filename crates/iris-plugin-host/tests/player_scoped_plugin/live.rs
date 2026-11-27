@@ -31,7 +31,7 @@ fn live_bilibili_popular_video_plays_in_libmpv() {
     })
     .unwrap();
     let (client, _) = hub.open_window(Generation::default(), None).unwrap();
-    let mut manager = PluginManager::new(client, None);
+    let mut manager = WindowSession::new(client, None);
     wait_until(Duration::from_secs(60), "bilibili ready", || {
         manager.poll();
         manager.client().is_ready("community.bilibili")
@@ -71,7 +71,7 @@ fn live_bilibili_popular_video_plays_in_libmpv() {
     let ((entry_id, entry_name), (second_id, second_name)) = (chosen[0].clone(), chosen[1].clone());
     assert!(!entry_id.is_empty() && !second_id.is_empty());
 
-    let resolve_video = |manager: &mut PluginManager, id: &str, name: &str| {
+    let resolve_video = |manager: &mut WindowSession, id: &str, name: &str| {
         let req = manager
             .client()
             .resolve("community.bilibili", "popular", None, id, None)

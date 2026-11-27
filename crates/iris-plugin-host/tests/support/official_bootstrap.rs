@@ -38,7 +38,7 @@ fn embedded_distribution_bootstraps_before_window_start_and_respects_disabled_pl
     })
     .unwrap();
     let (client, _) = hub.open_window(Generation::default(), None).unwrap();
-    let mut ui = PluginManager::new(client, None);
+    let mut ui = WindowSession::new(client, None);
     wait(|| {
         ui.poll();
         ui.overlay_nodes()
