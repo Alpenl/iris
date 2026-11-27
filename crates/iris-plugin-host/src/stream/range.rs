@@ -1,5 +1,8 @@
-//! One HTTP byte range, with checked arithmetic and no invented total length.
+//! Plugin-stream byte-range adapter over `iris_base::net::range`, mapping range
+//! errors to protocol-2 [`ErrorCode::RangeInvalid`].
 use iris_api::v2::ErrorCode;
+use iris_base::net::range::{HttpRange, parse_decimal_u64};
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Range {
     pub offset: u64,
@@ -7,92 +10,37 @@ pub struct Range {
     pub partial: bool,
     pub total: Option<u64>,
 }
+
 impl Range {
     pub fn parse(header: Option<&str>, size: Option<u64>) -> Result<Self, ErrorCode> {
-        let Some(value) = header else {
-            return Ok(Self {
-                offset: 0,
-                len: size,
-                partial: false,
-                total: size,
-            });
-        };
-        let (start, end) = value
-            .strip_prefix("bytes=")
-            .and_then(|v| v.split_once('-'))
-            .ok_or(ErrorCode::RangeInvalid)?;
-        if start.is_empty() {
-            let suffix = decimal(end)?;
-            let total = size.filter(|n| *n != 0).ok_or(ErrorCode::RangeInvalid)?;
-            if suffix == 0 {
-                return Err(ErrorCode::RangeInvalid);
-            }
-            let len = suffix.min(total);
-            Ok(Self {
-                offset: total - len,
-                len: Some(len),
-                partial: true,
-                total: size,
-            })
-        } else {
-            let offset = decimal(start)?;
-            if size.is_some_and(|n| offset >= n) {
-                return Err(ErrorCode::RangeInvalid);
-            }
-            let len = if end.is_empty() {
-                size.map(|n| n - offset)
-            } else {
-                let end = decimal(end)?;
-                let end = size.map_or(end, |n| end.min(n - 1));
-                Some(
-                    end.checked_sub(offset)
-                        .and_then(|n| n.checked_add(1))
-                        .ok_or(ErrorCode::RangeInvalid)?,
-                )
-            };
-            // With no size and no explicit end, a valid Content-Range cannot be
-            // produced before reading to EOF. Reject instead of buffering.
-            if len.is_none() {
-                if offset == 0 {
-                    return Ok(Self {
-                        offset,
-                        len: None,
-                        partial: false,
-                        total: None,
-                    });
-                }
-                return Err(ErrorCode::RangeInvalid);
-            }
-            Ok(Self {
-                offset,
-                len,
-                partial: true,
-                total: size,
-            })
-        }
+        let parsed = HttpRange::parse(header, size).map_err(|_| ErrorCode::RangeInvalid)?;
+        Ok(Self {
+            offset: parsed.offset,
+            len: parsed.len,
+            partial: parsed.partial,
+            total: parsed.total,
+        })
     }
+
     pub fn content_range(&self) -> Option<String> {
-        if !self.partial {
-            return None;
+        HttpRange {
+            offset: self.offset,
+            len: self.len,
+            partial: self.partial,
+            total: self.total,
         }
-        let end = self.offset.checked_add(self.len?.checked_sub(1)?)?;
-        Some(format!(
-            "bytes {}-{}/{}",
-            self.offset,
-            end,
-            self.total.map_or_else(|| "*".into(), |n| n.to_string())
-        ))
+        .content_range()
     }
 }
+
 pub(crate) fn decimal(value: &str) -> Result<u64, ErrorCode> {
-    if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
-        return Err(ErrorCode::RangeInvalid);
-    }
-    value.parse().map_err(|_| ErrorCode::RangeInvalid)
+    parse_decimal_u64(value).map_err(|_| ErrorCode::RangeInvalid)
 }
+
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::Range;
+
     #[test]
     fn boundaries_suffix_and_unknown_lengths() {
         assert_eq!(

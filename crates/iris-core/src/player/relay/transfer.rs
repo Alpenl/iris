@@ -85,21 +85,5 @@ pub(super) fn copy_stream(
 }
 
 pub(super) fn valid_range(value: &str) -> bool {
-    let Some((start, end)) = value.strip_prefix("bytes=").and_then(|s| s.split_once('-')) else {
-        return false;
-    };
-    let parse_u64 = |s: &str| {
-        (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
-            .then(|| s.parse::<u64>().ok())
-            .flatten()
-    };
-    match (start.is_empty(), end.is_empty()) {
-        (true, true) => false,
-        (true, false) => parse_u64(end).is_some_and(|n| n > 0),
-        (false, true) => parse_u64(start).is_some(),
-        (false, false) => match (parse_u64(start), parse_u64(end)) {
-            (Some(a), Some(b)) => a <= b,
-            _ => false,
-        },
-    }
+    iris_base::net::range::ByteRangeSpec::parse(value).is_ok()
 }

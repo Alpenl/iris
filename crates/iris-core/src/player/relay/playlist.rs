@@ -1,10 +1,14 @@
-//! Strict RFC 8216 subset parser and sealed-URI rewriter for authenticated HLS manifests.
+//! Strict RFC 8216 subset policy and sealed-URI rewriter for authenticated HLS manifests,
+//! backed by `iris_base::net::hls` syntax parsing.
 
 use std::collections::BTreeMap;
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Result, anyhow, ensure};
 use url::Url;
 
+use iris_base::net::hls::{
+    AttributeOptions, HlsLine, HlsLineOptions, has_hls_magic, parse_attributes, parse_lines,
+};
 use iris_base::net::http_client::validate_stream_url;
 
 use super::{RouteKind, Routes};
@@ -12,10 +16,7 @@ use super::{RouteKind, Routes};
 const MAX_REWRITTEN_PLAYLIST: usize = 16 * 1024 * 1024;
 
 pub(super) fn is_hls(prefix: &[u8]) -> bool {
-    prefix
-        .strip_prefix(b"\xef\xbb\xbf")
-        .unwrap_or(prefix)
-        .starts_with(b"#EXTM3U")
+    has_hls_magic(prefix)
 }
 
 pub(super) fn rewrite_playlist(input: &str, base: &Url, routes: &Routes) -> Result<String> {
@@ -28,96 +29,93 @@ fn rewrite_playlist_inner(
     routes: &Routes,
     mut extracted: Option<&mut Vec<String>>,
 ) -> Result<String> {
+    let lines = parse_lines(input, HlsLineOptions::CORE_REWRITE).map_err(|e| anyhow!(e))?;
     let mut out = String::with_capacity(input.len());
-    let lines = input.trim_start_matches('\u{feff}');
+    out.push_str("#EXTM3U\n");
     ensure!(
-        !lines.contains('\0') && !lines.contains("{$"),
-        "unsupported HLS playlist syntax"
+        out.len() <= MAX_REWRITTEN_PLAYLIST,
+        "rewritten playlist exceeds limit"
     );
-    ensure!(
-        lines.lines().next() == Some("#EXTM3U"),
-        "invalid HLS playlist"
-    );
+
     let mut variant = false;
     let mut rewritten = BTreeMap::new();
-    for line in lines.lines() {
-        // Match the demuxer's treatment of surrounding whitespace and reject
-        // control characters that could create a second logical line.
-        ensure!(
-            line.bytes().all(|b| b >= 0x20 || b == b'\t'),
-            "invalid HLS line"
-        );
-        let line = line.trim_ascii();
+    for item in lines {
+        let line = item.map_err(|e| anyhow!(e))?;
         let before = out.len();
-        if line.starts_with('#') {
-            ensure!(
-                !line.starts_with("#EXT-X-DEFINE:")
-                    && !line.starts_with("#EXT-X-CONTENT-STEERING:"),
-                "unsupported HLS playlist indirection"
-            );
-            if line.starts_with("#EXT-X-STREAM-INF:") {
-                variant = true;
-            }
-            if let Some((tag, attrs)) = line.split_once(':')
-                && tag.starts_with("#EXT-X-")
-            {
-                match tag {
-                    // Scalar tags never consult the attribute parser.
-                    "#EXT-X-VERSION"
-                    | "#EXT-X-TARGETDURATION"
-                    | "#EXT-X-MEDIA-SEQUENCE"
-                    | "#EXT-X-DISCONTINUITY-SEQUENCE"
-                    | "#EXT-X-PLAYLIST-TYPE"
-                    | "#EXT-X-BYTERANGE"
-                    | "#EXT-X-PROGRAM-DATE-TIME"
-                    | "#EXT-X-BITRATE" => out.push_str(line),
-                    "#EXT-X-STREAM-INF"
-                    | "#EXT-X-KEY"
-                    | "#EXT-X-MEDIA"
-                    | "#EXT-X-MAP"
-                    | "#EXT-X-START"
-                    | "#EXT-X-DATERANGE"
-                    | "#EXT-X-I-FRAME-STREAM-INF"
-                    | "#EXT-X-IMAGE-STREAM-INF"
-                    | "#EXT-X-SESSION-DATA"
-                    | "#EXT-X-SESSION-KEY"
-                    | "#EXT-X-PART"
-                    | "#EXT-X-PART-INF"
-                    | "#EXT-X-SERVER-CONTROL"
-                    | "#EXT-X-SKIP"
-                    | "#EXT-X-PRELOAD-HINT"
-                    | "#EXT-X-RENDITION-REPORT" => {
-                        out.push_str(tag);
-                        out.push(':');
-                        rewrite_attributes(
-                            tag,
-                            attrs,
-                            base,
-                            routes,
-                            &mut rewritten,
-                            &mut out,
-                            extracted.as_deref_mut(),
-                        )?;
-                    }
-                    // Preserve compatibility with private scalar extensions by
-                    // skipping unrecognized tags before they reach the demuxer.
-                    _ => continue,
+        match line {
+            HlsLine::Empty => {}
+            HlsLine::Comment(raw) => out.push_str(raw),
+            HlsLine::Tag { raw, name, value } => {
+                ensure!(
+                    !(matches!(name, "#EXT-X-DEFINE" | "#EXT-X-CONTENT-STEERING")
+                        && value.is_some()),
+                    "unsupported HLS playlist indirection"
+                );
+                if name == "#EXT-X-STREAM-INF" && value.is_some() {
+                    variant = true;
                 }
-            } else {
-                out.push_str(line);
+                if let Some(attrs) = value
+                    && name.starts_with("#EXT-X-")
+                {
+                    match name {
+                        // Scalar tags never consult the attribute parser.
+                        "#EXT-X-VERSION"
+                        | "#EXT-X-TARGETDURATION"
+                        | "#EXT-X-MEDIA-SEQUENCE"
+                        | "#EXT-X-DISCONTINUITY-SEQUENCE"
+                        | "#EXT-X-PLAYLIST-TYPE"
+                        | "#EXT-X-BYTERANGE"
+                        | "#EXT-X-PROGRAM-DATE-TIME"
+                        | "#EXT-X-BITRATE" => out.push_str(raw),
+                        "#EXT-X-STREAM-INF"
+                        | "#EXT-X-KEY"
+                        | "#EXT-X-MEDIA"
+                        | "#EXT-X-MAP"
+                        | "#EXT-X-START"
+                        | "#EXT-X-DATERANGE"
+                        | "#EXT-X-I-FRAME-STREAM-INF"
+                        | "#EXT-X-IMAGE-STREAM-INF"
+                        | "#EXT-X-SESSION-DATA"
+                        | "#EXT-X-SESSION-KEY"
+                        | "#EXT-X-PART"
+                        | "#EXT-X-PART-INF"
+                        | "#EXT-X-SERVER-CONTROL"
+                        | "#EXT-X-SKIP"
+                        | "#EXT-X-PRELOAD-HINT"
+                        | "#EXT-X-RENDITION-REPORT" => {
+                            out.push_str(name);
+                            out.push(':');
+                            rewrite_attributes(
+                                name,
+                                attrs,
+                                base,
+                                routes,
+                                &mut rewritten,
+                                &mut out,
+                                extracted.as_deref_mut(),
+                            )?;
+                        }
+                        // Preserve compatibility with private scalar extensions by
+                        // skipping unrecognized tags before they reach the demuxer.
+                        _ => continue,
+                    }
+                } else {
+                    out.push_str(raw);
+                }
             }
-        } else if !line.is_empty() {
-            let url = validate_stream_url(base.join(line)?.as_str())?;
-            if let Some(sink) = extracted.as_deref_mut() {
-                sink.push(url.as_str().to_owned());
+            HlsLine::Uri(reference) => {
+                let url = validate_stream_url(base.join(reference)?.as_str())?;
+                if let Some(sink) = extracted.as_deref_mut() {
+                    sink.push(url.as_str().to_owned());
+                }
+                let (kind, ext) = if variant {
+                    (RouteKind::Playlist, "m3u8")
+                } else {
+                    (RouteKind::Media, "ts")
+                };
+                rewrite_uri(url, kind, ext, routes, &mut rewritten, &mut out)?;
+                variant = false;
             }
-            let (kind, ext) = if variant {
-                (RouteKind::Playlist, "m3u8")
-            } else {
-                (RouteKind::Media, "ts")
-            };
-            rewrite_uri(url, kind, ext, routes, &mut rewritten, &mut out)?;
-            variant = false;
         }
         ensure!(
             out.len() - before < 4096,
@@ -174,65 +172,32 @@ fn rewrite_uri(
     Ok(())
 }
 
-/// Rewrite complete URI attributes, respecting commas inside quoted values (RFC 8216 §4.2).
+/// Rewrite complete URI attributes using `iris_base::net::hls::parse_attributes` (RFC 8216 §4.2).
 fn rewrite_attributes(
     tag: &str,
-    mut attrs: &str,
+    attrs: &str,
     base: &Url,
     routes: &Routes,
     rewritten: &mut RewrittenUris,
     out: &mut String,
     mut extracted: Option<&mut Vec<String>>,
 ) -> Result<()> {
-    // Accept an unambiguous subset of RFC 8216 §4.2. In particular, do not
-    // pass whitespace-delimited attributes or quotes interpreted by libavformat.
-    loop {
-        let (key, rest) = attrs
-            .split_once('=')
-            .context("missing HLS attribute value")?;
-        ensure!(
-            !key.is_empty()
-                && key
-                    .bytes()
-                    .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'-'),
-            "invalid HLS attribute name"
-        );
-        let (raw, tail, quoted) = if let Some(rest) = rest.strip_prefix('"') {
-            let (value, tail) = rest.split_once('"').context("unterminated HLS attribute")?;
-            ensure!(
-                !value.contains(['\\', '\t']),
-                "invalid quoted HLS attribute"
-            );
-            (value, tail, true)
-        } else {
-            let end = rest.find(',').unwrap_or(rest.len());
-            let value = &rest[..end];
-            ensure!(
-                !value.is_empty()
-                    && value
-                        .bytes()
-                        .all(|b| !b.is_ascii_whitespace() && !matches!(b, b'=' | b'"' | b'\\')),
-                "invalid unquoted HLS attribute"
-            );
-            (value, &rest[end..], false)
-        };
-        let next = if tail.is_empty() {
-            None
-        } else {
-            Some(
-                tail.strip_prefix(',')
-                    .filter(|s| !s.is_empty())
-                    .context("invalid HLS attribute separator")?,
-            )
-        };
-        out.push_str(key);
+    let parsed = parse_attributes(attrs, AttributeOptions::CORE_REWRITE).map_err(|e| anyhow!(e))?;
+    for (idx, attr) in parsed.into_iter().enumerate() {
+        if idx > 0 {
+            out.push(',');
+        }
+        out.push_str(attr.name);
         out.push('=');
-        if quoted {
+        if attr.quoted {
             out.push('"');
         }
-        if key == "URI" || key.ends_with("-URI") {
-            ensure!(quoted && !raw.is_empty(), "invalid HLS URI attribute");
-            let url = validate_stream_url(base.join(raw)?.as_str())?;
+        if attr.name == "URI" || attr.name.ends_with("-URI") {
+            ensure!(
+                attr.quoted && !attr.value.is_empty(),
+                "invalid HLS URI attribute"
+            );
+            let url = validate_stream_url(base.join(attr.value)?.as_str())?;
             if let Some(sink) = extracted.as_deref_mut() {
                 sink.push(url.as_str().to_owned());
             }
@@ -247,18 +212,15 @@ fn rewrite_attributes(
             };
             rewrite_uri(url, kind, fallback, routes, rewritten, out)?;
         } else {
-            out.push_str(raw);
+            out.push_str(attr.value);
         }
-        if quoted {
+        if attr.quoted {
             out.push('"');
         }
         ensure!(
             out.len() <= MAX_REWRITTEN_PLAYLIST,
             "rewritten playlist exceeds limit"
         );
-        let Some(rest) = next else { break };
-        out.push(',');
-        attrs = rest;
     }
     Ok(())
 }
