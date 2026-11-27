@@ -1,4 +1,4 @@
-//! Plugin `PollReport` application, `DirtySlots` UI redraw gating, modal async
+//! Plugin `PollReport` application, regional `DirtyRegions` redraw routing, modal async
 //! validation & focus synchronization, and `HostCommand` execution.
 
 use gpui::{Context, Window};
@@ -8,10 +8,11 @@ use iris_core::player::Command;
 use iris_core::preset::SidebarMode;
 use iris_plugin_host::ui::{self as plugin, PollReport};
 
-use super::IrisWindow;
+use super::AppModel;
 use super::state::{ActiveSource, PopoverKind, SourceErrorKind};
+use super::views::{DirtyRegions, dirty_regions_for_poll};
 
-impl IrisWindow {
+impl AppModel {
     pub(super) fn has_active_modal(&self) -> bool {
         self.has_host_consent()
             || self.overlays.settings_open
@@ -61,13 +62,14 @@ impl IrisWindow {
     }
 
     /// Drains background plugin messages (`cx.spawn_in` wakeup), auto-focusing
-    /// newly opened modals and only notifying GPUI when `PollReport::should_notify_ui` holds.
+    /// newly opened modals and notifying only the regional GPUI entities marked dirty.
     pub(super) fn poll_plugins(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let report = self.plugins.poll();
         self.bind_plugin_current_file();
         self.reconcile_plugin_lifetimes(cx);
-        if self.apply_poll_report(report, Some(window), cx) {
-            cx.notify();
+        let regions = self.apply_poll_report(report, Some(window), cx);
+        if regions.any() {
+            self.notify_regions(regions, cx);
         }
         self.run_deferred_plugin_commands(window, cx);
     }
@@ -77,24 +79,28 @@ impl IrisWindow {
         event: plugin::Event,
         window: Option<&mut Window>,
         cx: &mut Context<Self>,
-    ) -> bool {
+    ) -> DirtyRegions {
         self.bind_plugin_current_file();
         let report = self.plugins.broadcast(&event);
         self.apply_poll_report(report, window, cx)
     }
 
     /// Applies `PollReport`: executes `HostCommand`s, updates `ThemeTokens` only when
-    /// `dirty.theme`, syncs modal inputs, and returns whether UI needs a redraw.
+    /// `dirty.theme`, syncs modal inputs, and returns the exact regional `DirtyRegions`.
     pub(super) fn apply_poll_report(
         &mut self,
         report: PollReport,
         window: Option<&mut Window>,
         cx: &mut Context<Self>,
-    ) -> bool {
-        let should_notify = report.should_notify_ui(
+    ) -> DirtyRegions {
+        let mut regions = dirty_regions_for_poll(
+            report.dirty,
+            report.status_changed,
             self.chrome.fullscreen,
             self.chrome.chrome_visible,
             self.sidebar_is_visible() && self.catalog.sidebar_mode == SidebarMode::Plugins,
+            self.overlays.settings_open,
+            self.overlays.palette_open,
         );
         let PollReport {
             actions,
@@ -109,14 +115,15 @@ impl IrisWindow {
 
         for action in actions {
             if action.is_live(self.plugins.generation()) {
-                self.execute_one_host_command(&action, cx);
+                regions = regions.union(self.execute_one_host_command(&action, cx));
             }
         }
         for notice in notices {
-            self.apply_plugin_notice(notice, cx);
+            regions = regions.union(self.apply_plugin_notice(notice, cx));
         }
         if dirty.theme {
             self.sync_theme_tokens(cx);
+            self.sync_viewport_effects(cx);
         }
         if dirty.sources {
             self.reconcile_active_source();
@@ -133,7 +140,7 @@ impl IrisWindow {
             self.sync_plugin_modal_focus(window);
         }
         self.sync_view_timer(cx);
-        should_notify
+        regions
     }
 
     pub(super) fn sync_plugin_modal_focus(&mut self, window: &mut Window) {
@@ -170,21 +177,41 @@ impl IrisWindow {
         &mut self,
         action: &iris_plugin_host::ui::Action,
         cx: &mut Context<Self>,
-    ) {
+    ) -> DirtyRegions {
         let pid = &action.binding.installed.plugin_id;
         match action.command().clone() {
-            HostCommand::TogglePlayback => self.command(Command::TogglePlayback, cx),
+            HostCommand::TogglePlayback => {
+                self.command(Command::TogglePlayback, cx);
+                DirtyRegions::dock_only()
+            }
             HostCommand::SeekRelative { seconds } => {
                 self.command(Command::SeekRelative(seconds), cx);
+                DirtyRegions::dock_only()
             }
             HostCommand::SeekAbsolute { seconds } => {
                 self.command(Command::SeekAbsolute(seconds), cx);
+                DirtyRegions::dock_only()
             }
-            HostCommand::SetSpeed { speed } => self.command(Command::SetSpeed(speed), cx),
-            HostCommand::SetVolume { volume } => self.command(Command::SetVolume(volume), cx),
-            HostCommand::ToggleMute => self.command(Command::ToggleMute, cx),
-            HostCommand::OpenNext => self.step(1, true, cx),
-            HostCommand::OpenPrevious => self.step(-1, true, cx),
+            HostCommand::SetSpeed { speed } => {
+                self.command(Command::SetSpeed(speed), cx);
+                DirtyRegions::dock_only()
+            }
+            HostCommand::SetVolume { volume } => {
+                self.command(Command::SetVolume(volume), cx);
+                DirtyRegions::dock_only()
+            }
+            HostCommand::ToggleMute => {
+                self.command(Command::ToggleMute, cx);
+                DirtyRegions::dock_only()
+            }
+            HostCommand::OpenNext => {
+                self.step(1, true, cx);
+                DirtyRegions::ALL
+            }
+            HostCommand::OpenPrevious => {
+                self.step(-1, true, cx);
+                DirtyRegions::ALL
+            }
             HostCommand::ToggleFavorite => {
                 if self.active().session.may_share_current_identity()
                     && let Some(uri) = self.active().session.current_media_uri()
@@ -192,24 +219,36 @@ impl IrisWindow {
                     self.store.toggle_favorite(&uri);
                     self.rebuild_directory_rows();
                     self.scan_visible_favorites(cx);
+                    return DirtyRegions {
+                        sidebar: true,
+                        viewport: true,
+                        dock: true,
+                        ..DirtyRegions::NONE
+                    };
                 }
+                DirtyRegions::NONE
             }
             HostCommand::ShowToast { message } => {
                 if self.plugin_view.modal.clear_submitting_for(pid)
                     && self.plugins.active_modal().is_some_and(|(p, _)| p == pid)
                 {
                     self.plugin_view.modal.error = Some(message.into());
-                    cx.notify();
                 } else {
                     self.show_toast(message, cx);
                 }
+                DirtyRegions::root_only()
             }
             HostCommand::SetAbLoop { start, end } => {
-                self.command(Command::SetAbLoop { start, end }, cx)
+                self.command(Command::SetAbLoop { start, end }, cx);
+                DirtyRegions::dock_only()
             }
-            HostCommand::ClearAbLoop => self.command(Command::ClearAbLoop, cx),
+            HostCommand::ClearAbLoop => {
+                self.command(Command::ClearAbLoop, cx);
+                DirtyRegions::dock_only()
+            }
             HostCommand::RefreshSource { source_id } => {
                 self.refresh_plugin_source(pid, &source_id, cx);
+                DirtyRegions::sidebar_only()
             }
             HostCommand::SetSidebar { .. }
             | HostCommand::SetStatus { .. }
@@ -219,8 +258,15 @@ impl IrisWindow {
             | HostCommand::CloseModal { .. }
             | HostCommand::SetTheme { .. }
             | HostCommand::SetSources { .. }
-            | HostCommand::Log { .. } => {}
-            _ => self.apply_plugin_enhancement(action, cx),
+            | HostCommand::Log { .. } => DirtyRegions::NONE,
+            _ => {
+                self.apply_plugin_enhancement(action, cx);
+                DirtyRegions {
+                    viewport: true,
+                    dock: true,
+                    ..DirtyRegions::NONE
+                }
+            }
         }
     }
 
@@ -255,8 +301,10 @@ impl IrisWindow {
                 values,
             },
         );
-        self.apply_poll_report(report, Some(window), cx);
-        cx.notify();
+        let regions = self
+            .apply_poll_report(report, Some(window), cx)
+            .union(DirtyRegions::root_only());
+        self.notify_regions(regions, cx);
     }
 
     /// Unconditionally dismisses the active plugin modal (`Esc` / Cancel / scrim click),
@@ -280,9 +328,11 @@ impl IrisWindow {
         self.plugin_view.modal.cancel(&mut self.text_inputs);
         self.plugin_view.modal.focus_pending = true;
         // A dismissed front modal can reveal another queued modal without a dirty slot.
-        self.apply_poll_report(report, window, cx);
+        let regions = self
+            .apply_poll_report(report, window, cx)
+            .union(DirtyRegions::ALL);
         self.bump_activity(cx);
-        cx.notify();
+        self.notify_regions(regions, cx);
     }
 
     pub(super) fn invoke_plugin_command(
@@ -301,8 +351,10 @@ impl IrisWindow {
                 snapshot: Some(snap),
             },
         );
-        self.apply_poll_report(report, Some(window), cx);
-        cx.notify();
+        let regions = self.apply_poll_report(report, Some(window), cx);
+        if regions.any() {
+            self.notify_regions(regions, cx);
+        }
     }
 
     pub(super) fn invoke_plugin_widget_action(
@@ -323,8 +375,10 @@ impl IrisWindow {
                 snapshot: Some(snap),
             },
         );
-        self.apply_poll_report(report, Some(window), cx);
-        cx.notify();
+        let regions = self.apply_poll_report(report, Some(window), cx);
+        if regions.any() {
+            self.notify_regions(regions, cx);
+        }
     }
 
     pub(super) fn invoke_plugin_action(
@@ -448,9 +502,10 @@ impl IrisWindow {
         }
         let snap = self.plugin_snapshot();
         let report = self.plugins.set_enabled_with_snapshot(id, enabled, snap);
-        self.apply_poll_report(report, None, cx);
+        let _ = self.apply_poll_report(report, None, cx);
         self.reconcile_active_source();
-        cx.notify();
+        self.sync_viewport_effects(cx);
+        self.notify_all(cx);
     }
 
     pub(super) fn uninstall_plugin(&mut self, id: &str, keep_data: bool, cx: &mut Context<Self>) {
@@ -469,9 +524,10 @@ impl IrisWindow {
             self.sync_theme_tokens(cx);
         }
         let report = self.plugins.uninstall(id, keep_data);
-        self.apply_poll_report(report, None, cx);
+        let _ = self.apply_poll_report(report, None, cx);
         self.reconcile_active_source();
-        cx.notify();
+        self.sync_viewport_effects(cx);
+        self.notify_all(cx);
     }
 
     pub(super) fn reload_plugins(&mut self, cx: &mut Context<Self>) {
@@ -480,7 +536,7 @@ impl IrisWindow {
         let report = self
             .plugins
             .reload_with_snapshot(&self.settings.disabled_plugins, snap);
-        self.apply_poll_report(report, None, cx);
+        let _ = self.apply_poll_report(report, None, cx);
         let enabled_ids: Vec<String> = self
             .plugins
             .list()
@@ -491,7 +547,9 @@ impl IrisWindow {
         self.text_inputs
             .retain_enabled_sidebar_fields(|pid| enabled_ids.iter().any(|id| id == pid));
         self.reconcile_active_source();
+        self.sync_viewport_effects(cx);
         self.show_toast("插件列表已重新扫描", cx);
+        self.notify_all(cx);
     }
 
     pub(super) fn handle_source_error(
@@ -509,6 +567,7 @@ impl IrisWindow {
                 let vp = self.active_mut();
                 vp.loading_visible = false;
                 vp.pending_subtitles.clear();
+                self.notify_viewport(cx);
             }
             SourceErrorKind::Browse { source_id } => {
                 if let ActiveSource::Plugin(ps) = &mut self.catalog.active_source
@@ -517,6 +576,7 @@ impl IrisWindow {
                 {
                     ps.error = Some(message.clone());
                     self.rebuild_directory_rows();
+                    self.notify_sidebar(cx);
                 }
             }
         }

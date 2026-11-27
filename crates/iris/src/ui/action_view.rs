@@ -8,7 +8,7 @@ use iris_core::library::{self, Kind};
 use iris_core::player::Command;
 use iris_core::preset::SidebarMode;
 
-use super::IrisWindow;
+use super::AppModel;
 use super::actions::{
     ActivatePreset, CycleAspect, CyclePreset, ExitFullscreen, FitImage, OpenCommandPalette,
     OpenFile, OpenSettings, OpenStreamUrl, RefreshDirectory, RotateCcw, RotateCw, TakeScreenshot,
@@ -18,6 +18,7 @@ use super::actions::{
 };
 use super::chrome::DirectoryPopup;
 use super::state::{ActiveSource, BuiltinDialog, EscapeStep};
+use super::views::DirtyRegions;
 use crate::platform;
 
 fn format_screenshot_stamp() -> String {
@@ -46,7 +47,7 @@ fn format_screenshot_stamp() -> String {
     format!("{year:04}{month:02}{day:02}-{hour:02}{min:02}{sec:02}-{ms:03}")
 }
 
-impl IrisWindow {
+impl AppModel {
     pub(super) fn toggle_favorite(
         &mut self,
         _: &ToggleFavorite,
@@ -63,6 +64,15 @@ impl IrisWindow {
         let added = self.store.toggle_favorite(&uri);
         self.rebuild_directory_rows();
         self.scan_visible_favorites(cx);
+        self.notify_regions(
+            DirtyRegions {
+                sidebar: true,
+                viewport: true,
+                dock: true,
+                ..DirtyRegions::NONE
+            },
+            cx,
+        );
         self.show_toast(
             if added {
                 "已收藏"
@@ -134,6 +144,14 @@ impl IrisWindow {
         self.settings.always_on_top = !self.settings.always_on_top;
         platform::set_always_on_top(window, self.settings.always_on_top);
         self.persist_user_settings();
+        self.notify_regions(
+            DirtyRegions {
+                root: true,
+                settings: true,
+                ..DirtyRegions::NONE
+            },
+            cx,
+        );
         self.show_toast(
             if self.settings.always_on_top {
                 "窗口已置顶"
@@ -150,7 +168,7 @@ impl IrisWindow {
             self.active_mut().refresh_cached_stats(true);
             self.refresh_annotations(cx);
         }
-        cx.notify();
+        self.notify_viewport_and_dock(cx);
     }
 
     pub(super) fn take_screenshot(
@@ -215,7 +233,7 @@ impl IrisWindow {
     pub(super) fn toggle_directory(
         &mut self,
         _: &ToggleDirectory,
-        _: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if self.has_active_modal() {
@@ -229,19 +247,29 @@ impl IrisWindow {
                 DirectoryPopup::Manual
             };
             self.sync_view_timer(cx);
+            self.reconcile_input_focus(window, cx);
             self.bump_activity(cx);
-            cx.notify();
+            self.notify_regions(
+                DirtyRegions {
+                    root: true,
+                    viewport: true,
+                    dock: true,
+                    ..DirtyRegions::NONE
+                },
+                cx,
+            );
             return;
         }
         self.settings.directory_open = !self.settings.directory_open;
         self.persist_user_settings();
         self.sync_view_timer(cx);
+        self.reconcile_input_focus(window, cx);
         if self.settings.directory_open {
             self.scroll_directory_to_current();
-            cx.notify();
         } else {
             self.show_toast("侧栏已收起", cx);
         }
+        self.notify_all(cx);
     }
 
     pub(super) fn toggle_search(
@@ -270,7 +298,16 @@ impl IrisWindow {
             self.filter_directory_rows();
             self.focus.focus(window);
         }
-        cx.notify();
+        self.notify_regions(
+            DirtyRegions {
+                root: true,
+                sidebar: true,
+                viewport: true,
+                dock: true,
+                ..DirtyRegions::NONE
+            },
+            cx,
+        );
     }
 
     pub(super) fn refresh_directory(
@@ -323,6 +360,15 @@ impl IrisWindow {
                 this.rebuild_directory_rows();
                 this.scroll_directory_to_current();
                 this.ensure_filmstrip_thumbnails(cx);
+                this.notify_regions(
+                    DirtyRegions {
+                        sidebar: true,
+                        viewport: true,
+                        dock: true,
+                        ..DirtyRegions::NONE
+                    },
+                    cx,
+                );
                 this.show_toast("目录已刷新", cx);
             });
         }));
@@ -342,8 +388,17 @@ impl IrisWindow {
         }
         self.overlays.toggle_settings();
         self.focus.focus(window);
+        self.reconcile_input_focus(window, cx);
         self.bump_activity(cx);
-        cx.notify();
+        self.notify_regions(
+            DirtyRegions {
+                root: true,
+                settings: true,
+                dock: true,
+                ..DirtyRegions::NONE
+            },
+            cx,
+        );
     }
 
     pub(super) fn open_command_palette(
@@ -366,7 +421,14 @@ impl IrisWindow {
             self.focus.focus(window);
         }
         self.bump_activity(cx);
-        cx.notify();
+        self.notify_regions(
+            DirtyRegions {
+                root: true,
+                dock: true,
+                ..DirtyRegions::NONE
+            },
+            cx,
+        );
     }
 
     pub(super) fn toggle_fullscreen(
@@ -394,39 +456,108 @@ impl IrisWindow {
             return;
         }
         let has_plugin_modal = self.plugins.active_modal().is_some();
-        match self.overlays.dismiss_next_escape(
+        let step = self.overlays.dismiss_next_escape(
             &mut self.text_inputs,
             has_plugin_modal,
             window.is_fullscreen(),
-        ) {
-            EscapeStep::CancelRecording | EscapeStep::CloseContextMenu | EscapeStep::CloseInfo => {
+        );
+        match step {
+            EscapeStep::CancelRecording => {
+                self.focus.focus(window);
                 self.bump_activity(cx);
-                cx.notify();
+                self.notify_regions(
+                    DirtyRegions {
+                        root: true,
+                        settings: true,
+                        ..DirtyRegions::NONE
+                    },
+                    cx,
+                );
+            }
+            EscapeStep::CloseContextMenu => {
+                self.bump_activity(cx);
+                self.notify_root(cx);
+            }
+            EscapeStep::CloseInfo => {
+                self.bump_activity(cx);
+                self.notify_viewport_and_dock(cx);
             }
             EscapeStep::CancelPluginModal => {
                 self.cancel_active_plugin_modal(Some(window), cx);
             }
             EscapeStep::CloseBuiltinDialog
             | EscapeStep::ClosePalette
-            | EscapeStep::CloseSettings
-            | EscapeStep::ClosePopover
-            | EscapeStep::CloseDirPopup
-            | EscapeStep::BlurSidebarForm => {
+            | EscapeStep::ClosePopover => {
                 self.sync_view_timer(cx);
                 self.focus.focus(window);
                 self.bump_activity(cx);
-                cx.notify();
+                self.notify_regions(
+                    DirtyRegions {
+                        root: true,
+                        dock: true,
+                        ..DirtyRegions::NONE
+                    },
+                    cx,
+                );
+            }
+            EscapeStep::CloseSettings => {
+                self.sync_view_timer(cx);
+                self.focus.focus(window);
+                self.bump_activity(cx);
+                self.notify_regions(
+                    DirtyRegions {
+                        root: true,
+                        settings: true,
+                        dock: true,
+                        ..DirtyRegions::NONE
+                    },
+                    cx,
+                );
+            }
+            EscapeStep::CloseDirPopup => {
+                self.sync_view_timer(cx);
+                self.focus.focus(window);
+                self.bump_activity(cx);
+                self.notify_regions(
+                    DirtyRegions {
+                        root: true,
+                        viewport: true,
+                        dock: true,
+                        ..DirtyRegions::NONE
+                    },
+                    cx,
+                );
+            }
+            EscapeStep::BlurSidebarForm => {
+                self.sync_view_timer(cx);
+                self.focus.focus(window);
+                self.bump_activity(cx);
+                self.notify_regions(
+                    DirtyRegions {
+                        root: true,
+                        plugin_panel: true,
+                        ..DirtyRegions::NONE
+                    },
+                    cx,
+                );
             }
             EscapeStep::ClearSearchText => {
                 self.filter_directory_rows();
                 self.bump_activity(cx);
-                cx.notify();
+                self.notify_sidebar(cx);
             }
             EscapeStep::CloseSearch => {
                 self.filter_directory_rows();
                 self.focus.focus(window);
                 self.bump_activity(cx);
-                cx.notify();
+                self.notify_regions(
+                    DirtyRegions {
+                        root: true,
+                        sidebar: true,
+                        ..DirtyRegions::NONE
+                    },
+                    cx,
+                );
             }
             EscapeStep::ExitFullscreen => window.toggle_fullscreen(),
             EscapeStep::Noop => {}
@@ -548,7 +679,15 @@ impl IrisWindow {
         self.settings.photo_filmstrip = !self.settings.photo_filmstrip;
         self.persist_user_settings();
         self.ensure_filmstrip_thumbnails(cx);
-        cx.notify();
+        self.notify_regions(
+            DirtyRegions {
+                settings: true,
+                viewport: true,
+                dock: true,
+                ..DirtyRegions::NONE
+            },
+            cx,
+        );
     }
 
     pub(super) fn zoom_in(&mut self, _: &ZoomIn, _: &mut Window, cx: &mut Context<Self>) {

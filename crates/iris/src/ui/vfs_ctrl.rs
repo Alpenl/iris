@@ -17,12 +17,13 @@ use iris_core::preset::SidebarMode;
 use iris_core::vfs::{self, PinnedBookmark};
 use iris_plugin_host::requests::BrowseTarget;
 
-use super::IrisWindow;
+use super::AppModel;
 use super::state::{ActiveSource, PendingBrowse, PendingResolve, PluginSourceView, RemoteLoad};
+use super::views::DirtyRegions;
 
 const SOURCE_TIMEOUT: Duration = Duration::from_secs(30);
 
-impl IrisWindow {
+impl AppModel {
     /// Cancels in-flight remote/plugin media loads without interrupting directory browsing.
     pub(super) fn cancel_media_loads(&mut self) {
         let pending = self.catalog.cancel_resolve();
@@ -133,7 +134,16 @@ impl IrisWindow {
         self.sync_view_timer(cx);
         self.rebuild_directory_rows();
         self.ensure_filmstrip_thumbnails(cx);
-        cx.notify();
+        self.notify_regions(
+            DirtyRegions {
+                root: true,
+                sidebar: true,
+                viewport: true,
+                dock: true,
+                ..DirtyRegions::NONE
+            },
+            cx,
+        );
     }
 
     pub(super) fn refresh_plugin_source(
@@ -193,13 +203,14 @@ impl IrisWindow {
             .map(|n| format!("bm-{n}"))
             .find(|id| !self.locations.bookmarks.iter().any(|bm| &bm.id == id))
             .expect("finite bookmark list");
-        self.show_toast(format!("已固定书签 · {name}"), cx);
         self.locations.add_bookmark(PinnedBookmark {
             id,
-            name,
+            name: name.clone(),
             uri,
             folder_id,
         });
+        self.notify_sidebar(cx);
+        self.show_toast(format!("已固定书签 · {name}"), cx);
     }
 
     pub(super) fn open_bookmark(&mut self, bm: &PinnedBookmark, cx: &mut Context<Self>) {
@@ -208,6 +219,7 @@ impl IrisWindow {
                 self.catalog.active_source = ActiveSource::Local;
                 self.catalog.sidebar_mode = SidebarMode::Files;
                 self.sync_view_timer(cx);
+                self.notify_sidebar(cx);
                 self.open_path(path, cx);
             }
             MediaUri::Plugin {
@@ -360,6 +372,7 @@ impl IrisWindow {
             Err(error) => {
                 log::warn!("browse request rejected for {pid}: {error:?}");
                 self.rebuild_directory_rows();
+                self.notify_sidebar(cx);
                 self.show_error_toast(
                     format!(
                         "目录请求未能提交 · {}",
@@ -396,7 +409,16 @@ impl IrisWindow {
         }
         self.rebuild_directory_rows();
         self.ensure_filmstrip_thumbnails(cx);
-        cx.notify();
+        self.notify_regions(
+            DirtyRegions {
+                root: true,
+                sidebar: true,
+                viewport: true,
+                dock: true,
+                ..DirtyRegions::NONE
+            },
+            cx,
+        );
     }
 
     pub(super) fn manage_plugin_source(
@@ -424,8 +446,17 @@ impl IrisWindow {
                 action,
             },
         );
-        self.apply_poll_report(report, Some(window), cx);
-        cx.notify();
+        let regions = self
+            .apply_poll_report(report, Some(window), cx)
+            .union(DirtyRegions {
+                root: true,
+                sidebar: true,
+                settings: true,
+                viewport: true,
+                dock: true,
+                ..DirtyRegions::NONE
+            });
+        self.notify_regions(regions, cx);
     }
 
     pub(super) fn resolve_plugin_entry(
@@ -495,7 +526,15 @@ impl IrisWindow {
                 );
             }
         }
-        cx.notify();
+        self.notify_regions(
+            DirtyRegions {
+                root: true,
+                viewport: true,
+                dock: true,
+                ..DirtyRegions::NONE
+            },
+            cx,
+        );
     }
 
     pub(super) fn switch_stream_variant(&mut self, variant_id: &str, cx: &mut Context<Self>) {
@@ -573,7 +612,7 @@ impl IrisWindow {
             vp.loading_visible = true;
             vp.load_generation
         };
-        cx.notify();
+        self.notify_all(cx);
 
         let cancel = vfs::HttpCancel::default();
         let task = if req.kind != Kind::Photo {
@@ -628,7 +667,8 @@ impl IrisWindow {
                     }
                 }
                 this.active_mut().image.reset();
-                cx.notify();
+                this.sync_viewport_effects(cx);
+                this.notify_all(cx);
             });
         });
         self.catalog.remote_load = Some(RemoteLoad {

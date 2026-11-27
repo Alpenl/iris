@@ -19,7 +19,7 @@ crates/
 1. Cargo 依赖图强制隔离：`iris-net` 零领域依赖，`iris-core` 不依赖 GPUI、`iris-plugin-host`、`iris-api` 或 `wasmtime`，`iris-plugin-host` 不依赖 GPUI 或 `iris-mpv`；
 2. `iris-api` 常规依赖仅限 `serde`（不依赖 GPUI 或 `iris-mpv`）；
 3. `crates/iris/clippy.toml` 与 `crates/iris-core/clippy.toml` 通过 `disallowed-types` / `disallowed-methods` 强制约束 `iris_mpv::*` 与 `RenderHandle::new` / `Session::{render_handle, video_recovery}` 仅限视频层使用，全仓非测试生产代码禁止 `use super::*;`；
-4. `crates/iris/src/ui/` 禁止散落 `target_os` 条件编译；
+4. `crates/iris/src/ui/` 禁止散落 `target_os` 条件编译，且通用组件库 `crates/iris/src/ui/kit/` 禁止引用根窗口 `IrisWindow` 或业务宿主 `AppModel`；
 5. 全仓生产代码禁止直接调用 `std::thread::spawn` 或未登记的 `std::thread::Builder`，所有 OS 线程必须通过 `iris_net::concurrency::{spawn_thread, spawn_thread_named}` 按 `ThreadRole` 登记，且每个角色的线程名必须记录在本文第 6 节；
 6. `devtools` 控制管道门禁未被默认特性或普通发布版绕过；
 7. 全仓 `.rs` 模块行数预算（超过 650 行生产代码提示，生产代码上限 850 行、总行数上限 1,000 行），以及图标、官方嵌入插件摘要与示例插件清单一致性。
@@ -44,7 +44,7 @@ crates/
 - `crates/iris-core/src/photo/{mod,containers,heif,exif,icc}.rs`：魔数优先单遍照片头解析（JPEG/PNG/WebP/HEIF/TIFF 尺寸、方向、EXIF 摘要与内嵌 ICC 原色匹配）。
 - `crates/iris-core/src/{keymap/,vfs/,logging/,input,geometry,library,settings,fs_util}.rs`：三方案键位目录与结构化 `ConflictTarget`、常驻位置书签、单一集中脱敏日志与结构化事件流（`iris.log` + `events.jsonl`）、指针手势策略、几何变换与慢速共享盘优化扫描。
 - `crates/iris/src/video/{mod,mac,windows}.rs`：跨平台共享的 `VideoSurfaceBackend` trait（`attach`、`set_bounds`、`set_scale`、`set_visible`），在 macOS（`MacVideoSurface`）与 Windows（`WinVideoSurface`）上由编译器验证统一签名，并通过 `VideoSurface` 新类型对窗口层隐藏平台差异。
-- `crates/iris/src/theme.rs` + `ui/`：GPUI `Global` `ThemeTokens` 引擎与 Direction C 基础控件库（`ui/kit/`）、按领域归集的中文文案表（`ui/strings/`）、四模式统一侧栏、60fps 时间轴底栏、插件声明式工作台/叠层及 7 标签设置中心。
+- `crates/iris/src/theme.rs` + `ui/`：GPUI `Global` `ThemeTokens` 引擎、与根视图彻底解耦的通用控件库（`ui/kit/`，通过泛型 `Entity<V>` 与 `TextFieldHost` 组合，零 `IrisWindow`/`AppModel` 依赖）、按领域归集的中文文案表（`ui/strings/`），以及围绕 `AppModel` 领域宿主与 5 个独立区域 `Render` 实体（`Sidebar`、`PluginPanel`、`SettingsPanel`、`ViewportView`、`DockView`）构建的零副作用渲染树——窗口尺寸/焦点观察与字幕内边距同步均挂在观察器及帧后回调中，1–4Hz 播放进度与插件槽位变更经 `DirtyRegions` 局部通知对应子视图。
 - `crates/iris/src/instance.rs`：Windows 单实例，见第 9 节。macOS 由系统把打开请求发给已运行进程，经 GPUI `on_open_urls` 进来，只接受 `file://`。
 - `crates/iris/src/platform/{mod.rs,macos/{mod,imageio}.rs,windows.rs}`：按 OS 拆分的原生系统桥接——自实现窗口拖动、窗口置顶、播放期防休眠 `SleepPreventer`、macOS 触控板双指捏合 `PinchMonitor`、媒体键与系统播放中心桥接 `MediaKeyBridge`（macOS `MediaPlayer.framework` / Windows WinRT `SystemMediaTransportControls`，Windows 统一使用 `windows 0.61` 绑定）、默认截图目录与照片内存缩略图解码 `decode_thumbnail`。
 - `crates/iris/src/debug.rs`：调试控制管道（`IRIS_CONTROL`），见第 8 节。

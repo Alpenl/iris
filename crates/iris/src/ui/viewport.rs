@@ -16,8 +16,9 @@ use iris_core::library::Kind;
 use iris_core::player::{MediaStats, Session};
 use iris_core::settings::{Side, VideoWheel};
 
-use super::IrisWindow;
+use super::AppModel;
 use super::context_menu::{ContextMenu, ContextTarget};
+use super::views::{ViewportView, model_listener};
 use crate::platform;
 use crate::theme::{FLOAT_GAP, FONT_MONO, ThemeTokens};
 use crate::video::VideoSurface;
@@ -25,7 +26,24 @@ use crate::video::VideoSurface;
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub(super) struct VideoRect(pub(super) [f64; 4]);
 
-pub(super) struct Viewport {
+pub(in crate::ui) fn should_recover_after_gpu_reset(
+    reset_gen: u64,
+    current_gen: u64,
+    kind: Option<Kind>,
+    loaded: bool,
+    restored_vid: bool,
+) -> bool {
+    if reset_gen != current_gen {
+        return false;
+    }
+    match kind {
+        Some(Kind::Photo) => true,
+        Some(Kind::Video) if restored_vid && loaded => false,
+        _ => true,
+    }
+}
+
+pub(in crate::ui) struct Viewport {
     pub(super) session: Session,
     pub(super) video: Rc<RefCell<Option<VideoSurface>>>,
     pub(super) rect: Rc<Cell<Option<VideoRect>>>,
@@ -93,7 +111,7 @@ impl Drop for Viewport {
     }
 }
 
-impl IrisWindow {
+impl AppModel {
     pub(super) fn image_geometry(&self) -> ([f64; 2], [f64; 2]) {
         let rect = self.active().rect.get().map(|r| r.0).unwrap_or([0.; 4]);
         let (w, h) = self.active().session.display_size();
@@ -105,7 +123,7 @@ impl IrisWindow {
         viewport[0] > 0. && viewport[1] > 0. && media[0] > 0. && media[1] > 0.
     }
 
-    fn image_can_pan(&self) -> bool {
+    pub(super) fn image_can_pan(&self) -> bool {
         let (viewport, media) = self.image_geometry();
         if !self.image_geometry_ready() {
             return false;
@@ -115,12 +133,12 @@ impl IrisWindow {
     }
 
     pub(super) fn apply_image_view(&mut self, cx: &mut Context<Self>) {
-        let vp = self.active();
-        if let Err(e) = vp.session.transform(vp.image.zoom, vp.image.pan) {
+        let (zoom, pan) = (self.active().image.zoom, self.active().image.pan);
+        if let Err(e) = self.active_mut().session.transform(zoom, pan) {
             log::warn!("image transform failed: {e:#}");
             self.show_error_toast("画面缩放或平移失败", cx);
         }
-        cx.notify();
+        self.notify_viewport_and_dock(cx);
     }
 
     pub(super) fn zoom_at(
@@ -184,24 +202,27 @@ impl IrisWindow {
         }
         (!parts.is_empty()).then(|| parts.join(" · "))
     }
+}
 
-    pub(super) fn render_video_area(
-        &self,
-        fullscreen: bool,
+impl ViewportView {
+    pub(in crate::ui) fn render_viewport_entity(
+        &mut self,
         window: &Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let t = ThemeTokens::of(cx);
-        let vp = self.active();
+        let m = self.model.read(cx);
+        let vp = m.active();
         let last_rect = vp.rect.clone();
         let video = vp.video.clone();
-        let on_move = cx.listener(Self::on_root_mouse_move);
-        let on_up = cx.listener(Self::on_root_mouse_up);
-        let on_exit = cx.listener(|this, _: &gpui::MouseExitEvent, window, cx| {
+        let model_weak = self.model.downgrade();
+        let on_move = model_listener(&self.model, AppModel::on_root_mouse_move);
+        let on_up = model_listener(&self.model, AppModel::on_root_mouse_up);
+        let on_exit = model_listener(&self.model, |this, _: &gpui::MouseExitEvent, window, cx| {
             this.on_window_pointer_exit(window, cx);
         });
         let probe = canvas(
-            move |bounds, _, _| {
+            move |bounds, window, _| {
                 let r = VideoRect([
                     f32::from(bounds.origin.x) as f64,
                     f32::from(bounds.origin.y) as f64,
@@ -216,6 +237,10 @@ impl IrisWindow {
                     let [x, y, w, h] = r.0;
                     v.set_frame(x, y, w, h);
                 }
+                let weak = model_weak.clone();
+                window.on_next_frame(move |w, cx| {
+                    let _ = weak.update(cx, |this, cx| this.sync_window_and_viewport(w, cx));
+                });
             },
             move |_, _, window, _| {
                 // Scrims occlude sibling hitboxes and native drag release may be outside
@@ -242,19 +267,60 @@ impl IrisWindow {
 
         let session = &vp.session;
         let kind = session.kind();
-        let floating_dock = fullscreen || self.effective_floating_dock();
+        let fullscreen = m.chrome.fullscreen;
+        let chrome_visible = m.chrome.chrome_visible;
+        let chrome_shown = m.chrome_shown();
+        let floating_dock = fullscreen || m.effective_floating_dock();
         let dock_h = f32::from(t.dock_h);
         let has_media = session.current().is_some() || session.current_uri().is_some();
         let has_visual_surface =
             has_media && session.state().loaded && matches!(kind, Some(Kind::Video | Kind::Photo));
-        let is_photo_zoomed = kind == Some(Kind::Photo) && self.image_can_pan();
+        let is_photo_zoomed = kind == Some(Kind::Photo) && m.image_can_pan();
         let panning = vp.drag_origin.is_some();
+        let show_empty = !has_media && vp.pending_path.is_none() && !vp.loading_visible;
         let show_filmstrip = kind == Some(Kind::Photo)
-            && self.settings.photo_filmstrip
-            && (!fullscreen || self.chrome.chrome_visible)
+            && m.settings.photo_filmstrip
+            && (!fullscreen || chrome_visible)
             && session
                 .current()
-                .is_some_and(|cur| self.catalog.photo_paths.iter().any(|p| p == cur));
+                .is_some_and(|cur| m.catalog.photo_paths.iter().any(|p| p == cur));
+        let dir_side = m.settings.directory_side;
+        let info_open = m.overlays.info_open;
+        let dir_popup_open = m.overlays.dir_popup.is_open();
+        let focus = m.focus.clone();
+
+        let mut kc = KeyContext::default();
+        if m.has_blocking_overlay() || dir_popup_open || m.text_inputs.is_any_focused(window) {
+            kc.add("Overlay");
+        } else {
+            kc.add("Viewport");
+            kc.set(
+                "media",
+                match kind {
+                    Some(Kind::Photo) => "image",
+                    Some(Kind::Video) => "video",
+                    Some(Kind::Audio) => "audio",
+                    None => "none",
+                },
+            );
+            if vp.image.zoomed() {
+                kc.add("zoomed");
+            }
+        }
+
+        let fs_chip_data = (fullscreen && chrome_visible)
+            .then(|| {
+                let name = session
+                    .current()
+                    .and_then(|p| p.file_name())
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .or_else(|| session.current_title().map(str::to_string))?;
+                Some((name, m.media_info()))
+            })
+            .flatten();
+        let dock_bounds_slot = m.chrome.probes.dock_bounds.clone();
+        let audio_card =
+            (kind == Some(Kind::Audio)).then(|| super::viewport_cards::render_audio_card(m, t));
 
         div()
             .id("video")
@@ -264,76 +330,57 @@ impl IrisWindow {
             .w_full()
             .overflow_hidden()
             .when(!has_visual_surface, |d| d.bg(t.window_bg))
-            .when(self.chrome_shown() && is_photo_zoomed && panning, |d| {
+            .when(chrome_shown && is_photo_zoomed && panning, |d| {
                 d.cursor(CursorStyle::ClosedHand)
             })
-            .when(self.chrome_shown() && is_photo_zoomed && !panning, |d| {
+            .when(chrome_shown && is_photo_zoomed && !panning, |d| {
                 d.cursor(CursorStyle::OpenHand)
             })
             .child(probe)
-            .key_context({
-                let mut kc = KeyContext::default();
-                if self.has_blocking_overlay()
-                    || self.overlays.dir_popup.is_open()
-                    || self.text_inputs.is_any_focused(window)
-                {
-                    kc.add("Overlay");
-                } else {
-                    kc.add("Viewport");
-                    kc.set(
-                        "media",
-                        match kind {
-                            Some(Kind::Photo) => "image",
-                            Some(Kind::Video) => "video",
-                            Some(Kind::Audio) => "audio",
-                            None => "none",
-                        },
-                    );
-                    if vp.image.zoomed() {
-                        kc.add("zoomed");
+            .key_context(kc)
+            .track_focus(&focus)
+            .on_scroll_wheel(model_listener(
+                &self.model,
+                |this, ev: &gpui::ScrollWheelEvent, _, cx| {
+                    let raw_y = f32::from(ev.delta.pixel_delta(px(20.)).y) as f64;
+                    if raw_y == 0. {
+                        return;
                     }
-                }
-                kc
-            })
-            .track_focus(&self.focus)
-            .on_scroll_wheel(cx.listener(|this, ev: &gpui::ScrollWheelEvent, _, cx| {
-                let raw_y = f32::from(ev.delta.pixel_delta(px(20.)).y) as f64;
-                if raw_y == 0. {
-                    return;
-                }
-                match input::resolve_pointer_input(
-                    PointerInput::Wheel(raw_y / 240.),
-                    this.input_context(),
-                ) {
-                    Some(PointerCommand::Zoom(delta)) => {
-                        let scale = if ev.delta.precise() { 0.45 } else { 1.0 };
-                        this.zoom_at(delta * scale, Some(ev.position), cx);
-                        cx.stop_propagation();
-                    }
-                    Some(PointerCommand::VolumeBy(_)) => {
-                        let delta = this.damped_volume_delta(ev);
-                        if delta.abs() >= 0.5 {
-                            this.adjust_volume_by(delta, cx);
+                    match input::resolve_pointer_input(
+                        PointerInput::Wheel(raw_y / 240.),
+                        this.input_context(),
+                    ) {
+                        Some(PointerCommand::Zoom(delta)) => {
+                            let scale = if ev.delta.precise() { 0.45 } else { 1.0 };
+                            this.zoom_at(delta * scale, Some(ev.position), cx);
+                            cx.stop_propagation();
                         }
-                        cx.stop_propagation();
+                        Some(PointerCommand::VolumeBy(_)) => {
+                            let delta = this.damped_volume_delta(ev);
+                            if delta.abs() >= 0.5 {
+                                this.adjust_volume_by(delta, cx);
+                            }
+                            cx.stop_propagation();
+                        }
+                        _ => {}
                     }
-                    _ => {}
-                }
-            }))
+                },
+            ))
             .on_mouse_down(
                 MouseButton::Right,
-                cx.listener(|this, ev: &MouseDownEvent, _, cx| {
+                model_listener(&self.model, |this, ev: &MouseDownEvent, window, cx| {
                     this.overlays.open_context_menu(ContextMenu {
                         pos: ev.position,
                         target: ContextTarget::Viewport,
                     });
+                    this.reconcile_input_focus(window, cx);
                     cx.stop_propagation();
-                    cx.notify();
+                    this.notify_all(cx);
                 }),
             )
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(|this, ev: &MouseDownEvent, window, cx| {
+                model_listener(&self.model, |this, ev: &MouseDownEvent, window, cx| {
                     if !this.chrome.fullscreen && (ev.modifiers.alt || ev.modifiers.secondary()) {
                         this.chrome.scrub.click_seq += 1;
                         let vp = this.active_mut();
@@ -374,7 +421,7 @@ impl IrisWindow {
                         input::resolve_pointer_input(PointerInput::BeginDrag, ctx)
                     {
                         this.active_mut().drag_origin = Some(ev.position);
-                        cx.notify();
+                        this.notify_viewport(cx);
                     } else if let Some(PointerCommand::TogglePlayback) =
                         input::resolve_pointer_input(PointerInput::SingleClick, ctx)
                     {
@@ -383,67 +430,78 @@ impl IrisWindow {
                 }),
             )
             // Layer 0: media surface fallbacks (audio card / empty state)
-            .when(kind == Some(Kind::Audio), |d| {
-                d.child(self.render_audio_card(t))
+            .children(audio_card)
+            .when(show_empty, |d| {
+                d.child(super::viewport_cards::render_empty_state(
+                    &self.model,
+                    t,
+                    cx,
+                ))
             })
-            .when(
-                !has_media && vp.pending_path.is_none() && !vp.loading_visible,
-                |d| d.child(self.render_empty_state(t, cx)),
-            )
             // Layer 1: viewport overlays & floating chrome (media-normalized coords)
-            .children(self.render_plugin_overlay(cx))
-            .children(self.render_timed_overlay(cx))
-            .when(fullscreen && self.chrome.chrome_visible, |d| {
-                let name = session
-                    .current()
-                    .and_then(|p| p.file_name())
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .or_else(|| session.current_title().map(str::to_string));
-                d.when_some(name, |d, name| {
-                    let chip = div()
-                        .absolute()
-                        .top(px(FLOAT_GAP))
-                        .max_w(px(520.))
-                        .h(t.control_h_md)
-                        .px(px(10.))
-                        .flex()
-                        .items_center()
-                        .gap(px(10.))
-                        .rounded(t.radius_lg)
-                        .bg(t.overlay)
-                        .border_1()
-                        .border_color(t.line)
-                        .child(
+            .children(super::plugin_ui::overlay::render_plugin_overlay(
+                &self.model,
+                cx,
+            ))
+            .children(super::plugin_runtime::overlay::render_timed_overlay(
+                &self.model,
+                window,
+                cx,
+            ))
+            .when_some(fs_chip_data, |d, (name, info)| {
+                let chip = div()
+                    .absolute()
+                    .top(px(FLOAT_GAP))
+                    .max_w(px(520.))
+                    .h(t.control_h_md)
+                    .px(px(10.))
+                    .flex()
+                    .items_center()
+                    .gap(px(10.))
+                    .rounded(t.radius_lg)
+                    .bg(t.overlay)
+                    .border_1()
+                    .border_color(t.line)
+                    .child(
+                        div()
+                            .min_w(px(0.))
+                            .truncate()
+                            .text_size(t.text_md)
+                            .child(name),
+                    )
+                    .when_some(info, |d, info| {
+                        d.child(
                             div()
-                                .min_w(px(0.))
-                                .truncate()
-                                .text_size(t.text_md)
-                                .child(name),
+                                .flex_none()
+                                .font_family(FONT_MONO)
+                                .text_size(t.text_sm)
+                                .text_color(t.text_dim)
+                                .child(info),
                         )
-                        .when_some(self.media_info(), |d, info| {
-                            d.child(
-                                div()
-                                    .flex_none()
-                                    .font_family(FONT_MONO)
-                                    .text_size(t.text_sm)
-                                    .text_color(t.text_dim)
-                                    .child(info),
-                            )
-                        });
-                    d.child(if self.settings.directory_side == Side::Left {
-                        chip.right(px(FLOAT_GAP))
-                    } else {
-                        chip.left(px(FLOAT_GAP))
-                    })
+                    });
+                d.child(if dir_side == Side::Left {
+                    chip.right(px(FLOAT_GAP))
+                } else {
+                    chip.left(px(FLOAT_GAP))
                 })
             })
-            .when(self.overlays.info_open && has_media, |d| {
-                d.child(self.render_info_overlay(fullscreen, window, cx))
+            .when(info_open && has_media, |d| {
+                d.child(super::info::render_info_overlay(
+                    &self.model,
+                    fullscreen,
+                    window,
+                    cx,
+                ))
             })
             .when(show_filmstrip, |d| {
-                d.children(self.render_photo_filmstrip(fullscreen, t, cx))
+                d.children(super::viewport_cards::render_photo_filmstrip(
+                    &self.model,
+                    fullscreen,
+                    t,
+                    cx,
+                ))
             })
-            .when(fullscreen && self.overlays.dir_popup.is_open(), |d| {
+            .when(fullscreen && dir_popup_open, |d| {
                 let popup = div()
                     .absolute()
                     .top_0()
@@ -451,15 +509,15 @@ impl IrisWindow {
                     .overflow_hidden()
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
-                    .child(self.render_sidebar(true, window, cx));
-                d.child(if self.settings.directory_side == Side::Left {
+                    .child(self.floating_sidebar.clone());
+                d.child(if dir_side == Side::Left {
                     popup.left_0()
                 } else {
                     popup.right_0()
                 })
             })
-            .when(floating_dock && self.chrome.chrome_visible, |d| {
-                let slot = self.chrome.probes.dock_bounds.clone();
+            .when(floating_dock && chrome_visible, |d| {
+                let slot = dock_bounds_slot;
                 let seam = matches!(kind, Some(Kind::Video | Kind::Audio));
                 d.child(
                     div()
@@ -478,7 +536,7 @@ impl IrisWindow {
                                 .absolute()
                                 .size_full(),
                         )
-                        .child(self.render_dock(true, window, cx)),
+                        .child(self.floating_dock.clone()),
                 )
             })
     }

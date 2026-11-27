@@ -10,7 +10,7 @@ use iris_core::catalog::{
 use iris_core::library::{self, FolderEntry, Kind};
 use iris_core::media_uri::MediaUri;
 
-use super::super::IrisWindow;
+use super::super::AppModel;
 use super::super::state::ActiveSource;
 use super::DirRow;
 
@@ -61,7 +61,7 @@ fn fav_uri_to_catalog_item((uri, known_title): (MediaUri, Option<String>)) -> Ca
     }
 }
 
-impl IrisWindow {
+impl AppModel {
     pub(in crate::ui) fn submit_directory_search(&mut self, cx: &mut Context<Self>) {
         if let ActiveSource::Plugin(ps) = &self.catalog.active_source
             && ps.supports_search
@@ -77,7 +77,7 @@ impl IrisWindow {
             self.browse_plugin_source(&pid, &sid, fid, None, q, cx);
         } else {
             self.filter_directory_rows();
-            cx.notify();
+            self.notify_sidebar(cx);
         }
     }
 
@@ -176,7 +176,7 @@ impl IrisWindow {
                 this.catalog.favorite_items = items;
                 if this.catalog.filter == MediaFilter::FavoritesOnly {
                     this.filter_directory_rows();
-                    cx.notify();
+                    this.notify_sidebar(cx);
                 }
             });
         }));
@@ -227,8 +227,6 @@ impl IrisWindow {
                 }
             }
         }
-        // Media-open completion also rebuilds these rows, so the counter is
-        // refreshed on both catalog changes and changes to the current item.
         let current = self.active().session.current_media_uri();
         let (mut playable_count, mut current_playable_number) = (0, None);
         rows.extend(filtered.iter().map(|item| {

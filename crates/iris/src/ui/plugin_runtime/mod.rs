@@ -1,16 +1,18 @@
 //! Window-owned presentation of scoped plugin results and host consent.
-mod annotations;
+pub(in crate::ui) mod annotations;
 mod consent;
+pub(in crate::ui) use consent::render_host_consent;
 mod enhance;
 mod notices;
 pub(in crate::ui) use notices::describe_error_code;
-mod overlay;
+pub(in crate::ui) mod overlay;
 pub(in crate::ui) mod sources;
 pub(in crate::ui) use sources::remote_search_query;
 mod thumbnails;
-mod timeline;
-use super::IrisWindow;
+pub(in crate::ui) mod timeline;
+use super::AppModel;
 use super::kit::text_buffer::TextInputBuffers;
+use super::views::DirtyRegions;
 use crate::assets::Icon;
 use gpui::{Context, SharedString, Window};
 use iris_api::v2::{Capability, ErrorCode, Generation, Id, source::PlaylistEntry};
@@ -126,6 +128,7 @@ pub(super) struct PluginView {
     thumbnails: thumbnails::Thumbnails,
     enhance: enhance::EnhancementView,
 }
+
 impl PluginView {
     pub fn new(deferred: Vec<(String, String)>) -> Self {
         Self {
@@ -153,7 +156,8 @@ impl PluginView {
         }
     }
 }
-impl IrisWindow {
+
+impl AppModel {
     pub(in crate::ui) fn plugin_source_icon(&self, plugin_id: &str, source_id: &str) -> Icon {
         let sources = self.plugins.media_sources();
         let exact = sources
@@ -194,9 +198,11 @@ impl IrisWindow {
         }
         "插件源".into()
     }
+
     pub(super) fn plugin_media_id(&self) -> Id {
         self.plugins.generation().media
     }
+
     pub(in crate::ui) fn plugin_source_entries<'a>(
         &'a self,
         source_id: &'a str,
@@ -207,11 +213,13 @@ impl IrisWindow {
             .filter(move |p| p.page.source_id == source_id)
             .flat_map(|p| &p.page.entries)
     }
+
     pub(in crate::ui) fn restore_modal_focus_if_unblocked(&mut self) {
         if !self.has_host_consent() && self.plugins.active_modal().is_some() {
             self.plugin_view.modal.focus_pending = true;
         }
     }
+
     pub(in crate::ui) fn bind_plugin_current_file(&self) {
         let path = self
             .active()
@@ -228,6 +236,7 @@ impl IrisWindow {
             }
         }
     }
+
     pub(in crate::ui) fn precheck_plugin_capability(
         &self,
         plugin_id: &str,
@@ -262,6 +271,7 @@ impl IrisWindow {
         }
         Ok(())
     }
+
     pub(super) fn close_plugin_browse(&mut self) {
         if let Some((plugin, view)) = self.plugin_view.view.take() {
             let _ = self.plugins.client().close_view(&plugin, view);
@@ -273,6 +283,7 @@ impl IrisWindow {
         self.plugin_view.filter_values.clear();
         self.plugin_view.thumbnails = thumbnails::Thumbnails::default();
     }
+
     pub(super) fn advance_plugin_media(&mut self, cx: &mut Context<Self>) -> bool {
         self.plugin_view.enhance.annotations.selections.clear();
         std::mem::take(&mut self.plugin_view.enhance.annotations.cancel).cancel();
@@ -334,6 +345,7 @@ impl IrisWindow {
             }
         }
     }
+
     pub(super) fn advance_plugin_seek(&mut self, cx: &mut Context<Self>) {
         // Playback seeking does not revoke unrelated directory, configuration
         // or login work in ControlStore. StreamSession owns its read epoch;
@@ -373,6 +385,7 @@ impl IrisWindow {
             }
         }
     }
+
     pub(super) fn reconcile_plugin_lifetimes(&mut self, cx: &mut Context<Self>) {
         self.reconcile_enhancements(cx);
         if self
@@ -394,6 +407,7 @@ impl IrisWindow {
             self.close_plugin_browse();
             self.catalog.active_source = super::state::ActiveSource::Local;
             self.rebuild_directory_rows();
+            self.notify_sidebar(cx);
         }
         if let Some(pid) = self
             .catalog
@@ -426,7 +440,7 @@ impl IrisWindow {
             self.plugin_view.consent_busy.remove(&review.id);
             self.restore_modal_focus_if_unblocked();
             self.sync_view_timer(cx);
-            cx.notify();
+            self.notify_root(cx);
         }
         if self
             .plugin_view
@@ -439,9 +453,10 @@ impl IrisWindow {
             }
             self.restore_modal_focus_if_unblocked();
             self.sync_view_timer(cx);
-            cx.notify();
+            self.notify_root(cx);
         }
     }
+
     pub(super) fn run_deferred_plugin_commands(
         &mut self,
         window: &mut Window,
@@ -464,13 +479,17 @@ impl IrisWindow {
             }
         }
     }
-    pub(super) fn announce_plugin_media_if_loaded(&mut self, cx: &mut Context<Self>) -> bool {
+
+    pub(super) fn announce_plugin_media_if_loaded(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> DirtyRegions {
         if !self.active().session.state().loaded {
-            return false;
+            return DirtyRegions::NONE;
         }
         let media = self.plugin_media_id();
         if self.plugin_view.enhance.media_announced == Some(media) {
-            return false;
+            return DirtyRegions::NONE;
         }
         self.plugin_view.enhance.media_announced = Some(media);
         let snap = self.plugin_snapshot();
@@ -483,6 +502,7 @@ impl IrisWindow {
             cx,
         )
     }
+
     fn desired_view_timers(&self) -> BTreeMap<ViewTimerSlot, (String, u32)> {
         let panels = self.plugins.sidebar_panels();
         collect_view_timer_targets(
@@ -492,6 +512,7 @@ impl IrisWindow {
             &panels,
         )
     }
+
     pub(super) fn sync_view_timer(&mut self, cx: &mut Context<Self>) {
         let desired = self.desired_view_timers();
         self.plugin_view
@@ -528,8 +549,9 @@ impl IrisWindow {
                                     snapshot: Some(snap),
                                 },
                             );
-                            if this.apply_poll_report(report, None, cx) {
-                                cx.notify();
+                            let regions = this.apply_poll_report(report, None, cx);
+                            if regions.any() {
+                                this.notify_regions(regions, cx);
                             }
                             true
                         })

@@ -3,22 +3,23 @@
 //! `media_sources()`, pinned bookmarks, and plugin commands using `kit::text_field`.
 
 use gpui::{
-    Context, InteractiveElement, IntoElement, MouseButton, ParentElement,
+    App, Context, Entity, InteractiveElement, IntoElement, MouseButton, ParentElement,
     StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder, px,
 };
 use iris_core::keymap;
 use iris_core::preset::{PresetCaptureScope, SidebarMode};
 use iris_core::vfs::PinnedBookmark;
 
-use super::IrisWindow;
+use super::AppModel;
 use super::actions::{ClearAbLoop, CycleAbLoop};
 use super::actions::{
     CycleAspect, CyclePreset, OpenFile, RefreshDirectory, RotateCw, TakeScreenshot,
     ToggleDirectory, ToggleInfo, ToggleLoop, ToggleMute, TogglePause, ToggleSearch,
 };
 use super::kit::badge_pill;
-use super::kit::text_field::{TextFieldKind, TextFieldSpec};
+use super::kit::text_field::{TextFieldKind, TextFieldSpec, render_text_field};
 use super::state::{BuiltinDialog, SettingsTab};
+use super::views::{DirtyRegions, model_listener};
 use crate::assets::Icon;
 use crate::platform::IS_MACOS;
 use crate::theme::{BUILTIN_THEMES, FONT_MONO, ThemeTokens};
@@ -56,7 +57,7 @@ fn palette_selected_index(palette_index: usize, entry_count: usize) -> Option<us
     (entry_count > 0).then(|| palette_index.min(entry_count - 1))
 }
 
-impl IrisWindow {
+impl AppModel {
     fn palette_entries(&self) -> Vec<PaletteEntry> {
         use super::strings::{actions::action_title, chrome};
         let live_key = |id: &str| self.key_hint(id).map(|s| s.to_string());
@@ -332,7 +333,7 @@ impl IrisWindow {
         let next = (cur as isize + delta).rem_euclid(len as isize) as usize;
         self.overlays.palette_index = next;
         self.overlays.palette_scroll.scroll_to_item(next);
-        cx.notify();
+        self.notify_root(cx);
     }
 
     pub(in crate::ui) fn execute_palette_selected(
@@ -358,6 +359,14 @@ impl IrisWindow {
         self.overlays.palette_open = false;
         self.text_inputs.palette_input.clear();
         self.focus.focus(window);
+        self.notify_regions(
+            DirtyRegions {
+                root: true,
+                dock: true,
+                ..DirtyRegions::NONE
+            },
+            cx,
+        );
 
         match target {
             PaletteTarget::Host(id) => match id {
@@ -386,15 +395,39 @@ impl IrisWindow {
                 "cycle_preset" => self.cycle_preset_action(&CyclePreset, window, cx),
                 "settings" => {
                     self.overlays.open_settings(None);
-                    cx.notify();
+                    self.notify_regions(
+                        DirtyRegions {
+                            root: true,
+                            settings: true,
+                            dock: true,
+                            ..DirtyRegions::NONE
+                        },
+                        cx,
+                    );
                 }
                 "shortcuts" => {
                     self.overlays.open_settings(Some(SettingsTab::Shortcuts));
-                    cx.notify();
+                    self.notify_regions(
+                        DirtyRegions {
+                            root: true,
+                            settings: true,
+                            dock: true,
+                            ..DirtyRegions::NONE
+                        },
+                        cx,
+                    );
                 }
                 "plugins" => {
                     self.overlays.open_settings(Some(SettingsTab::Plugins));
-                    cx.notify();
+                    self.notify_regions(
+                        DirtyRegions {
+                            root: true,
+                            settings: true,
+                            dock: true,
+                            ..DirtyRegions::NONE
+                        },
+                        cx,
+                    );
                 }
                 _ => {}
             },
@@ -411,7 +444,7 @@ impl IrisWindow {
                 self.settings.theme_id = id.to_string();
                 self.persist_user_settings();
                 self.sync_theme_tokens(cx);
-                cx.notify();
+                self.notify_all(cx);
             }
             PaletteTarget::OpenUrl => {
                 self.open_builtin_dialog(BuiltinDialog::OpenUrl, window, cx);
@@ -432,162 +465,172 @@ impl IrisWindow {
             }
         }
     }
+}
 
-    pub(super) fn render_command_palette(
-        &self,
-        window: &Window,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let t = ThemeTokens::of(cx);
-        let entries = self.palette_entries();
-        let active_ix = palette_selected_index(self.overlays.palette_index, entries.len());
-        let viewport = window.viewport_size();
-        let margin = 12.;
-        let top = (f32::from(viewport.height) * 0.1).clamp(margin, 64.);
-        let width = (f32::from(viewport.width) - 2. * margin).clamp(0., 540.);
-        let height = (f32::from(viewport.height) - top - margin).clamp(0., 420.);
+pub(super) fn render_command_palette(
+    model: &Entity<AppModel>,
+    window: &Window,
+    cx: &App,
+) -> impl IntoElement {
+    let m = model.read(cx);
+    let t = ThemeTokens::of(cx);
+    let entries = m.palette_entries();
+    let active_ix = palette_selected_index(m.overlays.palette_index, entries.len());
+    let scroll_handle = m.overlays.palette_scroll.clone();
+    let viewport = window.viewport_size();
+    let margin = 12.;
+    let top = (f32::from(viewport.height) * 0.1).clamp(margin, 64.);
+    let width = (f32::from(viewport.width) - 2. * margin).clamp(0., 540.);
+    let height = (f32::from(viewport.height) - top - margin).clamp(0., 420.);
 
-        div()
-            .id("palette-backdrop")
-            .absolute()
-            .inset_0()
-            .flex()
-            .justify_center()
-            .pt(px(top))
-            .bg(t.scrim)
-            .occlude()
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _, w, cx| {
-                    this.overlays.palette_open = false;
-                    this.text_inputs.palette_input.clear();
-                    this.focus.focus(w);
-                    cx.stop_propagation();
-                    cx.notify();
-                }),
-            )
-            .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
-            .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
-            .child(
-                div()
-                    .id("palette-box")
-                    .w(px(width))
-                    .max_h(px(height))
-                    .flex()
-                    .flex_col()
-                    .rounded(t.radius_lg)
-                    .overflow_hidden()
-                    .bg(t.panel)
-                    .border_1()
-                    .border_color(t.line_strong)
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
-                    .child(
-                        div()
-                            .flex_none()
-                            .min_h(px((f32::from(t.control_h_md) + 12.).max(40.)))
-                            .px(px(6.))
-                            .py(px(3.))
-                            .flex()
-                            .items_center()
-                            .bg(t.window_bg)
-                            .border_b_1()
-                            .border_color(t.line)
-                            .child(self.render_text_field(
-                                TextFieldSpec {
-                                    id: "palette-search".into(),
-                                    kind: TextFieldKind::Palette,
-                                    placeholder: "输入命令、工作区预设、数据源或插件动作…".into(),
-                                    height: px((f32::from(t.control_h_md) + 6.).max(34.)),
-                                    leading_icon: Some(Icon::Command),
-                                    borderless: true,
-                                },
-                                Some(window),
-                                cx,
-                            )),
-                    )
-                    .child(
-                        div()
-                            .id("palette-list")
-                            .flex_1()
-                            .min_h(px(0.))
-                            .overflow_y_scroll()
-                            .track_scroll(&self.overlays.palette_scroll)
-                            .p(px(6.))
-                            .flex()
-                            .flex_col()
-                            .when(entries.is_empty(), |d| {
-                                d.child(
-                                    div()
-                                        .p(px(14.))
-                                        .text_size(t.text_md)
-                                        .text_color(t.text_faint)
-                                        .child("没有匹配的命令"),
-                                )
-                            })
-                            .children(entries.into_iter().enumerate().map(|(ix, entry)| {
-                                let selected = Some(ix) == active_ix;
-                                let target = entry.target;
+    div()
+        .id("palette-backdrop")
+        .absolute()
+        .inset_0()
+        .flex()
+        .justify_center()
+        .pt(px(top))
+        .bg(t.scrim)
+        .occlude()
+        .on_mouse_down(
+            MouseButton::Left,
+            model_listener(model, |this, _, w, cx| {
+                this.overlays.palette_open = false;
+                this.text_inputs.palette_input.clear();
+                this.focus.focus(w);
+                cx.stop_propagation();
+                this.notify_regions(
+                    DirtyRegions {
+                        root: true,
+                        dock: true,
+                        ..DirtyRegions::NONE
+                    },
+                    cx,
+                );
+            }),
+        )
+        .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
+        .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+        .child(
+            div()
+                .id("palette-box")
+                .w(px(width))
+                .max_h(px(height))
+                .flex()
+                .flex_col()
+                .rounded(t.radius_lg)
+                .overflow_hidden()
+                .bg(t.panel)
+                .border_1()
+                .border_color(t.line_strong)
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
+                .child(
+                    div()
+                        .flex_none()
+                        .min_h(px((f32::from(t.control_h_md) + 12.).max(40.)))
+                        .px(px(6.))
+                        .py(px(3.))
+                        .flex()
+                        .items_center()
+                        .bg(t.window_bg)
+                        .border_b_1()
+                        .border_color(t.line)
+                        .child(render_text_field(
+                            model,
+                            TextFieldSpec {
+                                id: "palette-search".into(),
+                                kind: TextFieldKind::Palette,
+                                placeholder: "输入命令、工作区预设、数据源或插件动作…".into(),
+                                height: px((f32::from(t.control_h_md) + 6.).max(34.)),
+                                leading_icon: Some(Icon::Command),
+                                borderless: true,
+                            },
+                            Some(window),
+                            cx,
+                        )),
+                )
+                .child(
+                    div()
+                        .id("palette-list")
+                        .flex_1()
+                        .min_h(px(0.))
+                        .overflow_y_scroll()
+                        .track_scroll(&scroll_handle)
+                        .p(px(6.))
+                        .flex()
+                        .flex_col()
+                        .when(entries.is_empty(), |d| {
+                            d.child(
                                 div()
-                                    .id(("pal-row", ix))
-                                    .px(px(10.))
-                                    .py(px(7.))
-                                    .flex()
-                                    .items_center()
-                                    .justify_between()
-                                    .gap(px(10.))
-                                    .rounded(t.radius_sm)
-                                    .cursor_pointer()
-                                    .when(selected, |d| d.bg(t.selected))
-                                    .when(!selected, |d| d.hover(|s| s.bg(t.hover)))
-                                    .on_click(cx.listener(move |this, _, w, cx| {
-                                        this.run_palette_target(target.clone(), w, cx);
-                                    }))
-                                    .child(
-                                        div()
-                                            .flex_1()
-                                            .min_w(px(0.))
-                                            .flex()
-                                            .flex_col()
-                                            .gap(px(2.))
-                                            .child(
+                                    .p(px(14.))
+                                    .text_size(t.text_md)
+                                    .text_color(t.text_faint)
+                                    .child("没有匹配的命令"),
+                            )
+                        })
+                        .children(entries.into_iter().enumerate().map(|(ix, entry)| {
+                            let selected = Some(ix) == active_ix;
+                            let target = entry.target;
+                            div()
+                                .id(("pal-row", ix))
+                                .px(px(10.))
+                                .py(px(7.))
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .gap(px(10.))
+                                .rounded(t.radius_sm)
+                                .cursor_pointer()
+                                .when(selected, |d| d.bg(t.selected))
+                                .when(!selected, |d| d.hover(|s| s.bg(t.hover)))
+                                .on_click(model_listener(model, move |this, _, w, cx| {
+                                    this.run_palette_target(target.clone(), w, cx);
+                                }))
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w(px(0.))
+                                        .flex()
+                                        .flex_col()
+                                        .gap(px(2.))
+                                        .child(
+                                            div()
+                                                .truncate()
+                                                .text_size(t.text_md)
+                                                .text_color(t.text)
+                                                .child(entry.title),
+                                        )
+                                        .when_some(entry.subtitle, |d, sub| {
+                                            d.child(
                                                 div()
                                                     .truncate()
-                                                    .text_size(t.text_md)
-                                                    .text_color(t.text)
-                                                    .child(entry.title),
+                                                    .text_size(t.text_xs)
+                                                    .text_color(t.text_dim)
+                                                    .child(sub),
                                             )
-                                            .when_some(entry.subtitle, |d, sub| {
-                                                d.child(
-                                                    div()
-                                                        .truncate()
-                                                        .text_size(t.text_xs)
-                                                        .text_color(t.text_dim)
-                                                        .child(sub),
-                                                )
-                                            }),
-                                    )
-                                    .child(
-                                        div()
-                                            .flex_none()
-                                            .flex()
-                                            .items_center()
-                                            .gap(px(6.))
-                                            .child(badge_pill(entry.badge, selected, t))
-                                            .when_some(entry.shortcut, |d, key| {
-                                                d.child(
-                                                    div()
-                                                        .font_family(FONT_MONO)
-                                                        .text_size(t.text_xs)
-                                                        .text_color(t.text_dim)
-                                                        .child(key),
-                                                )
-                                            }),
-                                    )
-                            })),
-                    ),
-            )
-    }
+                                        }),
+                                )
+                                .child(
+                                    div()
+                                        .flex_none()
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(6.))
+                                        .child(badge_pill(entry.badge, selected, t))
+                                        .when_some(entry.shortcut, |d, key| {
+                                            d.child(
+                                                div()
+                                                    .font_family(FONT_MONO)
+                                                    .text_size(t.text_xs)
+                                                    .text_color(t.text_dim)
+                                                    .child(key),
+                                            )
+                                        }),
+                                )
+                        })),
+                ),
+        )
 }
 
 #[cfg(test)]

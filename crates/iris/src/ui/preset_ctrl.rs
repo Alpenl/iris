@@ -7,12 +7,13 @@ use iris_core::library::{SortBy, SortOrder};
 use iris_core::player::Command;
 use iris_core::preset::{PresetCaptureScope, PresetLayout, PresetManager, SidebarMode};
 
-use super::IrisWindow;
+use super::AppModel;
 use super::chrome::DirectoryPopup;
+use super::views::DirtyRegions;
 use crate::platform;
 use crate::theme::ThemeTokens;
 
-impl IrisWindow {
+impl AppModel {
     pub(super) fn sync_theme_tokens(&mut self, cx: &mut Context<Self>) {
         let desired = self
             .settings
@@ -103,7 +104,7 @@ impl IrisWindow {
             self.cleanup_plugin_playback(Some(&pid), None);
             let snap = self.plugin_snapshot();
             let report = self.plugins.set_enabled_with_snapshot(&pid, false, snap);
-            self.apply_poll_report(report, Some(window), cx);
+            let _ = self.apply_poll_report(report, Some(window), cx);
         }
         while let Some((plugin, _)) = self.plugins.active_modal() {
             let plugin = plugin.to_owned();
@@ -120,22 +121,38 @@ impl IrisWindow {
         self.settings.hidden_dock_buttons.clear();
         self.persist_user_settings();
         self.sync_theme_tokens(cx);
+        self.sync_viewport_effects(cx);
+        self.notify_all(cx);
         self.show_toast("已恢复默认石墨外观", cx);
     }
 
     pub(super) fn set_sidebar_mode(&mut self, mode: SidebarMode, cx: &mut Context<Self>) {
+        let mut opened_sidebar = false;
         self.catalog.sidebar_mode = mode;
         if !self.chrome.fullscreen {
             if !self.settings.directory_open {
                 self.settings.directory_open = true;
                 self.persist_user_settings();
+                opened_sidebar = true;
             }
         } else {
             self.overlays.dir_popup = DirectoryPopup::Manual;
             self.bump_activity(cx);
+            opened_sidebar = true;
         }
         self.sync_view_timer(cx);
-        cx.notify();
+        if opened_sidebar {
+            self.notify_all(cx);
+        } else {
+            self.notify_regions(
+                DirtyRegions {
+                    sidebar: true,
+                    plugin_panel: mode == SidebarMode::Plugins,
+                    ..DirtyRegions::NONE
+                },
+                cx,
+            );
+        }
     }
 
     fn current_preset_layout(&self, window: &Window) -> PresetLayout {
@@ -178,7 +195,7 @@ impl IrisWindow {
                     snapshot: Some(snap),
                 },
             );
-            self.apply_poll_report(report, Some(window), cx);
+            let _ = self.apply_poll_report(report, Some(window), cx);
         }
 
         if prev_disabled != self.settings.disabled_plugins {
@@ -194,7 +211,7 @@ impl IrisWindow {
                 }
                 let snap = self.plugin_snapshot();
                 let report = self.plugins.set_enabled_with_snapshot(&pid, enable, snap);
-                self.apply_poll_report(report, Some(window), cx);
+                let _ = self.apply_poll_report(report, Some(window), cx);
             }
             self.reconcile_active_source();
         }
@@ -228,6 +245,8 @@ impl IrisWindow {
         self.sync_theme_tokens(cx);
         self.ensure_filmstrip_thumbnails(cx);
         self.overlays.popover = None;
+        self.sync_viewport_effects(cx);
+        self.notify_all(cx);
         self.show_toast(format!("已切换预设 · {preset_name}"), cx);
     }
 
@@ -288,6 +307,14 @@ impl IrisWindow {
                 self.preset_rt
                     .sync_updated_active_preset(&updated, &self.settings);
             }
+            self.notify_regions(
+                DirtyRegions {
+                    root: true,
+                    settings: true,
+                    ..DirtyRegions::NONE
+                },
+                cx,
+            );
             self.show_toast("已将当前状态更新至预设", cx);
         } else {
             self.show_toast("内置预设不可直接覆盖，请另存为新预设", cx);
@@ -308,6 +335,16 @@ impl IrisWindow {
         self.persist_user_settings();
         self.rebuild_directory_rows();
         self.ensure_filmstrip_thumbnails(cx);
+        self.notify_regions(
+            DirtyRegions {
+                sidebar: true,
+                settings: true,
+                viewport: true,
+                dock: true,
+                ..DirtyRegions::NONE
+            },
+            cx,
+        );
         let by_str = match next_by {
             SortBy::Name => "名称",
             SortBy::Modified => "修改时间",

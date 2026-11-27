@@ -353,6 +353,7 @@ def main():
     iris_src = ROOT / "crates/iris/src"
     video_dir = iris_src / "video"
     ui_dir = iris_src / "ui"
+    kit_dir = ui_dir / "kit"
 
     root_cargo = tomllib.loads((ROOT / "Cargo.toml").read_text(encoding="utf-8"))
     clippy_lints = root_cargo.get("workspace", {}).get("lints", {}).get("clippy", {})
@@ -389,6 +390,11 @@ def main():
             _require("use super::*;" not in prod_code, f"{rel} uses forbidden wildcard `use super::*;`")
         if is_under(path, ui_dir):
             _require(not re.search(r"\btarget_os\b", code), f"{rel} scatters `target_os` cfg in UI layer")
+        if is_under(path, kit_dir):
+            _require(
+                not re.search(r"\b(?:IrisWindow|AppModel)\b", code),
+                f"{rel} couples `ui/kit` to root window/model types",
+            )
 
     # 3. Cargo metadata: devtools security gates, layer dependency boundaries & workspace lints
     metadata = json.loads(

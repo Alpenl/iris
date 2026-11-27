@@ -1,4 +1,4 @@
-use super::super::IrisWindow;
+use super::super::AppModel;
 use gpui::{Context, RenderImage};
 use iris_api::v2::{Capability, ErrorCode};
 use iris_core::media_uri::MediaUri;
@@ -19,10 +19,12 @@ const REMOTE_THUMB_LEASE_BYTES: u64 = 128 << 10;
 const QUOTA_RETRY_COOLDOWN: Duration = Duration::from_secs(2);
 
 type Key = (String, String);
+
 struct Cached {
     image: Option<Arc<RenderImage>>,
     _lease: Option<Reservation>,
 }
+
 impl Cached {
     fn new(image: Option<Arc<RenderImage>>, lease: Reservation) -> Self {
         let lease = image.is_some().then_some(lease);
@@ -32,6 +34,7 @@ impl Cached {
         }
     }
 }
+
 #[derive(Default)]
 pub(super) struct Thumbnails {
     cache: BTreeMap<Key, Cached>,
@@ -40,6 +43,7 @@ pub(super) struct Thumbnails {
     cooldown: BTreeMap<Key, Instant>,
     cancel: HttpCancel,
 }
+
 impl Thumbnails {
     fn can_start(&self, key: &Key, now: Instant) -> bool {
         self.pending.len() < MAX_REMOTE_THUMB_CONCURRENT
@@ -59,16 +63,18 @@ impl Thumbnails {
         self.cooldown.insert(key, now + QUOTA_RETRY_COOLDOWN);
     }
 }
+
 impl Drop for Thumbnails {
     fn drop(&mut self) {
         self.cancel.cancel();
     }
 }
-impl IrisWindow {
-    pub(in crate::ui) fn plugin_thumbnail(
-        &mut self,
+
+impl AppModel {
+    /// Side-effect-free lookup of a decoded remote plugin thumbnail from cache.
+    pub(in crate::ui) fn cached_plugin_thumbnail(
+        &self,
         uri: &MediaUri,
-        cx: &mut Context<Self>,
     ) -> Option<Arc<RenderImage>> {
         let MediaUri::Plugin {
             plugin_id,
@@ -78,33 +84,109 @@ impl IrisWindow {
         else {
             return None;
         };
-        let binding = self.plugin_view.page_binding.clone()?;
+        let binding = self.plugin_view.page_binding.as_ref()?;
         if !binding.is_live() || binding.installed.plugin_id != *plugin_id {
             return None;
         }
         let key = (source_id.clone(), entry_id.clone());
-        if let Some(value) = self.plugin_view.thumbnails.cache.get(&key) {
-            return value.image.clone();
+        self.plugin_view
+            .thumbnails
+            .cache
+            .get(&key)
+            .and_then(|v| v.image.clone())
+    }
+
+    /// Side-effect-free check whether `uri` is eligible to schedule a remote thumbnail fetch.
+    pub(in crate::ui) fn needs_plugin_thumbnail(&self, uri: &MediaUri) -> bool {
+        let MediaUri::Plugin {
+            plugin_id,
+            source_id,
+            entry_id,
+        } = uri
+        else {
+            return false;
+        };
+        let Some(binding) = self.plugin_view.page_binding.as_ref() else {
+            return false;
+        };
+        if !binding.is_live() || binding.installed.plugin_id != *plugin_id {
+            return false;
+        }
+        if self
+            .plugin_view
+            .view
+            .as_ref()
+            .is_none_or(|(owner, _)| owner != plugin_id)
+        {
+            return false;
+        }
+        let key = (source_id.clone(), entry_id.clone());
+        if self.plugin_view.thumbnails.cache.contains_key(&key)
+            || !self.plugin_view.thumbnails.can_start(&key, Instant::now())
+        {
+            return false;
+        }
+        self.plugin_source_entries(source_id)
+            .any(|e| e.id == *entry_id && e.thumbnail.is_some())
+    }
+
+    /// Schedules bounded background fetches for uncached visible remote thumbnails post-frame.
+    pub(in crate::ui) fn request_plugin_thumbnails(
+        &mut self,
+        uris: Vec<MediaUri>,
+        cx: &mut Context<Self>,
+    ) {
+        for uri in uris {
+            self.start_plugin_thumbnail(&uri, cx);
+        }
+    }
+
+    fn start_plugin_thumbnail(&mut self, uri: &MediaUri, cx: &mut Context<Self>) {
+        let MediaUri::Plugin {
+            plugin_id,
+            source_id,
+            entry_id,
+        } = uri
+        else {
+            return;
+        };
+        let Some(binding) = self.plugin_view.page_binding.clone() else {
+            return;
+        };
+        if !binding.is_live() || binding.installed.plugin_id != *plugin_id {
+            return;
+        }
+        let key = (source_id.clone(), entry_id.clone());
+        if self.plugin_view.thumbnails.cache.contains_key(&key) {
+            return;
         }
         let now = Instant::now();
         if !self.plugin_view.thumbnails.can_start(&key, now) {
-            return None;
+            return;
         }
-        let (owner, view) = self.plugin_view.view.clone()?;
+        let Some((owner, view)) = self.plugin_view.view.clone() else {
+            return;
+        };
         if owner != *plugin_id {
-            return None;
+            return;
         }
-        let resource = self
+        let Some(resource) = self
             .plugin_source_entries(source_id)
-            .find(|e| e.id == *entry_id)?
-            .thumbnail
-            .clone()?;
-        let access = self.plugins.client().access(plugin_id).ok()?;
+            .find(|e| e.id == *entry_id)
+            .and_then(|e| e.thumbnail.clone())
+        else {
+            return;
+        };
+        let Ok(access) = self.plugins.client().access(plugin_id) else {
+            return;
+        };
         let generation = access.generation;
-        access.check(generation, Capability::MediaSource).ok()?;
-        let cancel = access
-            .request_cancel(&self.plugin_view.thumbnails.cancel)
-            .ok()?;
+        if access.check(generation, Capability::MediaSource).is_err() {
+            return;
+        }
+        let Ok(cancel) = access.request_cancel(&self.plugin_view.thumbnails.cancel) else {
+            return;
+        };
         let live = binding.clone();
         let result = match access.background(move |access| {
             if !live.is_live() {
@@ -134,9 +216,9 @@ impl IrisWindow {
             Ok(rx) => rx,
             Err(ErrorCode::QuotaExceeded | ErrorCode::Backpressure) => {
                 self.plugin_view.thumbnails.record_cooldown(key, now);
-                return None;
+                return;
             }
-            Err(_) => return None,
+            Err(_) => return,
         };
         self.plugin_view.thumbnails.pending.insert(key.clone());
         cx.spawn(async move |this, cx| {
@@ -166,7 +248,7 @@ impl IrisWindow {
                         }
                         state.order.push_back(key.clone());
                         state.cache.insert(key, result.value);
-                        cx.notify();
+                        this.notify_sidebar(cx);
                     }
                     Ok(Err(ErrorCode::QuotaExceeded | ErrorCode::Backpressure)) => {
                         state.record_cooldown(key, Instant::now());
@@ -176,7 +258,6 @@ impl IrisWindow {
             });
         })
         .detach();
-        None
     }
 }
 

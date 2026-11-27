@@ -145,7 +145,7 @@ impl Session {
         );
     }
 
-    pub fn set_sub_lang(&self, sub_lang: SubLang) {
+    pub fn set_sub_lang(&mut self, sub_lang: SubLang) {
         Self::log_mpv_err(
             "set slang",
             self.mpv
@@ -153,7 +153,7 @@ impl Session {
         );
     }
 
-    pub fn set_sub_scale(&self, scale: f64) {
+    pub fn set_sub_scale(&mut self, scale: f64) {
         Self::log_mpv_err(
             "set sub-scale",
             self.mpv
@@ -244,7 +244,7 @@ impl Session {
         Ok(())
     }
 
-    pub fn transform(&self, zoom: f64, pan: [f64; 2]) -> Result<()> {
+    pub fn transform(&mut self, zoom: f64, pan: [f64; 2]) -> Result<()> {
         self.mpv.set_property_f64_async("video-zoom", zoom)?;
         self.mpv.set_property_f64_async("video-pan-x", pan[0])?;
         self.mpv.set_property_f64_async("video-pan-y", pan[1])?;

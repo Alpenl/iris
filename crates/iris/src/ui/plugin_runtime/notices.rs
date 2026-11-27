@@ -1,14 +1,19 @@
 use super::super::{
-    IrisWindow,
+    AppModel,
     state::{ActiveSource, ActiveStreamMeta, StreamReply},
+    views::DirtyRegions,
 };
 use gpui::Context;
 use iris_core::media_uri::MediaUri;
 use iris_plugin_host::{hub::Notice, requests::RequestTarget};
 use std::sync::Arc;
 
-impl IrisWindow {
-    pub(in crate::ui) fn apply_plugin_notice(&mut self, notice: Notice, cx: &mut Context<Self>) {
+impl AppModel {
+    pub(in crate::ui) fn apply_plugin_notice(
+        &mut self,
+        notice: Notice,
+        cx: &mut Context<Self>,
+    ) -> DirtyRegions {
         match notice {
             Notice::Page {
                 binding,
@@ -17,14 +22,14 @@ impl IrisWindow {
                 page,
             } => {
                 if !binding.is_live() || generation.context != self.plugins.generation().context {
-                    return;
+                    return DirtyRegions::NONE;
                 }
                 let pid = &binding.installed.plugin_id;
                 let Some(append) =
                     self.catalog
                         .take_page(pid, &request.0.to_string(), &page.page.source_id)
                 else {
-                    return;
+                    return DirtyRegions::NONE;
                 };
                 if self
                     .plugin_view
@@ -32,11 +37,11 @@ impl IrisWindow {
                     .as_ref()
                     .is_none_or(|(p, v)| p != pid || *v != page.view)
                 {
-                    return;
+                    return DirtyRegions::NONE;
                 }
                 if let ActiveSource::Plugin(view) = &mut self.catalog.active_source {
                     if view.plugin_id != *pid || view.source_id != page.page.source_id {
-                        return;
+                        return DirtyRegions::NONE;
                     }
                     let p = &page.page;
                     view.error = None;
@@ -68,7 +73,13 @@ impl IrisWindow {
                     self.plugin_view.page_binding = Some(binding);
                     self.plugin_view.pages.push(page);
                     self.rebuild_directory_rows();
+                    return DirtyRegions {
+                        sidebar: true,
+                        dock: true,
+                        ..DirtyRegions::NONE
+                    };
                 }
+                DirtyRegions::NONE
             }
             Notice::Playback {
                 binding,
@@ -82,7 +93,7 @@ impl IrisWindow {
                     || generation != self.plugins.generation()
                     || ticket.cancel.is_cancelled()
                 {
-                    return;
+                    return DirtyRegions::NONE;
                 }
                 let pid = &binding.installed.plugin_id;
                 let Some(StreamReply::Requested {
@@ -93,7 +104,7 @@ impl IrisWindow {
                     .catalog
                     .accept_stream(pid, Some(&ticket.id.0.to_string()))
                 else {
-                    return;
+                    return DirtyRegions::NONE;
                 };
                 if playback.title.trim().is_empty()
                     || playback.title == super::super::strings::chrome::DEFAULT_PLUGIN_MEDIA_TITLE
@@ -135,7 +146,7 @@ impl IrisWindow {
                         true,
                         None,
                     ),
-                    _ => return,
+                    _ => return DirtyRegions::NONE,
                 };
                 self.save_progress_sync();
                 self.overlays.close_menus();
@@ -202,7 +213,8 @@ impl IrisWindow {
                     }
                 }
                 self.active_mut().image.reset();
-                cx.notify();
+                self.sync_viewport_effects(cx);
+                DirtyRegions::ALL
             }
             Notice::Error {
                 plugin,
@@ -214,12 +226,14 @@ impl IrisWindow {
                     "plugin error ({}, req={request:?}): {code:?} {message:?}",
                     plugin.as_deref().unwrap_or("unknown")
                 );
+                let mut dirty = DirtyRegions::NONE;
                 if let Some(id) = request {
                     self.plugin_view.consent_busy.remove(&id);
+                    dirty.root = true;
                 } else if let Some(pid) = plugin.as_deref()
                     && self.plugin_view.modal.clear_submitting_for(pid)
                 {
-                    cx.notify();
+                    dirty.root = true;
                 }
                 let detail = message.unwrap_or_else(|| describe_error_code(code));
                 let matched_source = if let (Some(pid), Some(id)) = (plugin.as_deref(), request) {
@@ -235,14 +249,17 @@ impl IrisWindow {
                         self.plugin_view.review = None;
                         self.plugin_view.review_created = None;
                         self.restore_modal_focus_if_unblocked();
+                        dirty.root = true;
                     }
                     if should_fallback_error_toast(matched_source, code) {
                         self.show_toast(
                             format!("{} · {detail}", plugin.as_deref().unwrap_or("插件")),
                             cx,
                         );
+                        dirty.root = true;
                     }
                 }
+                dirty
             }
             Notice::Browser {
                 binding,
@@ -253,6 +270,7 @@ impl IrisWindow {
                 if binding.is_live() && generation == self.plugins.generation() {
                     cx.open_url(&url);
                 }
+                DirtyRegions::NONE
             }
             Notice::Review(review) => {
                 let new_id = review.id;
@@ -264,7 +282,7 @@ impl IrisWindow {
                 self.plugin_view.review_created = Some(std::time::Instant::now());
                 self.plugin_view.keep_identity = false;
                 self.overlays.close_all();
-                cx.notify();
+                DirtyRegions::ALL
             }
             Notice::Origin(origin) => {
                 let new_id = origin.id;
@@ -275,15 +293,16 @@ impl IrisWindow {
                 self.plugin_view.consent_busy.remove(&new_id);
                 self.plugin_view.insecure_auth = false;
                 self.overlays.close_all();
-                cx.notify();
+                DirtyRegions::ALL
             }
             Notice::OriginClosed(id) => {
                 self.plugin_view.consent_busy.remove(&id);
                 if self.plugin_view.origin.as_ref().is_some_and(|o| o.id == id) {
                     self.plugin_view.origin = None;
                     self.restore_modal_focus_if_unblocked();
-                    cx.notify();
+                    return DirtyRegions::root_only();
                 }
+                DirtyRegions::NONE
             }
             Notice::Installed(record) => {
                 if let Some(old) = self.plugin_view.review.take() {
@@ -292,15 +311,17 @@ impl IrisWindow {
                 self.plugin_view.review_created = None;
                 self.restore_modal_focus_if_unblocked();
                 self.show_toast(format!("已安装 {}", record.plugin_id), cx);
+                DirtyRegions::ALL
             }
             Notice::Uninstalled(plugin_id) => {
                 self.cleanup_plugin_playback(Some(&plugin_id), None);
                 self.reconcile_active_source();
                 self.sync_theme_tokens(cx);
+                self.sync_viewport_effects(cx);
                 self.show_toast(format!("已删除插件 {plugin_id}"), cx);
-                cx.notify();
+                DirtyRegions::ALL
             }
-            Notice::Commands(_) => {} // Consumed into Action/slots by PluginManager.
+            Notice::Commands(_) => DirtyRegions::NONE, // Consumed into Action/slots by PluginManager.
         }
     }
 }

@@ -10,8 +10,9 @@ use iris_core::library::{self, Kind, ScanResult};
 use iris_core::player::{self, Command, SessionEvent, SessionUpdate, TrackKind};
 use iris_core::settings::{OnEof, PhotoDefault};
 
-use super::IrisWindow;
+use super::AppModel;
 use super::state::ActiveSource;
+use super::views::{DirtyRegions, dirty_regions_for_playback_tick};
 use crate::platform;
 
 const SAVE_EVERY: Duration = Duration::from_secs(5);
@@ -74,11 +75,14 @@ pub(in crate::ui) fn should_record_progress(resume_playback: bool, scoped_releas
     resume_playback && !scoped_released
 }
 
-impl IrisWindow {
+impl AppModel {
     pub(super) fn on_events(&mut self, batch: Vec<SessionUpdate>, cx: &mut Context<Self>) {
         let batch = iris_core::player::coalesce_updates(batch);
         let was_ended = self.active().session.state().ended;
-        let mut need_notify = false;
+        let mut broad_dirty = DirtyRegions::NONE;
+        let mut tick_dirty = false;
+        let mut info_refreshed = false;
+        let mut plugin_dirty = DirtyRegions::NONE;
         let mut saw_position: Option<f64> = None;
         let mut clock_changed = false;
         let mut saw_seek = false;
@@ -111,37 +115,57 @@ impl IrisWindow {
                 SessionEvent::Seek => {
                     saw_seek = true;
                     clock_changed = true;
-                    need_notify = true;
+                    broad_dirty.dock = true;
                 }
                 SessionEvent::Position(t) => saw_position = Some(*t),
                 SessionEvent::Duration(_) => {
                     saw_duration = true;
-                    need_notify = true;
+                    broad_dirty.dock = true;
+                    broad_dirty.viewport |= self.active().session.kind() == Some(Kind::Audio);
                 }
                 SessionEvent::Paused(_) | SessionEvent::Speed(_) => {
                     saw_pause_or_speed = true;
-                    need_notify = true;
+                    broad_dirty.dock = true;
+                    broad_dirty.viewport |= self.active().session.kind() == Some(Kind::Audio);
                 }
                 SessionEvent::Ended(true) => saw_ended_now = true,
                 SessionEvent::Audio(_) => {
                     saw_audio = true;
-                    need_notify = true;
+                    broad_dirty.dock = true;
                 }
                 SessionEvent::SubtitleTrack(_) => {
                     saw_sub = true;
-                    need_notify = true;
+                    broad_dirty.dock = true;
                 }
                 SessionEvent::Volume(_) => {
                     saw_volume = true;
-                    need_notify = true;
+                    broad_dirty.dock = true;
+                }
+                SessionEvent::Buffering(_) => {
+                    broad_dirty.root = true;
+                    broad_dirty.viewport = true;
+                    broad_dirty.dock = true;
                 }
                 SessionEvent::Loaded | SessionEvent::Reconfigured => {
                     saw_loaded_or_reconfig = true;
-                    need_notify = true;
+                    broad_dirty = broad_dirty.union(DirtyRegions {
+                        root: true,
+                        sidebar: true,
+                        viewport: true,
+                        dock: true,
+                        ..DirtyRegions::NONE
+                    });
                 }
                 SessionEvent::CacheDuration(_) => saw_cache_duration = true,
                 SessionEvent::Error(code) => last_error = Some(*code),
-                _ => need_notify = true,
+                _ => {
+                    broad_dirty = broad_dirty.union(DirtyRegions {
+                        root: true,
+                        viewport: true,
+                        dock: true,
+                        ..DirtyRegions::NONE
+                    });
+                }
             }
         }
         self.active_mut().session.flush_deferred();
@@ -151,13 +175,19 @@ impl IrisWindow {
         if saw_seek {
             self.advance_plugin_seek(cx);
         }
-        if saw_loaded_or_reconfig && self.announce_plugin_media_if_loaded(cx) {
-            need_notify = true;
+        if saw_loaded_or_reconfig {
+            plugin_dirty = plugin_dirty.union(self.announce_plugin_media_if_loaded(cx));
         }
         if saw_seek || saw_loaded_or_reconfig {
             self.reconcile_enhancements(cx);
         } else if clock_changed {
             self.update_overlay_window(cx);
+        }
+        if clock_changed || saw_seek || saw_loaded_or_reconfig {
+            self.step_timed_overlay_frame(cx);
+        }
+        if saw_loaded_or_reconfig || broad_dirty.viewport {
+            self.sync_viewport_effects(cx);
         }
         if saw_loaded_or_reconfig
             && self.active().session.state().loaded
@@ -174,6 +204,7 @@ impl IrisWindow {
 
         if saw_loaded_or_reconfig && self.overlays.info_open {
             self.active_mut().refresh_cached_stats(true);
+            info_refreshed = true;
         }
 
         if let Some(t) = saw_position {
@@ -181,7 +212,8 @@ impl IrisWindow {
                 && self.active().last_stats_refresh.elapsed() >= STATS_REFRESH_INTERVAL
             {
                 self.active_mut().refresh_cached_stats(false);
-                need_notify = true;
+                info_refreshed = true;
+                tick_dirty = true;
             }
             if self.chrome_shown() || self.active().session.kind() == Some(Kind::Audio) {
                 let sec = t.max(0.).floor() as i64;
@@ -205,7 +237,7 @@ impl IrisWindow {
                     self.chrome.last_render_sec = sec;
                     self.chrome.last_render_bar_px = bar_px;
                     self.chrome.last_bar_tick = Instant::now();
-                    need_notify = true;
+                    tick_dirty = true;
                 }
             }
             if self.plugins.has_state_listeners()
@@ -219,9 +251,7 @@ impl IrisWindow {
                     duration: st.duration,
                     paused: st.paused,
                 };
-                if self.broadcast_plugin_event(ev, None, cx) {
-                    need_notify = true;
-                }
+                plugin_dirty = plugin_dirty.union(self.broadcast_plugin_event(ev, None, cx));
             }
         }
         let (duration, paused, ended, cache_end) = {
@@ -236,7 +266,7 @@ impl IrisWindow {
         {
             self.chrome.scrub.seek_preview_ratio = None;
             self.chrome.scrub.seek_preview_timeout = None;
-            need_notify = true;
+            tick_dirty = true;
         }
         if saw_cache_duration && self.chrome_shown() && !paused && duration > 0. {
             let width = self
@@ -252,7 +282,7 @@ impl IrisWindow {
             {
                 self.chrome.last_render_cache_px = cache_px;
                 self.chrome.last_cache_tick = Instant::now();
-                need_notify = true;
+                tick_dirty = true;
             }
         }
 
@@ -266,16 +296,14 @@ impl IrisWindow {
 
         if saw_pause_or_speed {
             let snap = self.plugin_snapshot();
-            if self.broadcast_plugin_event(
+            plugin_dirty = plugin_dirty.union(self.broadcast_plugin_event(
                 HostEvent::StateChanged {
                     generation: self.plugins.generation(),
                     snapshot: snap,
                 },
                 None,
                 cx,
-            ) {
-                need_notify = true;
-            }
+            ));
         }
 
         if saw_ended_now
@@ -293,7 +321,12 @@ impl IrisWindow {
             {
                 self.step(1, false, cx);
             } else {
-                need_notify = true;
+                broad_dirty = broad_dirty.union(DirtyRegions {
+                    sidebar: true,
+                    viewport: true,
+                    dock: true,
+                    ..DirtyRegions::NONE
+                });
             }
         }
 
@@ -305,7 +338,6 @@ impl IrisWindow {
                 .selected_track(TrackKind::Audio)
                 .map_or_else(|| "无音轨".into(), super::strings::chrome::track_label);
             self.show_osd(format!("音轨 · {label}"), cx);
-            need_notify = false;
         }
 
         if saw_sub && self.active().announce_sub {
@@ -316,7 +348,6 @@ impl IrisWindow {
                 .selected_track(TrackKind::Sub)
                 .map_or_else(|| "无字幕".into(), super::strings::chrome::track_label);
             self.show_osd(format!("字幕 · {label}"), cx);
-            need_notify = false;
         }
 
         if saw_volume
@@ -328,7 +359,6 @@ impl IrisWindow {
         {
             let volume = self.active().session.state().volume;
             self.show_osd(format!("音量 · {volume:.0}%"), cx);
-            need_notify = false;
         }
 
         if let Some(code) = last_error
@@ -343,11 +373,32 @@ impl IrisWindow {
                 format!("{}（错误 {code}）", super::strings::errors::mpv_error(code)),
                 cx,
             );
-            need_notify = false;
+            broad_dirty = broad_dirty.union(DirtyRegions {
+                viewport: true,
+                dock: true,
+                ..DirtyRegions::NONE
+            });
         }
 
-        if need_notify {
-            cx.notify();
+        let mut final_dirty = broad_dirty.union(plugin_dirty);
+        if tick_dirty {
+            final_dirty = final_dirty.union(dirty_regions_for_playback_tick(
+                self.active().session.kind(),
+                info_refreshed,
+                self.chrome_shown(),
+            ));
+        }
+        if self.overlays.popover.is_some()
+            && (saw_audio
+                || saw_sub
+                || saw_pause_or_speed
+                || saw_duration
+                || saw_loaded_or_reconfig)
+        {
+            final_dirty.root = true;
+        }
+        if final_dirty.any() {
+            self.notify_regions(final_dirty, cx);
         }
     }
 
@@ -452,6 +503,7 @@ impl IrisWindow {
         if self.overlays.info_open {
             self.active_mut().refresh_cached_stats(true);
         }
+        self.sync_viewport_effects(cx);
     }
 
     pub(crate) fn open_paths(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
@@ -530,7 +582,14 @@ impl IrisWindow {
                 let vp = this.active_mut();
                 if vp.load_generation == generation && vp.pending_path.is_some() {
                     vp.loading_visible = true;
-                    cx.notify();
+                    this.notify_regions(
+                        DirtyRegions {
+                            root: true,
+                            viewport: true,
+                            ..DirtyRegions::NONE
+                        },
+                        cx,
+                    );
                 }
             });
         })
@@ -612,7 +671,8 @@ impl IrisWindow {
                     }
                 }
                 this.active_mut().image.reset();
-                cx.notify();
+                this.sync_viewport_effects(cx);
+                this.notify_all(cx);
             });
         })
         .detach();
@@ -655,6 +715,7 @@ impl IrisWindow {
                     this.active_mut().pending_subtitles.paths.clear();
                     this.rebuild_directory_rows();
                     this.show_toast("所选项目中没有可播放的媒体", cx);
+                    this.notify_all(cx);
                     return;
                 };
                 let count = prepared.entries().len();
@@ -682,7 +743,8 @@ impl IrisWindow {
                     }
                 }
                 this.active_mut().image.reset();
-                cx.notify();
+                this.sync_viewport_effects(cx);
+                this.notify_all(cx);
             });
         })
         .detach();
@@ -725,7 +787,7 @@ impl IrisWindow {
                     let changed = this.catalog.thumbs.finish(batch_gen, path, decoded);
                     this.pump_thumbnail_queue(cx);
                     if changed && this.chrome_shown() && this.settings.photo_filmstrip {
-                        cx.notify();
+                        this.notify_viewport(cx);
                     }
                 });
             })

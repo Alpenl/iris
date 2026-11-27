@@ -6,15 +6,16 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use gpui::{
-    Bounds, Context, InteractiveElement, IntoElement, MouseButton, MouseMoveEvent, MouseUpEvent,
-    ParentElement, Pixels, Point, ScrollWheelEvent, SharedString, Size, StatefulInteractiveElement,
-    Styled, Window, div, prelude::FluentBuilder, px,
+    App, Bounds, Context, Entity, InteractiveElement, IntoElement, MouseButton, MouseMoveEvent,
+    MouseUpEvent, ParentElement, Pixels, Point, ScrollWheelEvent, SharedString, Size,
+    StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder, px,
 };
 use iris_core::player::Command;
 use iris_core::settings::{MAX_DIRECTORY_WIDTH, MIN_DIRECTORY_WIDTH, Side};
 
-use super::IrisWindow;
+use super::AppModel;
 use super::state::{PopoverKind, ScrubState};
+use super::views::{DirtyRegions, model_listener};
 use crate::platform;
 use crate::theme::{FLOAT_GAP, FONT_MONO, ThemeTokens};
 
@@ -120,6 +121,7 @@ pub(super) struct WindowChromeState {
     pub(super) resizing_dir: Option<(f32, f32)>,
     pub(super) last_window_size: Option<(f32, f32)>,
     pub(super) pending_window_size: Option<(f32, f32)>,
+    pub(super) last_viewport_height: f64,
     pub(super) last_activity: Instant,
     pub(super) hide_armed: bool,
     pub(super) mouse_pos: Option<Point<Pixels>>,
@@ -135,7 +137,7 @@ pub(super) struct WindowChromeState {
     pub(super) last_cache_tick: Instant,
     pub(super) last_bar_tick: Instant,
     pub(super) last_scale: f64,
-    pub(super) render_count: u64,
+    pub(super) render_count: Cell<u64>,
 }
 
 impl WindowChromeState {
@@ -150,6 +152,7 @@ impl WindowChromeState {
             resizing_dir: None,
             pending_window_size: None,
             last_window_size: None,
+            last_viewport_height: 0.,
             last_activity: now,
             hide_armed: false,
             mouse_pos: None,
@@ -165,12 +168,85 @@ impl WindowChromeState {
             last_cache_tick: now,
             last_bar_tick: now,
             last_scale: initial_scale,
-            render_count: 0,
+            render_count: Cell::new(0),
         }
     }
 }
 
-impl IrisWindow {
+pub(super) fn render_top_pill(
+    model: &Entity<AppModel>,
+    fullscreen: bool,
+    t: ThemeTokens,
+    cx: &App,
+) -> Option<impl IntoElement> {
+    let m = model.read(cx);
+    let vp = m.active();
+    let (msg, is_toast, is_error) = if let Some(msg) = m.chrome.toast.clone() {
+        (msg, true, m.chrome.toast_is_error)
+    } else if let Some(msg) = m.chrome.osd.clone() {
+        (msg, false, false)
+    } else if vp.session.state().buffering {
+        (SharedString::from("缓冲中…"), false, false)
+    } else if vp.loading_visible {
+        (SharedString::from("加载中…"), false, false)
+    } else {
+        return None;
+    };
+    let top = if fullscreen {
+        FLOAT_GAP
+    } else if m.effective_hide_titlebar() {
+        12.
+    } else {
+        f32::from(t.titlebar_h) + 12.
+    };
+    let dot_color = if is_error { t.danger } else { t.accent };
+    let border_color = if is_error { t.danger } else { t.line };
+    let pill = div()
+        .id("top-feedback-pill")
+        .max_w(px(560.))
+        .min_h(t.control_h_md)
+        .px(px(10.))
+        .py(px(4.))
+        .flex()
+        .items_center()
+        .gap(px(8.))
+        .rounded(t.radius_lg)
+        .bg(t.overlay)
+        .border_1()
+        .border_color(border_color)
+        .when(is_toast, |d| {
+            d.cursor_pointer()
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_click(model_listener(model, |this, _, _, cx| {
+                    this.chrome.toast = None;
+                    this.chrome.toast_is_error = false;
+                    this.chrome.toast_seq += 1;
+                    this.notify_root(cx);
+                }))
+        })
+        .child(div().flex_none().size(px(6.)).bg(dot_color))
+        .child(
+            div()
+                .min_w(px(0.))
+                .truncate()
+                .font_family(FONT_MONO)
+                .text_size(t.text_md)
+                .text_color(t.text)
+                .child(msg),
+        );
+    Some(
+        div()
+            .absolute()
+            .top(px(top))
+            .left(px(12.))
+            .right(px(12.))
+            .flex()
+            .justify_center()
+            .child(pill),
+    )
+}
+
+impl AppModel {
     pub(super) fn popover_anchor(&self, kind: PopoverKind) -> Option<Bounds<Pixels>> {
         self.chrome.probes.popover_anchor(kind)
     }
@@ -178,14 +254,21 @@ impl IrisWindow {
     pub(super) fn toggle_popover(&mut self, kind: PopoverKind, cx: &mut Context<Self>) {
         self.overlays.toggle_popover(kind);
         self.bump_activity(cx);
-        cx.notify();
+        self.notify_regions(
+            DirtyRegions {
+                root: true,
+                dock: true,
+                ..DirtyRegions::NONE
+            },
+            cx,
+        );
     }
 
     pub(super) fn close_overlays(&mut self, cx: &mut Context<Self>) {
         self.overlays.close_all();
         self.sync_view_timer(cx);
         self.bump_activity(cx);
-        cx.notify();
+        self.notify_all(cx);
     }
 
     pub(super) fn chrome_shown(&self) -> bool {
@@ -220,13 +303,24 @@ impl IrisWindow {
                 window.resize(gpui::size(px(w), px(h)));
             }
         }
+        self.sync_viewport_effects(cx);
+        self.notify_all(cx);
     }
 
     pub(super) fn bump_activity(&mut self, cx: &mut Context<Self>) {
         self.chrome.last_activity = Instant::now();
         if !self.chrome.chrome_visible {
             self.chrome.chrome_visible = true;
-            cx.notify();
+            self.sync_viewport_effects(cx);
+            self.notify_regions(
+                DirtyRegions {
+                    root: true,
+                    viewport: true,
+                    dock: true,
+                    ..DirtyRegions::NONE
+                },
+                cx,
+            );
         }
         self.arm_fullscreen_hide(cx);
     }
@@ -267,7 +361,16 @@ impl IrisWindow {
             if let Some(pos) = self.chrome.mouse_pos {
                 self.chrome.last_pointer_pos = Some(pos);
             }
-            cx.notify();
+            self.sync_viewport_effects(cx);
+            self.notify_regions(
+                DirtyRegions {
+                    root: true,
+                    viewport: true,
+                    dock: true,
+                    ..DirtyRegions::NONE
+                },
+                cx,
+            );
         }
         self.chrome.hide_armed = false;
         None
@@ -302,84 +405,12 @@ impl IrisWindow {
                 if this.chrome.toast_seq == seq {
                     this.chrome.toast = None;
                     this.chrome.toast_is_error = false;
-                    cx.notify();
+                    this.notify_root(cx);
                 }
             });
         })
         .detach();
-        cx.notify();
-    }
-
-    pub(super) fn render_top_pill(
-        &self,
-        fullscreen: bool,
-        t: ThemeTokens,
-        cx: &mut Context<Self>,
-    ) -> Option<impl IntoElement> {
-        let vp = self.active();
-        let (msg, is_toast, is_error) = if let Some(msg) = self.chrome.toast.clone() {
-            (msg, true, self.chrome.toast_is_error)
-        } else if let Some(msg) = self.chrome.osd.clone() {
-            (msg, false, false)
-        } else if vp.session.state().buffering {
-            (SharedString::from("缓冲中…"), false, false)
-        } else if vp.loading_visible {
-            (SharedString::from("加载中…"), false, false)
-        } else {
-            return None;
-        };
-        let top = if fullscreen {
-            FLOAT_GAP
-        } else if self.effective_hide_titlebar() {
-            12.
-        } else {
-            f32::from(t.titlebar_h) + 12.
-        };
-        let dot_color = if is_error { t.danger } else { t.accent };
-        let border_color = if is_error { t.danger } else { t.line };
-        let pill = div()
-            .id("top-feedback-pill")
-            .max_w(px(560.))
-            .min_h(t.control_h_md)
-            .px(px(10.))
-            .py(px(4.))
-            .flex()
-            .items_center()
-            .gap(px(8.))
-            .rounded(t.radius_lg)
-            .bg(t.overlay)
-            .border_1()
-            .border_color(border_color)
-            .when(is_toast, |d| {
-                d.cursor_pointer()
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.chrome.toast = None;
-                        this.chrome.toast_is_error = false;
-                        this.chrome.toast_seq += 1;
-                        cx.notify();
-                    }))
-            })
-            .child(div().flex_none().size(px(6.)).bg(dot_color))
-            .child(
-                div()
-                    .min_w(px(0.))
-                    .truncate()
-                    .font_family(FONT_MONO)
-                    .text_size(t.text_md)
-                    .text_color(t.text)
-                    .child(msg),
-            );
-        Some(
-            div()
-                .absolute()
-                .top(px(top))
-                .left(px(12.))
-                .right(px(12.))
-                .flex()
-                .justify_center()
-                .child(pill),
-        )
+        self.notify_root(cx);
     }
 
     pub(super) fn show_osd(&mut self, msg: impl Into<SharedString>, cx: &mut Context<Self>) {
@@ -393,12 +424,12 @@ impl IrisWindow {
             let _ = this.update(cx, |this, cx| {
                 if this.chrome.osd_seq == seq {
                     this.chrome.osd = None;
-                    cx.notify();
+                    this.notify_root(cx);
                 }
             });
         })
         .detach();
-        cx.notify();
+        self.notify_root(cx);
     }
 
     pub(super) fn set_directory_side(&mut self, side: Side, cx: &mut Context<Self>) {
@@ -407,6 +438,7 @@ impl IrisWindow {
         }
         self.settings.directory_side = side;
         self.persist_user_settings();
+        self.notify_all(cx);
         self.show_toast(
             if side == Side::Left {
                 "侧栏移到左侧"
@@ -475,7 +507,7 @@ impl IrisWindow {
         }
         let vol = ((((x - b.origin.x) / b.size.width).clamp(0., 1.) as f64) * 100.).round();
         self.command(Command::SetVolume(vol), cx);
-        cx.notify();
+        self.notify_dock(cx);
     }
 
     pub(super) fn damped_volume_delta(&mut self, ev: &ScrollWheelEvent) -> f64 {
@@ -524,19 +556,28 @@ impl IrisWindow {
 
     pub(super) fn on_window_pointer_exit(&mut self, window: &Window, cx: &mut Context<Self>) {
         self.chrome.mouse_pos = None;
-        let changed = std::mem::take(&mut self.chrome.titlebar_hover)
-            | std::mem::take(&mut self.chrome.scrub.timeline_hover);
-        if changed {
-            cx.notify();
-        }
+        let tb_changed = std::mem::take(&mut self.chrome.titlebar_hover);
+        let tl_changed = std::mem::take(&mut self.chrome.scrub.timeline_hover);
+        let mut dirty = DirtyRegions {
+            root: tb_changed,
+            dock: tl_changed,
+            ..DirtyRegions::NONE
+        };
         if self.overlays.dir_popup == DirectoryPopup::Hover && self.directory_hover_allowed(window)
         {
             self.overlays.dir_popup = DirectoryPopup::Hidden;
             self.sync_view_timer(cx);
             self.bump_activity(cx);
-            cx.notify();
+            dirty = dirty.union(DirtyRegions {
+                viewport: true,
+                dock: true,
+                ..DirtyRegions::NONE
+            });
         } else if self.chrome.fullscreen && self.chrome.chrome_visible {
             self.arm_fullscreen_hide(cx);
+        }
+        if dirty.any() {
+            self.notify_regions(dirty, cx);
         }
     }
 
@@ -577,7 +618,14 @@ impl IrisWindow {
             if next != self.overlays.dir_popup {
                 self.overlays.dir_popup = next;
                 self.sync_view_timer(cx);
-                cx.notify();
+                self.notify_regions(
+                    DirtyRegions {
+                        viewport: true,
+                        dock: true,
+                        ..DirtyRegions::NONE
+                    },
+                    cx,
+                );
             }
         }
         let hot_h = f32::from(t.titlebar_h) + 8.;
@@ -591,7 +639,7 @@ impl IrisWindow {
         if in_hot != self.chrome.titlebar_hover {
             self.chrome.titlebar_hover = in_hot;
             if self.effective_hide_titlebar() {
-                cx.notify();
+                self.notify_root(cx);
             }
         }
         if let Some((start_x, start_w)) = self.chrome.resizing_dir {
@@ -602,12 +650,20 @@ impl IrisWindow {
                     start_x,
                     start_w,
                 );
-                cx.notify();
             } else {
                 self.chrome.resizing_dir = None;
                 self.persist_user_settings();
-                cx.notify();
             }
+            self.notify_regions(
+                DirtyRegions {
+                    root: true,
+                    sidebar: true,
+                    plugin_panel: true,
+                    dock: true,
+                    ..DirtyRegions::NONE
+                },
+                cx,
+            );
             return;
         }
         if self.chrome.scrub.dragging_volume {
@@ -615,7 +671,7 @@ impl IrisWindow {
                 self.set_volume_from_x(ev.position.x, cx);
             } else {
                 self.chrome.scrub.dragging_volume = false;
-                cx.notify();
+                self.notify_dock(cx);
             }
             return;
         }
@@ -630,9 +686,9 @@ impl IrisWindow {
             } else {
                 self.finish_seek(ev.position.x, cx);
             }
-            cx.notify();
+            self.notify_dock(cx);
         } else if self.chrome_shown() && self.chrome.scrub.timeline_hover {
-            cx.notify();
+            self.notify_dock(cx);
         }
         if ev.pressed_button == Some(MouseButton::Left) {
             if self
@@ -667,7 +723,7 @@ impl IrisWindow {
             self.active_mut().pending_win_drag_origin = None;
             self.active_mut().pending_click_origin = None;
             if self.active_mut().drag_origin.take().is_some() {
-                cx.notify();
+                self.notify_viewport(cx);
             }
         }
         if self.chrome.fullscreen && wake_fullscreen {
@@ -706,6 +762,7 @@ impl IrisWindow {
                         let pause = !state.paused && !state.ended;
                         this.command(Command::TogglePlayback, cx);
                         this.show_osd(if pause { "暂停" } else { "播放" }, cx);
+                        this.notify_dock(cx);
                     }
                 });
             })
@@ -713,14 +770,23 @@ impl IrisWindow {
         }
         if self.chrome.resizing_dir.take().is_some() {
             self.persist_user_settings();
-            cx.notify();
+            self.notify_regions(
+                DirtyRegions {
+                    root: true,
+                    sidebar: true,
+                    plugin_panel: true,
+                    dock: true,
+                    ..DirtyRegions::NONE
+                },
+                cx,
+            );
         }
         if self.chrome.scrub.dragging_volume {
             self.chrome.scrub.dragging_volume = false;
-            cx.notify();
+            self.notify_dock(cx);
         }
         if self.active_mut().drag_origin.take().is_some() {
-            cx.notify();
+            self.notify_viewport(cx);
         }
         self.finish_seek(ev.position.x, cx);
     }
@@ -742,11 +808,11 @@ impl IrisWindow {
                 if !this.chrome.scrub.seeking
                     && this.chrome.scrub.seek_preview_ratio.take().is_some()
                 {
-                    cx.notify();
+                    this.notify_dock(cx);
                 }
             });
         }));
-        cx.notify();
+        self.notify_dock(cx);
     }
 }
 

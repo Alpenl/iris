@@ -1,13 +1,12 @@
 //! Reusable form controls (`setting_row`, `toggle`, `checkbox`, `segmented`, `stepper`)
-//! backed by [`ThemeTokens`] radii and colors.
+//! backed by [`ThemeTokens`] radii and colors, decoupled from any concrete root view.
 
 use gpui::{
-    App, ClickEvent, Context, Div, ElementId, InteractiveElement, IntoElement, MouseButton,
+    App, ClickEvent, Context, Div, ElementId, Entity, InteractiveElement, IntoElement, MouseButton,
     ParentElement, Rgba, SharedString, Stateful, StatefulInteractiveElement, Styled, Window, div,
     prelude::FluentBuilder, px,
 };
 
-use super::super::IrisWindow;
 use super::icon;
 use crate::assets::Icon;
 use crate::theme::{FONT_MONO, ThemeTokens};
@@ -153,14 +152,15 @@ pub(in crate::ui) fn checkbox(
         )
 }
 
-pub(in crate::ui) fn segmented<T: Copy + PartialEq + 'static>(
+pub(in crate::ui) fn segmented<V: 'static, T: Copy + PartialEq + 'static>(
     id: &'static str,
     options: &[(&'static str, T)],
     current: T,
     t: ThemeTokens,
-    cx: &mut Context<IrisWindow>,
-    on_select: impl Fn(&mut IrisWindow, T, &mut Context<IrisWindow>) + Copy + 'static,
+    entity: &Entity<V>,
+    on_select: impl Fn(&mut V, T, &mut Window, &mut Context<V>) + Copy + 'static,
 ) -> Div {
+    let weak = entity.downgrade();
     div()
         .flex()
         .flex_wrap()
@@ -172,6 +172,7 @@ pub(in crate::ui) fn segmented<T: Copy + PartialEq + 'static>(
         .bg(t.window_bg)
         .children(options.iter().enumerate().map(|(i, &(label, value))| {
             let active = value == current;
+            let weak = weak.clone();
             div()
                 .id((id, i))
                 .h(t.control_h_sm)
@@ -188,11 +189,11 @@ pub(in crate::ui) fn segmented<T: Copy + PartialEq + 'static>(
                 })
                 .child(label)
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                .on_click(cx.listener(move |this, _, _, cx| {
+                .on_click(move |_, w, cx| {
                     if value != current {
-                        on_select(this, value, cx);
+                        let _ = weak.update(cx, |this, cx| on_select(this, value, w, cx));
                     }
-                }))
+                })
         }))
 }
 

@@ -1,8 +1,8 @@
-use super::super::{IrisWindow, state::ActiveSource};
+use super::super::{AppModel, state::ActiveSource, views::model_listener};
 use crate::theme::ThemeTokens;
 use crate::ui::kit::form::chip_button;
 use gpui::{
-    Context, InteractiveElement, IntoElement, ParentElement, SharedString,
+    App, Context, Entity, InteractiveElement, IntoElement, ParentElement, SharedString,
     StatefulInteractiveElement, Styled, div, px,
 };
 use iris_api::v2::{Capability, source::PlaylistEntry};
@@ -100,7 +100,128 @@ pub(in crate::ui) fn remote_search_query(supports_search: bool, raw: &str) -> Op
         .map(str::to_owned)
 }
 
-impl IrisWindow {
+pub(in crate::ui) fn render_source_filters(model: &Entity<AppModel>, cx: &App) -> impl IntoElement {
+    let m = model.read(cx);
+    let t = ThemeTokens::of(cx);
+    let filters = m.plugin_view.source_filters.clone();
+    div()
+        .id("source-filter-options")
+        .max_h(px(144.))
+        .overflow_y_scroll()
+        .flex()
+        .flex_col()
+        .gap(px(6.))
+        .children(filters.into_iter().map(|filter| {
+            let id = filter.id;
+            let selected = filter.selected;
+            let mut options: Vec<(Option<String>, String)> = vec![(None, "不限".into())];
+            options.extend(filter.options.into_iter().map(|o| (Some(o.value), o.label)));
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(4.))
+                .child(
+                    div()
+                        .text_size(t.text_xs)
+                        .text_color(t.text_dim)
+                        .child(filter.label),
+                )
+                .child(div().flex().flex_wrap().gap(px(4.)).children(
+                    options.into_iter().enumerate().map(|(oi, (val, label))| {
+                        let active = selected == val;
+                        let filter_id = id.clone();
+                        chip_button(
+                            SharedString::from(format!("source-filter-{filter_id}-{oi}")),
+                            label,
+                            active,
+                            t,
+                        )
+                        .on_click(model_listener(
+                            model,
+                            move |this, _, _, cx| {
+                                let ActiveSource::Plugin(view) = &this.catalog.active_source else {
+                                    return;
+                                };
+                                let (pid, sid, folder, supports_search) = (
+                                    view.plugin_id.clone(),
+                                    view.source_id.clone(),
+                                    view.folder_id.clone(),
+                                    view.supports_search,
+                                );
+                                if let Some(f) = this
+                                    .plugin_view
+                                    .source_filters
+                                    .iter_mut()
+                                    .find(|f| f.id == filter_id)
+                                {
+                                    f.selected = val.clone();
+                                }
+                                if let Some(value) = &val {
+                                    this.plugin_view
+                                        .filter_values
+                                        .insert(filter_id.clone(), value.clone());
+                                } else {
+                                    this.plugin_view.filter_values.remove(&filter_id);
+                                }
+                                let query = remote_search_query(
+                                    supports_search && this.text_inputs.search_open,
+                                    this.text_inputs.search_input.text(),
+                                );
+                                this.browse_plugin_source(&pid, &sid, folder, None, query, cx);
+                            },
+                        ))
+                    }),
+                ))
+        }))
+}
+
+pub(in crate::ui) fn render_url_resolver_choice(
+    model: &Entity<AppModel>,
+    cx: &App,
+) -> impl IntoElement {
+    let m = model.read(cx);
+    let t = ThemeTokens::of(cx);
+    let mut choices = vec![
+        ("auto".to_owned(), "自动匹配解析插件".to_owned()),
+        ("direct".into(), "直接播放媒体地址".into()),
+    ];
+    choices.extend(m.plugins.url_resolvers(None));
+    let selected = m.form_value("url-resolver");
+    let active_id = choices
+        .iter()
+        .find(|(id, _)| id == selected)
+        .map(|(id, _)| id.as_str())
+        .unwrap_or("auto")
+        .to_owned();
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(4.))
+        .child(
+            div()
+                .text_size(t.text_sm)
+                .text_color(t.text_muted)
+                .child("打开方式"),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_wrap()
+                .gap(px(4.))
+                .children(choices.into_iter().enumerate().map(|(i, (id, label))| {
+                    let active = id == active_id;
+                    chip_button(("url-resolver-choice", i), label, active, t).on_click(
+                        model_listener(model, move |this, _, _, cx| {
+                            this.set_form_value("url-resolver", &id);
+                            this.overlays.dialog_error = None;
+                            this.notify_root(cx);
+                        }),
+                    )
+                })),
+        )
+}
+
+impl AppModel {
     pub(in crate::ui) fn can_step_plugin_playlist(
         &self,
         current: Option<&MediaUri>,
@@ -176,123 +297,7 @@ impl IrisWindow {
         );
         true
     }
-    pub(in crate::ui) fn render_source_filters(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let t = ThemeTokens::of(cx);
-        div()
-            .id("source-filter-options")
-            .max_h(px(144.))
-            .overflow_y_scroll()
-            .flex()
-            .flex_col()
-            .gap(px(6.))
-            .children(self.plugin_view.source_filters.iter().map(|filter| {
-                let id = filter.id.clone();
-                let selected = filter.selected.clone();
-                let mut options: Vec<(Option<String>, String)> = vec![(None, "不限".into())];
-                options.extend(
-                    filter
-                        .options
-                        .iter()
-                        .map(|o| (Some(o.value.clone()), o.label.clone())),
-                );
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(px(4.))
-                    .child(
-                        div()
-                            .text_size(t.text_xs)
-                            .text_color(t.text_dim)
-                            .child(filter.label.clone()),
-                    )
-                    .child(div().flex().flex_wrap().gap(px(4.)).children(
-                        options.into_iter().enumerate().map(|(oi, (val, label))| {
-                            let active = selected == val;
-                            let filter_id = id.clone();
-                            chip_button(
-                                SharedString::from(format!("source-filter-{filter_id}-{oi}")),
-                                label,
-                                active,
-                                t,
-                            )
-                            .on_click(cx.listener(
-                                move |this, _, _, cx| {
-                                    let ActiveSource::Plugin(view) = &this.catalog.active_source
-                                    else {
-                                        return;
-                                    };
-                                    let (pid, sid, folder, supports_search) = (
-                                        view.plugin_id.clone(),
-                                        view.source_id.clone(),
-                                        view.folder_id.clone(),
-                                        view.supports_search,
-                                    );
-                                    if let Some(f) = this
-                                        .plugin_view
-                                        .source_filters
-                                        .iter_mut()
-                                        .find(|f| f.id == filter_id)
-                                    {
-                                        f.selected = val.clone();
-                                    }
-                                    if let Some(value) = &val {
-                                        this.plugin_view
-                                            .filter_values
-                                            .insert(filter_id.clone(), value.clone());
-                                    } else {
-                                        this.plugin_view.filter_values.remove(&filter_id);
-                                    }
-                                    let query = remote_search_query(
-                                        supports_search && this.text_inputs.search_open,
-                                        this.text_inputs.search_input.text(),
-                                    );
-                                    this.browse_plugin_source(&pid, &sid, folder, None, query, cx);
-                                },
-                            ))
-                        }),
-                    ))
-            }))
-    }
-    pub(in crate::ui) fn render_url_resolver_choice(
-        &self,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let t = ThemeTokens::of(cx);
-        let mut choices = vec![
-            ("auto".to_owned(), "自动匹配解析插件".to_owned()),
-            ("direct".into(), "直接播放媒体地址".into()),
-        ];
-        choices.extend(self.plugins.url_resolvers(None));
-        let selected = self.form_value("url-resolver");
-        let active_id = choices
-            .iter()
-            .find(|(id, _)| id == selected)
-            .map(|(id, _)| id.as_str())
-            .unwrap_or("auto")
-            .to_owned();
-        div()
-            .flex()
-            .flex_col()
-            .gap(px(4.))
-            .child(
-                div()
-                    .text_size(t.text_sm)
-                    .text_color(t.text_muted)
-                    .child("打开方式"),
-            )
-            .child(div().flex().flex_wrap().gap(px(4.)).children(
-                choices.into_iter().enumerate().map(|(i, (id, label))| {
-                    let active = id == active_id;
-                    chip_button(("url-resolver-choice", i), label, active, t).on_click(cx.listener(
-                        move |this, _, _, cx| {
-                            this.set_form_value("url-resolver", &id);
-                            this.overlays.dialog_error = None;
-                            cx.notify();
-                        },
-                    ))
-                }),
-            ))
-    }
+
     pub(in crate::ui) fn open_user_url(
         &mut self,
         url: &str,
@@ -301,7 +306,7 @@ impl IrisWindow {
     ) -> bool {
         let fail = |this: &mut Self, msg: &str, cx: &mut Context<Self>| {
             this.overlays.dialog_error = Some(msg.to_owned().into());
-            cx.notify();
+            this.notify_root(cx);
         };
         let matches = self.plugins.url_resolvers(Some(url));
         let plugin = match selected {
@@ -347,7 +352,8 @@ impl IrisWindow {
             }
             match self.plugins.client().resolve_url(&plugin, parsed.as_str()) {
                 Ok(request) => {
-                    self.begin_resolve_request(&plugin, "", String::new(), None, request, cx)
+                    self.begin_resolve_request(&plugin, "", String::new(), None, request, cx);
+                    self.notify_all(cx);
                 }
                 Err(error) => {
                     log::warn!("resolve_url failed for {plugin}: {error:?}");

@@ -2,15 +2,17 @@
 //! keystroke recorder interceptor, scope conflict alerts, and rebindable rows.
 
 use gpui::{
-    Context, InteractiveElement, IntoElement, KeyDownEvent, MouseButton, ParentElement,
-    SharedString, StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder, px,
+    App, Context, Entity, InteractiveElement, IntoElement, KeyDownEvent, MouseButton,
+    ParentElement, SharedString, StatefulInteractiveElement, Styled, Window, div,
+    prelude::FluentBuilder, px,
 };
 use iris_core::keymap::{self, KeymapScheme};
 
-use super::super::IrisWindow;
+use super::super::AppModel;
 use super::super::actions::rebind_keys;
 use super::super::kit::form::{chip_button, segmented};
 use super::super::kit::{badge_pill, section_label};
+use super::super::views::{DirtyRegions, model_listener};
 use crate::platform::IS_MACOS;
 use crate::theme::{FONT_MONO, FONT_UI, ThemeTokens};
 
@@ -29,7 +31,7 @@ fn scope_short_label(entry: &keymap::ActionEntry) -> &'static str {
     }
 }
 
-impl IrisWindow {
+impl AppModel {
     pub(super) fn handle_shortcut_recorder_key(
         &mut self,
         ev: &KeyDownEvent,
@@ -56,7 +58,14 @@ impl IrisWindow {
             self.overlays.shortcut_conflict = None;
             self.focus.focus(w);
             cx.stop_propagation();
-            cx.notify();
+            self.notify_regions(
+                DirtyRegions {
+                    root: true,
+                    settings: true,
+                    ..DirtyRegions::NONE
+                },
+                cx,
+            );
             return;
         }
         if keymap::reserved_shortcut(&spec) == Some("reset_appearance") {
@@ -69,445 +78,457 @@ impl IrisWindow {
             let other = super::super::strings::actions::describe_conflict(&conflict, &self.presets);
             let warn = format!("无法绑定 {disp}：与「{other}」冲突，请选择其他按键");
             self.overlays.shortcut_conflict = Some(warn.clone());
+            self.notify_settings(cx);
             self.show_error_toast(warn, cx);
         } else if let Some((target_id, _)) = self.overlays.recording_shortcut.take() {
             self.keymap.set_binding(&target_id, spec);
             rebind_keys(cx, &self.keymap);
             self.overlays.shortcut_conflict = None;
-            self.show_toast(format!("已绑定快捷键 · {disp}"), cx);
             self.focus.focus(w);
+            self.notify_all(cx);
+            self.show_toast(format!("已绑定快捷键 · {disp}"), cx);
         }
         cx.stop_propagation();
-        cx.notify();
+    }
+}
+
+pub(super) fn settings_shortcuts(
+    model: &Entity<AppModel>,
+    t: ThemeTokens,
+    cx: &App,
+) -> impl IntoElement {
+    let m = model.read(cx);
+    let cur_scheme = m.keymap.scheme;
+    let has_any_overrides = !m.keymap.overrides.is_empty();
+    let recording_id = m
+        .overlays
+        .recording_shortcut
+        .as_ref()
+        .map(|(id, _)| id.clone());
+    let conflict_banner = m.overlays.shortcut_conflict.clone();
+
+    let mut categories: Vec<(keymap::ActionCategory, Vec<&'static keymap::ActionEntry>)> =
+        Vec::new();
+    for entry in keymap::actions() {
+        if let Some((_, list)) = categories.iter_mut().find(|(c, _)| *c == entry.category) {
+            list.push(entry);
+        } else {
+            categories.push((entry.category, vec![entry]));
+        }
     }
 
-    pub(super) fn settings_shortcuts(
-        &self,
-        t: ThemeTokens,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let cur_scheme = self.keymap.scheme;
-        let has_any_overrides = !self.keymap.overrides.is_empty();
-        let recording_id = self
-            .overlays
-            .recording_shortcut
-            .as_ref()
-            .map(|(id, _)| id.clone());
-        let conflict_banner = self.overlays.shortcut_conflict.clone();
+    let preset_rows: Vec<(String, String)> = m
+        .presets
+        .list()
+        .iter()
+        .map(|p| {
+            (
+                format!("preset:{}", p.id),
+                format!(
+                    "切换到预设 · {}",
+                    super::super::strings::presets::preset_name(p)
+                ),
+            )
+        })
+        .collect();
 
-        let mut categories: Vec<(keymap::ActionCategory, Vec<&'static keymap::ActionEntry>)> =
-            Vec::new();
-        for entry in keymap::actions() {
-            if let Some((_, list)) = categories.iter_mut().find(|(c, _)| *c == entry.category) {
-                list.push(entry);
+    let plugin_rows: Vec<(String, String)> = m
+        .plugins
+        .commands()
+        .into_iter()
+        .map(|(pid, pname, spec)| {
+            (
+                format!("plugin:{pid}:{}", spec.id),
+                format!("{pname} · {}", spec.title),
+            )
+        })
+        .collect();
+
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(14.))
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(8.))
+                .pb(px(12.))
+                .border_b_1()
+                .border_color(t.line)
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap(px(8.))
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap(px(2.))
+                                .child(
+                                    div()
+                                        .text_size(t.text_md)
+                                        .text_color(t.text)
+                                        .child("快捷键方案与自定义录制"),
+                                )
+                                .child(div().text_size(t.text_sm).text_color(t.text_faint).child(
+                                    super::super::strings::actions::keymap_scheme_description(
+                                        cur_scheme,
+                                    ),
+                                )),
+                        )
+                        .child(
+                            chip_button(
+                                "reset-all-shortcuts",
+                                "全部恢复默认",
+                                has_any_overrides,
+                                t,
+                            )
+                            .on_click(model_listener(
+                                model,
+                                |this, _, w, cx| {
+                                    this.overlays.recording_shortcut = None;
+                                    this.overlays.shortcut_conflict = None;
+                                    this.keymap.reset_all();
+                                    rebind_keys(cx, &this.keymap);
+                                    this.focus.focus(w);
+                                    this.notify_all(cx);
+                                    this.show_toast("已将全部快捷键恢复为当前方案默认值", cx);
+                                },
+                            )),
+                        ),
+                )
+                .child({
+                    let schemes: Vec<_> = KeymapScheme::ALL
+                        .iter()
+                        .map(|&s| (super::super::strings::actions::keymap_scheme_label(s), s))
+                        .collect();
+                    segmented(
+                        "keymap-scheme",
+                        &schemes,
+                        cur_scheme,
+                        t,
+                        model,
+                        |this, scheme, w, cx| {
+                            if this.overlays.recording_shortcut.take().is_some() {
+                                this.focus.focus(w);
+                            }
+                            this.overlays.shortcut_conflict = None;
+                            this.keymap.set_scheme(scheme);
+                            this.keymap.save();
+                            rebind_keys(cx, &this.keymap);
+                            this.notify_all(cx);
+                            this.show_toast(
+                                format!(
+                                    "已切换快捷键方案 · {}",
+                                    super::super::strings::actions::keymap_scheme_label(scheme)
+                                ),
+                                cx,
+                            );
+                        },
+                    )
+                }),
+        )
+        .when_some(recording_id.clone(), |d, rec| {
+            let rec_label = if keymap::find_action(&rec).is_some() {
+                super::super::strings::actions::action_title(&rec).to_string()
+            } else if let Some(pid) = rec.strip_prefix("preset:") {
+                format!(
+                    "切换到预设 · {}",
+                    super::super::strings::presets::preset_name_by_id(&m.presets, pid)
+                )
+            } else if let Some(rest) = rec.strip_prefix("plugin:") {
+                m.plugins
+                    .commands()
+                    .into_iter()
+                    .find(|(pid, _, spec)| {
+                        rest.strip_prefix(*pid)
+                            .and_then(|tail| tail.strip_prefix(':'))
+                            == Some(spec.id.as_str())
+                    })
+                    .map(|(_, pname, spec)| format!("{pname} · {}", spec.title))
+                    .unwrap_or_else(|| rec.clone())
             } else {
-                categories.push((entry.category, vec![entry]));
-            }
-        }
-
-        let preset_rows: Vec<(String, String)> = self
-            .presets
-            .list()
-            .iter()
-            .map(|p| {
-                (
-                    format!("preset:{}", p.id),
-                    format!(
-                        "切换到预设 · {}",
-                        super::super::strings::presets::preset_name(p)
+                rec.clone()
+            };
+            d.child(
+                div()
+                    .px(px(10.))
+                    .py(px(7.))
+                    .rounded(t.radius_md)
+                    .bg(t.selected)
+                    .border_1()
+                    .border_color(t.accent)
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(8.))
+                    .child(div().text_size(t.text_sm).text_color(t.text).child(format!(
+                        "正在录制「{rec_label}」：请直接按下目标按键或组合键，按 Esc 取消"
+                    )))
+                    .child(chip_button("cancel-rec-banner", "取消", false, t).on_click(
+                        model_listener(model, |this, _, w, cx| {
+                            this.overlays.recording_shortcut = None;
+                            this.focus.focus(w);
+                            this.notify_regions(
+                                DirtyRegions {
+                                    root: true,
+                                    settings: true,
+                                    ..DirtyRegions::NONE
+                                },
+                                cx,
+                            );
+                        }),
+                    )),
+            )
+        })
+        .when_some(conflict_banner, |d, msg| {
+            d.child(
+                div()
+                    .px(px(10.))
+                    .py(px(7.))
+                    .rounded(t.radius_md)
+                    .bg(t.window_bg)
+                    .border_1()
+                    .border_color(t.danger)
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(8.))
+                    .child(div().text_size(t.text_sm).text_color(t.danger).child(msg))
+                    .child(
+                        chip_button("dismiss-conflict-banner", "知道了", false, t).on_click(
+                            model_listener(model, |this, _, _, cx| {
+                                this.overlays.shortcut_conflict = None;
+                                this.notify_settings(cx);
+                            }),
+                        ),
                     ),
-                )
-            })
-            .collect();
-
-        let plugin_rows: Vec<(String, String)> = self
-            .plugins
-            .commands()
-            .into_iter()
-            .map(|(pid, pname, spec)| {
-                (
-                    format!("plugin:{pid}:{}", spec.id),
-                    format!("{pname} · {}", spec.title),
-                )
-            })
-            .collect();
-
-        div()
-            .flex()
-            .flex_col()
-            .gap(px(14.))
-            .child(
+            )
+        })
+        .children({
+            let rec_str = recording_id.as_deref();
+            categories.into_iter().map(move |(cat, entries)| {
                 div()
                     .flex()
                     .flex_col()
-                    .gap(px(8.))
-                    .pb(px(12.))
-                    .border_b_1()
-                    .border_color(t.line)
+                    .gap(px(4.))
                     .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .gap(px(8.))
-                            .child(
-                                div()
-                                    .flex()
-                                    .flex_col()
-                                    .gap(px(2.))
-                                    .child(
-                                        div()
-                                            .text_size(t.text_md)
-                                            .text_color(t.text)
-                                            .child("快捷键方案与自定义录制"),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_size(t.text_sm)
-                                            .text_color(t.text_faint)
-                                            .child(
-                                                super::super::strings::actions::keymap_scheme_description(
-                                                    cur_scheme,
-                                                ),
-                                            ),
-                                    ),
-                            )
-                            .child(
-                                chip_button(
-                                    "reset-all-shortcuts",
-                                    "全部恢复默认",
-                                    has_any_overrides,
-                                    t,
-                                )
-                                .on_click(cx.listener(
-                                    |this, _, w, cx| {
-                                        this.overlays.recording_shortcut = None;
-                                        this.overlays.shortcut_conflict = None;
-                                        this.keymap.reset_all();
-                                        rebind_keys(cx, &this.keymap);
-                                        this.focus.focus(w);
-                                        this.show_toast("已将全部快捷键恢复为当前方案默认值", cx);
-                                        cx.notify();
-                                    },
-                                )),
-                            ),
-                    )
-                    .child({
-                        let schemes: Vec<_> = KeymapScheme::ALL
-                            .iter()
-                            .map(|&s| {
-                                (
-                                    super::super::strings::actions::keymap_scheme_label(s),
-                                    s,
-                                )
-                            })
-                            .collect();
-                        segmented(
-                            "keymap-scheme",
-                            &schemes,
-                            cur_scheme,
+                        section_label(
+                            super::super::strings::actions::action_category_label(cat),
                             t,
-                            cx,
-                            |this, scheme, cx| {
-                                this.overlays.recording_shortcut = None;
-                                this.overlays.shortcut_conflict = None;
-                                this.keymap.set_scheme(scheme);
-                                this.keymap.save();
-                                rebind_keys(cx, &this.keymap);
-                                this.show_toast(
-                                    format!(
-                                        "已切换快捷键方案 · {}",
-                                        super::super::strings::actions::keymap_scheme_label(scheme)
-                                    ),
-                                    cx,
-                                );
-                                cx.notify();
-                            },
                         )
-                    }),
-            )
-            .when_some(recording_id.clone(), |d, rec| {
-                let rec_label = if keymap::find_action(&rec).is_some() {
-                    super::super::strings::actions::action_title(&rec).to_string()
-                } else if let Some(pid) = rec.strip_prefix("preset:") {
-                    format!(
-                        "切换到预设 · {}",
-                        super::super::strings::presets::preset_name_by_id(&self.presets, pid)
+                        .pb(px(4.))
+                        .border_b_1()
+                        .border_color(t.line),
                     )
-                } else if let Some(rest) = rec.strip_prefix("plugin:") {
-                    self.plugins
-                        .commands()
-                        .into_iter()
-                        .find(|(pid, _, spec)| {
-                            rest.strip_prefix(*pid)
-                                .and_then(|tail| tail.strip_prefix(':'))
-                                == Some(spec.id.as_str())
-                        })
-                        .map(|(_, pname, spec)| format!("{pname} · {}", spec.title))
-                        .unwrap_or_else(|| rec.clone())
-                } else {
-                    rec.clone()
-                };
-                d.child(
-                    div()
-                        .px(px(10.))
-                        .py(px(7.))
-                        .rounded(t.radius_md)
-                        .bg(t.selected)
-                        .border_1()
-                        .border_color(t.accent)
-                        .flex()
-                        .items_center()
-                        .justify_between()
-                        .gap(px(8.))
-                        .child(div().text_size(t.text_sm).text_color(t.text).child(format!(
-                            "正在录制「{rec_label}」：请直接按下目标按键或组合键，按 Esc 取消"
-                        )))
-                        .child(chip_button("cancel-rec-banner", "取消", false, t).on_click(
-                            cx.listener(|this, _, w, cx| {
-                                this.overlays.recording_shortcut = None;
-                                this.focus.focus(w);
-                                cx.notify();
-                            }),
-                        )),
-                )
-            })
-            .when_some(conflict_banner, |d, msg| {
-                d.child(
-                    div()
-                        .px(px(10.))
-                        .py(px(7.))
-                        .rounded(t.radius_md)
-                        .bg(t.window_bg)
-                        .border_1()
-                        .border_color(t.danger)
-                        .flex()
-                        .items_center()
-                        .justify_between()
-                        .gap(px(8.))
-                        .child(div().text_size(t.text_sm).text_color(t.danger).child(msg))
-                        .child(
-                            chip_button("dismiss-conflict-banner", "知道了", false, t).on_click(
-                                cx.listener(|this, _, _, cx| {
-                                    this.overlays.shortcut_conflict = None;
-                                    cx.notify();
-                                }),
-                            ),
-                        ),
-                )
-            })
-            .children({
-                let cx_ref: &Context<Self> = cx;
-                let rec_str = recording_id.as_deref();
-                categories.into_iter().map(move |(cat, entries)| {
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap(px(4.))
-                        .child(
-                            section_label(
-                                super::super::strings::actions::action_category_label(cat),
-                                t,
-                            )
-                            .pb(px(4.))
-                            .border_b_1()
-                            .border_color(t.line),
+                    .children(entries.into_iter().map(|entry| {
+                        render_shortcut_recorder_row(
+                            model,
+                            m,
+                            entry.id.to_string(),
+                            super::super::strings::actions::action_title(entry.id).to_string(),
+                            Some(scope_short_label(entry)),
+                            entry.context.to_string(),
+                            rec_str,
+                            t,
                         )
-                        .children(entries.into_iter().map(move |entry| {
-                            self.render_shortcut_recorder_row(
-                                entry.id.to_string(),
-                                super::super::strings::actions::action_title(entry.id).to_string(),
-                                Some(scope_short_label(entry)),
-                                entry.context.to_string(),
-                                rec_str,
-                                t,
-                                cx_ref,
-                            )
-                        }))
-                })
+                    }))
             })
-            .child(
+        })
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(4.))
+                .pt(px(4.))
+                .child(
+                    section_label("工作区预设快捷键", t)
+                        .pb(px(4.))
+                        .border_b_1()
+                        .border_color(t.line),
+                )
+                .children(preset_rows.into_iter().map(|(target_id, title)| {
+                    render_shortcut_recorder_row(
+                        model,
+                        m,
+                        target_id,
+                        title,
+                        Some("预设"),
+                        "Workspace".into(),
+                        recording_id.as_deref(),
+                        t,
+                    )
+                })),
+        )
+        .when(!plugin_rows.is_empty(), |d| {
+            d.child(
                 div()
                     .flex()
                     .flex_col()
                     .gap(px(4.))
                     .pt(px(4.))
                     .child(
-                        section_label("工作区预设快捷键", t)
+                        section_label("启用插件命令快捷键", t)
                             .pb(px(4.))
                             .border_b_1()
                             .border_color(t.line),
                     )
-                    .children(preset_rows.into_iter().map(|(target_id, title)| {
-                        self.render_shortcut_recorder_row(
+                    .children(plugin_rows.into_iter().map(|(target_id, title)| {
+                        render_shortcut_recorder_row(
+                            model,
+                            m,
                             target_id,
                             title,
-                            Some("预设"),
+                            Some("插件"),
                             "Workspace".into(),
                             recording_id.as_deref(),
                             t,
-                            cx,
                         )
                     })),
             )
-            .when(!plugin_rows.is_empty(), |d| {
-                d.child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap(px(4.))
-                        .pt(px(4.))
-                        .child(
-                            section_label("启用插件命令快捷键", t)
-                                .pb(px(4.))
-                                .border_b_1()
-                                .border_color(t.line),
-                        )
-                        .children(plugin_rows.into_iter().map(|(target_id, title)| {
-                            self.render_shortcut_recorder_row(
-                                target_id,
-                                title,
-                                Some("插件"),
-                                "Workspace".into(),
-                                recording_id.as_deref(),
-                                t,
-                                cx,
-                            )
-                        })),
-                )
-            })
-    }
+        })
+}
 
-    #[allow(clippy::too_many_arguments)]
-    fn render_shortcut_recorder_row(
-        &self,
-        target_id: String,
-        title: String,
-        scope_tag: Option<&'static str>,
-        context_pred: String,
-        active_recording: Option<&str>,
-        t: ThemeTokens,
-        cx: &Context<Self>,
-    ) -> impl IntoElement {
-        let is_recording = active_recording == Some(target_id.as_str());
-        let is_overridden = self.keymap.is_overridden(&target_id);
-        let effective = self.keymap.effective_key(&target_id);
-        let key_text = if is_recording {
-            "按下组合键…".to_string()
-        } else if effective.is_empty() {
-            "点击设置".to_string()
+#[allow(clippy::too_many_arguments)]
+fn render_shortcut_recorder_row(
+    model: &Entity<AppModel>,
+    m: &AppModel,
+    target_id: String,
+    title: String,
+    scope_tag: Option<&'static str>,
+    context_pred: String,
+    active_recording: Option<&str>,
+    t: ThemeTokens,
+) -> impl IntoElement {
+    let is_recording = active_recording == Some(target_id.as_str());
+    let is_overridden = m.keymap.is_overridden(&target_id);
+    let effective = m.keymap.effective_key(&target_id);
+    let key_text = if is_recording {
+        "按下组合键…".to_string()
+    } else if effective.is_empty() {
+        "点击设置".to_string()
+    } else {
+        let formatted = keymap::format_keystroke_display(&effective, IS_MACOS);
+        if formatted.is_empty() {
+            effective
         } else {
-            let formatted = keymap::format_keystroke_display(&effective, IS_MACOS);
-            if formatted.is_empty() {
-                effective
-            } else {
-                formatted
-            }
-        };
+            formatted
+        }
+    };
 
-        let id_rec = target_id.clone();
-        let id_reset = target_id.clone();
-        let row_btn_id = SharedString::from(format!("sc-rec:{target_id}"));
-        let reset_btn_id = SharedString::from(format!("sc-rst:{target_id}"));
+    let id_rec = target_id.clone();
+    let id_reset = target_id.clone();
+    let row_btn_id = SharedString::from(format!("sc-rec:{target_id}"));
+    let reset_btn_id = SharedString::from(format!("sc-rst:{target_id}"));
 
-        div()
-            .min_h(t.row_h)
-            .py(px(2.))
-            .flex()
-            .items_center()
-            .justify_between()
-            .gap(px(10.))
-            .child(
-                div()
-                    .flex_1()
-                    .min_w(px(0.))
-                    .flex()
-                    .items_center()
-                    .gap(px(6.))
-                    .child(
-                        div()
-                            .text_size(t.text_md)
-                            .text_color(if is_recording { t.text } else { t.text_muted })
-                            .truncate()
-                            .child(title),
-                    )
-                    .when_some(scope_tag, |d, tag| d.child(badge_pill(tag, false, t))),
-            )
-            .child(
-                div()
-                    .flex_none()
-                    .flex()
-                    .items_center()
-                    .gap(px(6.))
-                    .when(is_overridden, |d| {
-                        d.child(
-                            chip_button(reset_btn_id, "重置", false, t).on_click(cx.listener(
-                                move |this, _, w, cx| {
-                                    if this.overlays.recording_shortcut.as_ref().map(|(k, _)| k)
-                                        == Some(&id_reset)
-                                    {
-                                        this.overlays.recording_shortcut = None;
-                                        this.focus.focus(w);
-                                    }
-                                    this.keymap.reset_binding(&id_reset);
-                                    rebind_keys(cx, &this.keymap);
-                                    cx.notify();
-                                },
-                            )),
-                        )
-                    })
-                    .child(
-                        div()
-                            .id(row_btn_id)
-                            .h(t.control_h_sm)
-                            .min_w(px(68.))
-                            .px(px(8.))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded(t.radius_sm)
-                            .cursor_pointer()
-                            .font_family(if is_recording || key_text == "点击设置" {
-                                FONT_UI
-                            } else {
-                                FONT_MONO
-                            })
-                            .text_size(t.text_sm)
-                            .bg(if is_recording {
-                                t.selected
-                            } else {
-                                t.window_bg
-                            })
-                            .border_1()
-                            .border_color(if is_recording || is_overridden {
-                                t.accent
-                            } else {
-                                t.line_strong
-                            })
-                            .text_color(if is_recording {
-                                t.accent
-                            } else if key_text == "点击设置" {
-                                t.text_faint
-                            } else {
-                                t.text
-                            })
-                            .hover(|s| s.bg(t.hover).border_color(t.accent))
-                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                            .on_click(cx.listener(move |this, _, w, cx| {
-                                if is_recording {
+    div()
+        .min_h(t.row_h)
+        .py(px(2.))
+        .flex()
+        .items_center()
+        .justify_between()
+        .gap(px(10.))
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.))
+                .flex()
+                .items_center()
+                .gap(px(6.))
+                .child(
+                    div()
+                        .text_size(t.text_md)
+                        .text_color(if is_recording { t.text } else { t.text_muted })
+                        .truncate()
+                        .child(title),
+                )
+                .when_some(scope_tag, |d, tag| d.child(badge_pill(tag, false, t))),
+        )
+        .child(
+            div()
+                .flex_none()
+                .flex()
+                .items_center()
+                .gap(px(6.))
+                .when(is_overridden, |d| {
+                    d.child(
+                        chip_button(reset_btn_id, "重置", false, t).on_click(model_listener(
+                            model,
+                            move |this, _, w, cx| {
+                                if this.overlays.recording_shortcut.as_ref().map(|(k, _)| k)
+                                    == Some(&id_reset)
+                                {
                                     this.overlays.recording_shortcut = None;
                                     this.focus.focus(w);
-                                } else {
-                                    this.text_inputs.active_form_key = None;
-                                    this.overlays.shortcut_conflict = None;
-                                    this.overlays.recording_shortcut =
-                                        Some((id_rec.clone(), context_pred.clone()));
-                                    this.text_inputs.recorder_focus.focus(w);
                                 }
-                                cx.notify();
-                            }))
-                            .child(key_text),
-                    ),
-            )
-    }
+                                this.keymap.reset_binding(&id_reset);
+                                rebind_keys(cx, &this.keymap);
+                                this.notify_all(cx);
+                            },
+                        )),
+                    )
+                })
+                .child(
+                    div()
+                        .id(row_btn_id)
+                        .h(t.control_h_sm)
+                        .min_w(px(68.))
+                        .px(px(8.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded(t.radius_sm)
+                        .cursor_pointer()
+                        .font_family(if is_recording || key_text == "点击设置" {
+                            FONT_UI
+                        } else {
+                            FONT_MONO
+                        })
+                        .text_size(t.text_sm)
+                        .bg(if is_recording {
+                            t.selected
+                        } else {
+                            t.window_bg
+                        })
+                        .border_1()
+                        .border_color(if is_recording || is_overridden {
+                            t.accent
+                        } else {
+                            t.line_strong
+                        })
+                        .text_color(if is_recording {
+                            t.accent
+                        } else if key_text == "点击设置" {
+                            t.text_faint
+                        } else {
+                            t.text
+                        })
+                        .hover(|s| s.bg(t.hover).border_color(t.accent))
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .on_click(model_listener(model, move |this, _, w, cx| {
+                            if is_recording {
+                                this.overlays.recording_shortcut = None;
+                                this.focus.focus(w);
+                            } else {
+                                this.text_inputs.active_form_key = None;
+                                this.overlays.shortcut_conflict = None;
+                                this.overlays.recording_shortcut =
+                                    Some((id_rec.clone(), context_pred.clone()));
+                                this.text_inputs.recorder_focus.focus(w);
+                            }
+                            this.notify_regions(
+                                DirtyRegions {
+                                    root: true,
+                                    settings: true,
+                                    ..DirtyRegions::NONE
+                                },
+                                cx,
+                            );
+                        }))
+                        .child(key_text),
+                ),
+        )
 }

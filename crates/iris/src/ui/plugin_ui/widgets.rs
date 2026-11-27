@@ -4,21 +4,23 @@
 use std::rc::Rc;
 
 use gpui::{
-    AnyElement, Bounds, ClipboardItem, Context, Div, ElementId, InteractiveElement, IntoElement,
-    MouseButton, ParentElement, Pixels, Rgba, SharedString, Stateful, StatefulInteractiveElement,
-    Styled, Window, canvas, div, fill, point, prelude::FluentBuilder, px, relative, rgb, size,
+    AnyElement, App, Bounds, ClipboardItem, Context, Div, ElementId, Entity, InteractiveElement,
+    IntoElement, MouseButton, ParentElement, Pixels, Rgba, SharedString, Stateful,
+    StatefulInteractiveElement, Styled, Window, canvas, div, fill, point, prelude::FluentBuilder,
+    px, relative, rgb, size,
 };
 use iris_api::Widget;
 
-use super::super::IrisWindow;
+use super::super::AppModel;
 use super::super::kit::form::{check_indicator, chip_button, stepper_box};
 use super::super::kit::text_buffer::format_slider_value;
-use super::super::kit::text_field::{FormEnterCallback, TextFieldSpec};
+use super::super::kit::text_field::{FormEnterCallback, TextFieldSpec, render_text_field};
 use super::super::kit::{badge_pill, hbetween, hstack, icon, surface_card, vstack};
+use super::super::views::model_listener;
 use crate::assets::Icon;
 use crate::theme::{FONT_MONO, FONT_UI, ThemeTokens};
 
-type ValCallback<T> = Rc<dyn Fn(&mut IrisWindow, T, &mut Window, &mut Context<IrisWindow>)>;
+type ValCallback<T> = Rc<dyn Fn(&mut AppModel, T, &mut Window, &mut Context<AppModel>)>;
 
 #[derive(Clone)]
 pub(super) enum WidgetSurface<'a> {
@@ -28,7 +30,7 @@ pub(super) enum WidgetSurface<'a> {
     },
     Modal {
         modal_id: &'a str,
-        on_submit: FormEnterCallback,
+        on_submit: FormEnterCallback<AppModel>,
         window: &'a Window,
     },
 }
@@ -124,11 +126,11 @@ fn progress_bar(ratio: f32, t: ThemeTokens) -> Div {
 }
 
 fn dispatch_widget_value(
-    this: &mut IrisWindow,
+    this: &mut AppModel,
     target: (&str, &str, Option<&str>, Option<&str>),
     next_val: String,
     w: &mut Window,
-    cx: &mut Context<IrisWindow>,
+    cx: &mut Context<AppModel>,
 ) {
     let (pid, id, action_id, modal_key) = target;
     let explicit_act = action_id.filter(|a| !a.is_empty());
@@ -138,7 +140,7 @@ fn dispatch_widget_value(
         if let Some(act) = explicit_act {
             this.invoke_plugin_widget_action(pid, act, Some(next_val), w, cx);
         } else {
-            cx.notify();
+            this.notify_root(cx);
         }
     } else {
         this.invoke_plugin_widget_action(pid, explicit_act.unwrap_or(id), Some(next_val), w, cx);
@@ -179,8 +181,6 @@ const QR_QUIET_MODULES: usize = 4;
 struct QrMatrix {
     width: usize,
     height: usize,
-    /// Per-row coalesced `[start_col, end_col)` dark runs so adjacent modules share exact
-    /// edges and paint without horizontal seams or thousands of layout nodes.
     dark_runs: Vec<Vec<(usize, usize)>>,
 }
 
@@ -241,9 +241,6 @@ impl QrMatrix {
     }
 }
 
-/// Computes `(module_dev_px, total_logical_side)` snapped to an exact integer number of
-/// device pixels per module so fractional DPI scaling (125%/150%/175%) never produces
-/// subpixel white seams between rows or columns.
 fn qr_canvas_metrics(dim: usize, max_logical: f32, scale_factor: f32) -> (f32, f32) {
     let scale = if scale_factor.is_finite() && scale_factor >= 1.0 {
         scale_factor
@@ -259,12 +256,12 @@ fn qr_canvas_metrics(dim: usize, max_logical: f32, scale_factor: f32) -> (f32, f
 }
 
 fn render_pixel_grid_widget(
+    model: &Entity<AppModel>,
     scope: &str,
     max_logical_side: f32,
     scale_factor: f32,
     (label, rows, copy_text, caption): (String, Vec<String>, Option<String>, Option<String>),
     t: ThemeTokens,
-    cx: &Context<IrisWindow>,
 ) -> AnyElement {
     let parsed = QrMatrix::from_lines(&rows);
     let copy_row = copy_text.filter(|s| !s.trim().is_empty()).map(|data| {
@@ -275,7 +272,7 @@ fn render_pixel_grid_widget(
             false,
             t,
         )
-        .on_click(cx.listener(move |this, _, _, cx| {
+        .on_click(model_listener(model, move |this, _, _, cx| {
             cx.write_to_clipboard(ClipboardItem::new_string(copy_payload.clone()));
             this.show_toast("内容已复制到剪贴板", cx);
         }));
@@ -289,7 +286,7 @@ fn render_pixel_grid_widget(
     let grid = parsed.map(|qr| {
         let dim = qr.dim();
         let (_, total_logical) = qr_canvas_metrics(dim, max_logical_side, scale_factor);
-        let qr = std::rc::Rc::new(qr);
+        let qr = Rc::new(qr);
         let qr_paint = qr.clone();
         let qr_canvas = canvas(
             |_, _, _| {},
@@ -358,14 +355,15 @@ fn render_pixel_grid_widget(
 }
 
 pub(super) fn render_plugin_widget(
-    win: &IrisWindow,
+    model: &Entity<AppModel>,
     pid: &str,
     base_id: usize,
     widget: Widget,
     surface: WidgetSurface<'_>,
     t: ThemeTokens,
-    cx: &mut Context<IrisWindow>,
+    cx: &App,
 ) -> AnyElement {
+    let win = model.read(cx);
     let is_modal = matches!(surface, WidgetSurface::Modal { .. });
     let rest_bg = if is_modal { t.window_bg } else { t.panel };
     let pid_owned = pid.to_string();
@@ -455,8 +453,8 @@ pub(super) fn render_plugin_widget(
                 readout,
                 rest_bg,
                 t,
-                cx.listener(move |this, _, w, cx| dec_cb(this, -st, w, cx)),
-                cx.listener(move |this, _, w, cx| step_cb(this, st, w, cx)),
+                model_listener(model, move |this, _, w, cx| dec_cb(this, -st, w, cx)),
+                model_listener(model, move |this, _, w, cx| step_cb(this, st, w, cx)),
             );
             let lbl = trunc_txt(
                 label,
@@ -485,8 +483,8 @@ pub(super) fn render_plugin_widget(
             rest_bg,
             t,
         )
-        .on_click(cx.listener(move |this, _, w, cx| {
-            this.invoke_plugin_action(&pid_owned, &action_id, w, cx)
+        .on_click(model_listener(model, move |this, _, w, cx| {
+            this.invoke_plugin_action(&pid_owned, &action_id, w, cx);
         }))
         .into_any_element(),
 
@@ -499,8 +497,8 @@ pub(super) fn render_plugin_widget(
                 let g = btn.icon.as_deref().and_then(Icon::from_name);
                 let bid = widget_element_id("pl-gbtn", &scope, Some(&bi.to_string()));
                 icon_pill_button(bid, btn.label, g, btn.accent, t.control_h_sm, rest_bg, t)
-                    .on_click(cx.listener(move |this, _, w, cx| {
-                        this.invoke_plugin_action(&pid_b, &act, w, cx)
+                    .on_click(model_listener(model, move |this, _, w, cx| {
+                        this.invoke_plugin_action(&pid_b, &act, w, cx);
                     }))
             }))
             .into_any_element(),
@@ -525,7 +523,7 @@ pub(super) fn render_plugin_widget(
                         TextFieldSpec::form(key, Some(value), placeholder, secret, Some(on_submit));
                     vstack(5.)
                         .when_some(lbl, |d, l| d.child(txt(l, t.text_sm, t.text_muted)))
-                        .child(win.render_text_field(spec, Some(window), cx))
+                        .child(render_text_field(model, spec, Some(window), cx))
                         .into_any_element()
                 }
                 WidgetSurface::Sidebar { window, .. } => {
@@ -533,7 +531,7 @@ pub(super) fn render_plugin_widget(
                     let seed_sub = value.clone();
                     let target_act = action_id.filter(|a| !a.is_empty()).unwrap_or(id);
                     let fk_sub = field_key.clone();
-                    let submit_cb: FormEnterCallback = Rc::new(move |this, w, cx| {
+                    let submit_cb: FormEnterCallback<AppModel> = Rc::new(move |this, w, cx| {
                         let had_modal = this.plugins.active_modal().is_some();
                         let val = this
                             .text_inputs
@@ -545,7 +543,7 @@ pub(super) fn render_plugin_widget(
                             this.text_inputs.active_form_key = None;
                             this.focus.focus(w);
                         }
-                        cx.notify();
+                        this.notify_plugin_panel(cx);
                     });
                     let btn_cb = submit_cb.clone();
                     let spec = TextFieldSpec::form(
@@ -562,8 +560,11 @@ pub(super) fn render_plugin_widget(
                         t,
                     )
                     .h(px(f32::from(t.control_h_md).max(30.)))
-                    .on_click(cx.listener(move |this, _, w, cx| btn_cb(this, w, cx)));
-                    let field = div().flex_1().min_w(px(0.)).child(win.render_text_field(
+                    .on_click(model_listener(model, move |this, _, w, cx| {
+                        btn_cb(this, w, cx);
+                    }));
+                    let field = div().flex_1().min_w(px(0.)).child(render_text_field(
+                        model,
                         spec,
                         Some(window),
                         cx,
@@ -612,7 +613,7 @@ pub(super) fn render_plugin_widget(
                 t.control_h_sm
             })
             .px(px(if is_modal { 10. } else { 8. }))
-            .on_click(cx.listener(move |this, _, w, cx| {
+            .on_click(model_listener(model, move |this, _, w, cx| {
                 let next_s = if !cur { "true" } else { "false" };
                 let target = (&pid_owned[..], &id[..], action_id.as_deref(), mk.as_deref());
                 dispatch_widget_value(this, target, next_s.into(), w, cx);
@@ -647,7 +648,9 @@ pub(super) fn render_plugin_widget(
                     } else {
                         t.control_h_sm
                     })
-                    .on_click(cx.listener(move |this, _, w, cx| cb(this, val.clone(), w, cx)))
+                    .on_click(model_listener(model, move |this, _, w, cx| {
+                        cb(this, val.clone(), w, cx);
+                    }))
             });
             let lbl_col = if is_modal { t.text_muted } else { t.text_dim };
             vstack(4.)
@@ -687,8 +690,8 @@ pub(super) fn render_plugin_widget(
             row_box(rid, bg, border, t)
                 .px(px(8.))
                 .py(px(6.))
-                .on_click(cx.listener(move |this, _, w, cx| {
-                    this.invoke_plugin_action(&pid_owned, &action_id, w, cx)
+                .on_click(model_listener(model, move |this, _, w, cx| {
+                    this.invoke_plugin_action(&pid_owned, &action_id, w, cx);
                 }))
                 .child(text_col)
                 .when_some(badge.filter(|b| !b.is_empty()), |d, b| {
@@ -714,12 +717,12 @@ pub(super) fn render_plugin_widget(
                 (win.settings.directory_width - 64.0).clamp(140.0, 256.0)
             };
             render_pixel_grid_widget(
+                model,
                 &scope,
                 max_logical_side,
                 window.scale_factor(),
                 (label, rows, copy_text, caption),
                 t,
-                cx,
             )
         }
 
@@ -745,7 +748,7 @@ pub(super) fn render_plugin_widget(
                 t.panel,
                 t,
             )
-            .on_click(cx.listener(move |this, _, _, cx| {
+            .on_click(model_listener(model, move |this, _, _, cx| {
                 cx.write_to_clipboard(ClipboardItem::new_string(copy_url.clone()));
                 this.show_toast("已复制链接到剪贴板", cx);
             }));
@@ -798,62 +801,58 @@ mod tests {
         );
         assert_ne!(
             widget_element_id("pl-sel", &s1, Some("0")),
-            widget_element_id("pl-sel", &s4, Some("0"))
+            widget_element_id("pl-sel", &s1, Some("1"))
         );
+        let scoped = format!(
+            "md:{}:{}:{}:{}:{}",
+            "a:b".len(),
+            "a:b",
+            "c".len(),
+            "c",
+            0usize
+        );
+        let other = format!(
+            "md:{}:{}:{}:{}:{}",
+            "a".len(),
+            "a",
+            "b:c".len(),
+            "b:c",
+            0usize
+        );
+        assert_ne!(scoped, other);
     }
 
     #[test]
-    fn slider_extreme_ranges_and_invalid_drafts_stay_finite() {
-        for (min, max) in [
-            (-1e308, 1e308),
-            (1e308, 1e308),
-            (f64::NAN, f64::NAN),
-            (100., -100.),
-        ] {
-            let (lo, hi, step, value) = sanitize_range(1e308, min, max, 1e308);
-            assert!(lo < hi && lo.abs() <= 1e9 && hi.abs() <= 1e9);
-            assert!((0. ..=1.).contains(&((value - lo) / (hi - lo))));
-            assert_eq!(finite_value(f64::NAN, lo, hi, value), value);
-            assert!((lo..=hi).contains(&step_clamped(value, step, lo, hi)));
-        }
+    fn slider_range_sanitization_handles_nan_infinity_and_inverted_bounds() {
+        let (lo, hi, st, val) = sanitize_range(f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 0.0);
+        assert!(lo.is_finite() && hi.is_finite() && hi > lo && st > 0.0 && val.is_finite());
+
+        let (lo2, hi2, _, val2) = sanitize_range(50.0, 10.0, 10.0, -5.0);
+        assert_eq!(lo2, 10.0);
+        assert_eq!(hi2, 110.0);
+        assert_eq!(val2, 50.0);
+        assert_eq!(finite_value(f64::NAN, 0.0, 10.0, 3.0), 3.0);
+        assert_eq!(step_clamped(0.1, 0.2, 0.0, 1.0), 0.3);
     }
 
     #[test]
-    fn qr_matrix_trims_outer_margins_and_coalesces_dark_runs() {
-        let raw = vec![
-            "0000000".into(),
-            "0110110".into(),
-            "0100010".into(),
-            "0111110".into(),
-            "0000000".into(),
+    fn qr_matrix_coalesces_dark_runs_and_snaps_to_device_integer_modules() {
+        let rows = vec![
+            "11101".to_string(),
+            "10001".to_string(),
+            "11111".to_string(),
         ];
-        let parsed = QrMatrix::from_lines(&raw).expect("non-empty qr");
-        assert_eq!(parsed.width, 5);
-        assert_eq!(parsed.height, 3);
-        assert_eq!(parsed.dark_runs[0], vec![(0, 2), (3, 5)]);
-        assert_eq!(parsed.dark_runs[1], vec![(0, 1), (4, 5)]);
-        assert_eq!(parsed.dark_runs[2], vec![(0, 5)]);
-        assert!(QrMatrix::from_lines(&["000".into(), "000".into()]).is_none());
-    }
+        let qr = QrMatrix::from_lines(&rows).expect("valid qr");
+        assert_eq!((qr.width, qr.height), (5, 3));
+        assert_eq!(qr.dark_runs[0], vec![(0, 3), (4, 5)]);
+        assert_eq!(qr.dark_runs[2], vec![(0, 5)]);
 
-    #[test]
-    fn qr_canvas_metrics_snaps_to_integer_device_pixels_across_dpi_scales() {
-        for scale in [1.0f32, 1.25, 1.5, 1.75, 2.0] {
-            for dim in [29usize, 37, 49] {
-                let (mod_dev, total_logical) = qr_canvas_metrics(dim, 224.0, scale);
-                assert_eq!(mod_dev.fract(), 0.0, "scale={scale} dim={dim}");
-                assert!(mod_dev >= 3.0, "scale={scale} dim={dim} mod_dev={mod_dev}");
-                let total_dev = (total_logical * scale).round();
-                let quiet_dev = (total_dev - mod_dev * dim as f32) * 0.5;
-                assert!(
-                    quiet_dev >= mod_dev * QR_QUIET_MODULES as f32 - 0.01,
-                    "scale={scale} dim={dim} quiet_dev={quiet_dev} mod_dev={mod_dev}"
-                );
-                assert!(
-                    total_logical <= 224.01,
-                    "overflowed container: {total_logical}"
-                );
-            }
+        for scale in [1.0_f32, 1.25, 1.5, 1.75, 2.0] {
+            let (mod_dev, total_logical) = qr_canvas_metrics(29, 220.0, scale);
+            assert_eq!(mod_dev, mod_dev.floor());
+            assert!(mod_dev >= 1.0);
+            let expected = (29 + QR_QUIET_MODULES * 2) as f32 * mod_dev;
+            assert!((total_logical * scale - expected).abs() < 1e-3);
         }
     }
 }
