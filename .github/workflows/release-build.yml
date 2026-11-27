@@ -73,7 +73,6 @@ jobs:
     env:
       IRIS_PACKAGE_VERSION: ${{ inputs.version }}
       IRIS_PACKAGE_MODE: ${{ inputs.mode }}
-      IRIS_VERIFIED_OFFICIAL_PLUGINS: ${{ runner.temp }}/verified-official-plugins
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
@@ -108,6 +107,8 @@ jobs:
         run: tar -C "$RUNNER_TEMP" -xzf "$RUNNER_TEMP/media-download/media-sdk.tar.gz"
       - name: Compile Iris and collect release inputs
         shell: bash
+        env:
+          IRIS_VERIFIED_OFFICIAL_PLUGINS: ${{ runner.temp }}/verified-official-plugins
         run: |
           set -euo pipefail
           python scripts/release/package.py --sdk "$RUNNER_TEMP/media-sdk" --output "$RUNNER_TEMP/iris-dist" --version "$IRIS_PACKAGE_VERSION" --mode "$IRIS_PACKAGE_MODE" --prepare-only

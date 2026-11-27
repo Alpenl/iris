@@ -42,8 +42,6 @@ jobs:
       matrix:
         runner: [macos-15, macos-15-intel]
     runs-on: ${{ matrix.runner }}
-    env:
-      IRIS_VERIFIED_OFFICIAL_PLUGINS: ${{ runner.temp }}/verified-official-plugins
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
@@ -73,6 +71,8 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo test --locked --workspace --future-incompat-report
       - run: python3 -B scripts/run-plugin-v2-ci.py
+        env:
+          IRIS_VERIFIED_OFFICIAL_PLUGINS: ${{ runner.temp }}/verified-official-plugins
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - run: cargo clippy --locked --workspace --all-targets --release -- -D warnings
       - run: cargo clippy --locked --workspace --all-targets --features iris/devtools -- -D warnings
@@ -86,8 +86,6 @@ jobs:
   windows:
     needs: [official-plugins, windows-media]
     runs-on: windows-2025
-    env:
-      IRIS_VERIFIED_OFFICIAL_PLUGINS: ${{ runner.temp }}\verified-official-plugins
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
@@ -128,6 +126,8 @@ jobs:
       - run: python -B scripts/check-project.py
       - run: cargo test --locked --workspace --future-incompat-report
       - run: python -B scripts/run-plugin-v2-ci.py
+        env:
+          IRIS_VERIFIED_OFFICIAL_PLUGINS: ${{ runner.temp }}\verified-official-plugins
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - run: cargo clippy --locked --workspace --all-targets --release -- -D warnings
       - run: cargo clippy --locked --workspace --all-targets --features iris/devtools -- -D warnings
