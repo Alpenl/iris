@@ -9,12 +9,12 @@ use crate::media_uri::MediaUri;
 
 /// Applies `Settings::fake_ip_doh_fallback` to every host and plugin HTTP client.
 pub fn set_fake_ip_doh_fallback(enabled: bool) {
-    iris_net::http_client::doh::set_fallback_enabled(enabled);
+    iris_base::net::http_client::doh::set_fallback_enabled(enabled);
 }
 
 /// Applies `Settings::doh_resolvers` to every host and plugin HTTP client.
 pub fn set_doh_resolvers(resolvers: &[String]) -> anyhow::Result<()> {
-    iris_net::http_client::doh::set_resolvers(resolvers)
+    iris_base::net::http_client::doh::set_resolvers(resolvers)
 }
 
 /// User-pinned local folder, network share, or `MediaSource` plugin folder.

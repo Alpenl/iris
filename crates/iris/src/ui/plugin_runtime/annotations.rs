@@ -13,12 +13,12 @@ use gpui::{
 use iris_api::v2::{
     Capability, ErrorCode, GuestError, HostEvent, Id, Reply, enhance::AnnotationEdit,
 };
+use iris_base::net::http_client::HttpCancel;
 use iris_core::media_uri::MediaUri;
 use iris_core::store::{
     AnnotationEdit as StoreAnnotationEdit, AnnotationError, AnnotationSnapshot, AnnotationTarget,
     ColorLabel, TimeMarker,
 };
-use iris_net::http_client::HttpCancel;
 use iris_plugin_host::{
     ledger::{Ledger, Resource},
     runtime::WindowAccess,

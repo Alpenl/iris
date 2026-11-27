@@ -173,10 +173,11 @@ mod imp {
                 return Claim::Rejected;
             }
         };
-        if let Err(e) = iris_net::concurrency::spawn_thread(
-            iris_net::concurrency::ThreadRole::SingleInstanceIpc,
-            move || serve(pipe, session, opened),
-        ) {
+        if let Err(e) =
+            iris_base::rt::spawn_thread(iris_base::rt::ThreadRole::SingleInstanceIpc, move || {
+                serve(pipe, session, opened)
+            })
+        {
             log::error!("starting file-open listener: {e}");
             return Claim::Rejected;
         }

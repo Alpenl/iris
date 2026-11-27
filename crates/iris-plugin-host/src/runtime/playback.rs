@@ -5,7 +5,7 @@ use crate::{
     stream::prepare::{GuestFactory, Playback, Preparation},
 };
 use iris_api::v2::{Capability, ErrorCode, Generation, Id, stream::StreamSpec};
-use iris_net::http_client::HttpCancel;
+use iris_base::net::http_client::HttpCancel;
 use std::collections::BTreeMap;
 
 pub struct PlaybackPermit {

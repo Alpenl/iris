@@ -10,10 +10,10 @@ use crate::{
     ledger::{Ledger, Reservation, Resource},
 };
 use iris_api::v2::{Capability, ErrorCode, Id, task_result::OriginResult};
+use iris_base::net::http_client::HttpCancel;
+use iris_base::rt::{Deadline, ThreadRole, spawn_thread};
 use iris_core::bounded_json;
 use iris_core::fs_util;
-use iris_net::concurrency::{Deadline, ThreadRole, spawn_thread};
-use iris_net::http_client::HttpCancel;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -310,13 +310,14 @@ fn resolve(
                     .filter(|ip| !matches!(ip, IpAddr::V6(v6) if v6.is_unicast_link_local()))
                     .collect();
                 let snapshot: Vec<_> = ips.iter().copied().collect();
-                if iris_net::http_client::doh::use_fallback(&host, &snapshot) {
+                if iris_base::net::http_client::doh::use_fallback(&host, &snapshot) {
                     let doh_deadline = Instant::now() + Duration::from_secs(8);
-                    let real =
-                        iris_net::http_client::doh::resolve_a_records(&host, &job_cancel, || {
-                            doh_deadline
-                        })
-                        .map_err(|_| ErrorCode::IoError)?;
+                    let real = iris_base::net::http_client::doh::resolve_a_records(
+                        &host,
+                        &job_cancel,
+                        || doh_deadline,
+                    )
+                    .map_err(|_| ErrorCode::IoError)?;
                     ips = real.into_iter().map(|ip| ip.to_canonical()).collect();
                 }
                 if ips.is_empty() {

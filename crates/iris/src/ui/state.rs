@@ -167,7 +167,7 @@ pub(super) enum StreamReply {
 
 /// Dropping the window or superseding a load must wake its blocking network read.
 pub(super) struct RemoteLoad {
-    pub(super) cancel: iris_net::http_client::HttpCancel,
+    pub(super) cancel: iris_base::net::http_client::HttpCancel,
     pub(super) _task: gpui::Task<()>,
 }
 
@@ -761,7 +761,7 @@ mod remote_lifecycle_tests {
 
     #[test]
     fn browse_and_resolve_lifecycles_never_clobber_each_other() {
-        let cancel = iris_net::http_client::HttpCancel::default();
+        let cancel = iris_base::net::http_client::HttpCancel::default();
         let mut catalog = CatalogState {
             pending_browse: Some(browse("browse-1", false)),
             pending_resolve: Some(resolve("resolve-1")),
@@ -845,7 +845,7 @@ mod remote_lifecycle_tests {
 
     #[test]
     fn replacing_remote_load_cancels_reader_and_serializes_preparation() {
-        let cancel = iris_net::http_client::HttpCancel::default();
+        let cancel = iris_base::net::http_client::HttpCancel::default();
         let mut catalog = CatalogState {
             pending_resolve: Some(resolve("resolve-1")),
             remote_load: Some(RemoteLoad {

@@ -4,7 +4,7 @@ use crate::{
     stream::{manifest::ROOT, reader::MemoryReader},
 };
 use iris_api::v2::{ErrorCode, stream::ManifestFormat};
-use iris_net::http_client::HttpCancel;
+use iris_base::net::http_client::HttpCancel;
 use serde_json::json;
 fn manifest(url: &RemoteResource) -> Vec<u8> {
     serde_json::to_vec(&json!({

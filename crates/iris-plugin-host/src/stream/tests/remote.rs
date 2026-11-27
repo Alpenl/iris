@@ -3,7 +3,7 @@ use crate::instance::Blob;
 use crate::ledger::Resource;
 use crate::stream::reader::Reader;
 use iris_api::v2::{ErrorCode, stream::ByteIdentity};
-use iris_net::http_client::HttpCancel;
+use iris_base::net::http_client::HttpCancel;
 fn partial(start: usize, total: usize, data: &[u8], etag: &str) -> Vec<u8> {
     let mut bytes = format!("HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes {}-{}/{total}\r\nETag: \"{etag}\"\r\nConnection: close\r\n\r\n",data.len(),start,start+data.len()-1).into_bytes();
     bytes.extend_from_slice(data);

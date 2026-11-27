@@ -4,7 +4,7 @@ use crate::{
     network::{Origin, TransportKind, normalize_url, raw::RawState},
 };
 use iris_api::v2::{ErrorCode, stream::RemoteResource};
-use iris_net::http_client::HttpCancel;
+use iris_base::net::http_client::HttpCancel;
 use std::time::{Duration, Instant};
 use url::Url;
 pub(crate) struct Fetched {

@@ -9,7 +9,7 @@ use super::{
     runtime::Setup,
 };
 use iris_api::v2::ErrorCode;
-use iris_net::concurrency::CancelToken;
+use iris_base::rt::CancelToken;
 use serde::Deserialize;
 use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
 

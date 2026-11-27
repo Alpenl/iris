@@ -32,7 +32,7 @@ use crate::logging;
 use crate::media_uri::MediaUri;
 use crate::photo::Photo;
 use crate::settings::Settings;
-use iris_net::http_client::{origin_headers, validate_stream_url};
+use iris_base::net::http_client::{origin_headers, validate_stream_url};
 
 pub use enhance::ExternalTrack;
 pub use machine::coalesce_updates;

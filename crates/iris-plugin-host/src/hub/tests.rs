@@ -168,7 +168,7 @@ fn wasm_fixture_recognizes_both_json_member_orders() {
     use crate::instance::{Instance, InstanceConfig};
     let package = Package::from_zip(&package("test.order"), Provenance::User).unwrap();
     let engine = RuntimeEngine::new().unwrap();
-    let cancel = iris_net::concurrency::CancelToken::new();
+    let cancel = iris_base::rt::CancelToken::new();
     let module = engine.compile(package.wasm().unwrap(), &cancel).unwrap();
     let mut guest = Instance::new(InstanceConfig {
         engine,

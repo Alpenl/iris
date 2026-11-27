@@ -8,7 +8,7 @@
 crates/
   iris-mpv/            libmpv 的手写 FFI（不用 bindgen）：client API + mpv_node 结构化传参 + RenderHandle 窄能力封装
   iris-api/            无头插件协议（protocol: 2 / ABI: 2）：根模块公共值类型与 v2/ 版本化线协议契约（仅依赖 serde）
-  iris-net/            通用网络与并发底座：HTTP/HTTPS 客户端、DNS/DoH（RFC 8484）、本地回环 HTTP 服务、WebSocket/原始 TCP 双工帧与 CancelToken/Deadline/ThreadRole
+  iris-base/           通用并发与网络底座：rt（CancelToken/Deadline/ThreadRole 受管线程与预算）+ net（HTTP/HTTPS 客户端、DNS/DoH、回环 HTTP、WebSocket/TCP 双工帧）
   iris-plugin-sdk/     Wasm 插件 Guest 侧 SDK：导出宏、类型化事件分发、异步任务/Blob 辅助与有界 JSON 校验（宿主零反向依赖）
   iris-plugin-guides/  官方构图辅助线插件（iris.guides）：使用公开 SDK 编译的可复现 Wasm 包
   iris-plugin-webdav/  官方 WebDAV 数据源插件（iris.webdav）：使用公开 SDK 编译的多实例远程存储 Wasm 包
@@ -17,13 +17,13 @@ crates/
   iris/                GPUI 应用：窗口、ThemeTokens 动态令牌、ui/kit 共用原语、统一 VideoSurfaceBackend 平台视频层与系统桥接、单实例、调试管道
 ```
 
-依赖方向严格单向：`iris` → `iris-plugin-host` → `iris-core` → `iris-net`，`iris-core` → `iris-mpv`，且 `iris` / `iris-plugin-host` → `iris-api`；`iris-plugin-sdk` 仅由 Wasm Guest 插件（含 `iris-plugin-guides`、`iris-plugin-webdav` 及 `examples/plugins/*`）引用，宿主零反向依赖（`iris` 仅在 `src/video/` 中通过 `clippy.toml` 豁免使用窄能力 `iris_mpv::RenderHandle` 与 `Session::video_recovery`，业务与 UI 代码由编译器强制禁止触碰 `iris_mpv` 或构造 `RenderHandle`）。`scripts/check-project.py` 与 `clippy` 自动检查：
+依赖方向严格单向：`iris` → `iris-plugin-host` → `iris-core` → `iris-base`，`iris-core` → `iris-mpv`，且 `iris` / `iris-plugin-host` → `iris-api`；`iris-plugin-sdk` 仅由 Wasm Guest 插件（含 `iris-plugin-guides`、`iris-plugin-webdav` 及 `examples/plugins/*`）引用，宿主零反向依赖（`iris` 仅在 `src/video/` 中通过 `clippy.toml` 豁免使用窄能力 `iris_mpv::RenderHandle` 与 `Session::video_recovery`，业务与 UI 代码由编译器强制禁止触碰 `iris_mpv` 或构造 `RenderHandle`）。`scripts/check-project.py` 与 `clippy` 自动检查：
 
-1. Cargo 依赖图强制隔离：`iris-net` 零领域依赖，`iris-core` 不依赖 GPUI、`iris-plugin-host`、`iris-api` 或 `wasmtime`，`iris-plugin-host` 不依赖 GPUI 或 `iris-mpv`；
+1. Cargo 依赖图强制隔离：`iris-base` 零领域依赖，`iris-core` 不依赖 GPUI、`iris-plugin-host`、`iris-api` 或 `wasmtime`，`iris-plugin-host` 不依赖 GPUI 或 `iris-mpv`；
 2. `iris-api` 常规依赖仅限 `serde`（不依赖 GPUI 或 `iris-mpv`）；
 3. `crates/iris/clippy.toml`、`crates/iris-core/clippy.toml` 与 `crates/iris-plugin-host/clippy.toml` 通过 `disallowed-types` / `disallowed-methods` 强制约束 `iris_mpv::*` 与 `RenderHandle::new` / `Session::{render_handle, video_recovery}` 的调用边界，扫描全仓 `crates/*` 的 `src/` 与 `tests/` 禁止越权 `allow/expect(clippy::disallowed_*)`（仅显式豁免 `crates/iris/src/video/` 与 `crates/iris-core/src/player/mod.rs` 的 `render_handle` / `video_recovery` 两处），且全仓非测试生产代码禁止 `use super::*;`；
 4. `crates/iris/src/ui/` 禁止散落 `target_os` 条件编译，且通用组件库 `crates/iris/src/ui/kit/` 禁止引用根窗口 `IrisWindow` 或业务宿主 `AppModel`；
-5. 全仓生产代码禁止直接调用 `std::thread::spawn` 或未登记的 `std::thread::Builder`，所有 OS 线程必须通过 `iris_net::concurrency::{spawn_thread, spawn_thread_named}` 按 `ThreadRole` 登记，且每个角色的线程名必须记录在本文第 6 节；
+5. 全仓生产代码禁止直接调用 `std::thread::spawn` 或未登记的 `std::thread::Builder`，所有 OS 线程必须通过 `iris_base::rt::{spawn_thread, spawn_thread_named}` 按 `ThreadRole` 登记，且每个角色的线程名必须记录在本文第 6 节；
 6. `devtools` 控制管道门禁未被默认特性或普通发布版绕过；
 7. 全仓 `.rs` 有效代码行（SLOC，剥离注释与空白行）预算（生产代码超过 650 SLOC 提示、硬上限 850 SLOC，尾部内联 `#[cfg(test)] mod tests` 硬上限 400 SLOC，独立测试文件硬上限 1,500 SLOC）、`crates/*/src` 顶层模块环单向棘轮、本文与双语 `README` 的成员同步门禁，以及图标、官方嵌入插件源码摘要隔离与示例插件清单一致性。
 
@@ -34,7 +34,7 @@ crates/
 - `crates/iris-api/src/`（根模块公共类型 vs `v2/` 协议子模块边界）：常规依赖仅 `serde`，零宿主 I/O 与零中文 UI 文案。
   - **根模块（`lib.rs` 及 `{manifest, overlay, source, workbench}.rs`）**：承载不绑定单版线协议帧外壳的共享声明式值类型与纯校验函数，供宿主侧（`iris`、`iris-plugin-host`）与 Guest SDK 直接经 `iris_api::*` 复用，包括 `PROTOCOL_VERSION = 2`、命令与数据源声明规格（`CommandSpec`、`SourceProviderSpec`、`is_valid_id`）、媒体与流变体值类型（`MediaKind`、`SourceEntryKind`、`SourceManageAction`、`StreamVariant`）、视口矢量叠层节点（`OverlayNode`、`TextAlign`）以及参数化工作台组件树与主题/栏位规格（`Widget` 含 `PixelGrid`、`PluginModal`、`SidebarPanel`、`SidebarSection`、`UiThemeSpec`、`ChromeLayoutSpec`、`ViewTimer`、`Color`、`is_valid_hex_color`）。
   - **`v2/` 协议子模块（`src/v2/{mod, manifest, wire, integer, source, stream, task, task_result, enhance, crypto}.rs`）**：收敛 `ABI_VERSION = 2` 的宿主↔Guest 版本化线协议契约与配额常量（`MESSAGE_LIMIT`、`CHUNK_LIMIT`、`JSON_DEPTH_LIMIT`、`COMMAND_LIMIT`、`ErrorCode`），包括包清单与权限/网络规则（`Manifest`、`Capability`、`NetworkDeclaration`、`HostRule`）、双向控制消息与句柄/整数编码（`HostEvent`、`HostCommand` 含 `Log`、`Id`、`Generation`、`WireU64` 十进制/数值双兼容）、目录分页与播放快照（`SourcePage`、`PlaybackSnapshot`）、三模流契约（`DirectHttp` / `RandomAccess` / `VirtualHls`）、异步任务请求与结果载荷（`Task`、`StoreRead`/`StoreWrite` 等）、媒体增强（轨道、LUT、章节、标注）及密码学原语规格。
-- `crates/iris-net/src/{concurrency,http_client,dns,loopback_http,net_Socket}.rs`：统一的取消令牌 `CancelToken`（无锁原子轮询快路径 + 嵌套子令牌与跨对象 `link` + TCP `shutdown(Both)` / `mio::Waker` / `Condvar` 唤醒回调）、单调截止时间 `Deadline`、受管 OS 线程注册表（`ThreadRole`、`budget`、`spawn_thread` / `spawn_thread_named`）、有界 HTTP/DoH 客户端、共用本地回环 HTTP 监听/Range 响应以及 WebSocket/原始 TCP 泵。
+- `crates/iris-base/src/{rt,net}/`：`rt` 收纳统一的取消令牌 `CancelToken`（无锁原子轮询快路径 + 嵌套子令牌与跨对象 `link` + TCP `shutdown(Both)` / `mio::Waker` / `Condvar` 唤醒回调）、单调截止时间 `Deadline` 与受管 OS 线程注册表（`ThreadRole`、`budget`、`spawn_thread` / `spawn_thread_named`）；`net` 收纳有界 HTTP/DoH 客户端、共用本地回环 HTTP 监听/Range 响应、WebSocket/原始 TCP 泵与零网络解析 `fuzz_net` 入口。
 - `crates/iris-core/src/player/`：
   - `machine.rs` + `machine/reduce.rs`：不依赖 `libmpv` 即可独立单测的纯状态机 `PlayerMachine`、穷尽生命周期变体 `MediaSourceState::{Idle, Opening, Loaded, Failed}`（收拢 `entry_id`、`OpeningTransport` / `LoadedTransport` / `FailedTransport`、`in_flight_adds`、`deferred_local_subs`、`dirty`、`reattach_on_load`、`FailedEnhancements` 与 `eof_paused`，令非法标志位组合不可表达）、声明式副作用 `MpvOp` 与批次属性合并纯函数 `coalesce_updates`。
   - `recovery.rs`：跨平台视频轨恢复状态机 `VideoRecoveryHandle`（由 `EventPump` 驱动异步 `vid` 查询，供渲染层在设备重建后恢复活跃视频轨）。
@@ -180,7 +180,7 @@ NSWindow contentView
 
 官方 `iris.guides` 与 `iris.webdav` 使用公开 SDK 编译成可复现 Wasm 包，构建时嵌入并校验摘要，遵守同样的授权与配额。A-B 循环归原生 Session；旧 BuiltinPlugin/stdio/Python 插件运行时已移除。用户包经设置中的宿主审核安装，更新增权不静默通过。
 
-网络将传输能力与目的地范围分开（统一收口在 `iris-net` 的策略层），全链路检查初始 URL、重定向和实际连接地址。任意公网权限仍拒绝私网；NAS 使用用户确认的具体 Origin 与固定地址集合。播放、字幕与缩略图复用所属插件授权，跨源剥离敏感头。
+网络将传输能力与目的地范围分开（统一收口在 `iris-base::net` 的策略层），全链路检查初始 URL、重定向和实际连接地址。任意公网权限仍拒绝私网；NAS 使用用户确认的具体 Origin 与固定地址集合。播放、字幕与缩略图复用所属插件授权，跨源剥离敏感头。
 
 DirectHttp、RandomAccess、VirtualManifest 共用受控播放准入。远端及虚拟 HLS 经结构化 `VirtualHls` 解析并生成本会话密封回环引用，拒绝未知必要语义且不向 libmpv 回退原始清单（零调用方的 DASH 与受限 HLS 文本通道已在 `0.0.2` 移除）。绑定资源持续到异步 mpv 加载确认和实际 I/O 结束，取消中的资源仍占额度。
 
@@ -188,7 +188,7 @@ DirectHttp、RandomAccess、VirtualManifest 共用受控播放准入。远端及
 
 ## 6. 并发模型、线程清单与预算
 
-所有生产环境的 OS 线程均在 `crates/iris-net/src/concurrency.rs` 中由 `ThreadRole` 集中登记，并通过 `spawn_thread` / `spawn_thread_named` 创建。`scripts/check-project.py` 在静态检查阶段禁止 `crates/iris-net/src/concurrency.rs` 以外的生产代码直接调用 `std::thread::spawn` 或 `std::thread::Builder`，并校验下表完整覆盖全部 18 类受管线程：
+所有生产环境的 OS 线程均在 `crates/iris-base/src/rt/mod.rs` 中由 `ThreadRole` 集中登记，并通过 `spawn_thread` / `spawn_thread_named` 创建。`scripts/check-project.py` 在静态检查阶段禁止 `crates/iris-base/src/rt/mod.rs` 以外的生产代码直接调用 `std::thread::spawn` 或 `std::thread::Builder`，并校验下表完整覆盖全部 18 类受管线程：
 
 | `ThreadRole` | 线程名 / 前缀 | 局部上限 | 全局上限 | 超限与背压策略 | 生命周期与回收所有权 |
 |---|---|---|---|---|---|
@@ -223,7 +223,7 @@ DirectHttp、RandomAccess、VirtualManifest 共用受控播放准入。远端及
 | `gpui = "=0.2.2"` | UI | crates.io 版，`default-features = false, features = ["font-kit", "runtime_shaders"]`，只需 Command Line Tools。锁死版本，主动升级。不引第三方 GPUI 组件库。|
 | `iris-mpv`（本仓库） | libmpv FFI | 手写声明，零常规依赖，不用 bindgen。|
 | `iris-api`（本仓库） | 插件协议 | 仅依赖 `serde`（测试用 `serde_json`），零 UI/媒体依赖。|
-| `iris-net`（本仓库） | 网络与并发原语 | 仅依赖网络/TLS/同步基础库，零领域依赖。|
+| `iris-base`（本仓库） | 并发与网络底座 | `rt` 并发原语 + `net` 网络协议，仅依赖网络/TLS/同步基础库，零领域依赖。|
 | `iris-plugin-host`（本仓库） | Wasm 插件宿主 | 依赖 `wasmtime`（仅开 `pulley` 字节码解释器）、`iris-core` 与 `iris-api`，不依赖 GPUI 或 `iris-mpv`。|
 | `windows = "0.61"` / `windows-sys = "0.61"` | Windows 原生绑定 | 全仓统一为 `0.61` 同代绑定，避免双代 Win32/COM crate 并存编译。|
 | `objc 0.2`、`cocoa =0.26.0` | macOS 原生调用 | GPUI 0.2.2 内部也用这两个，迁到 objc2 后类型不互通，暂不迁移。|
@@ -253,7 +253,7 @@ DirectHttp、RandomAccess、VirtualManifest 共用受控播放准入。远端及
 
 | 规划稿 | 实际 | 原因 |
 |---|---|---|
-| `iris-core` 不依赖 GPUI | 已拆分为 `iris-net` + `iris-core` + `iris-plugin-host` 并由 `check-project.py` 强制约束 | 核心领域、网络底座与 Wasm 宿主各自独立编译单测 |
+| `iris-core` 不依赖 GPUI | 已拆分为 `iris-base` + `iris-core` + `iris-plugin-host` 并由 `check-project.py` 强制约束 | 核心领域、并发/网络底座与 Wasm 宿主各自独立编译单测 |
 | `iris-api` crate 与控制面插件 | 已落地：`iris-api/src/v2/` + `iris-plugin-host/src/` + `ui/{palette.rs,plugin_ui/}` | 坚持不接触像素数据，同时保留高自由度 UI/数据源扩展并将官方 WebDAV 统一纳入 `iris.webdav` 插件 |
 | `engine/` 下的 `MediaBackend` trait | 仍没有；由 `player::machine` 将状态转移与 `MpvOp` 纯函数化，`Session` 薄适配 `iris-mpv` | 只有 mpv 一套实现，纯状态机已让播放逻辑脱离 `libmpv` 独立可测 |
 | `command.rs` / `state.rs` / `event.rs` 分文件 | `player/{mod,machine,model,prepare,backend,events,inspect,recovery,relay,scoped,enhance}.rs` | 按纯状态机、模型、准备、后端、事件、恢复、转发与增强拆分 |

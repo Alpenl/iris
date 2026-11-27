@@ -174,7 +174,7 @@ fn installed_guest_persists_state_without_read_state_and_cannot_receive_local_sn
 #[test]
 #[ignore = "requires compiled Rust guest; run scripts/test-plugin-v2.py"]
 fn admitted_playback_survives_request_cancel_and_control_timeout_until_explicit_stop() {
-    use iris_net::http_client::HttpCancel;
+    use iris_base::net::http_client::HttpCancel;
     let fixture = Fixture::new();
     let mut control = fixture.load();
     let window = fixture.open(&mut control);
@@ -261,7 +261,7 @@ fn admitted_playback_survives_request_cancel_and_control_timeout_until_explicit_
 #[test]
 #[ignore = "requires compiled Rust guest; run scripts/test-plugin-v2.py"]
 fn coordinator_routes_live_source_requests_and_stops_stream_on_window_close() {
-    use iris_net::http_client::HttpCancel;
+    use iris_base::net::http_client::HttpCancel;
     use iris_plugin_host::hub::{Config, Hub, Notice};
     let fixture = Fixture::new();
     let hub = Hub::new(Config {

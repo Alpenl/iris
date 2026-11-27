@@ -9,13 +9,13 @@ use crate::{
     ledger::{Reservation, Resource},
 };
 use iris_api::v2::{CHUNK_LIMIT, ErrorCode};
-use iris_core::logging;
-use iris_net::concurrency::{ThreadRole, budget, spawn_thread};
-use iris_net::http_client::HttpCancel;
-use iris_net::loopback_http::{
+use iris_base::net::http_client::HttpCancel;
+use iris_base::net::loopback_http::{
     ClientHub, ClientWatch, HttpMethod, HttpRequestError, parse_http_request, read_request,
     write_all_cancellable, write_chunk_cancellable,
 };
+use iris_base::rt::{ThreadRole, budget, spawn_thread};
+use iris_core::logging;
 use mio::{Events, Interest, Poll, Token, Waker};
 use serde_json::json;
 use std::{

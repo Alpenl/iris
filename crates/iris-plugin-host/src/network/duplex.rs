@@ -1,8 +1,8 @@
 //! Convert an already authorized connection into an owned nonblocking transport.
 use super::{RequestGrant, raw};
 use iris_api::v2::ErrorCode;
-use iris_net::http_client::{HttpCancel, NetworkScope, connect_transport};
-pub(crate) use iris_net::wire::Wire;
+use iris_base::net::http_client::{HttpCancel, NetworkScope, connect_transport};
+pub(crate) use iris_base::net::wire::Wire;
 use std::{
     sync::Arc,
     time::{Duration, Instant},

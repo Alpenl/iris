@@ -3,7 +3,7 @@ use crate::actor::Executor;
 use crate::auth::BrowserOpen;
 use crate::json_error;
 use iris_api::v2::{ErrorCode, Generation, HostEvent, Id, source::PlaybackSnapshot};
-use iris_net::http_client::HttpCancel;
+use iris_base::net::http_client::HttpCancel;
 use std::sync::Arc;
 
 /// Lightweight window-open plan; actual artifact directories are created lazily.

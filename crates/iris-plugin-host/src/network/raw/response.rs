@@ -4,7 +4,7 @@ use std::time::Instant;
 use iris_api::v2::ErrorCode;
 
 use super::{Connection, Headers, RawRequest, Response, io_error, unique_header};
-use iris_net::http_client::{ChunkedReader, HttpBody, parse_decimal_u64};
+use iris_base::net::http_client::{ChunkedReader, HttpBody, parse_decimal_u64};
 
 pub(super) fn receive(
     mut connection: Connection,

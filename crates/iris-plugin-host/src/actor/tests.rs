@@ -153,7 +153,7 @@ fn store_slots_are_reserved_before_spawning_threads() {
     )
     .unwrap();
     let module = engine
-        .compile(&wasm, &iris_net::concurrency::CancelToken::new())
+        .compile(&wasm, &iris_base::rt::CancelToken::new())
         .unwrap();
     let ledger = Ledger::default();
     let io = IoPool::new().unwrap();

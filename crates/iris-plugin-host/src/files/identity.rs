@@ -1,6 +1,6 @@
 //! Host-selected local file identities. Guest values never become filesystem paths.
 use iris_api::v2::ErrorCode;
-use iris_net::http_client::HttpCancel;
+use iris_base::net::http_client::HttpCancel;
 use std::{
     fs::{File, Metadata, OpenOptions},
     io::{Read, Seek, SeekFrom},

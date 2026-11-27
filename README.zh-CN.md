@@ -99,8 +99,8 @@ crates/
 │                          流中继、媒体增强
 ├── iris-core/             无头内核（不依赖 GPUI）：播放器状态机、目录与播放队列、工作区预设、键位、
 │                          照片解析与色彩匹配、凭据库、日志
-├── iris-net/              网络与并发底座：HTTP(S) 客户端、DNS/DoH、本地回环 HTTP 服务、
-│                          WebSocket/TCP 双工帧、受管线程与取消
+├── iris-base/             并发与网络底座（rt / net）：受管线程与取消原语、HTTP(S) 客户端、
+│                          DNS/DoH、本地回环 HTTP 服务、WebSocket/TCP 双工帧
 ├── iris-mpv/              手写 libmpv FFI（client API、mpv_node、RenderHandle）
 ├── iris-api/              无头插件协议（protocol: 2 / ABI: 2，仅依赖 serde）
 ├── iris-plugin-sdk/       Wasm 插件（Guest 侧）开发 SDK
@@ -116,7 +116,7 @@ docs/                      架构、决策与插件规范
 scripts/                   项目检查与构建工具
 ```
 
-依赖方向单向：`iris` → `iris-plugin-host` → `iris-core` → `iris-net`，另有 `iris-core` → `iris-mpv`。只有 `iris` 使用 GPUI，宿主侧 crate 都不依赖 Guest SDK；`scripts/check-project.py` 在 CI 中检查依赖图。模块级职责与完整规则见 [架构文档](docs/ARCHITECTURE.md)。
+依赖方向单向：`iris` → `iris-plugin-host` → `iris-core` → `iris-base`，另有 `iris-core` → `iris-mpv`。只有 `iris` 使用 GPUI，宿主侧 crate 都不依赖 Guest SDK；`scripts/check-project.py` 在 CI 中检查依赖图。模块级职责与完整规则见 [架构文档](docs/ARCHITECTURE.md)。
 
 ## 许可
 

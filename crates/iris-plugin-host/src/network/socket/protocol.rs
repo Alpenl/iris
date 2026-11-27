@@ -1,7 +1,7 @@
 use super::super::duplex::Wire;
 use iris_api::v2::{CHUNK_LIMIT, ErrorCode};
-pub(super) use iris_net::ws_tcp::{Data, ReadStep};
-use iris_net::ws_tcp::{Protocol as NetProtocol, WireError};
+pub(super) use iris_base::net::ws_tcp::{Data, ReadStep};
+use iris_base::net::ws_tcp::{Protocol as NetProtocol, WireError};
 use url::Url;
 
 pub(super) struct Protocol(NetProtocol);

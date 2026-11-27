@@ -11,7 +11,7 @@ use iris_api::v2::{
     CHUNK_LIMIT, Capability, ErrorCode, Generation, Id, Role, task::Task,
     task_result::ArtifactResult,
 };
-use iris_net::http_client::HttpCancel;
+use iris_base::net::http_client::HttpCancel;
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::PathBuf,

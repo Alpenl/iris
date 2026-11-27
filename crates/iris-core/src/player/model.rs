@@ -144,10 +144,10 @@ pub(super) fn fetch_subtitle(
     url: &url::Url,
     headers: &BTreeMap<String, String>,
     credentials: &url::Url,
-    scope: &iris_net::http_client::NetworkScope,
-    cancel: &iris_net::http_client::HttpCancel,
+    scope: &iris_base::net::http_client::NetworkScope,
+    cancel: &iris_base::net::http_client::HttpCancel,
 ) -> Result<String> {
-    let body = iris_net::http_client::fetch_subtitle_bytes(
+    let body = iris_base::net::http_client::fetch_subtitle_bytes(
         url.clone(),
         headers,
         credentials,

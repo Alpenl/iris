@@ -2,7 +2,7 @@
 //! other parallel tests. Count live Rust allocations, including the actor thread,
 //! because the resource ledger alone cannot detect unaccounted read history.
 use iris_api::v2::{ErrorCode, Generation, Role, task::Task};
-use iris_net::concurrency::CancelToken;
+use iris_base::rt::CancelToken;
 use iris_plugin_host::{
     actor::{Actor, Executor, Operation, Spawn, Status, TaskContext},
     engine::RuntimeEngine,

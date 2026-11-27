@@ -19,7 +19,7 @@ use crate::library::Kind;
 use crate::media_uri::MediaUri;
 use crate::player::{RemoteMediaRequest, RemoteSubtitle, Session};
 use crate::settings::Settings;
-use iris_net::loopback_http::read_request;
+use iris_base::net::loopback_http::read_request;
 
 impl PlaybackRelay {
     pub(in crate::player) fn start(

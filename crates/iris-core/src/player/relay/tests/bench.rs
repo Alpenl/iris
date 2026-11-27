@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use url::Url;
 
 use super::{CLIENT_TIMEOUT, MAX_REQUEST, PlaybackRelay};
-use iris_net::loopback_http::read_request;
+use iris_base::net::loopback_http::read_request;
 
 const PAYLOAD_BYTES: usize = 64 << 20;
 const ROUNDS: usize = 5;

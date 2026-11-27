@@ -6,8 +6,8 @@ use std::time::Duration;
 
 use anyhow::{Result, ensure};
 
-use iris_net::http_client::{HttpCancel, HttpStream};
-use iris_net::loopback_http::{
+use iris_base::net::http_client::{HttpCancel, HttpStream};
+use iris_base::net::loopback_http::{
     ClientWatch, HttpRequestError, read_request, write_all_cancellable, write_chunk_cancellable,
 };
 

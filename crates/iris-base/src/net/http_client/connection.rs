@@ -13,8 +13,8 @@ use mio::{Events, Interest, Poll, Token, Waker};
 use rustls_pki_types::ServerName;
 use url::{Host, Url};
 
-pub use crate::concurrency::SocketRegistration;
-use crate::concurrency::{CancelToken, Deadline, WaitError};
+pub use crate::rt::SocketRegistration;
+use crate::rt::{CancelToken, Deadline, WaitError};
 pub type HttpCancel = CancelToken;
 
 use super::address::{AddressKind, address_kind};

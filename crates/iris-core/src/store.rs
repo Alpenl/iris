@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 use crate::fs_util;
 use crate::media_uri::MediaUri;
-use iris_net::concurrency::CancelToken;
+use iris_base::rt::CancelToken;
 mod annotations;
 mod recent;
 mod tsv;

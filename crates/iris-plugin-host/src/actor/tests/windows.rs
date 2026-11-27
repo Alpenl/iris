@@ -192,7 +192,7 @@ fn window_closed_is_delivered_even_after_global_generation_advances() {
 
     let engine = RuntimeEngine::new().unwrap();
     let module = engine
-        .compile(&wasm, &iris_net::concurrency::CancelToken::new())
+        .compile(&wasm, &iris_base::rt::CancelToken::new())
         .unwrap();
     let ledger = Ledger::default();
     let actor = Actor::spawn(Spawn {

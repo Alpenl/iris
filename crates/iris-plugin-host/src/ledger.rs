@@ -1,7 +1,7 @@
 //! Reservations cover queued, running and undelivered resources. Cancellation
 //! never releases a reservation before its owner actually finishes.
 use iris_api::v2::ErrorCode;
-use iris_net::concurrency::budget;
+use iris_base::rt::budget;
 use std::{
     collections::BTreeMap,
     sync::{

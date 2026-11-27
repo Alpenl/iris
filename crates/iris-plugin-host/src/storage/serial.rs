@@ -2,8 +2,8 @@
 //! the bounded control I/O lane, never in a Store callback or the UI thread.
 use crate::instance::next_id;
 use iris_api::v2::{ErrorCode, Id};
-use iris_net::concurrency::{Deadline, WaitError};
-use iris_net::http_client::HttpCancel;
+use iris_base::net::http_client::HttpCancel;
+use iris_base::rt::{Deadline, WaitError};
 use std::{
     collections::VecDeque,
     sync::{Arc, Condvar, Mutex},

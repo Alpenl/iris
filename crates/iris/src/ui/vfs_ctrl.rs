@@ -8,6 +8,7 @@ use std::time::Duration;
 use gpui::{Context, Window};
 use iris_api::SourceManageAction;
 use iris_api::v2::{HostEvent, Id};
+use iris_base::net::http_client::{HttpCancel, validate_stream_url};
 use iris_core::catalog::{CatalogItem, CatalogItemKind};
 use iris_core::library::{self, Kind};
 use iris_core::media_uri::MediaUri;
@@ -15,7 +16,6 @@ use iris_core::photo;
 use iris_core::player::RemoteMediaRequest;
 use iris_core::preset::SidebarMode;
 use iris_core::vfs::PinnedBookmark;
-use iris_net::http_client::{HttpCancel, validate_stream_url};
 use iris_plugin_host::requests::BrowseTarget;
 
 use super::AppModel;

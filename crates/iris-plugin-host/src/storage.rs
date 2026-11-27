@@ -9,10 +9,10 @@ use super::{
 };
 pub use executor::StorageExecutor;
 use iris_api::v2::{ErrorCode, Id};
+use iris_base::net::http_client::HttpCancel;
 use iris_core::bounded_json;
 use iris_core::fs_util;
 use iris_core::vault::CredentialVault;
-use iris_net::http_client::HttpCancel;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,

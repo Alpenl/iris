@@ -7,7 +7,7 @@ use crate::{
     instance::{Blob, next_id},
 };
 use iris_api::v2::{ErrorCode, Generation, Id, task::ArtifactFormat, task_result::ArtifactResult};
-use iris_net::http_client::HttpCancel;
+use iris_base::net::http_client::HttpCancel;
 use std::{
     collections::BTreeMap,
     sync::{Arc, Weak},

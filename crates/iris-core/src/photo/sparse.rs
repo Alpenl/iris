@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::io::{self, Read, Seek, SeekFrom};
 
-use iris_net::http_client::{self, HttpCancel};
+use iris_base::net::http_client::{self, HttpCancel};
 
 use super::{Photo, detect_photo_format, finish_header, run_probe};
 

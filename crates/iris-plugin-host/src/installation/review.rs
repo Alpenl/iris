@@ -7,7 +7,7 @@ use crate::{
     runtime::Resources,
 };
 use iris_api::v2::{Capability, ErrorCode, Manifest};
-use iris_net::concurrency::{CancelToken, Deadline};
+use iris_base::rt::{CancelToken, Deadline};
 use std::{collections::BTreeSet, path::Path, sync::Arc, time::Duration};
 
 /// A reviewed archive is immutable in memory. Compilation checks the module

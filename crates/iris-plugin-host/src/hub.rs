@@ -339,10 +339,9 @@ impl Hub {
             }
         });
         let worker = worker::Worker::new(shared.clone(), config)?;
-        iris_net::concurrency::spawn_thread(
-            iris_net::concurrency::ThreadRole::PluginCoordinator,
-            move || worker.run(),
-        )
+        iris_base::rt::spawn_thread(iris_base::rt::ThreadRole::PluginCoordinator, move || {
+            worker.run()
+        })
         .map_err(|_| ErrorCode::Internal)?;
         Ok(Self(Arc::new(Connection(shared))))
     }

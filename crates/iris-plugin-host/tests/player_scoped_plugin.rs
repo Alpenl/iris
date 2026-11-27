@@ -19,6 +19,7 @@ use iris_api::v2::{
     stream::{RemoteResource, StreamSource, StreamSpec},
     task::{ArtifactFormat, Task},
 };
+use iris_base::net::http_client::HttpCancel;
 use iris_core::{
     library::Kind,
     media_uri::MediaUri,
@@ -26,7 +27,6 @@ use iris_core::{
     settings::{Hwdec, Settings},
     vault::CredentialVault,
 };
-use iris_net::http_client::HttpCancel;
 use iris_plugin_host::{
     actor::{Executor, Operation, TaskContext},
     enhancement::{AttachmentRegistry, AttachmentSpec},

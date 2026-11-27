@@ -1,5 +1,5 @@
 use super::*;
-use iris_net::http_client::HttpCancel;
+use iris_base::net::http_client::HttpCancel;
 use iris_plugin_host::{official::Bootstrap, storage::Storage};
 
 #[test]

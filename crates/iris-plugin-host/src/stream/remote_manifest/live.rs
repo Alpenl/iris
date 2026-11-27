@@ -4,7 +4,7 @@ use crate::stream::{
     session::{Refresh, StreamSession},
 };
 use iris_api::v2::{ErrorCode, stream::RemoteResource};
-use iris_net::http_client::HttpCancel;
+use iris_base::net::http_client::HttpCancel;
 use std::{
     sync::{Arc, Condvar, Mutex, Weak},
     time::{Duration, Instant},

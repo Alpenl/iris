@@ -7,7 +7,7 @@ use anyhow::Result;
 use mio::{Interest, Registry, Token};
 use url::Url;
 
-use crate::http_client::{
+use crate::net::http_client::{
     HttpCancel, NetworkScope, SocketRegistration, Transport, connect_transport,
 };
 

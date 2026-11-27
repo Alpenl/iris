@@ -11,7 +11,7 @@ use iris_mpv::{Event, Mpv, Value};
 use serde_json::json;
 
 use crate::logging::{self, EventLevel};
-use iris_net::concurrency::{CancelToken, ThreadRole, spawn_thread};
+use iris_base::rt::{CancelToken, ThreadRole, spawn_thread};
 
 use super::super::ScopedStream;
 use super::super::model::{SessionEvent, SessionUpdate};

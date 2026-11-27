@@ -2796,9 +2796,9 @@ dependencies = [
  "gpui",
  "image",
  "iris-api",
+ "iris-base",
  "iris-core",
  "iris-mpv",
- "iris-net",
  "iris-plugin-host",
  "libc",
  "log",
@@ -2819,6 +2819,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "iris-base"
+version = "0.0.2"
+dependencies = [
+ "anyhow",
+ "base64",
+ "httparse",
+ "log",
+ "mio",
+ "percent-encoding",
+ "rustls",
+ "rustls-native-certs",
+ "rustls-pki-types",
+ "tungstenite",
+ "url",
+]
+
+[[package]]
 name = "iris-core"
 version = "0.0.2"
 dependencies = [
@@ -2826,8 +2843,8 @@ dependencies = [
  "base64",
  "env_logger",
  "futures",
+ "iris-base",
  "iris-mpv",
- "iris-net",
  "libc",
  "log",
  "miniz_oxide 0.8.9",
@@ -2885,23 +2902,6 @@ name = "iris-mpv"
 version = "0.0.2"
 
 [[package]]
-name = "iris-net"
-version = "0.0.2"
-dependencies = [
- "anyhow",
- "base64",
- "httparse",
- "log",
- "mio",
- "percent-encoding",
- "rustls",
- "rustls-native-certs",
- "rustls-pki-types",
- "tungstenite",
- "url",
-]
-
-[[package]]
 name = "iris-plugin-guides"
 version = "0.0.2"
 dependencies = [
@@ -2922,8 +2922,8 @@ dependencies = [
  "httparse",
  "httpdate",
  "iris-api",
+ "iris-base",
  "iris-core",
- "iris-net",
  "libc",
  "log",
  "md-5",
