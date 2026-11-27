@@ -8,7 +8,7 @@ use crate::{
     runtime::{Control, PreparedWindow, Setup},
 };
 use iris_api::v2::{ErrorCode, Generation, Id};
-use iris_net::concurrency::{CancelToken, Deadline};
+use iris_base::rt::{CancelToken, Deadline};
 use std::{
     collections::BTreeSet,
     path::PathBuf,

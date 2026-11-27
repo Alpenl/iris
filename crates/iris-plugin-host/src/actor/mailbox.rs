@@ -6,8 +6,8 @@ use crate::json_error;
 use iris_api::v2::{
     CHUNK_LIMIT, Capability, ErrorCode, Generation, HostCommand, Id, MESSAGE_LIMIT, Role,
 };
-use iris_net::concurrency::CancelToken;
-use iris_net::http_client::HttpCancel;
+use iris_base::net::http_client::HttpCancel;
+use iris_base::rt::CancelToken;
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     sync::{

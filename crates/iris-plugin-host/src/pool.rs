@@ -1,6 +1,6 @@
 //! Blocking I/O stays outside Store threads; stream workers are reserved.
 use iris_api::v2::{ErrorCode, Role};
-use iris_net::concurrency::{ThreadRole, budget, spawn_thread_named};
+use iris_base::rt::{ThreadRole, budget, spawn_thread_named};
 use std::{
     collections::{BTreeMap, VecDeque},
     sync::{Arc, Condvar, Mutex},

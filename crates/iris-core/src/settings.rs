@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use crate::fs_util;
 use crate::library::{SortBy, SortOrder};
 use crate::player::{MAX_SPEED, MIN_SPEED};
-use crate::vfs::{DEFAULT_DOH_RESOLVERS, normalize_doh_resolver};
+use iris_base::net::http_client::doh::{DEFAULT_DOH_RESOLVERS, normalize_doh_resolver};
 
 pub const DEFAULT_DIRECTORY_WIDTH: f32 = 288.;
 pub const MIN_DIRECTORY_WIDTH: f32 = 220.;

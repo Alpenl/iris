@@ -1,6 +1,6 @@
 use super::identity::PinnedFile;
 use iris_api::v2::{ErrorCode, WireU64, task::FileHash, task_result::HashResult};
-use iris_net::http_client::HttpCancel;
+use iris_base::net::http_client::HttpCancel;
 use md5::Digest;
 use ring::digest;
 use std::time::{Duration, Instant};

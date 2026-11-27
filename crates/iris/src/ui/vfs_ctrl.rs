@@ -8,13 +8,14 @@ use std::time::Duration;
 use gpui::{Context, Window};
 use iris_api::SourceManageAction;
 use iris_api::v2::{HostEvent, Id};
+use iris_base::net::http_client::{HttpCancel, validate_stream_url};
 use iris_core::catalog::{CatalogItem, CatalogItemKind};
 use iris_core::library::{self, Kind};
 use iris_core::media_uri::MediaUri;
 use iris_core::photo;
 use iris_core::player::RemoteMediaRequest;
 use iris_core::preset::SidebarMode;
-use iris_core::vfs::{self, PinnedBookmark};
+use iris_core::vfs::PinnedBookmark;
 use iris_plugin_host::requests::BrowseTarget;
 
 use super::AppModel;
@@ -564,7 +565,7 @@ impl AppModel {
             self.open_path(Path::new(trimmed), cx);
             return;
         }
-        let Ok(parsed) = vfs::validate_stream_url(trimmed) else {
+        let Ok(parsed) = validate_stream_url(trimmed) else {
             self.show_toast("仅支持合法的 http:// 或 https:// 媒体地址", cx);
             return;
         };
@@ -614,7 +615,7 @@ impl AppModel {
         };
         self.notify_all(cx);
 
-        let cancel = vfs::HttpCancel::default();
+        let cancel = HttpCancel::default();
         let task = if req.kind != Kind::Photo {
             gpui::Task::ready(Some(req))
         } else {

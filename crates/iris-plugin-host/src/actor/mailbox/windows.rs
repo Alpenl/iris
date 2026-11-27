@@ -1,7 +1,7 @@
 use super::{Mailbox, Message, WindowContext};
 use crate::ledger::Resource;
 use iris_api::v2::{ErrorCode, Generation, Id, MESSAGE_LIMIT, Role};
-use iris_net::http_client::HttpCancel;
+use iris_base::net::http_client::HttpCancel;
 use std::collections::BTreeMap;
 
 fn same(a: Generation, b: Generation) -> bool {

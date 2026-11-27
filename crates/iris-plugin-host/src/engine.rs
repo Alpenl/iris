@@ -1,7 +1,7 @@
 //! In-memory compilation only. Active modules are part of the cache budget.
 use super::{imports, instance::State, package::WASM_LIMIT};
 use iris_api::v2::ErrorCode;
-use iris_net::concurrency::{CancelToken, ThreadRole, spawn_thread};
+use iris_base::rt::{CancelToken, ThreadRole, spawn_thread};
 use ring::digest::{SHA256, digest};
 use std::{
     collections::BTreeMap,
@@ -274,7 +274,7 @@ mod tests {
         ledger::{Ledger, Resource},
     };
     use iris_api::v2::{ErrorCode, Role};
-    use iris_net::concurrency::CancelToken;
+    use iris_base::rt::CancelToken;
     use std::collections::BTreeSet;
 
     impl RuntimeEngine {

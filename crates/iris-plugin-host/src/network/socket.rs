@@ -7,8 +7,8 @@ use crate::{
     ledger::Reservation,
 };
 use iris_api::v2::{CHUNK_LIMIT, ErrorCode};
-use iris_net::concurrency::{Deadline, ThreadRole, spawn_thread};
-use iris_net::http_client::HttpCancel;
+use iris_base::net::http_client::HttpCancel;
+use iris_base::rt::{Deadline, ThreadRole, spawn_thread};
 use mio::{Poll, Token, Waker};
 use std::{
     collections::VecDeque,

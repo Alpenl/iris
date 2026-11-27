@@ -20,8 +20,8 @@ futures = "0.3"
 httpdate = "1"
 httparse = "1.10"
 iris-api = { path = "../iris-api" }
+iris-base = { path = "../iris-base" }
 iris-core = { path = "../iris-core" }
-iris-net = { path = "../iris-net" }
 log = "0.4"
 md-5 = "0.10"
 miniz_oxide = "0.8"

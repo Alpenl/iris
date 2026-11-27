@@ -5,8 +5,8 @@ use std::io::{self, Read, Write};
 use tungstenite::{Message, WebSocket, client::IntoClientRequest, protocol::WebSocketConfig};
 use url::Url;
 
-use crate::http_client::{HeaderValidationError, validate_header_pairs};
-use crate::wire::Wire;
+use crate::net::http_client::{HeaderValidationError, validate_header_pairs};
+use crate::net::wire::Wire;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WireError {

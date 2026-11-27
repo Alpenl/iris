@@ -9,8 +9,8 @@ use crate::{
     stream::reader::{OpenedStream, StreamSlice},
 };
 use iris_api::v2::ErrorCode;
+use iris_base::net::http_client::HttpCancel;
 use iris_core::logging;
-use iris_net::http_client::HttpCancel;
 use serde_json::json;
 use std::{
     sync::Arc,

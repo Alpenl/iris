@@ -10,8 +10,8 @@ use futures::channel::mpsc::{UnboundedReceiver, unbounded};
 use iris_mpv::{Event, Mpv, Value};
 use serde_json::json;
 
-use crate::concurrency::{CancelToken, ThreadRole, spawn_thread};
 use crate::logging::{self, EventLevel};
+use iris_base::rt::{CancelToken, ThreadRole, spawn_thread};
 
 use super::super::ScopedStream;
 use super::super::model::{SessionEvent, SessionUpdate};

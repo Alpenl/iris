@@ -6,7 +6,7 @@ use crate::{
     package::{Package, Provenance},
 };
 use iris_api::v2::{ErrorCode, Reply, Role};
-use iris_net::concurrency::CancelToken;
+use iris_base::rt::CancelToken;
 use std::{sync::Arc, time::Instant};
 
 /// Executes embedded, digest-verified Wasm in the actual host process. No UI,

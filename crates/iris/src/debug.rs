@@ -42,10 +42,9 @@ mod enabled {
             }
         };
         let (tx, rx) = unbounded();
-        match iris_core::concurrency::spawn_thread(
-            iris_core::concurrency::ThreadRole::ControlPipe,
-            move || listener.run(tx),
-        ) {
+        match iris_base::rt::spawn_thread(iris_base::rt::ThreadRole::ControlPipe, move || {
+            listener.run(tx)
+        }) {
             Ok(_) => {
                 log::info!("control listening on {path:?}");
                 Some(rx)

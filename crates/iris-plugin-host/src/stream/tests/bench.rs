@@ -11,7 +11,7 @@ use crate::{
     },
 };
 use iris_api::v2::ErrorCode;
-use iris_net::http_client::HttpCancel;
+use iris_base::net::http_client::HttpCancel;
 use std::{
     io::{Read, Write},
     net::TcpStream,

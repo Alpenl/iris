@@ -27,14 +27,14 @@ use ring::aead::{Aad, CHACHA20_POLY1305, LessSafeKey, Nonce, UnboundKey};
 use ring::rand::{SecureRandom, SystemRandom};
 use url::Url;
 
-use crate::concurrency::{ThreadRole, budget, spawn_thread};
-use crate::loopback_http::{
+use iris_base::net::http_client::{
+    HttpCancel, HttpStream, NetworkScope, Request, open_stream, validate_stream_url,
+};
+use iris_base::net::loopback_http::{
     ClientHub, HttpMethod, HttpRequestError, is_adaptive_manifest, is_adaptive_prefix_undecided,
     parse_http_request, read_request,
 };
-use crate::vfs::http_client::{
-    HttpCancel, NetworkScope, Request, open_stream, validate_stream_url,
-};
+use iris_base::rt::{ThreadRole, budget, spawn_thread};
 
 use super::model::fetch_subtitle;
 
@@ -640,7 +640,7 @@ impl Service {
         range: Option<&str>,
         deadline: Option<Instant>,
         cancel: &HttpCancel,
-    ) -> Result<crate::vfs::http_client::HttpStream> {
+    ) -> Result<HttpStream> {
         open_stream(
             Request {
                 method,

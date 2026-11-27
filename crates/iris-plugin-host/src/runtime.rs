@@ -22,9 +22,9 @@ use super::{
 use iris_api::v2::{
     ErrorCode, Generation, HostEvent, Id, Manifest, Role, source::SourceDescriptor,
 };
+use iris_base::net::http_client::HttpCancel;
+use iris_base::rt::CancelToken;
 use iris_core::vault::CredentialVault;
-use iris_net::concurrency::CancelToken;
-use iris_net::http_client::HttpCancel;
 pub use playback::PlaybackPermit;
 use std::{collections::BTreeSet, path::PathBuf, sync::Arc};
 pub use window::{PreparedWindow, WindowPreparation};

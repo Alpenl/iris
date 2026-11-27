@@ -676,22 +676,22 @@ def check_lock_poisoning(rel: Path, text: str):
 
 
 def check_thread_spawns(rel: Path, text: str):
-    """Production code must spawn OS threads only via `iris_net::concurrency::{spawn_thread, spawn_thread_named}`."""
-    if rel.as_posix() == "crates/iris-net/src/concurrency.rs":
+    """Production code must spawn OS threads only via `iris_base::rt::{spawn_thread, spawn_thread_named}`."""
+    if rel.as_posix() == "crates/iris-base/src/rt/mod.rs":
         return
     match = RAW_THREAD_SPAWN_RE.search(prod_prefix(text))
     _require(
         match is None,
         f"{rel} spawns an unregistered OS thread via `{match.group(0) if match else ''}`; "
-        "use `iris_net::concurrency::{spawn_thread, spawn_thread_named}`",
+        "use `iris_base::rt::{spawn_thread, spawn_thread_named}`",
     )
 
 
-def check_thread_inventory_docs(concurrency_src: str, arch_doc: str):
-    """Every `ThreadRole::base_name` in `concurrency.rs` must be documented in `docs/ARCHITECTURE.md`."""
-    stripped = prod_prefix(concurrency_src)
+def check_thread_inventory_docs(rt_src: str, arch_doc: str):
+    """Every `ThreadRole::base_name` in `iris-base::rt` must be documented in `docs/ARCHITECTURE.md`."""
+    stripped = prod_prefix(rt_src)
     count_match = THREAD_ROLE_COUNT_RE.search(stripped)
-    _require(count_match is not None, "concurrency.rs missing `ThreadRole::COUNT`")
+    _require(count_match is not None, "rt/mod.rs missing `ThreadRole::COUNT`")
     expected_count = int(count_match.group(1))
     entries = THREAD_ROLE_NAME_RE.findall(stripped)
     _require(
@@ -980,9 +980,9 @@ def main():
         "image",
         "iris-plugin-sdk",
     }
-    net_deps = {d["name"] for d in pkgs["iris-net"]["dependencies"]}
-    forbidden_net = forbidden_headless | {"iris-core", "iris-plugin-host", "iris-api", "iris-mpv"}
-    _require(not (net_deps & forbidden_net), f"iris-net must stay domain-free, found {net_deps & forbidden_net}")
+    base_deps = {d["name"] for d in pkgs["iris-base"]["dependencies"]}
+    forbidden_base = forbidden_headless | {"iris-core", "iris-plugin-host", "iris-api", "iris-mpv"}
+    _require(not (base_deps & forbidden_base), f"iris-base must stay domain-free, found {base_deps & forbidden_base}")
 
     core_deps = {d["name"] for d in pkgs["iris-core"]["dependencies"]}
     forbidden_core = forbidden_headless | {"iris-plugin-host", "iris-api", "wasmtime"}
@@ -994,7 +994,7 @@ def main():
 
     # 3b. Wildcard-super ban across all headless & guest crates + top-level module cycle ratchet
     for crate_dir in (
-        ROOT / "crates/iris-net/src",
+        ROOT / "crates/iris-base/src",
         ROOT / "crates/iris-core/src",
         ROOT / "crates/iris-plugin-host/src",
         ROOT / "crates/iris-api/src",
@@ -1026,7 +1026,7 @@ def main():
 
     arch_doc = (ROOT / "docs/ARCHITECTURE.md").read_text(encoding="utf-8")
     check_thread_inventory_docs(
-        (ROOT / "crates/iris-net/src/concurrency.rs").read_text(encoding="utf-8"),
+        (ROOT / "crates/iris-base/src/rt/mod.rs").read_text(encoding="utf-8"),
         arch_doc,
     )
     crates_on_disk = {

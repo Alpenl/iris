@@ -21,8 +21,8 @@ use iris_api::{
     SourceEntryKind,
     v2::{Capability, ErrorCode, Generation, Id, Role, stream::*},
 };
+use iris_base::net::http_client::HttpCancel;
 use iris_core::library::Kind;
-use iris_net::http_client::HttpCancel;
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::Arc,
@@ -395,10 +395,10 @@ pub(crate) fn ensure_non_adaptive_prefix<R: Reader + ?Sized>(
     Ok(())
 }
 pub(crate) fn adaptive(bytes: &[u8]) -> bool {
-    iris_net::loopback_http::is_adaptive_manifest(bytes)
+    iris_base::net::loopback_http::is_adaptive_manifest(bytes)
 }
 pub(crate) fn adaptive_undecided(bytes: &[u8]) -> bool {
-    iris_net::loopback_http::is_adaptive_prefix_undecided(bytes)
+    iris_base::net::loopback_http::is_adaptive_prefix_undecided(bytes)
 }
 pub fn subtitle_format(bytes: &[u8]) -> Result<&'static str, ErrorCode> {
     if bytes.len() > 10 << 20 {

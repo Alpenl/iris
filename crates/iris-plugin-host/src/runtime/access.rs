@@ -9,7 +9,7 @@ use crate::{
 };
 use futures::channel::oneshot;
 use iris_api::v2::{Capability, ErrorCode, Generation, Id, Role};
-use iris_net::http_client::HttpCancel;
+use iris_base::net::http_client::HttpCancel;
 use std::{collections::BTreeSet, sync::Arc};
 
 #[derive(Clone)]

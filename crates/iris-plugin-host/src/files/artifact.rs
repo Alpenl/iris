@@ -5,7 +5,7 @@ use crate::{
 };
 use cap_std::fs::{Dir, OpenOptions};
 use iris_api::v2::ErrorCode;
-use iris_net::http_client::HttpCancel;
+use iris_base::net::http_client::HttpCancel;
 use std::{
     fs::File,
     io::Write,
@@ -27,29 +27,26 @@ fn cleanup_queue() -> Result<&'static mpsc::Sender<Cleanup>, ErrorCode> {
             // Every queued job retains a global Handle reservation; the ledger
             // bounds both this channel and the retry list, without blocking Drop.
             let (tx, rx) = mpsc::channel::<Cleanup>();
-            iris_net::concurrency::spawn_thread(
-                iris_net::concurrency::ThreadRole::ArtifactCleanup,
-                move || {
-                    let mut pending = Vec::<Cleanup>::new();
-                    loop {
-                        match rx.recv_timeout(Duration::from_millis(250)) {
-                            Ok(job) => pending.push(job),
-                            Err(mpsc::RecvTimeoutError::Disconnected) => break,
-                            Err(_) => {}
-                        }
-                        pending.extend(rx.try_iter());
-                        // Failed deletion keeps its handle/disk quota. There can be at
-                        // most 1024 jobs including live artifacts; no retry queue grows
-                        // independently of the global handle ledger.
-                        pending.retain(|job| {
-                            job.root
-                                .directory()
-                                .remove_file(&job.name)
-                                .is_err_and(|e| e.kind() != std::io::ErrorKind::NotFound)
-                        });
+            iris_base::rt::spawn_thread(iris_base::rt::ThreadRole::ArtifactCleanup, move || {
+                let mut pending = Vec::<Cleanup>::new();
+                loop {
+                    match rx.recv_timeout(Duration::from_millis(250)) {
+                        Ok(job) => pending.push(job),
+                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                        Err(_) => {}
                     }
-                },
-            )
+                    pending.extend(rx.try_iter());
+                    // Failed deletion keeps its handle/disk quota. There can be at
+                    // most 1024 jobs including live artifacts; no retry queue grows
+                    // independently of the global handle ledger.
+                    pending.retain(|job| {
+                        job.root
+                            .directory()
+                            .remove_file(&job.name)
+                            .is_err_and(|e| e.kind() != std::io::ErrorKind::NotFound)
+                    });
+                }
+            })
             .map(|_| tx)
             .map_err(|_| ())
         })

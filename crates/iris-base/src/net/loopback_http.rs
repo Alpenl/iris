@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use mio::{Interest, Registry, Token};
 
-use crate::http_client::HttpCancel;
+use crate::net::http_client::HttpCancel;
 
 struct ClientState {
     cancel: HttpCancel,

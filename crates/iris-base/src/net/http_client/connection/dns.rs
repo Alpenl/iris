@@ -8,7 +8,7 @@ use std::time::Instant;
 
 use anyhow::{Result, anyhow, bail};
 
-use crate::concurrency::{ThreadRole, budget, spawn_thread};
+use crate::rt::{ThreadRole, budget, spawn_thread};
 
 use super::super::CONNECT_TIMEOUT;
 use super::{HttpCancel, NetworkScope, doh, remaining_timeout};

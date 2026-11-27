@@ -1321,7 +1321,7 @@ class CheckProjectHelperTests(unittest.TestCase):
                 "#[expect(clippy::disallowed_methods)]\nfn t() {}\n",
             ),
             (
-                Path("crates/iris-net/src/http_client.rs"),
+                Path("crates/iris-base/src/net/http_client.rs"),
                 "#[allow(clippy::disallowed_types)]\nstruct S;\n",
             ),
         ):
@@ -1351,8 +1351,8 @@ class CheckProjectHelperTests(unittest.TestCase):
         check_project.check_crate_docs_sync(expected, arch_ok, en_ok, zh_ok)
 
         # Stale extra crate in ARCHITECTURE.md fails two-way check.
-        arch_extra = "```text\ncrates/\n  iris/\n  iris-api/\n  iris-core/\n  iris-net/\n```\n"
-        with self.assertRaisesRegex(AssertionError, "extra=\\['iris-net'\\]"):
+        arch_extra = "```text\ncrates/\n  iris/\n  iris-api/\n  iris-core/\n  iris-base/\n```\n"
+        with self.assertRaisesRegex(AssertionError, "extra=\\['iris-base'\\]"):
             check_project.check_crate_docs_sync(expected, arch_extra, en_ok, zh_ok)
 
         # `iris-api` alone must NOT satisfy missing `iris` in README layout section.
@@ -1412,7 +1412,7 @@ class CheckProjectHelperTests(unittest.TestCase):
         self.assertFalse(check_project.is_standalone_test_file(Path("crates/iris/src/debug.rs"), Path("crates/iris/src/debug.rs")))
 
     def test_thread_spawn_and_inventory_gates_reject_unregistered_threads_and_undocumented_roles(self):
-        rel_registry = Path("crates/iris-net/src/concurrency.rs")
+        rel_registry = Path("crates/iris-base/src/rt/mod.rs")
         rel_other = Path("crates/iris-core/src/demo.rs")
         check_project.check_thread_spawns(rel_registry, 'fn ok() { let _ = std::thread::Builder::new(); }\n')
         check_project.check_thread_spawns(

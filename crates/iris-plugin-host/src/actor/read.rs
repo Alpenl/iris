@@ -1,7 +1,7 @@
 use super::mailbox::Mailbox;
 use crate::instance::Blob;
 use iris_api::v2::ErrorCode;
-use iris_net::http_client::HttpCancel;
+use iris_base::net::http_client::HttpCancel;
 use std::{
     sync::{Arc, Condvar, Mutex},
     time::{Duration, Instant},

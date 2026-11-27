@@ -8,8 +8,8 @@ use super::{
 };
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use iris_api::v2::{ErrorCode, Generation, Id, Role, task::Task};
-use iris_net::concurrency::{Deadline, ThreadRole, spawn_thread};
-use iris_net::http_client::HttpCancel;
+use iris_base::net::http_client::HttpCancel;
+use iris_base::rt::{Deadline, ThreadRole, spawn_thread};
 use mio::{Interest, Poll, Token, Waker};
 use ring::{
     digest,

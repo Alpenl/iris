@@ -1,8 +1,8 @@
 use super::super::AppModel;
 use gpui::{Context, RenderImage};
 use iris_api::v2::{Capability, ErrorCode};
+use iris_base::net::http_client::HttpCancel;
 use iris_core::media_uri::MediaUri;
-use iris_core::vfs::HttpCancel;
 use iris_plugin_host::{
     ledger::{Reservation, Resource},
     stream::remote::RemoteFactory,

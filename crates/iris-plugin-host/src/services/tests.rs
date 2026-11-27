@@ -101,7 +101,7 @@ fn single_window_isolates_generations_enforces_capacity_and_keeps_temp_root_lazy
         owner: OWNER.into(),
         role: Role::Control,
         generation: gen0,
-        cancel: iris_net::http_client::HttpCancel::default(),
+        cancel: iris_base::net::http_client::HttpCancel::default(),
         ledger: f.ledger.clone(),
     };
     assert!(matches!(
@@ -120,7 +120,7 @@ fn single_window_isolates_generations_enforces_capacity_and_keeps_temp_root_lazy
         owner: OWNER.into(),
         role: Role::Control,
         generation: gen1,
-        cancel: iris_net::http_client::HttpCancel::default(),
+        cancel: iris_base::net::http_client::HttpCancel::default(),
         ledger: f.ledger.clone(),
     };
     assert!(
@@ -155,7 +155,7 @@ fn create_live_artifact(
         owner: OWNER.into(),
         role: Role::Control,
         generation,
-        cancel: iris_net::http_client::HttpCancel::default(),
+        cancel: iris_base::net::http_client::HttpCancel::default(),
         ledger: f.ledger.clone(),
     };
     let Operation::Blocking(begin) = f

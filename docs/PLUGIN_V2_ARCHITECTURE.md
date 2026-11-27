@@ -1,13 +1,13 @@
 # Iris 插件系统 v2 架构规范与演进路线图（protocol: 2）
 
 > **状态：源码已完成协议 2 切换并于 `0.0.2` 合入 `main`、通过远端多平台 CI 矩阵；设备端高刷显示与第三方公网服务仍按边界保留非声明项；修订日期：2026-11-27。**
-> **0.0.2 收敛与架构硬化说明**：遵循「极简、高效、自由」原则，已移除零调用方的 BYOB 外部工具（`external_tool` / `export_files` / `process_tree`）、DASH 与受限 HLS 文本通道（保留结构化 `VirtualHls` 与远端 HLS 转换，及轻量 `FileExecutor` 私有产物/当前媒体哈希）；用正交的 `Widget::PixelGrid` + `ViewTimer` 取代特化的 `Widget::QrCode` 轮询器；新增 `SourceDescriptor.badge` 与无特权 `HostCommand::Log`（20 条/秒限流 + 自动脱敏）；Wasmtime 切换至纯解释字节码 `pulley64`（零可执行内存页、零 macOS JIT entitlement）；工作区拆分为无领域网络底座 `iris-net`、无插件内核 `iris-core` 与独立宿主 `iris-plugin-host`（每窗口显式 `PluginHost` 单窗口模型）；控制面严格区分句柄标识 `Id`（`1..=i64::MAX`）与字节量纲 `WireU64`（`0..=u64::MAX` 十进制字符串）。
+> **0.0.2 收敛与架构硬化说明**：遵循「极简、高效、自由」原则，已移除零调用方的 BYOB 外部工具（`external_tool` / `export_files` / `process_tree`）、DASH 与受限 HLS 文本通道（保留结构化 `VirtualHls` 与远端 HLS 转换，及轻量 `FileExecutor` 私有产物/当前媒体哈希）；用正交的 `Widget::PixelGrid` + `ViewTimer` 取代特化的 `Widget::QrCode` 轮询器；新增 `SourceDescriptor.badge` 与无特权 `HostCommand::Log`（20 条/秒限流 + 自动脱敏）；Wasmtime 切换至纯解释字节码 `pulley64`（零可执行内存页、零 macOS JIT entitlement）；工作区拆分为无领域并发与网络底座 `iris-base`（`rt` + `net`）、无插件内核 `iris-core` 与独立宿主 `iris-plugin-host`（每窗口显式 `PluginHost` 单窗口模型）；控制面严格区分句柄标识 `Id`（`1..=i64::MAX`）与字节量纲 `WireU64`（`0..=u64::MAX` 十进制字符串）。
 > 决策依据见 [PLUGIN_V2_DECISIONS.md](PLUGIN_V2_DECISIONS.md)；当前产品行为以 [PLUGINS.md](PLUGINS.md) 与 [ARCHITECTURE.md](ARCHITECTURE.md) 为准，[PLUGIN_V2_IMPLEMENTATION.md](PLUGIN_V2_IMPLEMENTATION.md) 保留分阶段实现与验收证据。
 > 下文“必须”“禁止”是实现要求；配额是首版策略基线，性能项目按实测报告与非声明边界解读。
 
 ## 1. 目标、分层与信任模型
 
-- 无头底座分层隔离：`iris-net` 负责统一网络策略（DNS/SSRF/IP 钉扎）、HTTP/TCP/WS 传输与协作取消/并发预算；`iris-core` 保持无插件依赖，负责会话、纯状态机播放器、媒体库与持久存储；`iris-plugin-host` 负责 Wasmtime 沙箱、`PluginHost` 协调、流中继、受控清单与私有产物；原生窗口、统一视频表面和区域化 GPUI 视图留在 `iris`，零依赖 FFI 留在 `iris-mpv`。
+- 无头底座分层隔离：`iris-base` 负责协作取消/并发预算（`rt`）与统一网络策略（`net`：DNS/SSRF/IP 钉扎、HTTP/TCP/WS 传输）；`iris-core` 保持无插件依赖，负责会话、纯状态机播放器、媒体库与持久存储；`iris-plugin-host` 负责 Wasmtime 沙箱、`PluginHost` 协调、流中继、受控清单与私有产物；原生窗口、统一视频表面和区域化 GPUI 视图留在 `iris`，零依赖 FFI 留在 `iris-mpv`。
 - `iris-api` 常规依赖仅 `serde`；新 `iris-plugin-sdk` 封装 Guest ABI 与异步状态机，可编译到 `wasm32-unknown-unknown`。SDK 不向 Guest 暴露宿主任意文件、进程或网络权限。
 - Wasmtime 使用同步调用接口与 `pulley64` 纯字节码目标（禁用宿主原生 JIT、信号陷阱与 4 GiB 虚拟地址预留，零可执行内存页），宿主 I/O 协议异步化，不直接引入 `tokio`。同步 Wasmtime 不等于同步等待网络。
 - 新依赖按实际特性和传递依赖通过 `deny.toml`；生产模块维持 650 行软限 / 850 行硬限等现有门禁。没有基于选库名称的自动许可合规结论。

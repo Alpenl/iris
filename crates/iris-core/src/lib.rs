@@ -5,7 +5,6 @@
 
 pub mod bounded_json;
 pub mod catalog;
-pub use iris_net::{concurrency, loopback_http};
 pub mod fs_util;
 pub mod geometry;
 pub mod input;

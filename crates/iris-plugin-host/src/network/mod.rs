@@ -9,7 +9,7 @@ mod socket;
 pub use consent::parse_consent_origin_url;
 pub use executor::NetworkExecutor;
 pub use grant::{NetworkGrant, Origin, RequestGrant, TransportKind, normalize_url};
-pub use iris_net::http_client::{AddressKind, address_kind};
+pub use iris_base::net::http_client::{AddressKind, address_kind};
 
 #[cfg(test)]
 mod tests {

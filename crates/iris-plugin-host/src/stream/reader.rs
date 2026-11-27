@@ -4,7 +4,7 @@ use crate::{
     ledger::{Ledger, Reservation, Resource},
 };
 use iris_api::v2::{CHUNK_LIMIT, ErrorCode};
-use iris_net::http_client::HttpCancel;
+use iris_base::net::http_client::HttpCancel;
 use std::sync::Arc;
 
 /// Incremental upstream stream owned by one loopback relay response.

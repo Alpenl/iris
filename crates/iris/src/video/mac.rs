@@ -488,9 +488,8 @@ impl VideoSurfaceBackend for MacVideoSurface {
             let layer_ref = SendId(layer);
             let worker_state = Arc::clone(&state);
             let (tx, rx) = mpsc::sync_channel::<()>(1);
-            let worker = iris_core::concurrency::spawn_thread(
-                iris_core::concurrency::ThreadRole::VideoSurface,
-                move || {
+            let worker =
+                iris_base::rt::spawn_thread(iris_base::rt::ThreadRole::VideoSurface, move || {
                     let layer = layer_ref;
                     while rx.recv().is_ok() {
                         // CA can decline to call can_draw/draw (minimized, hidden,
@@ -515,8 +514,7 @@ impl VideoSurfaceBackend for MacVideoSurface {
                     autoreleasepool(|| {
                         let _: () = msg_send![layer.0, release];
                     });
-                },
-            );
+                });
             let worker = match worker {
                 Ok(worker) => worker,
                 Err(error) => {

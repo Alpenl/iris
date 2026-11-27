@@ -4,7 +4,7 @@ mod response;
 
 use super::{Origin, RequestGrant, TransportKind, normalize_url};
 use iris_api::v2::ErrorCode;
-use iris_net::http_client::{
+use iris_base::net::http_client::{
     HeaderValidationError, HttpBody, HttpCancel, HttpClientError, NetworkScope, SocketRegistration,
     Transport, connect_transport, is_tchar, validate_header_pairs,
 };

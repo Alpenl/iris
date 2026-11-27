@@ -19,13 +19,13 @@ use iris_api::v2::{
     stream::{RemoteResource, StreamSource, StreamSpec},
     task::{ArtifactFormat, Task},
 };
+use iris_base::net::http_client::HttpCancel;
 use iris_core::{
     library::Kind,
     media_uri::MediaUri,
     player::{Command, Session, SessionEvent, SessionUpdate, TrackKind, prepare},
     settings::{Hwdec, Settings},
     vault::CredentialVault,
-    vfs::HttpCancel,
 };
 use iris_plugin_host::{
     actor::{Executor, Operation, TaskContext},

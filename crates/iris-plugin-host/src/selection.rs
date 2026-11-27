@@ -106,7 +106,7 @@ struct Selection {
     generation: Id,
     uris: Vec<MediaUri>,
     expires: Instant,
-    cancel: iris_net::http_client::HttpCancel,
+    cancel: iris_base::net::http_client::HttpCancel,
     _lease: Reservation,
 }
 pub struct SelectionGrants {
@@ -178,7 +178,7 @@ impl SelectionGrants {
                 generation,
                 uris,
                 expires: Instant::now() + Duration::from_secs(300),
-                cancel: iris_net::http_client::HttpCancel::default(),
+                cancel: iris_base::net::http_client::HttpCancel::default(),
                 _lease: lease,
             }),
         );

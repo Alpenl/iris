@@ -9,7 +9,7 @@ use iris_api::v2::{
     Capability, ErrorCode, Generation, Id, Role,
     task::{CredentialBucket, Task},
 };
-use iris_net::http_client::HttpCancel;
+use iris_base::net::http_client::HttpCancel;
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::{Arc, Mutex},

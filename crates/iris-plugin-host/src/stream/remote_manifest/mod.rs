@@ -10,7 +10,7 @@ use super::{
 use crate::ledger::Resource;
 pub use hls_parse::{attributes as parse_hls_attributes, parse_media as parse_hls_media};
 use iris_api::v2::{ErrorCode, stream::*};
-use iris_net::http_client::HttpCancel;
+use iris_base::net::http_client::HttpCancel;
 use std::collections::BTreeMap;
 use url::Url;
 

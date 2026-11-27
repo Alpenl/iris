@@ -32,7 +32,7 @@ use crate::logging;
 use crate::media_uri::MediaUri;
 use crate::photo::Photo;
 use crate::settings::Settings;
-use crate::vfs::{self, http_client::origin_headers};
+use iris_base::net::http_client::{origin_headers, validate_stream_url};
 
 pub use enhance::ExternalTrack;
 pub use machine::coalesce_updates;
@@ -347,7 +347,7 @@ impl Session {
         resume: f64,
     ) -> Result<()> {
         let saved_remote = req.clone();
-        let main_url = vfs::validate_stream_url(&req.playback_url)?;
+        let main_url = validate_stream_url(&req.playback_url)?;
         let clean_headers = origin_headers(&main_url, &req.headers)?;
         let relay =
             PlaybackRelay::start_with_budget(main_url.clone(), clean_headers, &self.relay_budget)?;
@@ -369,7 +369,7 @@ impl Session {
         for sub in req.subtitles {
             match sub {
                 RemoteSubtitle::Url(raw_sub) => {
-                    let sub_url = vfs::validate_stream_url(&raw_sub)?;
+                    let sub_url = validate_stream_url(&raw_sub)?;
                     pending_subs.push(relay.subtitle_url(&sub_url)?);
                 }
                 RemoteSubtitle::InlineText(text) => {

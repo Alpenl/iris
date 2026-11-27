@@ -10,7 +10,7 @@ use crate::{
     runtime::Control,
 };
 use iris_api::v2::{ErrorCode, Generation, Id, source::PlaybackSnapshot};
-use iris_net::concurrency::{CancelToken, Deadline};
+use iris_base::rt::{CancelToken, Deadline};
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::{Arc, atomic::Ordering},
@@ -97,14 +97,10 @@ impl Worker {
             config,
             load_pool: WorkPool::new(
                 "package",
-                iris_net::concurrency::budget::PLUGIN_PACKAGE_IO_WORKERS,
+                iris_base::rt::budget::PLUGIN_PACKAGE_IO_WORKERS,
                 4,
             )?,
-            disk_pool: WorkPool::new(
-                "setup",
-                iris_net::concurrency::budget::PLUGIN_SETUP_IO_WORKERS,
-                8,
-            )?,
+            disk_pool: WorkPool::new("setup", iris_base::rt::budget::PLUGIN_SETUP_IO_WORKERS, 8)?,
             plugins: BTreeMap::new(),
             window: None,
             reviews: BTreeMap::new(),

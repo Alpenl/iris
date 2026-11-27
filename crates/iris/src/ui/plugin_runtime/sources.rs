@@ -330,7 +330,7 @@ impl AppModel {
             }
         };
         if let Some(plugin) = plugin {
-            let Ok(parsed) = iris_core::vfs::validate_stream_url(url) else {
+            let Ok(parsed) = iris_base::net::http_client::validate_stream_url(url) else {
                 fail(self, "请输入合法的 HTTP/HTTPS 地址", cx);
                 return false;
             };
@@ -364,7 +364,9 @@ impl AppModel {
             }
         } else {
             let trimmed = url.trim();
-            if trimmed.contains("://") && iris_core::vfs::validate_stream_url(trimmed).is_err() {
+            if trimmed.contains("://")
+                && iris_base::net::http_client::validate_stream_url(trimmed).is_err()
+            {
                 fail(self, "仅支持合法的 http:// 或 https:// 媒体地址", cx);
                 return false;
             }

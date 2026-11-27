@@ -2,7 +2,7 @@ use super::{AddressKind, address_kind};
 use crate::instance::next_id;
 use crate::ledger::{Activity, ActivityLease, Ledger, Reservation, Resource};
 use iris_api::v2::{Capability, ErrorCode, HostRule, Id, NetworkDeclaration};
-use iris_net::http_client::HttpCancel;
+use iris_base::net::http_client::HttpCancel;
 use std::{
     collections::{BTreeMap, BTreeSet},
     net::{IpAddr, SocketAddr},
@@ -492,7 +492,7 @@ impl RequestGrant {
     }
 }
 
-impl iris_net::http_client::ConnectionPolicy for RequestGrant {
+impl iris_base::net::http_client::ConnectionPolicy for RequestGrant {
     fn check_url(&self, url: &Url) -> anyhow::Result<()> {
         RequestGrant::check_url(self, url).map_err(anyhow::Error::new)
     }

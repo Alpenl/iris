@@ -5,8 +5,8 @@ use crate::{
     json_error,
 };
 use iris_api::v2::{ErrorCode, Generation, HostCommand, HostEvent, Id, LogLevel};
+use iris_base::net::http_client::HttpCancel;
 use iris_core::logging::{self, EventLevel};
-use iris_net::http_client::HttpCancel;
 use std::sync::Arc;
 impl Control {
     pub fn advance_window(&mut self, window: Id, generation: Generation) -> Result<(), ErrorCode> {

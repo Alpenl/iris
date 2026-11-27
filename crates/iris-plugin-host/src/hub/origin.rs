@@ -9,7 +9,7 @@ use crate::network::{
     parse_consent_origin_url,
 };
 use iris_api::v2::{ErrorCode, Generation, HostEvent, Id, task_result::OriginResult};
-use iris_net::http_client::HttpCancel;
+use iris_base::net::http_client::HttpCancel;
 use std::{
     net::IpAddr,
     sync::Arc,

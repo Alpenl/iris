@@ -18,8 +18,8 @@ use super::{
 use iris_api::v2::{
     Capability, ErrorCode, Generation, HostCommand, Id, MESSAGE_LIMIT, Reply, Role, task::Task,
 };
-use iris_net::concurrency::{Deadline, ThreadRole, spawn_thread_named};
-use iris_net::http_client::HttpCancel;
+use iris_base::net::http_client::HttpCancel;
+use iris_base::rt::{Deadline, ThreadRole, spawn_thread_named};
 use mailbox::{Mailbox, Message};
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},

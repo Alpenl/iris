@@ -124,7 +124,7 @@ cargo test --release --locked -p iris-plugin-host --lib stream::tests::bench::lo
 | `L-07` | 真实自建公网/NAS 与动态公网 CDN 联调及未知 Origin 拦截实测 | #5 | 本地回路契约、SSRF/IPv4-mapped IPv6/DNS 钉扎与跨源凭据剥离单测已全覆盖；缺真实公网/NAS/CDN 联调归档 | 首发 `0.1.0` 正式发版前 | 网络与连接器维护者 | 真实公网/自建 NAS（含 HTTPS 与私有 Origin 授权）及多跳动态 CDN 实测通过，捕获未知 Origin 触发宿主确认弹窗且零静默增权证据 |
 | `L-08` | 全平台干净新装、旧资料迁移与迁移失败无损回退演练（`A14`） | #2、#9 | 协议 2 原子切换已在 `43eee92` 完成，迁移单测已覆盖且实机走查入上方回归清单；缺双平台故障注入回退演练归档 | 首发 `0.1.0` 正式发版前 | 发布负责人 / 存储维护者 | 在 macOS 与 Windows 上分别验证干净新装、含多套 `v1` WebDAV/收藏/续播数据的升级，以及模拟损坏/锁冲突时保留原 `v1` 文件与系统凭据不丢失 |
 | `L-09` | 正式版本号（`0.1.0`）发布授权与版本门禁切换 | #2 | `scripts/check-project.py` 与 `scripts/package.py` 当前强锁 `0.0.x` 版本门禁，防止设计决议被误当发布授权 | 准备切出首个正式发行版 `0.1.0` 时 | 项目维护者（Owner） | 全部 `L-01`–`L-08` 与双平台重构回归清单核销完成后，获得显式发布授权并在独立发布 PR 中同步调整版本门禁与签名公证流水线 |
-| `L-10` | `external_tool`（公网 `yt-dlp` 任务专属代理与 BYOB 外部工具适配器）退役与未来重评 | #7 | **已于 `0.0.2` 退役**（见 `docs/PLUGIN_V2_DECISIONS.md` §4.1：因零调用方与高隔离维护成本，已移除 `external_tool`、`export_files`、`tools/` 与 `process_tree/`，仅保留 `FileExecutor` 私有临时产物与 `HashCurrentMedia`；特殊地址 DNS 出口拒绝测试已在 `iris-net` 保留） | **未来重新立项引入外部原生工具/子进程能力时触发**（不阻塞 `0.1.0`） | 安全与插件运行时维护者 | 独立架构与安全立项评审；恢复并扩展任务专属代理正向解析与特殊地址 DNS 出口拒绝实测、Windows Job / Unix 进程组回收与零宿主凭据泄露完整证据 |
+| `L-10` | `external_tool`（公网 `yt-dlp` 任务专属代理与 BYOB 外部工具适配器）退役与未来重评 | #7 | **已于 `0.0.2` 退役**（见 `docs/PLUGIN_V2_DECISIONS.md` §4.1：因零调用方与高隔离维护成本，已移除 `external_tool`、`export_files`、`tools/` 与 `process_tree/`，仅保留 `FileExecutor` 私有临时产物与 `HashCurrentMedia`；特殊地址 DNS 出口拒绝测试已在 `iris-base` 保留） | **未来重新立项引入外部原生工具/子进程能力时触发**（不阻塞 `0.1.0`） | 安全与插件运行时维护者 | 独立架构与安全立项评审；恢复并扩展任务专属代理正向解析与特殊地址 DNS 出口拒绝实测、Windows Job / Unix 进程组回收与零宿主凭据泄露完整证据 |
 | `L-11` | WIT / WebAssembly Component Model 协议层迁移重评 | #18 | 当前保持严格有界 JSON + `Id`/`WireU64` + 裸字节 `Blob` 句柄表（`iris-api` 仅依赖 `serde`） | 满足 `docs/PLUGIN_V2_DECISIONS.md` §4.5 任一重评条件时（官方维护 ≥2 套非 Rust SDK 出现同步偏差、控制面 JSON CPU >5% 或胶水变体 >30 个，且 `pulley64` 无可执行页开销达标） | 插件协议与运行时维护者 | 同机基准对比报告（体积、冷编译耗时、无 `tokio` 同步宿主调用延迟）与跨语言 Guest 兼容迁移方案 |
 
 ### 历史已关闭 Issue（#1–#19）核销索引
@@ -138,10 +138,10 @@ cargo test --release --locked -p iris-plugin-host --lib stream::tests::bench::lo
 | #3、#4 | 已完成 | 关闭时复选框已全部勾选完毕（包格式、`pulley64` 编译、ABI v2、双实例异步调度与 `Ledger` 资源账本） |
 | #5 | 单测已完成 + 实网联调待发版前执行 | 本地回路与网络策略单测已合入（PR #22、#23）；真实公网/NAS/CDN 联调对应 `L-07` |
 | #6 | 部分由 `R-01`/`R-07` 承接 + 整机项入遗留表 | `A09`（长直播窗口滚动、上下文刷新与旧能力撤销无越权）由本轮 `R-07`（#33）自动化契约测试完成；`A15` 回环传输子集由 `R-01`/`R-07` 覆盖，10 分钟整机供给指标对应 `L-04` |
-| #7 | 已退役（`0.0.2` 范围收敛） | `external_tool` 已按 `PLUGIN_V2_DECISIONS.md` §4.1 退役，`iris-net` 保留特殊地址 DNS 出口拒绝单测；未来重评触发条件见 `L-10` |
+| #7 | 已退役（`0.0.2` 范围收敛） | `external_tool` 已按 `PLUGIN_V2_DECISIONS.md` §4.1 退役，`iris-base` 保留特殊地址 DNS 出口拒绝单测；未来重评触发条件见 `L-10` |
 | #8 | 基础单测已完成 + 精度/高刷实测入遗留表 | 标注持久化与 A-B 循环基础单测已覆盖；高精度真实媒体夹具与叠层帧时间/CPU 实测分别对应 `L-06`、`L-05` |
 | #9 | 实现已合入 + 发版归档入遗留表 | 官方插件自举与切换已合入（PR #21 等）；旧资料迁移走查入**重构回归清单**，`A01`–`A14` 汇总归档、`A15` 多平台报告与持续 fuzz 分别对应 `L-01`、`L-03`、`L-02` |
-| #10 | 已完成 | PR #23（`ae05c25`）拆出 `iris-net` 与 `iris-plugin-host`；`clippy.toml` `disallowed_*` 与 `RenderHandle::new` 隔离门禁已在 `scripts/check-project.py` 生效 |
+| #10 | 已完成 | 历史 PR #23（`ae05c25`）拆出 `iris-net`（`R-03` 更名为 `iris-base`）与 `iris-plugin-host`；`clippy.toml` `disallowed_*` 与 `RenderHandle::new` 隔离门禁已在 `scripts/check-project.py` 生效 |
 | #11 | 已完成 | PR #24（`ce88233`）收敛至 `PlayerMachine` 枚举；无 `libmpv` 状态转移单测位于 `player/machine/tests.rs`，HLS 钩子 mpv 版本契约位于 `player/relay/tests.rs`，状态流转已载入 `docs/ARCHITECTURE.md` |
 | #12 | 已完成 | PR #25（`1d5a869`）解除 `ui/kit` 对 `IrisWindow`/`AppModel` 依赖，拆出区域实体与 `DirtyRegions`，消除 `render()` 副作用，并保留 `ui/contract_tests.rs` |
 | #13 | 2 项已完成 + 1 项尾项由 `R-13` 收口 | 单窗口会话决议已载入 `PLUGIN_V2_DECISIONS.md` §3.4，`Inbox` 已合并为单 `Mutex<InboxState>`；残留的 `files/artifact.rs` 进程级 `QUEUE` 收归 `PluginHost` 生命周期及 `instance.rs` `NEXT_HANDLE` 文档化由本轮 `R-13`（#39）完成 |

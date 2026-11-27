@@ -11,7 +11,7 @@ use crate::{
 };
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use iris_api::v2::{ErrorCode, Generation, Id, stream::*};
-use iris_net::http_client::HttpCancel;
+use iris_base::net::http_client::HttpCancel;
 use ring::rand::{SecureRandom, SystemRandom};
 use std::{
     cell::RefCell,

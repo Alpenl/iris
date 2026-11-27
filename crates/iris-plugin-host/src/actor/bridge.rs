@@ -8,7 +8,7 @@ use crate::{
     pool::IoPool,
 };
 use iris_api::v2::{ErrorCode, Generation, Id, MESSAGE_LIMIT, task::Task};
-use iris_net::http_client::HttpCancel;
+use iris_base::net::http_client::HttpCancel;
 use std::{
     collections::BTreeMap,
     sync::{Arc, atomic::Ordering},

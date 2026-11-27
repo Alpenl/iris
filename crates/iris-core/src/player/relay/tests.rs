@@ -16,10 +16,10 @@ use super::{
     CLIENT_TIMEOUT, MAX_REQUEST, PlaybackRelay, RELAY_WORKERS, RelayWorkerBudget, RouteKind, Routes,
 };
 use crate::library::Kind;
-use crate::loopback_http::read_request;
 use crate::media_uri::MediaUri;
 use crate::player::{RemoteMediaRequest, RemoteSubtitle, Session};
 use crate::settings::Settings;
+use iris_base::net::loopback_http::read_request;
 
 impl PlaybackRelay {
     pub(in crate::player) fn start(

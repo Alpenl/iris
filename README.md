@@ -189,8 +189,8 @@ crates/
 │                          bounded network and file access, stream relay, media enhancements
 ├── iris-core/             Headless core (no GPUI): player state machine, catalog and play queue,
 │                          presets, keymap, photo parsing and color matching, credential vault, logging
-├── iris-net/              Network and concurrency base: HTTP(S) client, DNS/DoH, loopback HTTP server,
-│                          WebSocket/TCP framing, managed threads and cancellation
+├── iris-base/             Runtime and network base (rt / net): managed threads, cancellation and
+│                          deadlines, HTTP(S) client, DNS/DoH, loopback HTTP server, WebSocket/TCP
 ├── iris-mpv/              Hand-written libmpv FFI (client API, mpv_node, render handle)
 ├── iris-api/              Headless plugin protocol (serde only)
 ├── iris-plugin-sdk/       Guest-side SDK for writing Wasm plugins
@@ -201,7 +201,7 @@ docs/                      Architecture, decisions and plugin specifications
 scripts/                   Project checks and build tooling
 ```
 
-Dependencies point one way: `iris` → `iris-plugin-host` → `iris-core` → `iris-net`, plus `iris-core` → `iris-mpv`. Only `iris` uses GPUI, and no host crate depends on the guest SDK. `scripts/check-project.py` checks the dependency graph in CI. See [ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full rules.
+Dependencies point one way: `iris` → `iris-plugin-host` → `iris-core` → `iris-base`, plus `iris-core` → `iris-mpv`. Only `iris` uses GPUI, and no host crate depends on the guest SDK. `scripts/check-project.py` checks the dependency graph in CI. See [ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full rules.
 
 ## Documentation
 

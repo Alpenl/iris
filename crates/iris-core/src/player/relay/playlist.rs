@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use anyhow::{Context, Result, ensure};
 use url::Url;
 
-use crate::vfs::http_client::validate_stream_url;
+use iris_base::net::http_client::validate_stream_url;
 
 use super::{RouteKind, Routes};
 

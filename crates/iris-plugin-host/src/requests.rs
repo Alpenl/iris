@@ -4,7 +4,7 @@ use super::{
     ledger::{Ledger, Reservation, Resource},
 };
 use iris_api::v2::{ErrorCode, Id, source::SourcePage};
-use iris_net::http_client::HttpCancel;
+use iris_base::net::http_client::HttpCancel;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Weak};
 

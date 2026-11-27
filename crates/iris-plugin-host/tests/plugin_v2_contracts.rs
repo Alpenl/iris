@@ -1,6 +1,6 @@
 //! Run with scripts/test-plugin-v2.py, which builds both real guest languages.
 use iris_api::v2::{Capability, ErrorCode, Generation, HostCommand, Reply, Role, task::Task};
-use iris_core::concurrency::CancelToken;
+use iris_base::rt::CancelToken;
 use iris_plugin_host::{
     actor::{Actor, Executor, IoOutcome, Operation, Spawn, Status, TaskContext},
     engine::RuntimeEngine,
@@ -245,7 +245,7 @@ fn cancelling_does_not_release_running_io_quota_early() {
 #[ignore = "requires compiled Rust guest; run scripts/test-plugin-v2.py"]
 fn random_access_relay_refresh_preserves_inflight_context_and_cancellation() {
     use iris_api::v2::{Id, NetworkDeclaration, stream::StreamContext};
-    use iris_core::vfs::HttpCancel;
+    use iris_base::net::http_client::HttpCancel;
     use iris_plugin_host::{
         network::NetworkGrant,
         stream::{

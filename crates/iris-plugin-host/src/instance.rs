@@ -8,9 +8,9 @@ use iris_api::v2::{
     CHUNK_LIMIT, COMMAND_LIMIT, Capability, ErrorCode, HostCommand, Id, MESSAGE_LIMIT, Reply, Role,
     unpack,
 };
+use iris_base::net::http_client::HttpCancel;
+use iris_base::rt::{CancelToken, Deadline, WaitError};
 use iris_core::bounded_json::{decode, decode_exact};
-use iris_net::concurrency::{CancelToken, Deadline, WaitError};
-use iris_net::http_client::HttpCancel;
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::{

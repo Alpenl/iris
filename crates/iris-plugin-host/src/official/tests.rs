@@ -3,8 +3,8 @@ use crate::ledger::Resource;
 use crate::runtime::Resources;
 use crate::storage::Storage;
 use iris_api::v2::Capability;
+use iris_base::net::http_client::HttpCancel;
 use iris_core::vault::CredentialVault;
-use iris_net::http_client::HttpCancel;
 use serde_json::{Value, json};
 use std::{
     collections::BTreeSet,

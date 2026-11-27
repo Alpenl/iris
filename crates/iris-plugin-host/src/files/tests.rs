@@ -10,7 +10,7 @@ use iris_api::v2::{
     Capability, ErrorCode, Generation, Id, NetworkDeclaration, Role,
     task::{ArtifactFormat, FileHash, Task},
 };
-use iris_net::http_client::HttpCancel;
+use iris_base::net::http_client::HttpCancel;
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::PathBuf,

@@ -230,7 +230,7 @@ fn exercise(input: &[u8]) {
         let _ = iris_core::player::fuzz_hls::parse_and_extract_uris(text, HLS_DIFF_BASE_URL);
     }
     let _ = prepare::subtitle_format(input);
-    iris_core::vfs::fuzz_net::exercise(input);
+    iris_base::net::fuzz_net::exercise(input);
     if let Ok(command) = decode_exact::<HostCommand>(input, MESSAGE_LIMIT) {
         let _ = validation::command(&command);
     }
@@ -295,26 +295,26 @@ fn seeded_plugin_parser_mutations() {
     let http_206 =
         std::fs::read(fuzz_corpus.join("http_head/valid_100_continue_206.http")).unwrap();
     assert_eq!(
-        iris_net::http_client::parse_response_head(&http_206)
+        iris_base::net::http_client::parse_response_head(&http_206)
             .expect("valid http 206 seed")
             .map(|(status, _, _)| status),
         Some(206)
     );
     let loopback_req =
         std::fs::read(fuzz_corpus.join("http_head/valid_loopback_get_range.http")).unwrap();
-    iris_net::loopback_http::parse_http_request(&loopback_req, "127.0.0.1:18080")
+    iris_base::net::loopback_http::parse_http_request(&loopback_req, "127.0.0.1:18080")
         .expect("valid loopback request seed");
     let chunked =
         std::fs::read(fuzz_corpus.join("chunked/valid_extensions_and_trailers.chunked")).unwrap();
     let mut decoded_chunked = Vec::new();
     std::io::Read::read_to_end(
-        &mut iris_net::http_client::ChunkedReader::new(std::io::Cursor::new(&chunked)),
+        &mut iris_base::net::http_client::ChunkedReader::new(std::io::Cursor::new(&chunked)),
         &mut decoded_chunked,
     )
     .expect("valid chunked seed");
     assert_eq!(decoded_chunked, b"Wikipedia");
     let doh_resp = std::fs::read(fuzz_corpus.join("doh/valid_http_dns_a_response.doh")).unwrap();
-    iris_net::http_client::doh::parse_doh_response_bytes(&doh_resp).expect("valid doh seed");
+    iris_base::net::http_client::doh::parse_doh_response_bytes(&doh_resp).expect("valid doh seed");
     let open_range =
         std::fs::read_to_string(fuzz_corpus.join("range/valid_open_ended.txt")).unwrap();
     iris_plugin_host::stream::range::Range::parse(Some(open_range.trim()), Some(8192))

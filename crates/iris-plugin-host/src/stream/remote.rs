@@ -19,7 +19,7 @@ use iris_api::v2::{
     CHUNK_LIMIT, ErrorCode,
     stream::{ByteIdentity, RemoteResource},
 };
-use iris_net::http_client::HttpCancel;
+use iris_base::net::http_client::HttpCancel;
 use std::{
     sync::{
         Arc, Mutex,
