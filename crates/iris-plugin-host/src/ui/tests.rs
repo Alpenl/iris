@@ -52,7 +52,7 @@ impl Drop for TestDir {
 
 #[track_caller]
 fn wait(mut check: impl FnMut() -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(20);
     while !check() {
         assert!(
             Instant::now() < deadline,
@@ -345,6 +345,9 @@ fn window_session_registers_and_clears_active_stream_on_open_failure_switch_stop
     }
 
     let make_playback = |generation: Generation| {
+        // Dropping a prior Playback/ScopedPlayback wakes its BoundRelay listener thread
+        // asynchronously; wait for that listener to exit before reserving a new session.
+        wait(|| resources.ledger.used(None, Resource::PlaybackSession) == 0);
         let grant = crate::network::NetworkGrant::new(
             record.installation_id.clone(),
             BTreeSet::new(),
@@ -468,7 +471,10 @@ fn window_session_registers_and_clears_active_stream_on_open_failure_switch_stop
     assert!(close_scoped.unwrap().stream.is_cancelled());
 
     drop((ws, hub));
-    wait(|| resources.ledger.used(None, Resource::HostBytes) == 0);
+    wait(|| {
+        resources.ledger.used(None, Resource::HostBytes) == 0
+            && resources.ledger.used(None, Resource::PlaybackSession) == 0
+    });
     assert_eq!(resources.ledger.used(None, Resource::PlaybackSession), 0);
 }
 

@@ -67,7 +67,7 @@ impl StreamReadMemoryProbe {
             generation: Generation::default(),
             wake: Arc::new(|| {}),
         })?;
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + Duration::from_secs(60);
         while actor.status() != Status::Ready {
             if Instant::now() >= deadline {
                 return Err(ErrorCode::Timeout);

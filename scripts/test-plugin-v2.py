@@ -50,7 +50,7 @@ def main():
                     "tests::guest_contracts::", "--", "--ignored", "--nocapture"], cwd=ROOT, env=env, check=True)
     subprocess.run(["cargo", "test", "--locked", "-p", "iris-plugin-host", "--test", "plugin_v2_contracts",
                     "--test", "plugin_v2_read_memory",
-                    "--", "--include-ignored", "--nocapture"], cwd=ROOT, env=env, check=True)
+                    "--", "--include-ignored", "--test-threads=1", "--nocapture"], cwd=ROOT, env=env, check=True)
 
 
 if __name__ == "__main__":

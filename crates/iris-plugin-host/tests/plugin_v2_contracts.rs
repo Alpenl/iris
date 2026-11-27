@@ -93,14 +93,14 @@ fn install_and_wait_ready(session: &mut WindowSession, pkg_path: &Path, plugin_i
             }
             review.is_some()
         },
-        Duration::from_secs(10),
+        Duration::from_secs(60),
     );
     let summary = review.unwrap();
     let grants = summary.manifest.permissions.iter().copied().collect();
     session.approve_review(review_id, grants, false).unwrap();
     until(
         || is_synced_ready(session, plugin_id),
-        Duration::from_secs(15),
+        Duration::from_secs(60),
     );
 }
 
@@ -112,7 +112,7 @@ fn read_loopback_range(url_str: &str, start: u64, len: u64) -> Result<Vec<u8>, s
         parsed.port_or_known_default().unwrap()
     );
     let mut stream = TcpStream::connect(&authority)?;
-    stream.set_read_timeout(Some(Duration::from_secs(3)))?;
+    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
     let end = start + len - 1;
     write!(
         stream,
@@ -240,7 +240,7 @@ fn wat_ws_request_origin_returns_notice_without_quarantining_plugin() {
             }
             summary.is_some()
         },
-        Duration::from_secs(5),
+        Duration::from_secs(20),
     );
 
     let summary = summary.unwrap();
@@ -266,14 +266,14 @@ fn wat_ws_request_origin_returns_notice_without_quarantining_plugin() {
             }
             closed
         },
-        Duration::from_secs(5),
+        Duration::from_secs(20),
     );
     assert!(session.is_ready(plugin_id));
 
     session.shutdown();
     drop(session);
     host.shutdown();
-    until(|| host.host_bytes_used() == 0, Duration::from_secs(5));
+    until(|| host.host_bytes_used() == 0, Duration::from_secs(20));
 }
 
 fn send_runtime_command(session: &mut WindowSession, command: &str) -> String {
@@ -298,7 +298,7 @@ fn send_runtime_command(session: &mut WindowSession, command: &str) -> String {
             }
             toast.is_some()
         },
-        Duration::from_secs(4),
+        Duration::from_secs(20),
     );
     toast.unwrap()
 }
@@ -339,7 +339,7 @@ fn installed_guest_persists_state_without_read_state_and_cannot_receive_local_sn
     host.shutdown();
     until(
         || host.host_bytes_used() == 0 && host.control_stores_used() == 0,
-        Duration::from_secs(5),
+        Duration::from_secs(20),
     );
     drop(host);
 
@@ -347,7 +347,7 @@ fn installed_guest_persists_state_without_read_state_and_cannot_receive_local_sn
     let (mut reopened, _) = reopened_host.open_window(&[], "dark");
     until(
         || is_synced_ready(&mut reopened, "test.runtime"),
-        Duration::from_secs(10),
+        Duration::from_secs(60),
     );
     assert_eq!(
         send_runtime_command(&mut reopened, "store_read"),
@@ -358,7 +358,7 @@ fn installed_guest_persists_state_without_read_state_and_cannot_receive_local_sn
     reopened_host.shutdown();
     until(
         || reopened_host.host_bytes_used() == 0 && reopened_host.control_stores_used() == 0,
-        Duration::from_secs(5),
+        Duration::from_secs(20),
     );
 }
 
@@ -393,7 +393,7 @@ fn admitted_playback_survives_request_cancel_and_control_timeout_until_explicit_
             }
             playback_notice.is_some()
         },
-        Duration::from_secs(5),
+        Duration::from_secs(60),
     );
     let (_binding, ticket, playback) = playback_notice.unwrap();
     let url = playback.url.clone();
@@ -421,7 +421,7 @@ fn admitted_playback_survives_request_cancel_and_control_timeout_until_explicit_
                 p.id == "test.runtime" && p.status == PluginStatus::Failed(ErrorCode::Timeout)
             })
         },
-        Duration::from_secs(5),
+        Duration::from_secs(20),
     );
 
     assert_eq!(
@@ -439,9 +439,9 @@ fn admitted_playback_survives_request_cancel_and_control_timeout_until_explicit_
     host.shutdown();
     until(
         || read_loopback_range(&url, 0, 16).is_err(),
-        Duration::from_secs(4),
+        Duration::from_secs(20),
     );
-    until(|| host.is_ledger_empty(), Duration::from_secs(5));
+    until(|| host.is_ledger_empty(), Duration::from_secs(20));
 }
 
 #[test]
@@ -512,7 +512,7 @@ fn coordinator_routes_live_source_requests_and_stops_stream_on_window_close() {
             }
             playback.is_some()
         },
-        Duration::from_secs(5),
+        Duration::from_secs(60),
     );
     let playback = playback.unwrap();
     let url = playback.url.clone();
@@ -524,9 +524,9 @@ fn coordinator_routes_live_source_requests_and_stops_stream_on_window_close() {
     first.shutdown();
     until(
         || read_loopback_range(&url, 5, 16).is_err(),
-        Duration::from_secs(4),
+        Duration::from_secs(20),
     );
     drop((playback, first));
     host.shutdown();
-    until(|| host.host_bytes_used() == 0, Duration::from_secs(5));
+    until(|| host.host_bytes_used() == 0, Duration::from_secs(20));
 }

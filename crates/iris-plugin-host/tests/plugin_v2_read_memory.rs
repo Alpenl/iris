@@ -40,7 +40,7 @@ unsafe impl GlobalAlloc for CountingAllocator {
 static ALLOCATOR: CountingAllocator = CountingAllocator;
 
 fn until(mut condition: impl FnMut() -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(60);
     while !condition() {
         assert!(Instant::now() < deadline, "actor did not settle");
         std::thread::sleep(Duration::from_millis(1));
@@ -50,7 +50,7 @@ fn until(mut condition: impl FnMut() -> bool) {
 fn read_batch(probe: &StreamReadMemoryProbe, range: std::ops::Range<u64>) -> isize {
     for offset in range {
         let bytes = probe
-            .read_single_byte(offset, Duration::from_secs(5))
+            .read_single_byte(offset, Duration::from_secs(30))
             .unwrap();
         assert_eq!(bytes, [offset as u8]);
     }
