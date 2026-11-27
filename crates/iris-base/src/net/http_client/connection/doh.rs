@@ -16,7 +16,6 @@
 use std::collections::BTreeMap;
 use std::io::{Cursor, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -229,100 +228,236 @@ fn parse_doh_framing(headers: &[httparse::Header<'_>]) -> Result<DohFraming> {
     })
 }
 
-static DOH_CACHE: Mutex<BTreeMap<String, CachedDns>> = Mutex::new(BTreeMap::new());
-static DOH_ENDPOINTS: Mutex<Option<Vec<DohEndpoint>>> = Mutex::new(None);
-static FALLBACK_ENABLED: AtomicBool = AtomicBool::new(false);
-static FALLBACK_NOTICE: AtomicBool = AtomicBool::new(false);
-
-fn current_endpoints() -> Vec<DohEndpoint> {
-    DOH_ENDPOINTS
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .clone()
-        .unwrap_or_else(default_endpoints)
+struct DohInner {
+    endpoints: Option<Vec<DohEndpoint>>,
+    fallback_enabled: bool,
+    fallback_notice: bool,
+    epoch: u64,
+    cache: BTreeMap<String, CachedDns>,
 }
+
+impl DohInner {
+    fn active_endpoints(&self) -> Vec<DohEndpoint> {
+        self.endpoints.clone().unwrap_or_else(default_endpoints)
+    }
+
+    fn bump_epoch_and_reset(&mut self) {
+        self.cache.clear();
+        self.epoch = self
+            .epoch
+            .checked_add(1)
+            .expect("DoH config epoch overflow");
+        self.fallback_notice = false;
+    }
+}
+
+/// Module-private instantiable DoH configuration, epoch, and response cache state.
+/// Production callers share [`DEFAULT_DOH`]; unit tests create isolated instances.
+struct DohState {
+    inner: Mutex<DohInner>,
+}
+
+impl DohState {
+    const fn new() -> Self {
+        Self {
+            inner: Mutex::new(DohInner {
+                endpoints: None,
+                fallback_enabled: false,
+                fallback_notice: false,
+                epoch: 0,
+                cache: BTreeMap::new(),
+            }),
+        }
+    }
+
+    fn epoch(&self) -> u64 {
+        self.inner
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .epoch
+    }
+
+    fn set_resolvers(&self, resolvers: &[String]) -> Result<()> {
+        if resolvers.is_empty() || resolvers.len() > MAX_DOH_RESOLVERS {
+            bail!("DoH resolver list must contain 1..={MAX_DOH_RESOLVERS} entries");
+        }
+        let mut parsed = Vec::with_capacity(resolvers.len());
+        for raw in resolvers {
+            let ep = parse_doh_endpoint(raw)
+                .ok_or_else(|| anyhow!("invalid or non-public DoH resolver: {raw}"))?;
+            if !parsed.contains(&ep) {
+                parsed.push(ep);
+            }
+        }
+        let mut guard = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        let changed = match &guard.endpoints {
+            Some(prev) => prev != &parsed,
+            None => default_endpoints() != parsed,
+        };
+        if changed {
+            guard.endpoints = Some(parsed);
+            guard.bump_epoch_and_reset();
+        }
+        Ok(())
+    }
+
+    fn active_resolvers(&self) -> Vec<String> {
+        self.inner
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .active_endpoints()
+            .into_iter()
+            .map(|ep| ep.canonical_string())
+            .collect()
+    }
+
+    fn set_fallback_enabled(&self, enabled: bool) {
+        let mut guard = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        if guard.fallback_enabled != enabled {
+            guard.fallback_enabled = enabled;
+            guard.bump_epoch_and_reset();
+        }
+    }
+
+    fn fallback_enabled(&self) -> bool {
+        self.inner
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .fallback_enabled
+    }
+
+    fn use_fallback(&self, host: &str, resolved: &[IpAddr]) -> bool {
+        if !should_bypass_fake_ip(host, resolved) {
+            return false;
+        }
+        let (enabled, should_log, servers) = {
+            let mut guard = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+            let enabled = guard.fallback_enabled;
+            let should_log = !std::mem::replace(&mut guard.fallback_notice, true);
+            let servers = if should_log && enabled {
+                guard
+                    .active_endpoints()
+                    .into_iter()
+                    .map(|ep| ep.canonical_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            } else {
+                String::new()
+            };
+            (enabled, should_log, servers)
+        };
+        if should_log {
+            if enabled {
+                log::info!(
+                    "system DNS returned benchmark Fake-IP addresses (local TUN proxy?); \
+                     resolving through configured public DoH resolvers ({servers}). \
+                     Set fake_ip_doh_fallback = false to keep hostnames on the system resolver"
+                );
+            } else {
+                log::warn!(
+                    "system DNS returned benchmark Fake-IP addresses and the public DoH \
+                     fallback is disabled (default); requests to such hosts are refused"
+                );
+            }
+        }
+        enabled
+    }
+
+    fn resolve_a_records(
+        &self,
+        host: &str,
+        cancel: &HttpCancel,
+        current_deadline: impl Fn() -> Instant,
+    ) -> Result<Vec<IpAddr>> {
+        self.resolve_a_records_with(host, cancel, current_deadline, query_single_server)
+    }
+
+    fn resolve_a_records_with(
+        &self,
+        host: &str,
+        cancel: &HttpCancel,
+        current_deadline: impl Fn() -> Instant,
+        mut query_fn: impl FnMut(
+            &DohEndpoint,
+            &str,
+            &HttpCancel,
+            &dyn Fn() -> Instant,
+        ) -> Result<(Vec<IpAddr>, u64)>,
+    ) -> Result<Vec<IpAddr>> {
+        let key = host.trim_end_matches('.').to_ascii_lowercase();
+        let (start_epoch, servers) = {
+            let guard = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+            if !guard.fallback_enabled {
+                bail!("public DoH fallback is disabled");
+            }
+            let now = Instant::now();
+            if let Some(hit) = guard
+                .cache
+                .get(&key)
+                .filter(|entry| entry.expires > now)
+                .map(|entry| entry.ips.clone())
+            {
+                return Ok(hit);
+            }
+            (guard.epoch, guard.active_endpoints())
+        };
+
+        let wire_query = encode_dns_a_query(&key)?;
+        let dns_param = URL_SAFE_NO_PAD.encode(&wire_query);
+        let (ips, ttl_secs) = query_servers(
+            &servers,
+            || self.epoch() == start_epoch,
+            cancel,
+            current_deadline,
+            |endpoint, deadline_fn| query_fn(endpoint, &dns_param, cancel, deadline_fn),
+        )?;
+
+        let mut guard = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        if guard.epoch != start_epoch {
+            if !guard.fallback_enabled {
+                bail!("public DoH fallback disabled during lookup");
+            }
+            bail!("DoH configuration changed during lookup");
+        }
+        let now = Instant::now();
+        let expires = now + Duration::from_secs(ttl_secs.clamp(MIN_TTL_SECS, MAX_TTL_SECS));
+        cache_insert(
+            &mut guard.cache,
+            key,
+            ips.clone(),
+            expires,
+            now,
+            MAX_CACHE_ENTRIES,
+        );
+        Ok(ips)
+    }
+}
+
+static DEFAULT_DOH: DohState = DohState::new();
 
 /// Applies a validated list of public numeric DoH resolvers (`1..=8` entries).
 pub fn set_resolvers(resolvers: &[String]) -> Result<()> {
-    if resolvers.is_empty() || resolvers.len() > MAX_DOH_RESOLVERS {
-        bail!("DoH resolver list must contain 1..={MAX_DOH_RESOLVERS} entries");
-    }
-    let mut parsed = Vec::with_capacity(resolvers.len());
-    for raw in resolvers {
-        let ep = parse_doh_endpoint(raw)
-            .ok_or_else(|| anyhow!("invalid or non-public DoH resolver: {raw}"))?;
-        if !parsed.contains(&ep) {
-            parsed.push(ep);
-        }
-    }
-    let changed = {
-        let mut guard = DOH_ENDPOINTS.lock().unwrap_or_else(PoisonError::into_inner);
-        let prev = guard.clone().unwrap_or_else(default_endpoints);
-        if prev == parsed {
-            false
-        } else {
-            *guard = Some(parsed);
-            true
-        }
-    };
-    if changed {
-        DOH_CACHE
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clear();
-        FALLBACK_NOTICE.store(false, Ordering::Release);
-    }
-    Ok(())
+    DEFAULT_DOH.set_resolvers(resolvers)
 }
 
 pub fn active_resolvers() -> Vec<String> {
-    current_endpoints()
-        .into_iter()
-        .map(|ep| ep.canonical_string())
-        .collect()
+    DEFAULT_DOH.active_resolvers()
 }
 
 /// Applies the user's `fake_ip_doh_fallback` setting. Turning it off also drops
 /// cached DoH answers so no earlier public resolution is reused.
 pub fn set_fallback_enabled(enabled: bool) {
-    if FALLBACK_ENABLED.swap(enabled, Ordering::AcqRel) != enabled {
-        if !enabled {
-            DOH_CACHE
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .clear();
-        }
-        FALLBACK_NOTICE.store(false, Ordering::Release);
-    }
+    DEFAULT_DOH.set_fallback_enabled(enabled);
 }
 
 pub fn fallback_enabled() -> bool {
-    FALLBACK_ENABLED.load(Ordering::Acquire)
+    DEFAULT_DOH.fallback_enabled()
 }
 
 /// Decides whether a system DNS answer goes through the public DoH fallback.
 /// Logs once per setting change; the hostname is never logged.
 pub fn use_fallback(host: &str, resolved: &[IpAddr]) -> bool {
-    if !should_bypass_fake_ip(host, resolved) {
-        return false;
-    }
-    let enabled = fallback_enabled();
-    if !FALLBACK_NOTICE.swap(true, Ordering::AcqRel) {
-        if enabled {
-            let servers = active_resolvers().join(", ");
-            log::info!(
-                "system DNS returned benchmark Fake-IP addresses (local TUN proxy?); \
-                 resolving through configured public DoH resolvers ({servers}). \
-                 Set fake_ip_doh_fallback = false to keep hostnames on the system resolver"
-            );
-        } else {
-            log::warn!(
-                "system DNS returned benchmark Fake-IP addresses and the public DoH \
-                 fallback is disabled (default); requests to such hosts are refused"
-            );
-        }
-    }
-    enabled
+    DEFAULT_DOH.use_fallback(host, resolved)
 }
 
 pub(crate) fn is_benchmark_fake_ip(ip: IpAddr) -> bool {
@@ -358,64 +493,12 @@ pub fn resolve_a_records(
     cancel: &HttpCancel,
     current_deadline: impl Fn() -> Instant,
 ) -> Result<Vec<IpAddr>> {
-    resolve_a_records_with(host, cancel, current_deadline, query_single_server)
-}
-
-fn resolve_a_records_with(
-    host: &str,
-    cancel: &HttpCancel,
-    current_deadline: impl Fn() -> Instant,
-    mut query_fn: impl FnMut(
-        &DohEndpoint,
-        &str,
-        &HttpCancel,
-        &dyn Fn() -> Instant,
-    ) -> Result<(Vec<IpAddr>, u64)>,
-) -> Result<Vec<IpAddr>> {
-    if !fallback_enabled() {
-        bail!("public DoH fallback is disabled");
-    }
-    let key = host.trim_end_matches('.').to_ascii_lowercase();
-    let now = Instant::now();
-    if let Some(hit) = DOH_CACHE
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .get(&key)
-        .filter(|entry| entry.expires > now)
-        .map(|entry| entry.ips.clone())
-    {
-        return Ok(hit);
-    }
-
-    let wire_query = encode_dns_a_query(&key)?;
-    let dns_param = URL_SAFE_NO_PAD.encode(&wire_query);
-    let servers = current_endpoints();
-    let (ips, ttl_secs) = query_servers(
-        &servers,
-        cancel,
-        current_deadline,
-        |endpoint, deadline_fn| query_fn(endpoint, &dns_param, cancel, deadline_fn),
-    )?;
-    let mut cache = DOH_CACHE.lock().unwrap_or_else(PoisonError::into_inner);
-    if !fallback_enabled() {
-        cache.clear();
-        bail!("public DoH fallback disabled during lookup");
-    }
-    let now = Instant::now();
-    let expires = now + Duration::from_secs(ttl_secs.clamp(MIN_TTL_SECS, MAX_TTL_SECS));
-    cache_insert(
-        &mut cache,
-        key,
-        ips.clone(),
-        expires,
-        now,
-        MAX_CACHE_ENTRIES,
-    );
-    Ok(ips)
+    DEFAULT_DOH.resolve_a_records(host, cancel, current_deadline)
 }
 
 fn query_servers<T>(
     servers: &[DohEndpoint],
+    epoch_unchanged: impl Fn() -> bool,
     cancel: &HttpCancel,
     current_deadline: impl Fn() -> Instant,
     mut query: impl FnMut(&DohEndpoint, &dyn Fn() -> Instant) -> Result<T>,
@@ -424,8 +507,10 @@ fn query_servers<T>(
     loop {
         let round_deadline = current_deadline();
         for endpoint in servers {
-            if !fallback_enabled() || cancel.is_cancelled() || Instant::now() >= current_deadline()
-            {
+            if !epoch_unchanged() {
+                return Err(anyhow!("DoH configuration changed during lookup"));
+            }
+            if cancel.is_cancelled() || Instant::now() >= current_deadline() {
                 break;
             }
             match query(endpoint, &current_deadline) {
@@ -433,7 +518,10 @@ fn query_servers<T>(
                 Err(err) => last_err = err,
             }
         }
-        if !fallback_enabled() || cancel.is_cancelled() {
+        if !epoch_unchanged() {
+            return Err(anyhow!("DoH configuration changed during lookup"));
+        }
+        if cancel.is_cancelled() {
             break;
         }
         let latest = current_deadline();
@@ -674,49 +762,15 @@ pub fn parse_dns_a_response(msg: &[u8]) -> Result<(Vec<IpAddr>, u64)> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CachedDns, DEFAULT_DOH_RESOLVERS, DOH_CACHE, DOH_ENDPOINTS, DohFraming, FALLBACK_ENABLED,
-        FALLBACK_NOTICE, HttpCancel, active_resolvers, cache_insert, default_endpoints,
-        encode_dns_a_query, fallback_enabled, normalize_doh_resolver, parse_dns_a_response,
-        parse_doh_framing, parse_doh_response_bytes, query_servers, resolve_a_records,
-        resolve_a_records_with, set_fallback_enabled, set_resolvers, should_bypass_fake_ip,
-        use_fallback,
+        CachedDns, DEFAULT_DOH_RESOLVERS, DohFraming, DohState, HttpCancel, cache_insert,
+        default_endpoints, encode_dns_a_query, normalize_doh_resolver, parse_dns_a_response,
+        parse_doh_framing, parse_doh_response_bytes, query_servers, should_bypass_fake_ip,
     };
     use anyhow::anyhow;
     use std::collections::BTreeMap;
     use std::net::{IpAddr, Ipv4Addr};
-    use std::sync::atomic::Ordering;
-    use std::sync::{Mutex, MutexGuard, PoisonError};
+    use std::sync::{Mutex, PoisonError};
     use std::time::{Duration, Instant};
-
-    static TEST_STATE_LOCK: Mutex<()> = Mutex::new(());
-
-    struct DohStateGuard(#[allow(dead_code)] MutexGuard<'static, ()>);
-
-    impl DohStateGuard {
-        fn lock() -> Self {
-            let guard = TEST_STATE_LOCK
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            Self::reset();
-            Self(guard)
-        }
-
-        fn reset() {
-            FALLBACK_ENABLED.store(false, Ordering::Release);
-            FALLBACK_NOTICE.store(false, Ordering::Release);
-            *DOH_ENDPOINTS.lock().unwrap_or_else(PoisonError::into_inner) = None;
-            DOH_CACHE
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .clear();
-        }
-    }
-
-    impl Drop for DohStateGuard {
-        fn drop(&mut self) {
-            Self::reset();
-        }
-    }
 
     #[test]
     fn detects_fake_ip_without_affecting_local_or_public_records() {
@@ -747,18 +801,22 @@ mod tests {
 
     #[test]
     fn defaults_off_and_mid_flight_disable_aborts_without_caching() {
-        let _guard = DohStateGuard::lock();
+        let state = DohState::new();
         let fake: [IpAddr; 1] = ["198.18.1.82".parse().unwrap()];
         let real: [IpAddr; 1] = ["14.17.92.73".parse().unwrap()];
-        assert!(!fallback_enabled(), "DoH fallback defaults to off");
-        assert!(!use_fallback("passport.bilibili.com", &fake));
+        assert!(!state.fallback_enabled(), "DoH fallback defaults to off");
+        assert_eq!(state.epoch(), 0);
+        assert!(!state.use_fallback("passport.bilibili.com", &fake));
 
-        set_fallback_enabled(true);
-        assert!(use_fallback("passport.bilibili.com", &fake));
-        assert!(!use_fallback("passport.bilibili.com", &real));
-        DOH_CACHE
+        state.set_fallback_enabled(true);
+        assert_eq!(state.epoch(), 1);
+        assert!(state.use_fallback("passport.bilibili.com", &fake));
+        assert!(!state.use_fallback("passport.bilibili.com", &real));
+        state
+            .inner
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
+            .cache
             .insert(
                 "cached.example".into(),
                 CachedDns {
@@ -767,41 +825,59 @@ mod tests {
                 },
             );
 
-        set_fallback_enabled(false);
-        assert!(!use_fallback("passport.bilibili.com", &fake));
+        // No-op write leaves cache and epoch untouched.
+        state.set_fallback_enabled(true);
+        assert_eq!(state.epoch(), 1);
         assert!(
-            !DOH_CACHE
+            state
+                .inner
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
+                .cache
+                .contains_key("cached.example")
+        );
+
+        state.set_fallback_enabled(false);
+        assert_eq!(state.epoch(), 2);
+        assert!(!state.use_fallback("passport.bilibili.com", &fake));
+        assert!(
+            !state
+                .inner
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .cache
                 .contains_key("cached.example"),
             "opting out must drop cached public answers"
         );
 
-        // Mid-flight TOCTOU: disabling fallback while query_fn is in flight must neither cache nor return IPs.
-        set_fallback_enabled(true);
-        let err = resolve_a_records_with(
-            "midflight.example",
-            &HttpCancel::default(),
-            || Instant::now() + Duration::from_secs(5),
-            |_ep, _param, _cancel, _dl| {
-                set_fallback_enabled(false);
-                Ok((real.to_vec(), 60))
-            },
-        )
-        .unwrap_err();
+        // Mid-flight disable: turning off fallback while query_fn is in flight errors and skips caching.
+        state.set_fallback_enabled(true);
+        let err = state
+            .resolve_a_records_with(
+                "midflight.example",
+                &HttpCancel::default(),
+                || Instant::now() + Duration::from_secs(5),
+                |_ep, _param, _cancel, _dl| {
+                    state.set_fallback_enabled(false);
+                    Ok((real.to_vec(), 60))
+                },
+            )
+            .unwrap_err();
         assert!(err.to_string().contains("disabled"), "{err}");
         assert!(
-            !DOH_CACHE
+            !state
+                .inner
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
+                .cache
                 .contains_key("midflight.example")
         );
     }
 
     #[test]
     fn configurable_resolvers_accept_public_numeric_endpoints_and_reject_non_public() {
-        let _guard = DohStateGuard::lock();
-        assert_eq!(active_resolvers(), DEFAULT_DOH_RESOLVERS);
+        let state = DohState::new();
+        assert_eq!(state.active_resolvers(), DEFAULT_DOH_RESOLVERS);
 
         assert_eq!(
             normalize_doh_resolver(" https://1.1.1.1/dns-query "),
@@ -826,18 +902,30 @@ mod tests {
             assert_eq!(normalize_doh_resolver(bad), None, "must reject {bad}");
         }
 
-        set_resolvers(&[
-            "8.8.8.8".into(),
-            "https://9.9.9.9:8443/dns-query".into(),
-            "8.8.8.8".into(),
-        ])
-        .unwrap();
+        // Setting the default resolvers again is a no-op.
+        state
+            .set_resolvers(&DEFAULT_DOH_RESOLVERS.map(String::from))
+            .unwrap();
+        assert_eq!(state.epoch(), 0);
+
+        state
+            .set_resolvers(&[
+                "8.8.8.8".into(),
+                "https://9.9.9.9:8443/dns-query".into(),
+                "8.8.8.8".into(),
+            ])
+            .unwrap();
+        assert_eq!(state.epoch(), 1);
         assert_eq!(
-            active_resolvers(),
+            state.active_resolvers(),
             vec!["8.8.8.8", "https://9.9.9.9:8443/dns-query"]
         );
-        assert!(set_resolvers(&[]).is_err());
-        assert!(set_resolvers(&["198.18.0.1".into()]).is_err());
+        state
+            .set_resolvers(&["8.8.8.8".into(), "https://9.9.9.9:8443/dns-query".into()])
+            .unwrap();
+        assert_eq!(state.epoch(), 1);
+        assert!(state.set_resolvers(&[]).is_err());
+        assert!(state.set_resolvers(&["198.18.0.1".into()]).is_err());
     }
 
     #[test]
@@ -871,8 +959,8 @@ mod tests {
 
     #[test]
     fn doh_cache_evicts_earliest_expiry_and_headers_reject_duplicates() {
-        let _guard = DohStateGuard::lock();
-        set_fallback_enabled(true);
+        let state = DohState::new();
+        state.set_fallback_enabled(true);
         let now = Instant::now();
         let ip = vec![IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4))];
         let mut cache: BTreeMap<String, CachedDns> = BTreeMap::new();
@@ -934,7 +1022,8 @@ mod tests {
         let cancel = HttpCancel::default();
         cancel.cancel();
         assert!(
-            resolve_a_records("uncached.example", &cancel, || now + Duration::from_secs(5))
+            state
+                .resolve_a_records("uncached.example", &cancel, || now + Duration::from_secs(5))
                 .is_err()
         );
 
@@ -944,6 +1033,7 @@ mod tests {
         let servers = default_endpoints();
         let rescued = query_servers(
             &servers,
+            || true,
             &active_cancel,
             || *shared_deadline.lock().unwrap(),
             |_ep, deadline_fn| {
@@ -960,5 +1050,122 @@ mod tests {
         .unwrap();
         assert_eq!(rescued, Ipv4Addr::new(14, 17, 92, 73));
         assert_eq!(attempts, 2);
+    }
+
+    #[test]
+    fn epoch_rejects_mid_flight_resolver_and_aba_toggle_changes_and_isolates_instances() {
+        let cancel = HttpCancel::default();
+        let dl = || Instant::now() + Duration::from_secs(5);
+        let ip_a = IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34));
+        let ip_b = IpAddr::V4(Ipv4Addr::new(151, 101, 1, 69));
+
+        // 1. Unchanged configuration caches and returns result; subsequent lookup hits cache.
+        let state = DohState::new();
+        state.set_fallback_enabled(true);
+        state
+            .set_resolvers(&["8.8.8.8".into(), "1.1.1.1".into()])
+            .unwrap();
+        let mut calls = 0usize;
+        let got = state
+            .resolve_a_records_with("stable.example", &cancel, dl, |ep, _p, _c, _d| {
+                calls += 1;
+                assert_eq!(ep.ip, "8.8.8.8".parse::<IpAddr>().unwrap());
+                Ok((vec![ip_a], 120))
+            })
+            .unwrap();
+        assert_eq!(got, vec![ip_a]);
+        assert_eq!(calls, 1);
+        let cached = state
+            .resolve_a_records_with("stable.example", &cancel, dl, |_ep, _p, _c, _d| {
+                unreachable!("must be served from cache")
+            })
+            .unwrap();
+        assert_eq!(cached, vec![ip_a]);
+
+        // 2. Resolver list change mid-query: aborts remaining old endpoints, returns Err, and skips cache.
+        let mut tried_ips = Vec::new();
+        let err = state
+            .resolve_a_records_with("switch-fail.example", &cancel, dl, |ep, _p, _c, _d| {
+                tried_ips.push(ep.ip);
+                state.set_resolvers(&["9.9.9.9".into()]).unwrap();
+                Err(anyhow!("first resolver failed"))
+            })
+            .unwrap_err();
+        assert!(err.to_string().contains("changed"), "{err}");
+        assert_eq!(
+            tried_ips,
+            vec!["8.8.8.8".parse::<IpAddr>().unwrap()],
+            "epoch change must stop querying remaining old servers immediately"
+        );
+
+        let err = state
+            .resolve_a_records_with("switch-ok.example", &cancel, dl, |ep, _p, _c, _d| {
+                assert_eq!(ep.ip, "9.9.9.9".parse::<IpAddr>().unwrap());
+                state.set_resolvers(&["223.5.5.5".into()]).unwrap();
+                Ok((vec![ip_a], 300))
+            })
+            .unwrap_err();
+        assert!(err.to_string().contains("changed"), "{err}");
+        assert!(
+            !state
+                .inner
+                .lock()
+                .unwrap()
+                .cache
+                .contains_key("switch-ok.example"),
+            "late answer from previous resolver list must neither return Ok nor enter cache"
+        );
+
+        // 3. Fallback toggled off -> on (ABA) mid-query: returns Err and skips cache.
+        let err = state
+            .resolve_a_records_with("toggle-aba.example", &cancel, dl, |_ep, _p, _c, _d| {
+                state.set_fallback_enabled(false);
+                state.set_fallback_enabled(true);
+                Ok((vec![ip_a], 300))
+            })
+            .unwrap_err();
+        assert!(err.to_string().contains("changed"), "{err}");
+        assert!(
+            !state
+                .inner
+                .lock()
+                .unwrap()
+                .cache
+                .contains_key("toggle-aba.example"),
+            "pre-opt-out answer must neither return Ok nor enter cache after re-enable"
+        );
+
+        // 4. Two DohState instances keep configurations, epochs, and caches isolated.
+        let other = DohState::new();
+        assert!(!other.fallback_enabled());
+        assert_eq!(other.active_resolvers(), DEFAULT_DOH_RESOLVERS);
+        other.set_fallback_enabled(true);
+        other.set_resolvers(&["1.0.0.1".into()]).unwrap();
+
+        let got_state = state
+            .resolve_a_records_with("shared.example", &cancel, dl, |ep, _p, _c, _d| {
+                assert_eq!(ep.ip, "223.5.5.5".parse::<IpAddr>().unwrap());
+                Ok((vec![ip_a], 120))
+            })
+            .unwrap();
+        let got_other = other
+            .resolve_a_records_with("shared.example", &cancel, dl, |ep, _p, _c, _d| {
+                assert_eq!(ep.ip, "1.0.0.1".parse::<IpAddr>().unwrap());
+                Ok((vec![ip_b], 120))
+            })
+            .unwrap();
+        assert_eq!(got_state, vec![ip_a]);
+        assert_eq!(got_other, vec![ip_b]);
+
+        other.set_fallback_enabled(false);
+        assert!(state.fallback_enabled());
+        assert_eq!(
+            state
+                .resolve_a_records_with("shared.example", &cancel, dl, |_ep, _p, _c, _d| {
+                    unreachable!("state cache must not be cleared by other instance")
+                })
+                .unwrap(),
+            vec![ip_a]
+        );
     }
 }
