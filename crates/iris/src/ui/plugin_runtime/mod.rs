@@ -103,7 +103,7 @@ impl AppModel {
     }
 
     pub(super) fn advance_plugin_media(&mut self, cx: &mut Context<Self>) -> bool {
-        let (ok, out) = self.plugins.advance_media(&mut self.viewport.session);
+        let (ok, out) = self.plugins.advance_media(self.playback.session_mut());
         let regions = self.apply_plugin_outcome(out, None, cx);
         if regions.any() {
             self.notify_regions(regions, cx);

@@ -82,7 +82,7 @@ impl AppModel {
     }
 
     pub(in crate::ui) fn scroll_directory_to_current(&self) {
-        let Some(cur) = self.active().session.current_media_uri() else {
+        let Some(cur) = self.session().current_media_uri() else {
             return;
         };
         if let Some(ix) = self
@@ -126,7 +126,7 @@ impl AppModel {
         );
 
         let (mut videos, mut audio, mut photos) = (0, 0, 0);
-        let current = self.active().session.current();
+        let current = self.session().current();
         let mut current_index = 0;
         let mut photo_paths = Vec::new();
         for item in &source_items {
@@ -227,7 +227,7 @@ impl AppModel {
                 }
             }
         }
-        let current = self.active().session.current_media_uri();
+        let current = self.session().current_media_uri();
         let (mut playable_count, mut current_playable_number) = (0, None);
         rows.extend(filtered.iter().map(|item| {
             if !item.is_folder() {

@@ -155,7 +155,7 @@ fn viewport_context_items(
     m: &AppModel,
     t: ThemeTokens,
 ) -> Vec<AnyElement> {
-    let session = &m.active().session;
+    let session = m.session();
     let kind = session.kind();
     let st = session.state();
     let cur_uri = session.current_media_uri();

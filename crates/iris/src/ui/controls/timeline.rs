@@ -48,7 +48,7 @@ pub(super) fn render_timeline(
     cx: &App,
 ) -> impl IntoElement {
     let m = model.read(cx);
-    let session = &m.active().session;
+    let session = m.session();
     let state = session.state();
     let slot = m.chrome.probes.progress_bounds.clone();
 
@@ -238,7 +238,7 @@ pub(super) fn render_timeline(
         .on_mouse_down(
             MouseButton::Left,
             model_listener(model, |this, ev: &MouseDownEvent, _, cx| {
-                let duration = this.active().session.state().duration;
+                let duration = this.session().state().duration;
                 if !duration.is_finite() || duration <= 0. {
                     return;
                 }

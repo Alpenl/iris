@@ -8,10 +8,9 @@ use gpui::{Context, Window};
 use iris_api::v2::Id;
 use iris_app::{PluginBatchOutcome, PluginContext, PluginController, PluginSideEffect};
 use iris_core::player::Session;
-use iris_core::preset::SidebarMode;
 
 use super::AppModel;
-use super::views::{DirtyRegions, dirty_regions_for_poll};
+use super::views::{DirtyRegions, dirty_regions_for_plugin_outcome};
 
 impl AppModel {
     pub(in crate::ui) fn with_plugin_ctx<R>(
@@ -19,7 +18,7 @@ impl AppModel {
         f: impl FnOnce(&mut PluginController, PluginContext<'_, Session>) -> R,
     ) -> R {
         let ctx = PluginContext {
-            player: &mut self.viewport.session,
+            player: self.playback.session_mut(),
             store: &mut self.store,
             settings: &self.settings,
             active_source: &mut self.catalog.active_source,
@@ -92,14 +91,11 @@ impl AppModel {
         window: Option<&mut Window>,
         cx: &mut Context<Self>,
     ) -> DirtyRegions {
-        let mut regions = dirty_regions_for_poll(
+        let mut regions = dirty_regions_for_plugin_outcome(
             outcome.dirty_slots,
             outcome.status_changed,
-            self.chrome.fullscreen,
-            self.chrome.chrome_visible,
-            self.sidebar_is_visible() && self.catalog.sidebar_mode == SidebarMode::Plugins,
-            self.overlays.settings_open,
-            self.overlays.palette_open,
+            &outcome.domain,
+            self.ui_visibility(),
         );
 
         let d = outcome.domain;
@@ -108,53 +104,27 @@ impl AppModel {
         }
         if d.close_overlays {
             self.overlays.close_all();
-            regions = DirtyRegions::ALL;
         }
         if d.stream_meta_cleared {
             self.overlays.close_variants_popover();
-            regions.root = true;
-            regions.dock = true;
         }
-        if d.uninstalled_changed {
-            if let Some(pid) = self.settings.theme_id.strip_prefix("plugin:")
-                && !self.plugins.list().iter().any(|p| p.id == pid)
-            {
-                self.settings.theme_id = "graphite".into();
-                self.persist_user_settings();
-            }
-            regions = DirtyRegions::ALL;
+        if d.uninstalled_changed
+            && let Some(pid) = self.settings.theme_id.strip_prefix("plugin:")
+            && !self.plugins.list().iter().any(|p| p.id == pid)
+        {
+            self.settings.theme_id = "graphite".into();
+            self.persist_user_settings();
         }
         if d.theme_changed {
             self.sync_theme_tokens(cx);
             self.sync_viewport_effects(cx);
-            regions = DirtyRegions::ALL;
         }
         if d.favorites_changed {
             self.rebuild_directory_rows();
             self.scan_visible_favorites(cx);
-            regions.sidebar = true;
-            regions.viewport = true;
-            regions.dock = true;
         } else if d.catalog_changed {
             self.rebuild_directory_rows();
             self.ensure_filmstrip_thumbnails(cx);
-            regions.root = true;
-            regions.sidebar = true;
-            regions.viewport = true;
-            regions.dock = true;
-        }
-        if d.consent_changed || d.modal_changed {
-            regions.root = true;
-        }
-        if d.playback_changed || d.timeline_changed || d.track_changed {
-            regions.dock = true;
-        }
-        if d.lut_changed || d.overlay_changed {
-            regions.viewport = true;
-        }
-        if d.annotations_changed {
-            regions.viewport = true;
-            regions.dock = true;
         }
 
         for effect in outcome.effects {
@@ -199,33 +169,22 @@ impl AppModel {
                 }
                 PluginSideEffect::MediaResolveStarted => {
                     let _ = self.catalog.remote_load.take();
-                    let vp = self.active_mut();
-                    vp.load_generation += 1;
-                    vp.pending_path = None;
-                    vp.loading_visible = true;
-                    vp.pending_subtitles.clear();
+                    self.playback.begin_plugin_resolve();
                     regions.root = true;
                     regions.viewport = true;
                     regions.dock = true;
                 }
                 PluginSideEffect::MediaLoadCancelled => {
                     self.plugin_ui.resolve_timeout = None;
-                    let vp = self.active_mut();
-                    vp.load_generation += 1;
-                    vp.loading_visible = false;
-                    vp.pending_subtitles.clear();
+                    let _ = self.playback.cancel_in_flight_load(true);
                     regions.viewport = true;
                 }
                 PluginSideEffect::MediaOpenSucceeded => {
                     self.plugin_ui.resolve_timeout = None;
                     let _ = self.catalog.remote_load.take();
                     self.overlays.close_menus();
-                    {
-                        let vp = self.active_mut();
-                        vp.pending_path = None;
-                        vp.commit_media_open_generation();
-                        vp.image.reset();
-                    }
+                    self.playback.commit_media_open_generation();
+                    self.active_mut().image.reset();
                     self.finish_media_open(cx);
                     regions = DirtyRegions::ALL;
                 }
@@ -233,21 +192,18 @@ impl AppModel {
                     self.plugin_ui.resolve_timeout = None;
                     let _ = self.catalog.remote_load.take();
                     self.overlays.close_menus();
-                    {
-                        let vp = self.active_mut();
-                        vp.pending_path = None;
-                        vp.commit_media_open_generation();
-                        vp.loading_visible = false;
-                        vp.pending_subtitles.clear();
-                        vp.image.reset();
+                    self.playback.commit_media_open_generation();
+                    if let Some(np) = self.playback.on_media_open_failed(Instant::now()) {
+                        self.apply_now_playing_snapshot(np);
                     }
-                    self.sync_now_playing(true);
+                    self.active_mut().image.reset();
                     self.sync_viewport_effects(cx);
                     regions = DirtyRegions::ALL;
                 }
                 PluginSideEffect::PlaybackStopped => {
                     self.active_mut().image.reset();
-                    self.sleep_preventer.set_active(false);
+                    self.sleep_preventer
+                        .set_active(self.playback.should_prevent_sleep());
                     self.sync_now_playing(true);
                     regions.viewport = true;
                     regions.dock = true;
@@ -327,7 +283,7 @@ impl AppModel {
     ) {
         let text_inputs = &self.text_inputs;
         let ctx = PluginContext {
-            player: &mut self.viewport.session,
+            player: self.playback.session_mut(),
             store: &mut self.store,
             settings: &self.settings,
             active_source: &mut self.catalog.active_source,

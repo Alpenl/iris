@@ -5,7 +5,7 @@ use gpui::{
     App, Entity, InteractiveElement, IntoElement, MouseButton, ParentElement, ScrollWheelEvent,
     StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder, px,
 };
-use iris_core::player::{self, AspectMode, Command, TrackKind, format_time};
+use iris_core::player::{AspectMode, Command, TrackKind, format_time};
 use iris_core::{catalog::PlayQueue, media_uri::MediaUri};
 
 use super::super::AppModel;
@@ -114,7 +114,7 @@ fn render_variant_selector(
         .plugin_id
         .as_deref()
         .is_some_and(|pid| !m.plugins.is_ready(pid))
-        || m.active().session.current_media_uri().is_none()
+        || m.session().current_media_uri().is_none()
     {
         return None;
     }
@@ -141,11 +141,11 @@ fn render_variant_selector(
 
 fn can_step_media(m: &AppModel, delta: isize) -> bool {
     let current = m
-        .active()
-        .pending_path
-        .clone()
+        .playback
+        .pending_path()
+        .map(std::path::Path::to_path_buf)
         .map(MediaUri::Local)
-        .or_else(|| m.active().session.current_media_uri());
+        .or_else(|| m.session().current_media_uri());
     if !m.queue.is_empty() {
         return can_step_queue(&m.queue, current.as_ref(), delta);
     }
@@ -240,10 +240,8 @@ fn speed_button(
                 |this, ev: &ScrollWheelEvent, _, cx| {
                     let step = this.damped_wheel_steps(ev, 36.);
                     if step != 0 {
-                        let cur = this.active().session.state().speed;
-                        let next = player::step_speed(cur, step.signum());
-                        this.command(Command::SetSpeed(next), cx);
-                        this.show_osd(format!("倍速 · {next:.2}×"), cx);
+                        let out = this.playback.step_speed(step.signum());
+                        this.apply_playback_action(out, cx);
                         this.notify_dock(cx);
                     }
                     cx.stop_propagation();
@@ -261,7 +259,7 @@ pub(super) fn video_transport(
     cx: &App,
 ) -> impl IntoElement {
     let m = model.read(cx);
-    let state = m.active().session.state();
+    let state = m.session().state();
     let (paused, rem) = (state.paused, m.chrome.show_remaining);
     let scrub = &m.chrome.scrub;
     let shown_pos = scrub
@@ -358,7 +356,7 @@ pub(super) fn video_fields(
     cx: &App,
 ) -> impl IntoElement {
     let m = model.read(cx);
-    let session = &m.active().session;
+    let session = m.session();
     let state = session.state();
     let subs = state.subs_visible;
     let aspect_on = state.aspect != AspectMode::Original;
@@ -461,7 +459,7 @@ pub(super) fn audio_fields(
     cx: &App,
 ) -> impl IntoElement {
     let m = model.read(cx);
-    let state = m.active().session.state();
+    let state = m.session().state();
     let loop_file = state.loop_file;
     let speed = state.speed;
     let audio_pop = m.overlays.popover == Some(PopoverKind::Audio);
@@ -494,7 +492,7 @@ pub(super) fn photo_transport(
     cx: &App,
 ) -> impl IntoElement {
     let m = model.read(cx);
-    let session = &m.active().session;
+    let session = m.session();
     let standalone_remote = m.catalog.current_playable_number.is_none()
         && session.current().is_none()
         && m.catalog.active_source.is_local()
@@ -543,7 +541,7 @@ pub(super) fn photo_fields(
 ) -> impl IntoElement {
     let m = model.read(cx);
     let view = &m.active().image;
-    let state = m.active().session.state();
+    let state = m.session().state();
     let strip_on = m.settings.photo_filmstrip;
     let more_pop = m.overlays.popover == Some(PopoverKind::More);
     let (viewport, media) = m.image_geometry();
@@ -566,7 +564,7 @@ pub(super) fn photo_fields(
         .on_click(model_listener(model, |this, _, w, cx| {
             this.toggle_filmstrip(&ToggleFilmstrip, w, cx);
         }));
-    let (hflip, _) = m.active().session.display_flips();
+    let (hflip, _) = m.session().display_flips();
     let flip_btn = icon_button(("hflip", usize::from(hflip)), Icon::FlipH, hflip, t)
         .tooltip(m.act_tip("水平镜像翻转", "toggle_hflip"))
         .on_click(model_listener(model, |this, _, w, cx| {

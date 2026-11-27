@@ -214,7 +214,7 @@ impl Sidebar {
                 let model = sidebar.model.clone();
                 let m = model.read(cx);
                 let t = ThemeTokens::of(cx);
-                let cur_uri = m.active().session.current_media_uri();
+                let cur_uri = m.session().current_media_uri();
                 let mut missing_thumbs: Vec<MediaUri> = Vec::new();
 
                 let elements: Vec<AnyElement> = range

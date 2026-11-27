@@ -80,7 +80,7 @@ impl AppModel {
         self.text_inputs.active_form_key = None;
         self.focus.focus(window);
         let (theme_plugin_ids, out) = self.plugins.reset_theme_plugins_and_modals(
-            &mut self.viewport.session,
+            self.playback.session_mut(),
             &mut self.store,
             &mut self.settings,
             &mut self.catalog.active_source,
@@ -213,7 +213,7 @@ impl AppModel {
             self.command(Command::SetAspect(asp), cx);
         }
 
-        self.viewport.session.apply_settings(&self.settings);
+        self.playback.session_mut().apply_settings(&self.settings);
         self.sync_theme_tokens(cx);
         self.ensure_filmstrip_thumbnails(cx);
         self.overlays.popover = None;
@@ -231,7 +231,7 @@ impl AppModel {
         cx: &mut Context<Self>,
     ) {
         let win_sz = self.current_preset_layout(window).window_size;
-        let st = self.active().session.state();
+        let st = self.session().state();
         let preset = PresetManager::capture_from_current(
             String::new(),
             if name.trim().is_empty() {
@@ -262,7 +262,7 @@ impl AppModel {
         cx: &mut Context<Self>,
     ) {
         let win_sz = self.current_preset_layout(window).window_size;
-        let st = self.active().session.state();
+        let st = self.session().state();
         if self.presets.update_from_current(
             id,
             scope,

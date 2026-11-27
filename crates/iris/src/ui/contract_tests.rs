@@ -522,35 +522,35 @@ fn plugin_modal_feedback_clears_inline_error_on_non_text_edit() {
 fn gpu_reset_recovery_skips_vid_fallback_when_restore_vid_already_queued() {
     use iris_core::library::Kind;
 
-    assert!(super::should_recover_after_gpu_reset(
+    assert!(iris_app::should_recover_after_gpu_reset(
         4,
         4,
         Some(Kind::Photo),
         true,
         true
     ));
-    assert!(!super::should_recover_after_gpu_reset(
+    assert!(!iris_app::should_recover_after_gpu_reset(
         4,
         4,
         Some(Kind::Video),
         true,
         true
     ));
-    assert!(super::should_recover_after_gpu_reset(
+    assert!(iris_app::should_recover_after_gpu_reset(
         4,
         4,
         Some(Kind::Video),
         false,
         true
     ));
-    assert!(super::should_recover_after_gpu_reset(
+    assert!(iris_app::should_recover_after_gpu_reset(
         4,
         4,
         Some(Kind::Video),
         true,
         false
     ));
-    assert!(super::should_recover_after_gpu_reset(
+    assert!(iris_app::should_recover_after_gpu_reset(
         4,
         4,
         Some(Kind::Audio),
@@ -565,7 +565,7 @@ fn gpu_reset_recovery_skips_vid_fallback_when_restore_vid_already_queued() {
         Some(Kind::Audio),
         None,
     ] {
-        assert!(!super::should_recover_after_gpu_reset(
+        assert!(!iris_app::should_recover_after_gpu_reset(
             4, 5, kind, false, false
         ));
     }
@@ -717,7 +717,7 @@ fn remote_search_query_gates_supports_search_and_trims_whitespace() {
 
 #[test]
 fn scoped_release_guards_spurious_error_toasts_and_progress_wipes() {
-    use super::events::{should_record_progress, should_suppress_playback_error_toast};
+    use iris_app::{should_record_progress, should_suppress_playback_error_toast};
 
     assert!(!should_suppress_playback_error_toast(false, false));
     assert!(should_suppress_playback_error_toast(true, false));

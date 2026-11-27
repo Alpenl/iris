@@ -40,7 +40,7 @@ impl AppModel {
     pub(in crate::ui) fn sync_overlay_clock(&mut self) {
         let _ = self
             .plugins
-            .sync_overlay_clock(&self.viewport.session, Instant::now());
+            .sync_overlay_clock(self.playback.session(), Instant::now());
         self.plugin_ui.overlay_wake = None;
     }
 

@@ -71,7 +71,7 @@ pub(in crate::ui) fn render_dock_entity(
 ) -> impl IntoElement {
     let m = model.read(cx);
     let t = ThemeTokens::of(cx);
-    let kind = m.active().session.kind();
+    let kind = m.session().kind();
     let left = m.settings.directory_side == Side::Left;
     let compact = m.effective_compact_controls();
     let avail_w = m.dock_available_width(window);
@@ -184,7 +184,7 @@ pub(super) fn render_volume(
     cx: &App,
 ) -> impl IntoElement {
     let m = model.read(cx);
-    let state = m.active().session.state();
+    let state = m.session().state();
     let volume = state.volume;
     let muted = state.muted;
     let filled = if muted {
@@ -296,7 +296,7 @@ fn window_buttons(
     cx: &App,
 ) -> impl IntoElement {
     let m = model.read(cx);
-    let session = &m.active().session;
+    let session = m.session();
     let cur_uri = session.current_media_uri();
     let has_media = cur_uri.is_some();
     let favorite = cur_uri.as_ref().is_some_and(|u| m.store.is_favorite(u));

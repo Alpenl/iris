@@ -1,7 +1,7 @@
 //! Window, preset, sidebar, overlay, screenshot, and photo-view action handlers.
 
 use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use gpui::{Context, PathPromptOptions, Pixels, Point, Window};
 use iris_core::library::{self, Kind};
@@ -54,10 +54,10 @@ impl AppModel {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(uri) = self.active().session.current_media_uri() else {
+        let Some(uri) = self.session().current_media_uri() else {
             return;
         };
-        if !self.active().session.may_share_current_identity() {
+        if !self.session().may_share_current_identity() {
             self.show_toast("此链接仅用于本次播放，无法收藏", cx);
             return;
         }
@@ -165,7 +165,7 @@ impl AppModel {
     pub(super) fn toggle_info(&mut self, _: &ToggleInfo, _: &mut Window, cx: &mut Context<Self>) {
         self.overlays.info_open = !self.overlays.info_open;
         if self.overlays.info_open {
-            self.active_mut().refresh_cached_stats(true);
+            self.playback.refresh_cached_stats(true, Instant::now());
             self.refresh_annotations(cx);
         }
         self.notify_viewport_and_dock(cx);
@@ -177,7 +177,7 @@ impl AppModel {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let session = &self.active().session;
+        let session = self.session();
         if session.kind() == Some(Kind::Audio) {
             self.show_toast("当前为音频文件，无法截图", cx);
             return;
@@ -209,7 +209,7 @@ impl AppModel {
         let out = platform::default_screenshot_dir()
             .join(format!("Iris-{stem}-{}.png", format_screenshot_stamp()));
         let with_subs = self.settings.screenshot_subs;
-        if let Err(e) = self.active_mut().session.execute(Command::Screenshot {
+        if let Err(e) = self.session_mut().execute(Command::Screenshot {
             path: out.clone(),
             with_subs,
         }) {
@@ -222,12 +222,8 @@ impl AppModel {
     }
 
     pub(super) fn cycle_aspect(&mut self, _: &CycleAspect, _: &mut Window, cx: &mut Context<Self>) {
-        let next = self.active().session.state().aspect.next();
-        self.command(Command::SetAspect(next), cx);
-        self.show_osd(
-            format!("画面比例 · {}", super::strings::chrome::aspect_label(next)),
-            cx,
-        );
+        let out = self.playback.cycle_aspect();
+        self.apply_playback_action(out, cx);
     }
 
     pub(super) fn toggle_directory(
@@ -333,13 +329,13 @@ impl AppModel {
             self.browse_plugin_source(&pid, &sid, fid, None, q, cx);
             return;
         }
-        if self.active().pending_path.is_some() {
+        if self.playback.pending_path().is_some() {
             return;
         }
         let Some(folder) = self.catalog.local_dir.folder().map(Path::to_path_buf) else {
             return;
         };
-        let generation = self.active().load_generation;
+        let generation = self.playback.load_generation();
         let f_scan = folder.clone();
         let task = cx
             .background_executor()
@@ -347,8 +343,8 @@ impl AppModel {
         self.catalog.directory_refresh = Some(cx.spawn(async move |this, cx| {
             let scan = task.await;
             let _ = this.update(cx, |this, cx| {
-                if this.active().load_generation != generation
-                    || this.active().pending_path.is_some()
+                if this.playback.load_generation() != generation
+                    || this.playback.pending_path().is_some()
                     || !this.catalog.active_source.is_local()
                     || this.catalog.local_dir.folder() != Some(folder.as_path())
                 {
@@ -616,18 +612,8 @@ impl AppModel {
     }
 
     fn rotate_media(&mut self, degrees: i64, label: &'static str, cx: &mut Context<Self>) {
-        if let Err(error) = self
-            .active_mut()
-            .session
-            .execute(Command::RotateMedia(degrees))
-        {
-            log::warn!("rotate media failed: {error:#}");
-            self.show_error_toast(super::strings::errors::player_action_error(&error), cx);
-            return;
-        }
-        self.active_mut().image.reset();
-        self.apply_image_view(cx);
-        self.show_osd(label, cx);
+        let out = self.playback.rotate_media(degrees, label);
+        self.apply_playback_action(out, cx);
     }
 
     pub(super) fn toggle_hflip(&mut self, _: &ToggleHFlip, _: &mut Window, cx: &mut Context<Self>) {
@@ -639,35 +625,8 @@ impl AppModel {
     }
 
     fn flip_display_axis(&mut self, horizontal: bool, cx: &mut Context<Self>) {
-        let command = if horizontal {
-            Command::ToggleHFlip
-        } else {
-            Command::ToggleVFlip
-        };
-        if let Err(error) = self.active_mut().session.execute(command) {
-            log::warn!("flip display axis failed: {error:#}");
-            self.show_error_toast(super::strings::errors::player_action_error(&error), cx);
-            return;
-        }
-        self.active_mut().image.pan[usize::from(!horizontal)] *= -1.;
-        self.apply_image_view(cx);
-        let session = &self.active().session;
-        let source_horizontal = horizontal ^ (session.display_rotation().rem_euclid(180) == 90);
-        let state = session.state();
-        let on = if source_horizontal {
-            state.hflip
-        } else {
-            state.vflip
-        };
-        self.show_osd(
-            match (horizontal, on) {
-                (true, true) => "水平镜像",
-                (true, false) => "还原水平镜像",
-                (false, true) => "垂直镜像",
-                (false, false) => "还原垂直镜像",
-            },
-            cx,
-        );
+        let out = self.playback.flip_display_axis(horizontal);
+        self.apply_playback_action(out, cx);
     }
 
     pub(super) fn toggle_filmstrip(
