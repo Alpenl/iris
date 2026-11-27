@@ -41,7 +41,7 @@ impl IrisWindow {
                     |this, val, cx| {
                         this.settings.on_eof = val;
                         this.preset_rt.record_user_edit(&this.settings);
-                        this.active().session.set_on_eof_loop(val);
+                        this.active_mut().session.set_on_eof_loop(val);
                         cx.notify();
                     },
                 ),
@@ -91,7 +91,7 @@ impl IrisWindow {
                     |this, val, cx| {
                         this.settings.hwdec = val;
                         this.preset_rt.record_user_edit(&this.settings);
-                        this.active().session.set_hwdec(val);
+                        this.active_mut().session.set_hwdec(val);
                         cx.notify();
                     },
                 ),

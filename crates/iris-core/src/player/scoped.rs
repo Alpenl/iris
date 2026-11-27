@@ -6,7 +6,8 @@ use std::sync::Arc;
 use anyhow::{Result, ensure};
 use iris_mpv::Mpv;
 
-use super::{MediaSourceState, Session};
+use super::Session;
+use super::machine::{MediaIdentity, OpeningTransport};
 use crate::library::Kind;
 use crate::media_uri::MediaUri;
 use crate::settings::Settings;
@@ -147,10 +148,11 @@ impl Session {
             "plugin media cannot adopt a local identity"
         );
         ensure!(!playback.stream.is_cancelled(), "playback session expired");
-        let same_stream = matches!(
-            &self.source,
-            MediaSourceState::PluginScoped { playback: old, .. } if Arc::ptr_eq(old, &playback)
-        );
+        let same_stream = self
+            .machine
+            .source
+            .scoped_playback()
+            .is_some_and(|old| Arc::ptr_eq(old, &playback));
         let unpause_after_eof = if user_open {
             if same_stream {
                 playback.stream.advance_seek()?;
@@ -160,7 +162,7 @@ impl Session {
             false
         };
         self.reset_backend_for_load()?;
-        self.on_eof.set(settings.on_eof);
+        self.machine.on_eof = settings.on_eof;
         let mut owned = options(playback.profile);
         let apply_resume = (!user_open || settings.resume_playback)
             && !playback.is_live
@@ -169,7 +171,10 @@ impl Session {
         if apply_resume {
             owned.push(("start", format!("+{resume:.3}")));
         }
-        owned.push(("loop-file", self.loop_value(playback.is_live).into()));
+        owned.push((
+            "loop-file",
+            self.machine.loop_value(playback.is_live).into(),
+        ));
         let opts: Vec<_> = owned.iter().map(|(k, v)| (*k, v.as_str())).collect();
         let old_relay = self.event_pump.set_relay(Default::default());
         let old_scope = self.event_pump.set_scoped(Arc::downgrade(&playback.stream));
@@ -184,11 +189,6 @@ impl Session {
                 return Err(error.into());
             }
         };
-        if let MediaSourceState::PluginScoped { playback: old, .. } = &self.source
-            && !Arc::ptr_eq(old, &playback)
-        {
-            old.stream.stop();
-        }
         let pending_tracks = playback.attachments.clone();
         let profile_label = match playback.profile {
             Some(StreamProfile::Hls) => "hls",
@@ -198,22 +198,25 @@ impl Session {
         let kind = playback.kind;
         let is_live = playback.is_live;
         let title = playback.title.clone();
-        self.source = MediaSourceState::PluginScoped {
-            playback,
-            pending_tracks,
-        };
-        self.reset_for_load(
-            None,
-            uri.to_uri_string(),
-            Some(title),
+        self.prepare_enhancements_for_load();
+        let ops = self.machine.begin_load(
             id,
-            kind,
+            MediaIdentity {
+                local_path: None,
+                uri: uri.to_uri_string(),
+                title: Some(title),
+                private_identity: false,
+                kind,
+                photo: None,
+            },
             is_live,
-            None,
+            OpeningTransport::PluginScoped {
+                playback,
+                pending_tracks,
+            },
+            unpause_after_eof,
         );
-        if unpause_after_eof {
-            self.finish_eof_unpause();
-        }
+        let _ = self.run_ops(ops);
         crate::logging::event(
             crate::logging::EventLevel::Info,
             "player",
@@ -231,10 +234,7 @@ impl Session {
     }
 
     pub fn scoped_stream(&self) -> Option<Arc<dyn ScopedStream>> {
-        match &self.source {
-            MediaSourceState::PluginScoped { playback, .. } => Some(Arc::clone(&playback.stream)),
-            _ => None,
-        }
+        self.machine.source.scoped_stream()
     }
 
     pub fn release_scoped(&mut self) {
@@ -242,55 +242,12 @@ impl Session {
     }
 
     pub(super) fn discard_scoped(&mut self) {
-        if let MediaSourceState::PluginScoped { playback, .. } = &self.source {
-            playback.stream.stop();
-            self.source = MediaSourceState::Idle;
+        if self.machine.source.is_plugin_scoped() {
+            let eof_paused = self.machine.source.eof_paused();
+            self.machine.source.stop_active_transports();
+            self.machine.source = super::MediaSourceState::Idle { eof_paused };
         }
         self.event_pump.set_scoped(empty_scoped());
-    }
-
-    pub(super) fn attach_scoped_tracks(&mut self) {
-        let MediaSourceState::PluginScoped { pending_tracks, .. } = &mut self.source else {
-            return;
-        };
-        let tracks = std::mem::take(pending_tracks);
-        if tracks.is_empty() {
-            return;
-        }
-        if restore_attachment_policy(&self.mpv).is_err() {
-            log::error!("could not restore scoped attachment policy");
-            return;
-        }
-        for track in tracks {
-            let command = if track.audio { "audio-add" } else { "sub-add" };
-            let flags = if track.default && self.deferred_local_subs.is_empty() {
-                "select"
-            } else {
-                "auto"
-            };
-            match self.receipts.next().and_then(|receipt| {
-                self.mpv
-                    .command_with_reply(
-                        receipt,
-                        &[
-                            command,
-                            &track.url,
-                            flags,
-                            &track.label,
-                            track.lang.as_deref().unwrap_or(""),
-                        ],
-                    )
-                    .map(|()| receipt)
-                    .map_err(anyhow::Error::from)
-            }) {
-                Ok(receipt) => {
-                    self.in_flight_scoped_adds.insert(receipt);
-                }
-                Err(_) => {
-                    log::warn!("could not attach scoped media track");
-                }
-            }
-        }
     }
 }
 

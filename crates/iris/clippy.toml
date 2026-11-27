@@ -12,4 +12,5 @@ disallowed-types = [
 disallowed-methods = [
     { path = "iris_mpv::RenderHandle::new", reason = "RenderHandle may only be constructed for the video surface" },
     { path = "iris_core::player::Session::render_handle", reason = "Session::render_handle may only be called in crates/iris/src/video/" },
+    { path = "iris_core::player::Session::video_recovery", reason = "Session::video_recovery may only be called in crates/iris/src/video/" },
 ]

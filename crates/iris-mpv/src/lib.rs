@@ -83,8 +83,6 @@ fn with_cstr<R>(s: &str, f: impl FnOnce(*const c_char) -> Result<R>) -> Result<R
 pub struct Mpv {
     handle: *mut sys::mpv_handle,
     wait_lock: Mutex<()>,
-    #[cfg(target_os = "windows")]
-    video_recovery: Mutex<render::VideoRecovery>,
 }
 
 // SAFETY: libmpv documents `mpv_handle` as thread-safe across threads.
@@ -106,8 +104,6 @@ impl Mpv {
         Ok(Self {
             handle,
             wait_lock: Mutex::new(()),
-            #[cfg(target_os = "windows")]
-            video_recovery: Mutex::default(),
         })
     }
 
@@ -309,7 +305,7 @@ impl Mpv {
         })
     }
 
-    pub(crate) fn set_property_string_async(&self, name: &str, value: &str) -> Result<()> {
+    pub fn set_property_string_async(&self, name: &str, value: &str) -> Result<()> {
         with_cstr(name, |n| {
             with_cstr(value, |mut v| {
                 // SAFETY: The live handle queues a copy of the NUL-terminated value.
@@ -327,6 +323,23 @@ impl Mpv {
                     || format!("set_property_async {name}"),
                 )
             })
+        })
+    }
+
+    pub fn get_property_async(
+        &self,
+        reply_userdata: u64,
+        name: &str,
+        format: Format,
+    ) -> Result<()> {
+        with_cstr(name, |n| {
+            // SAFETY: The live handle queues a copy of the NUL-terminated property name.
+            check(
+                unsafe {
+                    sys::mpv_get_property_async(self.handle, reply_userdata, n, format.raw())
+                },
+                || format!("get_property_async {name}"),
+            )
         })
     }
 
@@ -426,24 +439,6 @@ impl Mpv {
         unsafe { sys::mpv_wakeup(self.handle) }
     }
 
-    /// Unblocks any pending device-recovery video track query if shutdown skips normal events.
-    #[cfg(target_os = "windows")]
-    pub fn abort_video_recovery(&self) {
-        self.video_recovery
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .on_event(&Event::Shutdown);
-    }
-
-    /// Restores the active playlist entry ID in `VideoRecovery` after `Event::QueueOverflow`.
-    #[cfg(target_os = "windows")]
-    pub fn reseed_video_recovery(&self, entry: Option<i64>) {
-        self.video_recovery
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .set_entry(entry);
-    }
-
     /// Waits for the next event. `timeout < 0` waits forever. Returns `None` on timeout.
     pub fn wait_event(&self, timeout: f64) -> Option<Event> {
         let _wait = self.wait_lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -454,51 +449,8 @@ impl Mpv {
             return None;
         }
         let ev = unsafe { &*raw };
-        #[cfg(target_os = "windows")]
-        if ev.event_id == sys::MPV_EVENT_GET_PROPERTY_REPLY && ev.reply_userdata != 0 {
-            let vid = if ev.error >= 0 && !ev.data.is_null() {
-                // SAFETY: A successful GET_PROPERTY_REPLY contains mpv_event_property.
-                let prop = unsafe { &*ev.data.cast::<sys::mpv_event_property>() };
-                if prop.format == sys::MPV_FORMAT_STRING && !prop.data.is_null() {
-                    // SAFETY: STRING data contains a C-string pointer valid for this event.
-                    let value = unsafe { *prop.data.cast::<*const c_char>() };
-                    if value.is_null() {
-                        None
-                    } else {
-                        // SAFETY: libmpv provided a non-null NUL-terminated string.
-                        unsafe { CStr::from_ptr(value) }
-                            .to_str()
-                            .ok()
-                            .and_then(|s| s.parse::<i64>().ok())
-                            .filter(|&id| id > 0)
-                    }
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-            self.video_recovery
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .reply(ev.reply_userdata, vid);
-        }
         // SAFETY: `ev` is valid for the duration of this `wait_lock` guard.
-        let event = unsafe { event::decode_event(ev) }?;
-        #[cfg(target_os = "windows")]
-        match event {
-            Event::StartFile(_)
-            | Event::EndFile { .. }
-            | Event::QueueOverflow
-            | Event::Shutdown => {
-                self.video_recovery
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .on_event(&event);
-            }
-            _ => (),
-        }
-        Some(event)
+        unsafe { event::decode_event(ev) }
     }
 }
 

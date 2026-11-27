@@ -322,7 +322,7 @@ impl TrackState {
 impl Session {
     pub fn attach_plugin_track(&mut self, track: Arc<dyn ExternalTrack>) -> Result<()> {
         ensure!(
-            self.state.loaded && track.is_live(),
+            self.machine.state.loaded && track.is_live(),
             "attachment has no live media"
         );
         ensure!(
@@ -357,11 +357,11 @@ impl Session {
                         .is_some_and(|sel| sel.id == old_id)
                 });
         let select_sub = !track.is_audio()
-            && self.state.subs_visible
+            && self.machine.state.subs_visible
             && (replacing_selected_sub
                 || (self.selected_track(super::TrackKind::Sub).is_none()
                     && !self.enhancements.tracks.has_sub_track()
-                    && self.deferred_local_subs.is_empty()));
+                    && !self.machine.source.has_deferred_local_subs()));
         let flag = if select_sub { "select" } else { "auto" };
         // Applies also to enhancements of ordinary local media; decoder policy
         // for the already-open primary stream has already been captured by mpv.
@@ -391,7 +391,7 @@ impl Session {
             receipt,
             Pending::Add {
                 track,
-                entry_id: self.playlist_entry_id,
+                entry_id: self.machine.source.entry_id(),
                 wanted: true,
                 stopping: false,
             },
@@ -401,39 +401,33 @@ impl Session {
 
     pub fn revoke_plugin_tracks(&mut self, owner: &str) {
         self.enhancements.tracks.revoke(&self.mpv, owner);
-        self.enhancements
-            .reattach_on_load
-            .retain(|t| t.owner() != owner);
-        self.enhancements
-            .error_tracks
-            .retain(|w| w.upgrade().is_some_and(|t| t.owner() != owner));
+        match &mut self.machine.source {
+            super::MediaSourceState::Opening {
+                reattach_on_load, ..
+            } => reattach_on_load.retain(|t| t.owner() != owner),
+            super::MediaSourceState::Failed { enhancements, .. } => {
+                enhancements
+                    .tracks
+                    .retain(|w| w.upgrade().is_some_and(|t| t.owner() != owner));
+                if enhancements
+                    .timeline
+                    .as_ref()
+                    .is_some_and(|(o, _)| o == owner)
+                {
+                    enhancements.timeline = None;
+                }
+            }
+            _ => {}
+        }
         if self.enhancements.timeline_owner.as_deref() == Some(owner) {
             self.enhancements.timeline_owner = None;
-            self.chapters_dirty = true;
-        }
-        if self
-            .enhancements
-            .error_timeline
-            .as_ref()
-            .is_some_and(|(o, _)| o == owner)
-        {
-            self.enhancements.error_timeline = None;
-        }
-    }
-
-    pub(super) fn reattach_plugin_tracks(&mut self) {
-        for track in std::mem::take(&mut self.enhancements.reattach_on_load) {
-            if track.is_live()
-                && let Err(err) = self.attach_plugin_track(track)
-            {
-                log::warn!("reattaching plugin track after GPU reset failed: {err:#}");
-            }
+            self.machine.source.mark_chapters_dirty();
         }
     }
 
     pub fn set_plugin_timeline(&mut self, owner: String, chapters: &[Chapter]) -> Result<()> {
         ensure!(
-            self.state.loaded && chapters.len() <= 1000,
+            self.machine.state.loaded && chapters.len() <= 1000,
             "invalid timeline"
         );
         ensure!(
@@ -442,18 +436,19 @@ impl Session {
             "unordered timeline"
         );
         self.enhancements.timeline_owner = Some(owner);
-        self.state.chapters = chapters.to_vec();
+        self.machine.state.chapters = chapters.to_vec();
         self.update_plugin_chapter();
         Ok(())
     }
 
     pub(super) fn update_plugin_chapter(&mut self) {
         if self.enhancements.timeline_owner.is_some() {
-            self.state.current_chapter = self
+            self.machine.state.current_chapter = self
+                .machine
                 .state
                 .chapters
                 .iter()
-                .rposition(|c| c.time <= self.state.time_pos)
+                .rposition(|c| c.time <= self.machine.state.time_pos)
                 .map_or(-1, |v| v as i64);
         }
     }
@@ -462,15 +457,16 @@ impl Session {
         self.enhancements.timeline_owner.as_ref()?;
         let index = match command {
             Command::SelectChapter(index) => *index,
-            Command::NextChapter => (self.state.current_chapter + 1).max(0) as usize,
-            Command::PrevChapter => (self.state.current_chapter - 1).max(0) as usize,
+            Command::NextChapter => (self.machine.state.current_chapter + 1).max(0) as usize,
+            Command::PrevChapter => (self.machine.state.current_chapter - 1).max(0) as usize,
             _ => return None,
         };
         Some(
-            self.state
+            self.machine
+                .state
                 .chapters
                 .get(index)
-                .map_or(self.state.time_pos, |c| c.time),
+                .map_or(self.machine.state.time_pos, |c| c.time),
         )
     }
 }
@@ -479,6 +475,8 @@ impl Session {
 mod tests {
     use std::sync::Arc;
 
+    use crate::library::Kind;
+    use crate::player::machine::{MediaIdentity, OpeningTransport};
     use crate::player::{MonitorLutFilter, Session, SessionEvent};
 
     struct StubLut;
@@ -492,6 +490,22 @@ mod tests {
     #[test]
     fn lut_reply_does_not_mark_tracks_dirty() {
         let mut session = Session::new().unwrap();
+        session.machine.begin_load(
+            1,
+            MediaIdentity {
+                local_path: None,
+                uri: "file:///video.mp4".into(),
+                title: None,
+                private_identity: false,
+                kind: Kind::Video,
+                photo: None,
+            },
+            false,
+            OpeningTransport::Local,
+            false,
+        );
+        let _ = session.machine.promote_opening_to_loaded();
+        let _ = session.machine.take_deferred_refresh_ops();
         session
             .enhancements
             .retired_luts
@@ -500,13 +514,12 @@ mod tests {
             .enhancements
             .retired_luts
             .push((78, Arc::new(StubLut)));
-        session.tracks_dirty = false;
 
         session.apply(&SessionEvent::CommandReply { id: 77, error: 0 });
         assert_eq!(session.enhancements.retired_luts.len(), 1);
         assert_eq!(session.enhancements.retired_luts[0].0, 78);
         assert!(
-            !session.tracks_dirty,
+            session.machine.take_deferred_refresh_ops().is_empty(),
             "LUT receipt must not trigger a redundant track-list IPC query"
         );
 
@@ -514,7 +527,7 @@ mod tests {
         assert!(session.enhancements.retired_luts.is_empty());
 
         session.apply(&SessionEvent::CommandReply { id: 999, error: 0 });
-        assert!(!session.tracks_dirty);
+        assert!(session.machine.take_deferred_refresh_ops().is_empty());
         session.shutdown();
     }
 
@@ -522,12 +535,26 @@ mod tests {
     fn error_event_retires_active_lut_until_vf_clear_reply() {
         let mut session = Session::new_headless(true).unwrap();
         let lut: Arc<dyn MonitorLutFilter> = Arc::new(StubLut);
+        session.machine.begin_load(
+            1,
+            MediaIdentity {
+                local_path: None,
+                uri: "file:///video.mp4".into(),
+                title: None,
+                private_identity: false,
+                kind: Kind::Video,
+                photo: None,
+            },
+            false,
+            OpeningTransport::Local,
+            false,
+        );
+        session.machine.state.loaded = true;
         session.enhancements.monitor_lut = Some(Arc::clone(&lut));
-        session.state.loaded = true;
         assert_eq!(Arc::strong_count(&lut), 2);
 
         session.apply(&SessionEvent::Error(-13));
-        assert!(!session.state.loaded);
+        assert!(!session.state().loaded);
         assert!(session.enhancements.monitor_lut.is_none());
         assert_eq!(session.enhancements.retired_luts.len(), 1);
         assert_eq!(Arc::strong_count(&lut), 2);

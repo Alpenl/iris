@@ -215,7 +215,11 @@ fn release_scoped_preserves_direct_http_transport_and_pending_subtitles() {
             0.,
         )
         .unwrap();
-    let crate::player::MediaSourceState::DirectRemote { relay, .. } = &session.source else {
+    let crate::player::machine::MediaSourceState::Opening {
+        transport: crate::player::machine::OpeningTransport::DirectRemote { relay, .. },
+        ..
+    } = &session.machine.source
+    else {
         panic!("remote load did not install its transport");
     };
     let local = Url::parse(&relay.url(&Url::parse(&playback_url).unwrap()).unwrap()).unwrap();
@@ -240,11 +244,15 @@ fn release_scoped_preserves_direct_http_transport_and_pending_subtitles() {
         assert!(reply.starts_with(b"HTTP/1.1 200"));
         assert!(reply.ends_with(&silent_mp3()));
         assert_eq!(session.current_media_uri(), Some(uri.clone()));
-        let crate::player::MediaSourceState::DirectRemote {
-            last_remote,
-            pending_subs,
+        let crate::player::machine::MediaSourceState::Opening {
+            transport:
+                crate::player::machine::OpeningTransport::DirectRemote {
+                    last_remote,
+                    pending_subs,
+                    ..
+                },
             ..
-        } = &session.source
+        } = &session.machine.source
         else {
             panic!("plugin cleanup discarded direct remote state");
         };
@@ -809,4 +817,171 @@ fn media_route_rejects_whitespace_prefixed_adaptive_manifests_while_key_route_al
     let aes_key_reply = fetch(&key_urls[1]);
     assert!(aes_key_reply.starts_with(b"HTTP/1.1 200 OK\r\n"));
     assert!(aes_key_reply.ends_with(b"\r\n\r\n#EXTM3U\n12345678"));
+}
+
+#[test]
+fn hls_hook_contract_pins_mpv_version_restores_reference_policy_and_keeps_segments_readable() {
+    let origin = Fixture::new(|path| match path {
+        "/hls/index.m3u8" => (
+            "200 OK",
+            "Content-Type: application/vnd.apple.mpegurl\r\n".into(),
+            concat!(
+                "#EXTM3U\n",
+                "#EXT-X-VERSION:3\n",
+                "#EXT-X-TARGETDURATION:1\n",
+                "#EXT-X-MEDIA-SEQUENCE:0\n",
+                "#EXTINF:0.5,\n",
+                "seg0.mp3\n",
+                "#EXTINF:0.5,\n",
+                "seg1.mp3\n",
+                "#EXT-X-ENDLIST\n",
+            )
+            .as_bytes()
+            .to_vec(),
+        ),
+        "/hls/seg0.mp3" | "/hls/seg1.mp3" => {
+            let mut frame = [0u8; 417];
+            frame[..4].copy_from_slice(&[0xff, 0xfb, 0x90, 0x64]);
+            (
+                "200 OK",
+                "Content-Type: audio/mpeg\r\n".into(),
+                frame.repeat(20),
+            )
+        }
+        "/canary-ref.vtt" => (
+            "200 OK",
+            "Content-Type: text/vtt\r\n".into(),
+            b"WEBVTT\n\n00:00.000 --> 00:01.000\nLeaked\n".to_vec(),
+        ),
+        _ => ("404 Not Found", String::new(), Vec::new()),
+    });
+
+    let mut session = Session::new_headless(false).unwrap();
+    let raw_ver = session.mpv.get_property_string("mpv-version").unwrap();
+    let ver_token = raw_ver
+        .split_whitespace()
+        .find(|tok| {
+            tok.trim_start_matches('v')
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_digit())
+        })
+        .unwrap_or(&raw_ver)
+        .trim_start_matches('v');
+    let mut nums = ver_token
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|s| !s.is_empty());
+    let major: u32 = nums.next().unwrap().parse().unwrap();
+    let minor: u32 = nums.next().unwrap().parse().unwrap();
+    assert!(
+        major == 0 && (40..=42).contains(&minor),
+        "unreviewed libmpv version {raw_ver:?} ({major}.{minor}); verify HLS on_load/on_preloaded demuxer policy capture per docs/ARCHITECTURE.md upgrade checklist before bumping baseline"
+    );
+
+    let mut events = session.events().unwrap();
+    let playback_url = format!("http://{}/hls/index.m3u8", origin.address);
+    session
+        .open_remote(
+            RemoteMediaRequest {
+                uri: MediaUri::HttpUrl(playback_url.clone()),
+                playback_url,
+                title: "HLS Hook Contract".into(),
+                headers: BTreeMap::from([("X-Media-Key".into(), "fixture".into())]),
+                kind: Kind::Audio,
+                is_live: false,
+                photo: None,
+                subtitles: Vec::new(),
+            },
+            &Settings::default(),
+            0.0,
+        )
+        .unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        while let Ok(update) = events.try_recv() {
+            if let Some(crate::player::SessionEvent::Error(code)) = session.apply_update(&update) {
+                panic!("HLS contract playback failed: {code}");
+            }
+        }
+        let saw_both_segments = {
+            let hits = origin.seen.lock().unwrap();
+            hits.iter().any(|(p, auth)| p == "/hls/seg0.mp3" && *auth)
+                && hits.iter().any(|(p, auth)| p == "/hls/seg1.mp3" && *auth)
+        };
+        if session.state().loaded && saw_both_segments {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        session.state().loaded,
+        "HLS stream never reached Loaded (requests: {:?})",
+        origin.seen.lock().unwrap()
+    );
+    assert!(
+        origin
+            .seen
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(p, auth)| p == "/hls/seg1.mp3" && *auth),
+        "HLS demuxer failed to read second segment after on_preloaded reset"
+    );
+
+    // `on_preloaded` must have already restored strict per-file reference defaults.
+    assert_eq!(
+        session
+            .mpv
+            .get_property_string("file-local-options/access-references")
+            .unwrap(),
+        "no"
+    );
+    assert_eq!(
+        session
+            .mpv
+            .get_property_string("file-local-options/demuxer")
+            .unwrap(),
+        ""
+    );
+    assert_eq!(
+        session
+            .mpv
+            .get_property_string("file-local-options/demuxer-lavf-format")
+            .unwrap(),
+        ""
+    );
+    assert_eq!(
+        session
+            .mpv
+            .get_property_string("file-local-options/demuxer-lavf-o")
+            .unwrap(),
+        ""
+    );
+
+    // A post-load external playlist subtitle must not be allowed to follow remote references.
+    let dir = crate::test_util::TestDir::new("hls-contract-post-load-ref");
+    let evil_sub = dir.join("evil.m3u8");
+    std::fs::write(
+        &evil_sub,
+        format!(
+            "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:2\n#EXTINF:1.0,\nhttp://{}/canary-ref.vtt\n#EXT-X-ENDLIST\n",
+            origin.address
+        ),
+    )
+    .unwrap();
+    let _ = session
+        .mpv
+        .command(&["sub-add", evil_sub.to_str().unwrap(), "select"]);
+    thread::sleep(Duration::from_millis(150));
+    assert!(
+        !origin
+            .seen
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(p, _)| p == "/canary-ref.vtt"),
+        "post-load subtitle attachment followed remote m3u8 reference despite access-references=no"
+    );
+    session.shutdown();
 }

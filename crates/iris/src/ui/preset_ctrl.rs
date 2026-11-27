@@ -224,7 +224,7 @@ impl IrisWindow {
             self.command(Command::SetAspect(asp), cx);
         }
 
-        self.active().session.apply_settings(&self.settings);
+        self.viewport.session.apply_settings(&self.settings);
         self.sync_theme_tokens(cx);
         self.ensure_filmstrip_thumbnails(cx);
         self.overlays.popover = None;

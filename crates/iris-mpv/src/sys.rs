@@ -52,9 +52,8 @@ pub type mpv_event_id = c_int;
 pub const MPV_EVENT_NONE: mpv_event_id = 0;
 pub const MPV_EVENT_SHUTDOWN: mpv_event_id = 1;
 pub const MPV_EVENT_LOG_MESSAGE: mpv_event_id = 2;
-pub const MPV_EVENT_COMMAND_REPLY: mpv_event_id = 5;
-#[cfg(target_os = "windows")]
 pub const MPV_EVENT_GET_PROPERTY_REPLY: mpv_event_id = 3;
+pub const MPV_EVENT_COMMAND_REPLY: mpv_event_id = 5;
 pub const MPV_EVENT_START_FILE: mpv_event_id = 6;
 pub const MPV_EVENT_END_FILE: mpv_event_id = 7;
 pub const MPV_EVENT_FILE_LOADED: mpv_event_id = 8;
@@ -218,7 +217,6 @@ unsafe extern "C" {
         data: *mut c_void,
     ) -> c_int;
     pub fn mpv_get_property_string(ctx: *mut mpv_handle, name: *const c_char) -> *mut c_char;
-    #[cfg(target_os = "windows")]
     pub fn mpv_get_property_async(
         ctx: *mut mpv_handle,
         reply_userdata: u64,

@@ -323,7 +323,7 @@ mod tests {
         assert_eq!(session.current(), None);
         assert_eq!(session.current_title(), Some("EP1"));
 
-        session.state.tracks = vec![Track {
+        session.machine.state.tracks = vec![Track {
             id: 1,
             kind: TrackKind::Audio,
             title: String::new(),

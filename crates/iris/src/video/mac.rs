@@ -11,11 +11,12 @@ use std::sync::mpsc::{self, SyncSender};
 use std::sync::{Arc, LazyLock, Mutex, Once};
 use std::thread::JoinHandle;
 
-use super::VideoReset;
+use super::{VideoReset, VideoSurfaceBackend};
 use anyhow::{Context as _, Result, anyhow};
 use cocoa::base::{NO, YES, id, nil};
 use cocoa::foundation::NSRect;
 use futures::channel::mpsc::{UnboundedReceiver, unbounded};
+use iris_core::player::VideoRecoveryHandle;
 use iris_mpv::render::{RenderContext, RenderHandle};
 use objc::declare::ClassDecl;
 use objc::rc::autoreleasepool;
@@ -242,7 +243,7 @@ impl Drop for LayerState {
 struct SendId(id);
 unsafe impl Send for SendId {}
 
-pub(crate) struct VideoSurface {
+pub(super) struct MacVideoSurface {
     state: Arc<LayerState>,
     view: id,
     layer: id,
@@ -417,12 +418,13 @@ fn layer_class() -> &'static Class {
     Class::get("IrisVideoLayer").expect("IrisVideoLayer registered")
 }
 
-impl VideoSurface {
+impl VideoSurfaceBackend for MacVideoSurface {
     /// Creates the GL context and mpv render context, and inserts the video
     /// view under GPUI's view. Must run on the main thread.
-    pub(crate) fn attach(
+    fn attach(
         window: &gpui::Window,
         mpv: RenderHandle,
+        _recovery: VideoRecoveryHandle,
     ) -> Result<(Self, UnboundedReceiver<VideoReset>)> {
         let gpui_view: id = match HasWindowHandle::window_handle(window)
             .map_err(|e| anyhow!("{e:?}"))?
@@ -586,7 +588,7 @@ impl VideoSurface {
     }
 
     /// Re-renders the current frame even if mpv has no new one.
-    pub(crate) fn request_redraw(&self) {
+    fn request_redraw(&self) {
         self.state.force.store(true, Ordering::Release);
         if let Some(tx) = &self.redraw_tx {
             let _ = tx.try_send(());
@@ -596,7 +598,7 @@ impl VideoSurface {
     /// Places the video view over the video area, given in GPUI window
     /// coordinates (logical points, top-left origin). mpv's OSD and subtitles
     /// then live inside this rect, letterbox bars included.
-    pub(crate) fn set_frame(&self, x: f64, y: f64, w: f64, h: f64) {
+    fn set_frame(&self, x: f64, y: f64, w: f64, h: f64) {
         // Publish visibility without reading mutable layer geometry on CA threads.
         self.state.drawable.store(false, Ordering::Release);
         if !x.is_finite()
@@ -645,7 +647,7 @@ impl VideoSurface {
     }
 
     /// Keeps the layer at the window's backing scale (Retina vs. non-Retina screens).
-    pub(crate) fn set_scale(&mut self, scale: f64) {
+    fn set_scale(&mut self, scale: f64) {
         if !scale.is_finite() || scale <= 0. {
             return;
         }
@@ -659,10 +661,12 @@ impl VideoSurface {
     }
 
     #[cfg(any(debug_assertions, feature = "devtools"))]
-    pub(crate) fn debug_force_device_reset(&self) -> bool {
+    fn debug_force_device_reset(&self) -> bool {
         false
     }
+}
 
+impl MacVideoSurface {
     /// Stops mpv callbacks, joins the video thread, and detaches its view.
     fn shutdown(&mut self) {
         // 1. Free the render context first so mpv's update callback stops firing
@@ -699,7 +703,7 @@ impl VideoSurface {
     }
 }
 
-impl Drop for VideoSurface {
+impl Drop for MacVideoSurface {
     fn drop(&mut self) {
         self.shutdown();
         unsafe {
