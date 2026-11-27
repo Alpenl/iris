@@ -208,9 +208,16 @@ fn exercise(input: &[u8]) {
         let _ = iris_plugin_host::network::parse_consent_origin_url(text);
         let _ = iris_plugin_host::package::validate_path(text);
         for size in [None, Some(0), Some(1024), Some(u64::MAX)] {
-            if let Ok(range) =
-                iris_plugin_host::stream::range::Range::parse(Some(text.trim()), size)
-            {
+            let trimmed = text.trim();
+            let base_range = iris_base::net::range::HttpRange::parse(Some(trimmed), size);
+            let host_range = iris_plugin_host::stream::range::Range::parse(Some(trimmed), size);
+            assert_eq!(base_range.is_ok(), host_range.is_ok());
+            if let Ok(range) = host_range {
+                let base = base_range.unwrap();
+                assert_eq!(
+                    (range.offset, range.len, range.partial, range.total),
+                    (base.offset, base.len, base.partial, base.total)
+                );
                 if let Some(len) = range.len {
                     assert!(len > 0);
                     assert!(range.offset.checked_add(len - 1).is_some());
@@ -218,7 +225,7 @@ fn exercise(input: &[u8]) {
                         assert!(range.offset + len - 1 < size);
                     }
                 }
-                let _ = range.content_range();
+                assert_eq!(range.content_range(), base.content_range());
             }
         }
         let _ = remote_manifest::parse_hls_attributes(text);
@@ -319,6 +326,13 @@ fn seeded_plugin_parser_mutations() {
         std::fs::read_to_string(fuzz_corpus.join("range/valid_open_ended.txt")).unwrap();
     iris_plugin_host::stream::range::Range::parse(Some(open_range.trim()), Some(8192))
         .expect("valid range seed");
+    iris_base::net::hls::parse_lines(
+        &hls_media_seed,
+        iris_base::net::hls::HlsLineOptions::CORE_REWRITE,
+    )
+    .expect("valid base hls lines")
+    .collect::<Result<Vec<_>, _>>()
+    .expect("valid base hls line items");
     assert_eq!(
         prepare::subtitle_format(b"WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nhello\n"),
         Ok("vtt")

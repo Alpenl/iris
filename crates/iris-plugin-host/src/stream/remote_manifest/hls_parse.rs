@@ -1,5 +1,5 @@
-//! Bounded remote HLS media-playlist grammar and attribute-list parser.
-//! Only known tags and explicitly bound local resources survive parsing.
+//! Bounded remote HLS media-playlist conversion policy over `iris_base::net::hls`.
+//! Only known tags and explicitly bound local resources survive conversion.
 use crate::stream::{
     manifest::{INPUT_LIMIT, RESOURCE_LIMIT, logical},
     range::decimal,
@@ -11,28 +11,34 @@ use iris_api::v2::{
         TrackKind,
     },
 };
+use iris_base::net::hls::{
+    AttributeOptions, HlsError, HlsLine, HlsLineOptions, parse_attribute_map, parse_byterange,
+    parse_extinf, parse_hex_iv_128, parse_lines, parse_version,
+};
 use std::collections::{BTreeMap, BTreeSet};
+
+pub(super) const fn map_hls_error(err: HlsError) -> ErrorCode {
+    match err {
+        HlsError::InvalidSyntax(_) => ErrorCode::InvalidArgument,
+        HlsError::NumberInvalid(_) => ErrorCode::RangeInvalid,
+        HlsError::QuotaExceeded(_) => ErrorCode::QuotaExceeded,
+        HlsError::Unsupported(_) => ErrorCode::Unsupported,
+    }
+}
 
 pub fn parse_media(
     text: &str,
     kind: TrackKind,
     mut bind: impl FnMut(&str, ResourceKind, ResourceExtension) -> Result<String, ErrorCode>,
 ) -> Result<(HlsTrack, bool), ErrorCode> {
-    if text.len() > INPUT_LIMIT {
-        return Err(ErrorCode::QuotaExceeded);
-    }
-    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
-    if text
-        .lines()
-        .any(|l| l.starts_with("#EXT-X-STREAM-INF:") || l.starts_with("#EXT-X-MEDIA:"))
+    let lines =
+        parse_lines(text, HlsLineOptions::strict_remote(INPUT_LIMIT)).map_err(map_hls_error)?;
+    if lines.any_line_starts_with("#EXT-X-STREAM-INF:")
+        || lines.any_line_starts_with("#EXT-X-MEDIA:")
     {
         return Err(ErrorCode::Unsupported);
     }
-    let fragmented = text.lines().any(|l| l.starts_with("#EXT-X-MAP:"));
-    let mut lines = text.lines();
-    if lines.next() != Some("#EXTM3U") {
-        return Err(ErrorCode::InvalidArgument);
-    }
+    let fragmented = lines.any_line_starts_with("#EXT-X-MAP:");
     let mut track = HlsTrack {
         id: "media".into(),
         kind,
@@ -53,214 +59,204 @@ pub fn parse_media(
     let mut key: Option<(String, Option<String>)> = None;
     let mut discontinuity = false;
     let mut ended = false;
-    for line in lines {
-        if line.is_empty() {
+    for item in lines {
+        let line = item.map_err(map_hls_error)?;
+        if matches!(line, HlsLine::Empty) {
             continue;
         }
-        if line.len() > 4096
-            || line.trim_ascii() != line
-            || line.chars().any(char::is_control)
-            || ended
-        {
+        if ended {
             return Err(ErrorCode::InvalidArgument);
         }
-        if !line.starts_with('#') {
-            if track.segments.len() >= RESOURCE_LIMIT {
-                return Err(ErrorCode::QuotaExceeded);
-            }
-            let (res_kind, res_ext) = match kind {
-                TrackKind::Subtitle => (ResourceKind::Subtitle, ResourceExtension::Vtt),
-                _ => (
-                    ResourceKind::Media,
-                    if fragmented {
-                        ResourceExtension::M4s
-                    } else {
-                        ResourceExtension::Ts
-                    },
-                ),
-            };
-            let resource_id = bind(line, res_kind, res_ext)?;
-            logical(&resource_id)?;
-            let range = range
-                .take()
-                .map(|(len, offset): (u64, Option<u64>)| {
-                    let offset = match offset {
-                        Some(n) => n,
-                        None => {
-                            let previous = track
-                                .segments
-                                .last()
-                                .filter(|s| s.resource.resource_id == resource_id)
-                                .ok_or(ErrorCode::RangeInvalid)?;
-                            range_end(
-                                previous
-                                    .resource
-                                    .range
-                                    .as_ref()
-                                    .ok_or(ErrorCode::RangeInvalid)?,
-                            )?
-                        }
-                    };
-                    let range = ByteRange {
-                        offset: WireU64(offset),
-                        len: WireU64(len),
-                    };
-                    range_end(&range)?;
-                    Ok::<_, ErrorCode>(range)
-                })
-                .transpose()?;
-            let sequence = track
-                .sequence
-                .0
-                .checked_add(track.segments.len() as u64)
-                .ok_or(ErrorCode::RangeInvalid)?;
-            if init.is_some() && key.as_ref().is_some_and(|(_, iv)| iv.is_none()) {
-                return Err(ErrorCode::InvalidArgument);
-            }
-            track.segments.push(HlsSegment {
-                resource: ResourceSpan { resource_id, range },
-                duration_ms: WireU64(duration.take().ok_or(ErrorCode::InvalidArgument)?),
-                init: init.clone(),
-                key: key.as_ref().map(|(resource_id, iv)| HlsKey {
-                    resource_id: resource_id.clone(),
-                    iv: iv.clone().unwrap_or_else(|| format!("{sequence:032x}")),
-                }),
-                discontinuity: std::mem::take(&mut discontinuity),
-            });
-            continue;
-        }
-        let (tag, value) = line
-            .split_once(':')
-            .map_or((line, None), |(tag, value)| (tag, Some(value)));
-        match tag {
-            "#EXT-X-VERSION"
-            | "#EXT-X-TARGETDURATION"
-            | "#EXT-X-MEDIA-SEQUENCE"
-            | "#EXT-X-DISCONTINUITY-SEQUENCE"
-            | "#EXT-X-PLAYLIST-TYPE" => {
-                if !seen.insert(tag) || !track.segments.is_empty() {
-                    return Err(ErrorCode::InvalidArgument);
-                }
-                let value = value.ok_or(ErrorCode::InvalidArgument)?;
-                match tag {
-                    "#EXT-X-VERSION" => {
-                        if !(1..=7).contains(&decimal(value)?) {
-                            return Err(ErrorCode::Unsupported);
-                        }
-                    }
-                    "#EXT-X-TARGETDURATION" => {
-                        let n = decimal(value)?;
-                        if n == 0 || n > 86400 {
-                            return Err(ErrorCode::InvalidArgument);
-                        }
-                        target = Some(n);
-                    }
-                    "#EXT-X-MEDIA-SEQUENCE" => track.sequence = WireU64(decimal(value)?),
-                    "#EXT-X-DISCONTINUITY-SEQUENCE" => {
-                        track.discontinuity_sequence = WireU64(decimal(value)?)
-                    }
-                    _ => {
-                        if !matches!(value, "VOD" | "EVENT") {
-                            return Err(ErrorCode::InvalidArgument);
-                        }
-                    }
-                }
-            }
-            "#EXTINF" => {
-                if duration.is_some() {
-                    return Err(ErrorCode::InvalidArgument);
-                }
-                let (seconds, title) = value
-                    .and_then(|v| v.split_once(','))
-                    .ok_or(ErrorCode::InvalidArgument)?;
-                if title.len() > 256 {
+        match line {
+            HlsLine::Empty => unreachable!(),
+            HlsLine::Comment(_) => return Err(ErrorCode::Unsupported),
+            HlsLine::Uri(uri_ref) => {
+                if track.segments.len() >= RESOURCE_LIMIT {
                     return Err(ErrorCode::QuotaExceeded);
                 }
-                duration = Some(milliseconds(seconds)?);
-            }
-            "#EXT-X-BYTERANGE" => {
-                if range.is_some() {
-                    return Err(ErrorCode::InvalidArgument);
-                }
-                range = Some(byte_range(value.ok_or(ErrorCode::InvalidArgument)?)?);
-            }
-            "#EXT-X-MAP" => {
-                let mut attrs = attributes(value.ok_or(ErrorCode::InvalidArgument)?)?;
-                let uri = take(&mut attrs, "URI", true)?;
-                let resource_id = bind(&uri, ResourceKind::Init, ResourceExtension::Mp4)?;
+                let (res_kind, res_ext) = match kind {
+                    TrackKind::Subtitle => (ResourceKind::Subtitle, ResourceExtension::Vtt),
+                    _ => (
+                        ResourceKind::Media,
+                        if fragmented {
+                            ResourceExtension::M4s
+                        } else {
+                            ResourceExtension::Ts
+                        },
+                    ),
+                };
+                let resource_id = bind(uri_ref, res_kind, res_ext)?;
                 logical(&resource_id)?;
-                let range = attrs
-                    .remove("BYTERANGE")
-                    .map(|(v, quoted)| {
-                        if !quoted {
-                            return Err(ErrorCode::InvalidArgument);
-                        }
-                        let (len, offset) = byte_range(&v)?;
-                        Ok(ByteRange {
+                let range = range
+                    .take()
+                    .map(|(len, offset): (u64, Option<u64>)| {
+                        let offset = match offset {
+                            Some(n) => n,
+                            None => {
+                                let previous = track
+                                    .segments
+                                    .last()
+                                    .filter(|s| s.resource.resource_id == resource_id)
+                                    .ok_or(ErrorCode::RangeInvalid)?;
+                                range_end(
+                                    previous
+                                        .resource
+                                        .range
+                                        .as_ref()
+                                        .ok_or(ErrorCode::RangeInvalid)?,
+                                )?
+                            }
+                        };
+                        let range = ByteRange {
+                            offset: WireU64(offset),
                             len: WireU64(len),
-                            offset: WireU64(offset.ok_or(ErrorCode::RangeInvalid)?),
-                        })
+                        };
+                        range_end(&range)?;
+                        Ok::<_, ErrorCode>(range)
                     })
                     .transpose()?;
-                if !attrs.is_empty() {
-                    return Err(ErrorCode::Unsupported);
+                let sequence = track
+                    .sequence
+                    .0
+                    .checked_add(track.segments.len() as u64)
+                    .ok_or(ErrorCode::RangeInvalid)?;
+                if init.is_some() && key.as_ref().is_some_and(|(_, iv)| iv.is_none()) {
+                    return Err(ErrorCode::InvalidArgument);
                 }
-                init = Some(ResourceSpan { resource_id, range });
+                track.segments.push(HlsSegment {
+                    resource: ResourceSpan { resource_id, range },
+                    duration_ms: WireU64(duration.take().ok_or(ErrorCode::InvalidArgument)?),
+                    init: init.clone(),
+                    key: key.as_ref().map(|(resource_id, iv)| HlsKey {
+                        resource_id: resource_id.clone(),
+                        iv: iv.clone().unwrap_or_else(|| format!("{sequence:032x}")),
+                    }),
+                    discontinuity: std::mem::take(&mut discontinuity),
+                });
             }
-            "#EXT-X-KEY" => {
-                let mut attrs = attributes(value.ok_or(ErrorCode::InvalidArgument)?)?;
-                let method = take(&mut attrs, "METHOD", false)?;
-                key = if method == "NONE" {
-                    None
-                } else {
-                    if method != "AES-128" {
-                        return Err(ErrorCode::Unsupported);
+            HlsLine::Tag { name, value, .. } => match name {
+                "#EXT-X-VERSION"
+                | "#EXT-X-TARGETDURATION"
+                | "#EXT-X-MEDIA-SEQUENCE"
+                | "#EXT-X-DISCONTINUITY-SEQUENCE"
+                | "#EXT-X-PLAYLIST-TYPE" => {
+                    if !seen.insert(name) || !track.segments.is_empty() {
+                        return Err(ErrorCode::InvalidArgument);
                     }
-                    let uri = take(&mut attrs, "URI", true)?;
-                    let resource_id = bind(&uri, ResourceKind::Key, ResourceExtension::Key)?;
-                    logical(&resource_id)?;
-                    let iv = attrs
-                        .remove("IV")
-                        .map(|(v, quoted)| {
-                            let v = v.strip_prefix("0x").ok_or(ErrorCode::InvalidArgument)?;
-                            if quoted || v.len() != 32 || !v.bytes().all(|b| b.is_ascii_hexdigit())
-                            {
+                    let value = value.ok_or(ErrorCode::InvalidArgument)?;
+                    match name {
+                        "#EXT-X-VERSION" => {
+                            parse_version(value).map_err(map_hls_error)?;
+                        }
+                        "#EXT-X-TARGETDURATION" => {
+                            let n = decimal(value)?;
+                            if n == 0 || n > 86400 {
                                 return Err(ErrorCode::InvalidArgument);
                             }
-                            Ok::<_, ErrorCode>(v.to_owned())
-                        })
-                        .transpose()?;
-                    for (k, expected) in [("KEYFORMAT", "identity"), ("KEYFORMATVERSIONS", "1")] {
-                        if let Some((v, quoted)) = attrs.remove(k)
-                            && (!quoted || v != expected)
-                        {
-                            return Err(ErrorCode::Unsupported);
+                            target = Some(n);
+                        }
+                        "#EXT-X-MEDIA-SEQUENCE" => track.sequence = WireU64(decimal(value)?),
+                        "#EXT-X-DISCONTINUITY-SEQUENCE" => {
+                            track.discontinuity_sequence = WireU64(decimal(value)?)
+                        }
+                        _ => {
+                            if !matches!(value, "VOD" | "EVENT") {
+                                return Err(ErrorCode::InvalidArgument);
+                            }
                         }
                     }
-                    Some((resource_id, iv))
-                };
-                if !attrs.is_empty() {
-                    return Err(ErrorCode::Unsupported);
                 }
-            }
-            "#EXT-X-DISCONTINUITY" => {
-                if value.is_some() || discontinuity {
-                    return Err(ErrorCode::InvalidArgument);
+                "#EXTINF" => {
+                    if duration.is_some() {
+                        return Err(ErrorCode::InvalidArgument);
+                    }
+                    let raw = value.ok_or(ErrorCode::InvalidArgument)?;
+                    let (ms, _) = parse_extinf(raw, Some(256)).map_err(map_hls_error)?;
+                    duration = Some(ms);
                 }
-                discontinuity = true;
-            }
-            "#EXT-X-ENDLIST" => {
-                if value.is_some() {
-                    return Err(ErrorCode::InvalidArgument);
+                "#EXT-X-BYTERANGE" => {
+                    if range.is_some() {
+                        return Err(ErrorCode::InvalidArgument);
+                    }
+                    let raw = value.ok_or(ErrorCode::InvalidArgument)?;
+                    range = Some(parse_byterange(raw).map_err(map_hls_error)?);
                 }
-                ended = true;
-            }
-            "#EXT-X-INDEPENDENT-SEGMENTS" => {
-                if value.is_some() || !seen.insert(tag) {
-                    return Err(ErrorCode::InvalidArgument);
+                "#EXT-X-MAP" => {
+                    let mut attrs = attributes(value.ok_or(ErrorCode::InvalidArgument)?)?;
+                    let uri = take(&mut attrs, "URI", true)?;
+                    let resource_id = bind(&uri, ResourceKind::Init, ResourceExtension::Mp4)?;
+                    logical(&resource_id)?;
+                    let range = attrs
+                        .remove("BYTERANGE")
+                        .map(|(v, quoted)| {
+                            if !quoted {
+                                return Err(ErrorCode::InvalidArgument);
+                            }
+                            let (len, offset) = parse_byterange(&v).map_err(map_hls_error)?;
+                            Ok(ByteRange {
+                                len: WireU64(len),
+                                offset: WireU64(offset.ok_or(ErrorCode::RangeInvalid)?),
+                            })
+                        })
+                        .transpose()?;
+                    if !attrs.is_empty() {
+                        return Err(ErrorCode::Unsupported);
+                    }
+                    init = Some(ResourceSpan { resource_id, range });
                 }
-            }
-            _ => return Err(ErrorCode::Unsupported),
+                "#EXT-X-KEY" => {
+                    let mut attrs = attributes(value.ok_or(ErrorCode::InvalidArgument)?)?;
+                    let method = take(&mut attrs, "METHOD", false)?;
+                    key = if method == "NONE" {
+                        None
+                    } else {
+                        if method != "AES-128" {
+                            return Err(ErrorCode::Unsupported);
+                        }
+                        let uri = take(&mut attrs, "URI", true)?;
+                        let resource_id = bind(&uri, ResourceKind::Key, ResourceExtension::Key)?;
+                        logical(&resource_id)?;
+                        let iv = attrs
+                            .remove("IV")
+                            .map(|(v, quoted)| {
+                                parse_hex_iv_128(&v, quoted)
+                                    .map(str::to_owned)
+                                    .map_err(map_hls_error)
+                            })
+                            .transpose()?;
+                        for (k, expected) in [("KEYFORMAT", "identity"), ("KEYFORMATVERSIONS", "1")]
+                        {
+                            if let Some((v, quoted)) = attrs.remove(k)
+                                && (!quoted || v != expected)
+                            {
+                                return Err(ErrorCode::Unsupported);
+                            }
+                        }
+                        Some((resource_id, iv))
+                    };
+                    if !attrs.is_empty() {
+                        return Err(ErrorCode::Unsupported);
+                    }
+                }
+                "#EXT-X-DISCONTINUITY" => {
+                    if value.is_some() || discontinuity {
+                        return Err(ErrorCode::InvalidArgument);
+                    }
+                    discontinuity = true;
+                }
+                "#EXT-X-ENDLIST" => {
+                    if value.is_some() {
+                        return Err(ErrorCode::InvalidArgument);
+                    }
+                    ended = true;
+                }
+                "#EXT-X-INDEPENDENT-SEGMENTS" => {
+                    if value.is_some() || !seen.insert(name) {
+                        return Err(ErrorCode::InvalidArgument);
+                    }
+                }
+                _ => return Err(ErrorCode::Unsupported),
+            },
         }
     }
     let target = target.ok_or(ErrorCode::InvalidArgument)?;
@@ -291,42 +287,6 @@ fn range_end(range: &ByteRange) -> Result<u64, ErrorCode> {
         .ok_or(ErrorCode::RangeInvalid)
 }
 
-fn milliseconds(value: &str) -> Result<u64, ErrorCode> {
-    let (whole, fraction) = value.split_once('.').unwrap_or((value, ""));
-    if !fraction.bytes().all(|b| b.is_ascii_digit()) {
-        return Err(ErrorCode::InvalidArgument);
-    }
-    let fraction = fraction.trim_end_matches('0');
-    if fraction.len() > 3 {
-        return Err(ErrorCode::Unsupported);
-    }
-    let whole = decimal(whole)?;
-    let fraction = if fraction.is_empty() {
-        0
-    } else {
-        decimal(fraction)? * 10u64.pow(3 - fraction.len() as u32)
-    };
-    let n = whole
-        .checked_mul(1000)
-        .and_then(|n| n.checked_add(fraction))
-        .ok_or(ErrorCode::RangeInvalid)?;
-    if n == 0 || n > 86_400_000 {
-        return Err(ErrorCode::InvalidArgument);
-    }
-    Ok(n)
-}
-
-fn byte_range(value: &str) -> Result<(u64, Option<u64>), ErrorCode> {
-    let (len, offset) = value
-        .split_once('@')
-        .map_or((value, None), |(len, offset)| (len, Some(offset)));
-    let len = decimal(len)?;
-    if len == 0 {
-        return Err(ErrorCode::RangeInvalid);
-    }
-    Ok((len, offset.map(decimal).transpose()?))
-}
-
 fn take(
     attrs: &mut BTreeMap<String, (String, bool)>,
     name: &str,
@@ -339,44 +299,6 @@ fn take(
     Ok(value)
 }
 
-pub fn attributes(mut input: &str) -> Result<BTreeMap<String, (String, bool)>, ErrorCode> {
-    let mut out = BTreeMap::new();
-    loop {
-        let (name, rest) = input.split_once('=').ok_or(ErrorCode::InvalidArgument)?;
-        if name.is_empty()
-            || !name
-                .bytes()
-                .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'-')
-        {
-            return Err(ErrorCode::InvalidArgument);
-        }
-        let (value, tail, quoted) = if let Some(rest) = rest.strip_prefix('"') {
-            let (v, tail) = rest.split_once('"').ok_or(ErrorCode::InvalidArgument)?;
-            if v.is_empty() || v.len() > 4096 || v.chars().any(|c| c.is_control() || c == '\\') {
-                return Err(ErrorCode::InvalidArgument);
-            }
-            (v, tail, true)
-        } else {
-            let end = rest.find(',').unwrap_or(rest.len());
-            let v = &rest[..end];
-            if v.is_empty()
-                || !v
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b".-_".contains(&b))
-            {
-                return Err(ErrorCode::InvalidArgument);
-            }
-            (v, &rest[end..], false)
-        };
-        if out.len() >= 16 || out.insert(name.into(), (value.into(), quoted)).is_some() {
-            return Err(ErrorCode::InvalidArgument);
-        }
-        if tail.is_empty() {
-            return Ok(out);
-        }
-        input = tail
-            .strip_prefix(',')
-            .filter(|s| !s.is_empty())
-            .ok_or(ErrorCode::InvalidArgument)?;
-    }
+pub fn attributes(input: &str) -> Result<BTreeMap<String, (String, bool)>, ErrorCode> {
+    parse_attribute_map(input, AttributeOptions::STRICT_REMOTE).map_err(map_hls_error)
 }
