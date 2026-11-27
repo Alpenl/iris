@@ -27,8 +27,19 @@ pub mod ui;
 pub mod url_resolver;
 pub mod validation;
 
-pub use product::PluginHost;
-pub use ui::WindowSession;
+pub use hub::{Binding, Notice, OriginSummary, PluginInfo, PluginStatus, ReviewSummary};
+pub use overlay::{OverlayFrame, OverlayGlyphLease, PaintCue};
+pub use product::{PluginHost, plugins_dir};
+pub use requests::{AcceptedPage, BrowseTarget, RequestTarget, RequestTicket};
+pub use runtime::BackgroundResult;
+pub use selection::{HostAnnotationJob, HostAnnotationLease, annotation_error_code};
+pub use ui::{
+    ActionKind, DirtySlots, EnhancementOutcome, EnhancementRequest, Event, OverlayStep,
+    POLL_ACTION_LIMIT, POLL_EFFECT_LIMIT, POLL_NOTICE_LIMIT, PollReport, REMOTE_THUMB_LEASE_BYTES,
+    REMOTE_THUMB_SCRATCH_BYTES, ReadyAnnotations, ReadyAttachment, ReadyEffect, ReadyMonitorLut,
+    ReadyOverlayUpdate, ReadyStreamUpdate, RetainedThumbnail, RevokedEnhancements,
+    ThumbnailReceiver, TimelineLease, WindowAction, WindowSession, snapshot_from_input,
+};
 
 /// Maps a [`iris_core::bounded_json::BoundedJsonError`] to a protocol-2 [`iris_api::v2::ErrorCode`].
 pub(crate) const fn json_error(

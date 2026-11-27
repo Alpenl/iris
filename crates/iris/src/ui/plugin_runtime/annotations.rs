@@ -7,25 +7,8 @@ use gpui::{
     App, Context, Entity, IntoElement, ParentElement, StatefulInteractiveElement, Styled, div,
     prelude::FluentBuilder, px,
 };
-use iris_api::v2::ErrorCode;
-use iris_base::net::http_client::HttpCancel;
 use iris_core::media_uri::MediaUri;
 use iris_core::store::{AnnotationEdit as StoreAnnotationEdit, ColorLabel, TimeMarker};
-use iris_plugin_host::selection::annotation_error_code;
-
-#[derive(Default)]
-pub(in crate::ui) struct AnnotationView {
-    pub cancel: HttpCancel,
-    busy: bool,
-    refresh_pending: bool,
-    marker_page: usize,
-}
-
-impl Drop for AnnotationView {
-    fn drop(&mut self) {
-        self.cancel.cancel();
-    }
-}
 
 impl AppModel {
     pub(super) fn annotation_uri(&self) -> Option<MediaUri> {
@@ -36,89 +19,42 @@ impl AppModel {
             .flatten()
     }
 
-    pub(in crate::ui) fn grant_current_annotations(
-        &mut self,
-        plugin: &str,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(uri) = self.annotation_uri() else {
-            return;
-        };
-        if let Some(report) = self.plugins.grant_annotations(plugin, vec![uri]) {
-            let regions = self.apply_poll_report(report, None, cx);
-            if regions.any() {
-                self.notify_regions(regions, cx);
-            }
-        }
-    }
-
     pub(in crate::ui) fn refresh_annotations(&mut self, cx: &mut Context<Self>) {
         self.native_annotation(None, cx);
     }
 
     fn native_annotation(&mut self, edit: Option<StoreAnnotationEdit>, cx: &mut Context<Self>) {
-        let Some(uri) = self.annotation_uri() else {
-            return;
-        };
-        if self.plugin_view.annotations.busy {
-            if edit.is_none() {
-                self.plugin_view.annotations.refresh_pending = true;
-            } else {
-                self.show_toast("标记正在保存，请稍后重试", cx);
-            }
-            return;
-        }
-        let setup = (|| {
-            let target = self
-                .store
-                .annotation_target()
-                .map_err(annotation_error_code)?;
-            let host_job = self.plugin_host.begin_host_annotation()?;
-            Ok::<_, ErrorCode>((target, host_job))
-        })();
-        let (target, host_job) = match setup {
-            Ok(value) => value,
-            Err(error) => {
-                self.show_toast(
-                    format!(
-                        "个人标记不可用 · {}",
-                        super::notices::describe_error_code(error)
-                    ),
-                    cx,
-                );
+        let saving = edit.is_some();
+        let started = self
+            .plugins
+            .begin_host_annotation(&self.viewport.session, &self.store, edit);
+        let (target, uri, edit, cancel, host_job) = match started {
+            Ok(Some(args)) => args,
+            Ok(None) => return,
+            Err(outcome) => {
+                let regions = self.apply_plugin_outcome(outcome, None, cx);
+                if regions.any() {
+                    self.notify_regions(regions, cx);
+                }
                 return;
             }
         };
-        self.plugin_view.annotations.busy = true;
-        let cancel = self.plugin_view.annotations.cancel.clone();
-        let saving = edit.is_some();
         let job = cx
             .background_executor()
             .spawn(async move { host_job.run(&target, &uri, edit.as_ref(), &cancel) });
         cx.spawn(async move |this, cx| {
             let (result, _lease) = job.await;
             let _ = this.update(cx, |this, cx| {
-                this.plugin_view.annotations.busy = false;
-                match result {
-                    Ok(snapshot) => {
-                        let _ = this.store.apply_annotation_snapshot(snapshot);
-                        if saving {
-                            this.show_toast("个人标记已保存", cx);
-                        }
-                    }
-                    Err(ErrorCode::Cancelled) => {}
-                    Err(error) => this.show_toast(
-                        format!(
-                            "个人标记未更新 · {}",
-                            super::notices::describe_error_code(error)
-                        ),
-                        cx,
-                    ),
-                }
-                if std::mem::take(&mut this.plugin_view.annotations.refresh_pending) {
+                let (refresh, outcome) =
+                    this.plugins
+                        .finish_host_annotation(&mut this.store, saving, result);
+                let regions = this.apply_plugin_outcome(outcome, None, cx);
+                if refresh {
                     this.refresh_annotations(cx);
                 }
-                this.notify_viewport_and_dock(cx);
+                if regions.any() {
+                    this.notify_regions(regions, cx);
+                }
             });
         })
         .detach();
@@ -173,7 +109,7 @@ pub(in crate::ui) fn render_personal_annotations(
         ))
     });
     let pages = marker_count.div_ceil(8).max(1);
-    let page = m.plugin_view.annotations.marker_page.min(pages - 1);
+    let page = m.plugin_ui.marker_page.min(pages - 1);
     let markers: Vec<_> = value
         .markers
         .values()
@@ -252,8 +188,7 @@ pub(in crate::ui) fn render_personal_annotations(
                         .child(
                             chip_button("marker-prev-page", "上一页", false, t).on_click(
                                 model_listener(model, move |this, _, _, cx| {
-                                    this.plugin_view.annotations.marker_page =
-                                        page.saturating_sub(1);
+                                    this.plugin_ui.marker_page = page.saturating_sub(1);
                                     this.notify_viewport(cx);
                                 }),
                             ),
@@ -266,8 +201,7 @@ pub(in crate::ui) fn render_personal_annotations(
                         .child(
                             chip_button("marker-next-page", "下一页", false, t).on_click(
                                 model_listener(model, move |this, _, _, cx| {
-                                    this.plugin_view.annotations.marker_page =
-                                        (page + 1).min(pages - 1);
+                                    this.plugin_ui.marker_page = (page + 1).min(pages - 1);
                                     this.notify_viewport(cx);
                                 }),
                             ),

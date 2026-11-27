@@ -49,6 +49,7 @@ FUTURE_INCOMPAT_WARNING_RE = re.compile(r"(?m)^> warning(?:\[([^]]+)\])?: ([^\r\
 # it here so the baseline only shrinks (R-05 clears `iris-core`; R-13 clears `iris-plugin-host`).
 KNOWN_MODULE_CYCLE_EDGES: dict[str, frozenset[tuple[str, str]]] = {
     "iris-core": frozenset(),
+    "iris-app": frozenset(),
     "iris-plugin-host": frozenset(
         {
             ("actor", "engine"),
@@ -113,20 +114,43 @@ KNOWN_MODULE_CYCLE_EDGES: dict[str, frozenset[tuple[str, str]]] = {
 
 # Exact file/directory exemptions for `allow/expect(clippy::disallowed_*)` across `crates/*/{src,tests}`.
 DISALLOWED_LINT_EXEMPT_PREFIXES = ("crates/iris/src/video/",)
-# Temporary R-08 cross-layer integration test exemption for `disallowed_types` (`Session`) only,
-# until R-09 (#35) migrates `player_scoped_plugin` into `crates/iris-app/tests/`.
-HOST_SCOPED_TEST_DISALLOWED_TYPES_EXEMPT_FILES = frozenset(
-    {"crates/iris-plugin-host/tests/player_scoped_plugin.rs"}
+HOST_INTERNAL_MODULES = frozenset(
+    {
+        "actor",
+        "auth",
+        "crypto",
+        "engine",
+        "enhancement",
+        "files",
+        "hub",
+        "installation",
+        "instance",
+        "ledger",
+        "lut",
+        "network",
+        "official",
+        "overlay",
+        "package",
+        "pool",
+        "product",
+        "requests",
+        "runtime",
+        "selection",
+        "services",
+        "storage",
+        "stream",
+        "ui",
+        "url_resolver",
+        "validation",
+    }
 )
-HOST_SCOPED_TEST_DISALLOWED_TYPES_EXEMPT_PREFIXES = (
-    "crates/iris-plugin-host/tests/player_scoped_plugin/",
-)
-HOST_SCOPED_TEST_TYPES_ONLY_ALLOW_RE = re.compile(
-    r"#\s*!?\s*\[\s*(?:allow|expect)\s*\(\s*clippy::disallowed_types\s*\)\s*\]"
+APP_FORBIDDEN_HOST_MOD_RE = re.compile(
+    r"\biris_plugin_host::(?:" + "|".join(sorted(HOST_INTERNAL_MODULES)) + r")\b"
 )
 IRIS_FORBIDDEN_HOST_INTERNAL_RE = re.compile(
     r"\biris_plugin_host::(?:ledger|actor)\b|\bstream::prepare\b"
 )
+IRIS_FORBIDDEN_HOST_COMMAND_RE = re.compile(r"\bHostCommand\b")
 DISALLOWED_LINT_SUPPRESSION_RE = re.compile(
     r"#\s*!?\s*\[\s*(?:allow|expect)\s*\([^]]*\b(?:clippy::)?disallowed_[A-Za-z0-9_]+[^]]*\)\s*\]"
     r"|\b(?:allow|expect)\s*\([^)]*\b(?:clippy::)?disallowed_[A-Za-z0-9_]+"
@@ -787,14 +811,27 @@ def check_clippy_disallowed_configs(root: Path):
             rel_toml, "disallowed-methods"
         )
 
-    iris_paths = configured_paths("crates/iris/clippy.toml")
-    for required_rule in (
+    required_mpv_types = (
         "iris_mpv::Mpv",
+        "iris_mpv::Error",
+        "iris_mpv::Event",
+        "iris_mpv::Format",
+        "iris_mpv::Value",
         "iris_mpv::RenderHandle",
+        "iris_mpv::render::RenderContext",
+    )
+    required_mpv_methods = (
         "iris_mpv::RenderHandle::new",
         "iris_core::player::Session::render_handle",
-    ):
-        _require(required_rule in iris_paths, f"crates/iris/clippy.toml must disallow `{required_rule}`")
+        "iris_core::player::Session::video_recovery",
+    )
+    for rel_toml in ("crates/iris/clippy.toml", "crates/iris-app/clippy.toml"):
+        types = configured_section_paths(rel_toml, "disallowed-types")
+        methods = configured_section_paths(rel_toml, "disallowed-methods")
+        for required_type in required_mpv_types:
+            _require(required_type in types, f"{rel_toml} must disallow type `{required_type}`")
+        for required_method in required_mpv_methods:
+            _require(required_method in methods, f"{rel_toml} must disallow method `{required_method}`")
 
     core_paths = configured_paths("crates/iris-core/clippy.toml")
     _require(
@@ -820,11 +857,6 @@ def check_disallowed_lint_suppressions(rel: Path, raw_text: str):
     if any(posix == prefix or posix.startswith(prefix) for prefix in DISALLOWED_LINT_EXEMPT_PREFIXES):
         return
     sanitized = strip_comments_and_literals(raw_text)
-    if (
-        posix in HOST_SCOPED_TEST_DISALLOWED_TYPES_EXEMPT_FILES
-        or any(posix.startswith(p) for p in HOST_SCOPED_TEST_DISALLOWED_TYPES_EXEMPT_PREFIXES)
-    ):
-        sanitized = HOST_SCOPED_TEST_TYPES_ONLY_ALLOW_RE.sub("", sanitized)
     if posix == "crates/iris-core/src/player/mod.rs":
         seen_fns: list[str] = []
 
@@ -846,7 +878,7 @@ def check_disallowed_lint_suppressions(rel: Path, raw_text: str):
 
 
 def check_iris_plugin_host_facade_imports(rel: Path, raw_text: str):
-    """Reject direct references from `crates/iris/src` into `iris_plugin_host::{ledger, actor}` or `stream::prepare`."""
+    """Reject direct references from `crates/iris/src` into `iris_plugin_host::{ledger, actor}`, `stream::prepare`, or `HostCommand`."""
     sanitized = strip_comments_and_literals(raw_text)
     for match in USE_STMT_RE.finditer(sanitized):
         for expanded in expand_use_tree(match.group(1)):
@@ -863,6 +895,38 @@ def check_iris_plugin_host_facade_imports(rel: Path, raw_text: str):
     _require(
         hit is None,
         f"{rel} references forbidden plugin-host internal `{hit.group(0) if hit else ''}`; route through `WindowSession` / `PluginHost`",
+    )
+    cmd_hit = IRIS_FORBIDDEN_HOST_COMMAND_RE.search(sanitized)
+    _require(
+        cmd_hit is None,
+        f"{rel} directly references `HostCommand`; route plugin command dispatch through `iris-app` / `WindowSession`",
+    )
+
+
+def check_app_plugin_host_facade_only(rel: Path, raw_text: str):
+    """Enforce that `crates/iris-app/{src,tests}` only accesses `iris_plugin_host` root facade items."""
+    sanitized = strip_comments_and_literals(raw_text)
+    for match in USE_STMT_RE.finditer(sanitized):
+        for expanded in expand_use_tree(match.group(1)):
+            segs = [seg for seg in expanded.split("::") if seg]
+            if segs and segs[0] == "iris_plugin_host" and len(segs) >= 2:
+                _require(
+                    segs[1] not in HOST_INTERNAL_MODULES,
+                    f"{rel} imports internal `iris-plugin-host` module `{expanded}`; use root facade exports only",
+                )
+    hit = APP_FORBIDDEN_HOST_MOD_RE.search(sanitized)
+    _require(
+        hit is None,
+        f"{rel} references internal `iris-plugin-host` module `{hit.group(0) if hit else ''}`; use root facade exports only",
+    )
+
+
+def check_no_transitive_gpui(tree_output: str):
+    """Reject any transitive `gpui` dependency in `cargo tree -p iris-app -e normal,build,dev --target all`."""
+    hit = re.search(r"(?m)(?:^|\s)gpui\s+v[0-9]", tree_output)
+    _require(
+        hit is None,
+        f"iris-app transitive dependency graph must never contain `gpui`:\n{tree_output}",
     )
 
 
@@ -945,7 +1009,10 @@ def main():
                 continue
             for path in sorted(subdir.rglob("*.rs")):
                 rel = path.relative_to(ROOT)
-                check_disallowed_lint_suppressions(rel, path.read_text(encoding="utf-8"))
+                raw_text = path.read_text(encoding="utf-8")
+                check_disallowed_lint_suppressions(rel, raw_text)
+                if crate_dir.name == "iris-app":
+                    check_app_plugin_host_facade_only(rel, raw_text)
 
     for path in sorted(iris_src.rglob("*.rs")):
         rel = path.relative_to(ROOT)
@@ -1026,22 +1093,36 @@ def main():
         "iris-plugin-sdk",
     }
     base_deps = {d["name"] for d in pkgs["iris-base"]["dependencies"]}
-    forbidden_base = forbidden_headless | {"iris-core", "iris-plugin-host", "iris-api", "iris-mpv"}
+    forbidden_base = forbidden_headless | {"iris-core", "iris-plugin-host", "iris-app", "iris", "iris-api", "iris-mpv"}
     _require(not (base_deps & forbidden_base), f"iris-base must stay domain-free, found {base_deps & forbidden_base}")
 
     core_deps = {d["name"] for d in pkgs["iris-core"]["dependencies"]}
-    forbidden_core = forbidden_headless | {"iris-plugin-host", "iris-api", "wasmtime"}
+    forbidden_core = forbidden_headless | {"iris-plugin-host", "iris-app", "iris", "iris-api", "wasmtime"}
     _require(not (core_deps & forbidden_core), f"iris-core must stay headless and plugin-free, found {core_deps & forbidden_core}")
 
     host_deps = {d["name"] for d in pkgs["iris-plugin-host"]["dependencies"]}
-    forbidden_host = forbidden_headless | {"iris-mpv"}
+    forbidden_host = forbidden_headless | {"iris-app", "iris", "iris-mpv"}
     _require(not (host_deps & forbidden_host), f"iris-plugin-host must stay headless and mpv-free, found {host_deps & forbidden_host}")
+
+    app_deps = {d["name"] for d in pkgs["iris-app"]["dependencies"]}
+    forbidden_app = forbidden_headless | {"iris-mpv", "iris"}
+    _require(not (app_deps & forbidden_app), f"iris-app must stay headless and mpv-free, found {app_deps & forbidden_app}")
+
+    app_tree = subprocess.run(
+        ["cargo", "tree", "--offline", "--locked", "-p", "iris-app", "-e", "normal,build,dev", "--target", "all"],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    check_no_transitive_gpui(app_tree)
 
     # 3b. Wildcard-super ban across all headless & guest crates + top-level module cycle ratchet
     for crate_dir in (
         ROOT / "crates/iris-base/src",
         ROOT / "crates/iris-core/src",
         ROOT / "crates/iris-plugin-host/src",
+        ROOT / "crates/iris-app/src",
         ROOT / "crates/iris-api/src",
         ROOT / "crates/iris-mpv/src",
         ROOT / "crates/iris-plugin-sdk/src",

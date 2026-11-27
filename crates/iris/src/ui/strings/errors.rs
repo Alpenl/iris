@@ -1,6 +1,5 @@
-//! Localized user-facing error descriptions for mpv, player commands, and plugins.
+//! Localized user-facing error descriptions for mpv and player commands.
 
-use iris_api::v2::ErrorCode;
 use iris_core::player::PlayerActionError;
 
 pub(in crate::ui) fn mpv_error(code: i32) -> &'static str {
@@ -26,24 +25,4 @@ pub(in crate::ui) fn player_action_error(err: &anyhow::Error) -> &'static str {
         };
     }
     "当前状态无法执行此操作"
-}
-
-pub(in crate::ui) fn plugin_error_code(code: ErrorCode) -> String {
-    match code {
-        ErrorCode::AuthFailed => "鉴权失败或播放源拒绝访问",
-        ErrorCode::Denied => "播放地址或权限被策略拒绝",
-        ErrorCode::QuotaExceeded => "插件资源配额不足",
-        ErrorCode::Timeout => "请求超时",
-        ErrorCode::IoError => "网络或文件读取失败",
-        ErrorCode::StaleHandle => "会话已过期，请重试",
-        ErrorCode::Unsupported => "不支持的媒体格式或操作",
-        ErrorCode::Backpressure => "请求过于频繁，请稍后重试",
-        ErrorCode::Cancelled => "操作已取消",
-        ErrorCode::InvalidArgument => "参数格式无效",
-        ErrorCode::RangeInvalid => "分片范围无效",
-        ErrorCode::BadState => "插件状态异常，请重试",
-        ErrorCode::OutOfWindow => "请求超出当前播放窗口范围",
-        ErrorCode::Internal => "插件内部错误",
-    }
-    .into()
 }

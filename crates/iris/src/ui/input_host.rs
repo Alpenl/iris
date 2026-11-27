@@ -113,9 +113,8 @@ impl TextFieldHost for AppModel {
                 self.overlays.palette_scroll.scroll_to_item(0);
             }
             ActiveSlot::Form => {
-                self.plugin_view.modal.submitting = None;
+                self.plugins.modal_mut().clear_feedback();
                 self.overlays.dialog_error = None;
-                self.plugin_view.modal.error = None;
             }
         }
         let regions =

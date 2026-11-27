@@ -1,8 +1,9 @@
 //! Workspace preset switching (`PresetRuntime`), clean personal-baseline
 //! persistence, effective chrome queries, and `ResetAppearance` guardrail.
 
+use std::time::Instant;
+
 use gpui::{Context, Window, px, size};
-use iris_api::v2::{Capability, HostEvent};
 use iris_core::library::{SortBy, SortOrder};
 use iris_core::player::Command;
 use iris_core::preset::{PresetCaptureScope, PresetLayout, PresetManager, SidebarMode};
@@ -15,13 +16,7 @@ use crate::theme::ThemeTokens;
 
 impl AppModel {
     pub(super) fn sync_theme_tokens(&mut self, cx: &mut Context<Self>) {
-        let desired = self
-            .settings
-            .theme_id
-            .strip_prefix("plugin:")
-            .map(str::to_owned);
-        let _ = self.plugins.select_theme(desired);
-        let (plugin_theme, _) = self.plugins.active_ui_overrides();
+        let (plugin_theme, _) = self.plugins.select_theme(&self.settings.theme_id);
         let tokens = ThemeTokens::resolve_scaled(
             &self.settings.theme_id,
             plugin_theme.as_ref(),
@@ -84,36 +79,17 @@ impl AppModel {
         self.overlays.close_all();
         self.text_inputs.active_form_key = None;
         self.focus.focus(window);
-        let theme_plugin_ids: Vec<String> = self
-            .plugins
-            .list()
-            .iter()
-            .filter(|p| {
-                p.enabled
-                    && p.binding
-                        .as_ref()
-                        .is_some_and(|b| b.installed.grants.contains(&Capability::UiTheme))
-            })
-            .map(|p| p.id.clone())
-            .collect();
-        for pid in theme_plugin_ids {
-            if !self.settings.disabled_plugins.iter().any(|d| d == &pid) {
-                self.settings.disabled_plugins.push(pid.clone());
-            }
-            self.text_inputs.clear_plugin_sidebar_fields(&pid);
-            self.cleanup_plugin_playback(Some(&pid), None);
-            let snap = self.plugin_snapshot();
-            let report = self.plugins.set_enabled_with_snapshot(&pid, false, snap);
-            let _ = self.apply_poll_report(report, Some(window), cx);
+        let (theme_plugin_ids, out) = self.plugins.reset_theme_plugins_and_modals(
+            &mut self.viewport.session,
+            &mut self.store,
+            &mut self.settings,
+            &mut self.catalog.active_source,
+            Instant::now(),
+        );
+        for pid in &theme_plugin_ids {
+            self.text_inputs.clear_plugin_sidebar_fields(pid);
         }
-        while let Some((plugin, _)) = self.plugins.active_modal() {
-            let plugin = plugin.to_owned();
-            self.plugins.dismiss_modal(&plugin);
-        }
-        self.reconcile_active_source();
-        self.plugin_view.modal.focus_pending = true;
-        self.sync_plugin_modal_focus(window);
-        self.sync_view_timer(cx);
+        let _ = self.apply_plugin_outcome(out, Some(window), cx);
         self.settings.theme_id = "graphite".into();
         self.settings.floating_dock = false;
         self.settings.compact_controls = false;
@@ -186,16 +162,11 @@ impl AppModel {
             .preset_rt
             .switch_preset(&self.presets, id, &mut self.settings, layout);
 
-        for (pid, cmd_id) in trans.on_exit_commands {
-            let snap = self.plugin_snapshot();
-            let report = self.plugins.send_to(
-                &pid,
-                HostEvent::Command {
-                    id: cmd_id,
-                    snapshot: Some(snap),
-                },
-            );
-            let _ = self.apply_poll_report(report, Some(window), cx);
+        if !trans.on_exit_commands.is_empty() {
+            let out = self.with_plugin_ctx(|ctrl, ctx| {
+                ctrl.send_exit_commands(ctx, trans.on_exit_commands, Instant::now())
+            });
+            let _ = self.apply_plugin_outcome(out, Some(window), cx);
         }
 
         if prev_disabled != self.settings.disabled_plugins {
@@ -207,19 +178,20 @@ impl AppModel {
                 }
                 if !enable {
                     self.text_inputs.clear_plugin_sidebar_fields(&pid);
-                    self.cleanup_plugin_playback(Some(&pid), None);
                 }
-                let snap = self.plugin_snapshot();
-                let report = self.plugins.set_enabled_with_snapshot(&pid, enable, snap);
-                let _ = self.apply_poll_report(report, Some(window), cx);
+                let out = self.with_plugin_ctx(|ctrl, ctx| {
+                    ctrl.toggle_plugin_enabled(ctx, &pid, enable, Instant::now())
+                });
+                let _ = self.apply_plugin_outcome(out, Some(window), cx);
             }
-            self.reconcile_active_source();
         }
 
-        for (pid, cmd_id) in trans.plugin_commands {
-            self.plugin_view.deferred.push((pid, cmd_id));
+        if !trans.plugin_commands.is_empty() {
+            let out = self.with_plugin_ctx(|ctrl, ctx| {
+                ctrl.queue_deferred_commands(ctx, trans.plugin_commands, Instant::now())
+            });
+            let _ = self.apply_plugin_outcome(out, Some(window), cx);
         }
-        self.run_deferred_plugin_commands(window, cx);
 
         if let Some(mode) = trans.sidebar_mode {
             self.catalog.sidebar_mode = mode;

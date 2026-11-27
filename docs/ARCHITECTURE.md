@@ -13,15 +13,16 @@ crates/
   iris-plugin-guides/  官方构图辅助线插件（iris.guides）：使用公开 SDK 编译的可复现 Wasm 包
   iris-plugin-webdav/  官方 WebDAV 数据源插件（iris.webdav）：使用公开 SDK 编译的多实例远程存储 Wasm 包
   iris-core/           无头领域核心：纯状态机播放器会话、统一目录与独立队列、稀疏工作区预设、键位引擎、照片探测、凭据库与日志脱敏；不依赖 GPUI、iris-api 或插件运行时
-  iris-plugin-host/    Wasm 插件宿主运行时（pulley64）：显式 PluginHost、单窗口会话生命周期、能力授权、有界网络/私有产物与三模流中继；不依赖 GPUI 或 iris-mpv
+  iris-plugin-host/    Wasm 插件宿主运行时（pulley64）：显式 PluginHost、单窗口 WindowSession 门面、能力授权、有界网络/私有产物与三模流中继；不依赖 GPUI、iris-mpv 或 Session
+  iris-app/            无头应用编排层：PluginController 插件纵切（弹窗提交保活、来源分页/解析、安装与 Origin 授权、增强与叠层生命周期）及跨层契约测试；传递依赖零 GPUI，不直接依赖 iris-mpv
   iris/                GPUI 应用：窗口、ThemeTokens 动态令牌、ui/kit 共用原语、统一 VideoSurfaceBackend 平台视频层与系统桥接、单实例、调试管道
 ```
 
-依赖方向严格单向：`iris` → `iris-plugin-host` → `iris-core` → `iris-base`，`iris-core` → `iris-mpv`，且 `iris` / `iris-plugin-host` → `iris-api`；`iris-plugin-sdk` 仅由 Wasm Guest 插件（含 `iris-plugin-guides`、`iris-plugin-webdav` 及 `examples/plugins/*`）引用，宿主零反向依赖（`iris` 仅在 `src/video/` 中通过 `clippy.toml` 豁免使用窄能力 `iris_mpv::RenderHandle` 与 `Session::video_recovery`，业务与 UI 代码由编译器强制禁止触碰 `iris_mpv` 或构造 `RenderHandle`）。`scripts/check-project.py` 与 `clippy` 自动检查：
+依赖方向严格单向：`iris` → `iris-app` → `iris-plugin-host` → `iris-core` → `iris-base`（`iris-app` 同时直接依赖 `iris-core`、`iris-base` 与 `iris-api`），`iris-core` → `iris-mpv`，且 `iris` / `iris-app` / `iris-plugin-host` → `iris-api`；`iris-plugin-sdk` 仅由 Wasm Guest 插件（含 `iris-plugin-guides`、`iris-plugin-webdav` 及 `examples/plugins/*`）引用，宿主零反向依赖（`iris` 仅在 `src/video/` 中通过 `clippy.toml` 豁免使用窄能力 `iris_mpv::RenderHandle` 与 `Session::video_recovery`，业务与 UI 代码由编译器强制禁止触碰 `iris_mpv` 或构造 `RenderHandle`）。`scripts/check-project.py` 与 `clippy` 自动检查：
 
-1. Cargo 依赖图强制隔离：`iris-base` 零领域依赖，`iris-core` 不依赖 GPUI、`iris-plugin-host`、`iris-api` 或 `wasmtime`，`iris-plugin-host` 不依赖 GPUI 或 `iris-mpv`；
+1. Cargo 依赖图强制隔离：`iris-base` 零领域依赖，`iris-core` 不依赖 GPUI、`iris-plugin-host`、`iris-app`、`iris-api` 或 `wasmtime`，`iris-plugin-host` 不依赖 GPUI、`iris-app` 或 `iris-mpv`，`iris-app` 直接依赖禁止 `iris-mpv` 且全目标传递依赖零 `gpui`；
 2. `iris-api` 常规依赖仅限 `serde`（不依赖 GPUI 或 `iris-mpv`）；
-3. `crates/iris/clippy.toml`、`crates/iris-core/clippy.toml` 与 `crates/iris-plugin-host/clippy.toml` 通过 `disallowed-types` / `disallowed-methods` 强制约束 `iris_mpv::*` 与 `RenderHandle::new` / `Session::{render_handle, video_recovery}` 的调用边界，扫描全仓 `crates/*` 的 `src/` 与 `tests/` 禁止越权 `allow/expect(clippy::disallowed_*)`（仅显式豁免 `crates/iris/src/video/` 与 `crates/iris-core/src/player/mod.rs` 的 `render_handle` / `video_recovery` 两处），且全仓非测试生产代码禁止 `use super::*;`；
+3. `crates/iris/clippy.toml`、`crates/iris-app/clippy.toml`、`crates/iris-core/clippy.toml` 与 `crates/iris-plugin-host/clippy.toml` 通过 `disallowed-types` / `disallowed-methods` 强制约束 `iris_mpv::*`、`Session` 与 `RenderHandle::new` / `Session::{render_handle, video_recovery}` 的调用边界，扫描全仓 `crates/*` 的 `src/` 与 `tests/` 禁止越权 `allow/expect(clippy::disallowed_*)`（仅显式豁免 `crates/iris/src/video/` 与 `crates/iris-core/src/player/mod.rs` 的 `render_handle` / `video_recovery` 两处，`iris-app` 与 `iris-plugin-host` 零豁免），且全仓非测试生产代码禁止 `use super::*;`；
 4. `crates/iris/src/ui/` 禁止散落 `target_os` 条件编译，且通用组件库 `crates/iris/src/ui/kit/` 禁止引用根窗口 `IrisWindow` 或业务宿主 `AppModel`；
 5. 全仓生产代码禁止直接调用 `std::thread::spawn` 或未登记的 `std::thread::Builder`，所有 OS 线程必须通过 `iris_base::rt::{spawn_thread, spawn_thread_named}` 按 `ThreadRole` 登记，且每个角色的线程名必须记录在本文第 6 节；
 6. `devtools` 控制管道门禁未被默认特性或普通发布版绕过；
@@ -45,7 +46,8 @@ crates/
   - `store.rs`：以稳定媒体身份保存收藏、续播和最近记录。写入时取得文件锁，重读磁盘、合并修改字段并原子替换。写入失败保留待保存变更，旧记录在迁移成功后退役。
   - `vault.rs`：系统安全凭据库 `CredentialVault`（macOS Keychain / Windows Credential Manager，单条上限 2048B，失败显式报错）。v2 插件按安装身份 `plugin-v2.<installation_id>` 隔离（兼容读取迁移期 `builtin.<id>` 与 `ext.<id>`），Windows 下采用 `app.iris.vault.v2:` 小写十六进制编码目标名以消除大小写不敏感碰撞并保护作用域/键名边界。`credential_index.json` 只保存作用域与键名，测试可用 `in_memory()`。
   - `preset.rs` + `preset/runtime.rs`：`1B+` 稀疏工作区预设（`Option<T>` 补丁 + 显式插件启停差量与退出指令），`settings.conf` 始终只存纯净个人基线，运行期通过内存 `PresetRevert` 自动回正（全局字号 `ui_font_scale` 属个人偏好不进预设）。
-- `crates/iris-plugin-host/src/`：显式 `PluginHost` 实例（零全局单例，支持同进程多宿主并行测试）、有界 Wasmtime Pulley64 字节码运行时、单窗口会话生命周期、安装/能力授权、网络、三模流（`DirectHttp` / `RandomAccess` / `VirtualHls`）、轻量私有文件产物与哈希（`FileExecutor`）及媒体增强；`iris-plugin-sdk` 和两个官方插件 crate 使用同一套公开 Guest 入口。
+- `crates/iris-plugin-host/src/`：显式 `PluginHost` 与 `WindowSession` 门面（零全局单例，零 `Session` 依赖，支持同进程多宿主并行测试）、有界 Wasmtime Pulley64 字节码运行时、安装/能力授权、网络、三模流（`DirectHttp` / `RandomAccess` / `VirtualHls`）、轻量私有文件产物与哈希（`FileExecutor`）及媒体增强；`iris-plugin-sdk` 和两个官方插件 crate 使用同一套公开 Guest 入口。
+- `crates/iris-app/src/plugins/`：无头应用编排层首个纵切 `PluginController`——单一拥有 `PluginHost`、`WindowSession`、模态框提交/错误状态、远程目录浏览与流解析请求表、插件播放列表与清晰度元数据、安装审核/Origin 授权状态、媒体增强/时间轴叠层与远程缩略图缓存状态，对外输出纯领域变化摘要与最小平台副作用描述（不接收窗口可见性、不感知 `DirtyRegions`）。
 - `crates/iris-core/src/photo/{mod,containers,heif,exif,icc}.rs`：魔数优先单遍照片头解析（JPEG/PNG/WebP/HEIF/TIFF 尺寸、方向、EXIF 摘要与内嵌 ICC 原色匹配）。
 - `crates/iris-core/src/{keymap/,bookmarks,legacy/,logging/,input,geometry,library,settings,fs_util}.rs`：三方案键位目录与结构化 `ConflictTarget`、常驻位置书签与旧版数据兼容、单一集中脱敏日志与结构化事件流（`iris.log` + `events.jsonl`）、指针手势策略、几何变换与慢速共享盘优化扫描。
 - `crates/iris/src/video/{mod,mac,windows}.rs`：跨平台共享的 `VideoSurfaceBackend` trait（`attach`、`set_bounds`、`set_scale`、`set_visible`），在 macOS（`MacVideoSurface`）与 Windows（`WinVideoSurface`）上由编译器验证统一签名，并通过 `VideoSurface` 新类型对窗口层隐藏平台差异。
@@ -224,7 +226,8 @@ DirectHttp、RandomAccess、VirtualManifest 共用受控播放准入。远端及
 | `iris-mpv`（本仓库） | libmpv FFI | 手写声明，零常规依赖，不用 bindgen。|
 | `iris-api`（本仓库） | 插件协议 | 仅依赖 `serde`（测试用 `serde_json`），零 UI/媒体依赖。|
 | `iris-base`（本仓库） | 并发与网络底座 | `rt` 并发原语 + `net` 网络协议，仅依赖网络/TLS/同步基础库，零领域依赖。|
-| `iris-plugin-host`（本仓库） | Wasm 插件宿主 | 依赖 `wasmtime`（仅开 `pulley` 字节码解释器）、`iris-core` 与 `iris-api`，不依赖 GPUI 或 `iris-mpv`。|
+| `iris-plugin-host`（本仓库） | Wasm 插件宿主 | 依赖 `wasmtime`（仅开 `pulley` 字节码解释器）、`iris-core` 与 `iris-api`，不依赖 GPUI、`iris-app` 或 `iris-mpv`，零 `Session` 引用。|
+| `iris-app`（本仓库） | 无头应用编排层 | 依赖 `iris-base`、`iris-core`、`iris-plugin-host` 门面与 `iris-api`，直接依赖禁止 `iris-mpv` 且全目标传递依赖零 `gpui`。|
 | `windows = "0.61"` / `windows-sys = "0.61"` | Windows 原生绑定 | 全仓统一为 `0.61` 同代绑定，避免双代 Win32/COM crate 并存编译。|
 | `objc 0.2`、`cocoa =0.26.0` | macOS 原生调用 | GPUI 0.2.2 内部也用这两个，迁到 objc2 后类型不互通，暂不迁移。|
 | `futures` | 通道 | 用 GPUI 自带的 executor；Iris 自己不直接引 tokio（GPUI 的 HTTP 客户端会间接带进来，这不归 Iris 管）。|

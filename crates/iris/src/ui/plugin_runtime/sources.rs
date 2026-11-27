@@ -1,3 +1,5 @@
+use std::time::Instant;
+
 use super::super::{AppModel, state::ActiveSource, views::model_listener};
 use crate::theme::ThemeTokens;
 use crate::ui::kit::form::chip_button;
@@ -5,105 +7,15 @@ use gpui::{
     App, Context, Entity, InteractiveElement, IntoElement, ParentElement, SharedString,
     StatefulInteractiveElement, Styled, div, px,
 };
-use iris_api::v2::{Capability, source::PlaylistEntry};
+use iris_app::OpenUrlOutcome;
 use iris_core::media_uri::MediaUri;
 
-pub(in crate::ui) fn resolve_playlist_current(
-    playlist: &[PlaylistEntry],
-    playback_source_id: Option<&str>,
-    playback_entry_id: Option<&str>,
-    requested: Option<(&str, &str)>,
-) -> Option<(String, String)> {
-    if playlist.is_empty() {
-        return None;
-    }
-    if let (Some(sid), Some(eid)) = (playback_source_id, playback_entry_id)
-        && playlist
-            .iter()
-            .any(|p| p.source_id == sid && p.entry_id == eid)
-    {
-        return Some((sid.to_owned(), eid.to_owned()));
-    }
-    if let Some(eid) = playback_entry_id {
-        if let Some((req_sid, _)) = requested
-            && playlist
-                .iter()
-                .any(|p| p.source_id == req_sid && p.entry_id == eid)
-        {
-            return Some((req_sid.to_owned(), eid.to_owned()));
-        }
-        if let Some(hit) = playlist.iter().find(|p| p.entry_id == eid) {
-            return Some((hit.source_id.clone(), hit.entry_id.clone()));
-        }
-    }
-    if let Some((req_sid, req_eid)) = requested {
-        if playlist
-            .iter()
-            .any(|p| p.source_id == req_sid && p.entry_id == req_eid)
-        {
-            return Some((req_sid.to_owned(), req_eid.to_owned()));
-        }
-        if let Some(hit) = playlist.iter().find(|p| p.entry_id == req_eid) {
-            return Some((hit.source_id.clone(), hit.entry_id.clone()));
-        }
-    }
-    playlist
-        .first()
-        .map(|first| (first.source_id.clone(), first.entry_id.clone()))
-}
-
-pub(in crate::ui) fn find_plugin_playlist_index(
-    playlist: &[PlaylistEntry],
-    playlist_plugin_id: &str,
-    stream_plugin_id: Option<&str>,
-    playlist_current: Option<&(String, String)>,
-    current_uri: Option<&MediaUri>,
-) -> Option<usize> {
-    if playlist.len() <= 1 {
-        return None;
-    }
-    match current_uri {
-        Some(MediaUri::Local(_)) => return None,
-        Some(MediaUri::Plugin { plugin_id, .. }) if plugin_id != playlist_plugin_id => {
-            return None;
-        }
-        Some(MediaUri::HttpUrl(_)) | None if stream_plugin_id != Some(playlist_plugin_id) => {
-            return None;
-        }
-        _ => {}
-    }
-    if let Some((sid, eid)) = playlist_current
-        && let Some(ix) = playlist
-            .iter()
-            .position(|p| p.source_id == *sid && p.entry_id == *eid)
-    {
-        return Some(ix);
-    }
-    if let Some(MediaUri::Plugin {
-        plugin_id,
-        source_id,
-        entry_id,
-    }) = current_uri
-        && plugin_id == playlist_plugin_id
-    {
-        return playlist
-            .iter()
-            .position(|p| p.source_id == *source_id && p.entry_id == *entry_id);
-    }
-    None
-}
-
-pub(in crate::ui) fn remote_search_query(supports_search: bool, raw: &str) -> Option<String> {
-    supports_search
-        .then(|| raw.trim())
-        .filter(|q| !q.is_empty())
-        .map(str::to_owned)
-}
+pub(in crate::ui) use iris_app::remote_search_query;
 
 pub(in crate::ui) fn render_source_filters(model: &Entity<AppModel>, cx: &App) -> impl IntoElement {
     let m = model.read(cx);
     let t = ThemeTokens::of(cx);
-    let filters = m.plugin_view.source_filters.clone();
+    let filters = m.plugins.source_filters().to_vec();
     div()
         .id("source-filter-options")
         .max_h(px(144.))
@@ -148,21 +60,8 @@ pub(in crate::ui) fn render_source_filters(model: &Entity<AppModel>, cx: &App) -
                                     view.folder_id.clone(),
                                     view.supports_search,
                                 );
-                                if let Some(f) = this
-                                    .plugin_view
-                                    .source_filters
-                                    .iter_mut()
-                                    .find(|f| f.id == filter_id)
-                                {
-                                    f.selected = val.clone();
-                                }
-                                if let Some(value) = &val {
-                                    this.plugin_view
-                                        .filter_values
-                                        .insert(filter_id.clone(), value.clone());
-                                } else {
-                                    this.plugin_view.filter_values.remove(&filter_id);
-                                }
+                                this.plugins
+                                    .set_source_filter_value(&filter_id, val.clone());
                                 let query = remote_search_query(
                                     supports_search && this.text_inputs.search_open,
                                     this.text_inputs.search_input.text(),
@@ -227,34 +126,7 @@ impl AppModel {
         current: Option<&MediaUri>,
         delta: isize,
     ) -> bool {
-        let Some(binding) = &self.plugin_view.playlist_binding else {
-            return false;
-        };
-        if !binding.is_live() {
-            return false;
-        }
-        let pid = &binding.installed.plugin_id;
-        if self
-            .precheck_plugin_capability(pid, Capability::MediaSource)
-            .is_err()
-        {
-            return false;
-        }
-        let Some(index) = find_plugin_playlist_index(
-            &self.plugin_view.playlist,
-            pid,
-            self.plugin_view.stream_plugin.as_deref(),
-            self.plugin_view.playlist_current.as_ref(),
-            current,
-        ) else {
-            return false;
-        };
-        let len = self.plugin_view.playlist.len() as isize;
-        let target = &self.plugin_view.playlist[(index as isize + delta).rem_euclid(len) as usize];
-        iris_api::is_valid_id(&target.source_id)
-            && !target.entry_id.is_empty()
-            && target.entry_id.len() <= 4096
-            && !target.entry_id.chars().any(char::is_control)
+        self.plugins.can_step_playlist(current, delta)
     }
 
     pub(in crate::ui) fn step_plugin_playlist(
@@ -264,37 +136,15 @@ impl AppModel {
         wrap: bool,
         cx: &mut Context<Self>,
     ) -> bool {
-        let Some(binding) = &self.plugin_view.playlist_binding else {
+        let Some(out) = self.with_plugin_ctx(|ctrl, ctx| {
+            ctrl.step_playlist(ctx, current, delta, wrap, Instant::now())
+        }) else {
             return false;
         };
-        if !binding.is_live() {
-            return false;
+        let regions = self.apply_plugin_outcome(out, None, cx);
+        if regions.any() {
+            self.notify_regions(regions, cx);
         }
-        let plugin = binding.installed.plugin_id.clone();
-        let Some(index) = find_plugin_playlist_index(
-            &self.plugin_view.playlist,
-            &plugin,
-            self.plugin_view.stream_plugin.as_deref(),
-            self.plugin_view.playlist_current.as_ref(),
-            current,
-        ) else {
-            return false;
-        };
-        let next = index as isize + delta;
-        let len = self.plugin_view.playlist.len() as isize;
-        if !wrap && !(0..len).contains(&next) {
-            self.show_toast("已播完插件播放列表", cx);
-            return true;
-        }
-        let item = self.plugin_view.playlist[next.rem_euclid(len) as usize].clone();
-        self.resolve_plugin_entry(
-            &plugin,
-            &item.source_id,
-            &item.entry_id,
-            Some(item.title),
-            None,
-            cx,
-        );
         true
     }
 
@@ -304,74 +154,41 @@ impl AppModel {
         selected: &str,
         cx: &mut Context<Self>,
     ) -> bool {
-        let fail = |this: &mut Self, msg: &str, cx: &mut Context<Self>| {
-            this.overlays.dialog_error = Some(msg.to_owned().into());
-            this.notify_root(cx);
-        };
-        let matches = self.plugins.url_resolvers(Some(url));
-        let plugin = match selected {
-            "direct" => None,
-            "auto" | "" if matches.len() > 1 => {
-                fail(self, "多个插件匹配此地址，请选择打开方式", cx);
-                return false;
+        let (outcome, batch) = self
+            .with_plugin_ctx(|ctrl, ctx| ctrl.open_user_url(ctx, url, selected, Instant::now()));
+        let regions = self.apply_plugin_outcome(batch, None, cx);
+        match outcome {
+            OpenUrlOutcome::ValidationError(msg) => {
+                self.overlays.dialog_error = Some(msg.into());
+                self.notify_regions(
+                    regions.union(super::super::views::DirtyRegions::root_only()),
+                    cx,
+                );
+                false
             }
-            "auto" | "" => matches.first().map(|(id, _)| id.clone()),
-            id if self
-                .plugins
-                .url_resolvers(None)
-                .iter()
-                .any(|(p, _)| p == id) =>
-            {
-                Some(id.into())
-            }
-            _ => {
-                fail(self, "所选解析插件已不可用", cx);
-                return false;
-            }
-        };
-        if let Some(plugin) = plugin {
-            let Ok(parsed) = iris_base::net::http_client::validate_stream_url(url) else {
-                fail(self, "请输入合法的 HTTP/HTTPS 地址", cx);
-                return false;
-            };
-            if !parsed.username().is_empty() || parsed.password().is_some() {
-                fail(self, "解析地址不能内嵌账号密码，请通过插件登录", cx);
-                return false;
-            }
-            if let Err(error) =
-                self.precheck_plugin_capability(&plugin, iris_api::v2::Capability::UrlResolver)
-            {
-                let msg = super::notices::describe_error_code(error);
-                fail(self, &format!("解析请求未能提交 · {msg}"), cx);
-                return false;
-            }
-            self.cancel_media_loads();
-            self.save_progress_sync();
-            if !self.advance_plugin_media(cx) {
-                return false;
-            }
-            match self.plugins.resolve_url(&plugin, parsed.as_str()) {
-                Ok(request) => {
-                    self.begin_resolve_request(&plugin, "", String::new(), None, request, cx);
-                    self.notify_all(cx);
-                }
-                Err(error) => {
-                    log::warn!("resolve_url failed for {plugin}: {error:?}");
-                    let msg = super::notices::describe_error_code(error);
-                    fail(self, &format!("解析请求未能提交 · {msg}"), cx);
+            OpenUrlOutcome::OpenDirect { url } => {
+                let trimmed = url.trim();
+                if trimmed.contains("://")
+                    && iris_base::net::http_client::validate_stream_url(trimmed).is_err()
+                {
+                    self.overlays.dialog_error =
+                        Some("仅支持合法的 http:// 或 https:// 媒体地址".into());
+                    self.notify_regions(
+                        regions.union(super::super::views::DirtyRegions::root_only()),
+                        cx,
+                    );
                     return false;
                 }
+                if regions.any() {
+                    self.notify_regions(regions, cx);
+                }
+                self.open_direct_stream_url(&url, None, cx);
+                true
             }
-        } else {
-            let trimmed = url.trim();
-            if trimmed.contains("://")
-                && iris_base::net::http_client::validate_stream_url(trimmed).is_err()
-            {
-                fail(self, "仅支持合法的 http:// 或 https:// 媒体地址", cx);
-                return false;
+            OpenUrlOutcome::ResolvedByPlugin => {
+                self.notify_all(cx);
+                true
             }
-            self.open_direct_stream_url(url, None, cx);
         }
-        true
     }
 }

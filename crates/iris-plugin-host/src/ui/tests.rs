@@ -464,3 +464,246 @@ fn window_session_registers_and_clears_active_stream_on_open_failure_switch_stop
     wait(|| resources.ledger.used(None, Resource::HostBytes) == 0);
     assert_eq!(resources.ledger.used(None, Resource::PlaybackSession), 0);
 }
+
+#[test]
+fn attachment_preparation_enforces_format_owner_quota_and_holds_ledger_until_external_track_drop() {
+    use crate::{
+        actor::{Executor, Operation, TaskContext},
+        enhancement::{AttachmentRegistry, AttachmentSpec},
+        files::{FileExecutor, FileSetup},
+        instance::Blob,
+        network::NetworkGrant,
+        runtime::WindowAccess,
+    };
+    use iris_api::v2::{
+        NetworkDeclaration, Role,
+        enhance::{EnhancementResource, SubtitleFormat},
+        task::{ArtifactFormat, Task},
+    };
+    use iris_base::net::http_client::HttpCancel;
+    use iris_core::player::ExternalTrack;
+    use std::collections::BTreeMap;
+
+    let root = TestDir::new("host-attach-contract");
+    let resources = Resources::new().unwrap();
+    let ledger = resources.ledger.clone();
+    let caps = BTreeSet::from([Capability::MediaEnhance]);
+    let network = NetworkGrant::new(
+        "enhance-test".into(),
+        caps.clone(),
+        NetworkDeclaration::default(),
+        &ledger,
+    )
+    .unwrap();
+    let files = FileExecutor::new(FileSetup {
+        network: network.clone(),
+        ledger: ledger.clone(),
+        capabilities: caps.clone(),
+        temporary_directory: root.0.clone(),
+    })
+    .unwrap();
+    let access = WindowAccess {
+        instance: Id(1),
+        window: Id(2),
+        generation: Generation::default(),
+        owner: "enhance-test".into(),
+        capabilities: caps,
+        network,
+        files,
+        resources,
+        cancel: HttpCancel::default(),
+        attachments: Arc::new(AttachmentRegistry::default()),
+    };
+    let run = |task, blobs: &BTreeMap<u64, Arc<Blob>>| {
+        let context = TaskContext {
+            instance_id: access.instance,
+            window: Some(access.window),
+            owner: access.owner.clone(),
+            role: Role::Control,
+            generation: access.generation,
+            cancel: access.cancel.clone(),
+            ledger: ledger.clone(),
+        };
+        match access.files.prepare(task, blobs, context).unwrap() {
+            Operation::Blocking(job) => job().unwrap(),
+            _ => panic!("expected blocking artifact job"),
+        }
+    };
+    let created = run(
+        Task::ArtifactBegin {
+            format: ArtifactFormat::WebVtt,
+        },
+        &BTreeMap::new(),
+    );
+    let writer = Id(created.value["artifact_writer"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap());
+    let vtt = b"WEBVTT\n\n00:00.000 --> 00:03.000\nReceipt\n".to_vec();
+    let blobs = BTreeMap::from([(9, Arc::new(Blob::new(&ledger, &access.owner, vtt).unwrap()))]);
+    let written = run(
+        Task::ArtifactWrite {
+            handle: writer,
+            blob: Id(9),
+            finish: true,
+        },
+        &blobs,
+    );
+    let artifact = Id(written.value["artifact"].as_str().unwrap().parse().unwrap());
+    let spec = || AttachmentSpec {
+        id: "subtitle".into(),
+        label: "Receipt".into(),
+        lang: None,
+        subtitle: Some(SubtitleFormat::WebVtt),
+        resource: EnhancementResource::Artifact { handle: artifact },
+    };
+
+    // 1. Format mismatch -> InvalidArgument.
+    let mut wrong = spec();
+    wrong.subtitle = Some(SubtitleFormat::Ass);
+    assert!(matches!(
+        access.prepare_attachment(wrong),
+        Err(ErrorCode::InvalidArgument)
+    ));
+
+    // 2. Installation owner mismatch -> Denied.
+    let mut unauthorized = access.clone();
+    unauthorized.owner = "another-installation".into();
+    assert!(matches!(
+        unauthorized.prepare_attachment(spec()),
+        Err(ErrorCode::Denied)
+    ));
+    drop(unauthorized);
+
+    // 3. Per-plugin 8-track quota -> 9th rejected with QuotaExceeded.
+    let track: Arc<dyn ExternalTrack> = access.prepare_attachment(spec()).unwrap();
+    let extra: Vec<_> = (0..7)
+        .map(|_| access.prepare_attachment(spec()).unwrap())
+        .collect();
+    assert!(matches!(
+        access.prepare_attachment(spec()),
+        Err(ErrorCode::QuotaExceeded)
+    ));
+    drop(extra);
+    assert_eq!(
+        ledger.used(Some(&access.owner), Resource::EnhancementTrack),
+        1
+    );
+
+    // 4. Simulated native receipt queue holds EnhancementTrack reservation after revoke until dropped.
+    let mut in_flight_receipts: Vec<Arc<dyn ExternalTrack>> = vec![track.clone()];
+    drop(track);
+    assert_eq!(ledger.used(None, Resource::EnhancementTrack), 1);
+    in_flight_receipts.clear();
+    assert_eq!(ledger.used(None, Resource::EnhancementTrack), 0);
+
+    access.cancel.cancel();
+    access.files.stop();
+    drop((created, written, blobs));
+    wait(|| access.files.is_quiescent());
+    drop(access);
+    wait(|| {
+        ledger.used(None, Resource::HostBytes) == 0 && ledger.used(None, Resource::TempBytes) == 0
+    });
+}
+
+#[test]
+fn monitor_lut_and_scoped_stream_ports_hold_ledger_until_consumer_releases_handles() {
+    use crate::{
+        files::TempRoot,
+        lut::MonitorLut,
+        network::NetworkGrant,
+        stream::{
+            prepare::{AttachmentView, Playback},
+            reader::MemoryReader,
+            relay::BoundRelay,
+            remote::RemoteFactory,
+            session::{StreamSession, new_session_id},
+        },
+    };
+    use iris_api::v2::NetworkDeclaration;
+    use iris_base::net::http_client::HttpCancel;
+    use iris_core::{
+        library::Kind,
+        player::{MonitorLutFilter, ScopedPlayback},
+    };
+
+    // 1. Rapid MonitorLut replacements held by a simulated native receipt queue keep TempBytes
+    // reserved until all retired `Arc<dyn MonitorLutFilter>` handles drop.
+    let lut_dir = TestDir::new("lut-[,;' port");
+    let ledger = Ledger::default();
+    let root = TempRoot::new(&lut_dir.0, "lut-port".into(), ledger.clone()).unwrap();
+    let cancel = HttpCancel::default();
+    let make_lut = |rgb: &str| -> Arc<dyn MonitorLutFilter> {
+        let mut writer = root.writer("cube").unwrap();
+        let cube = format!("LUT_3D_SIZE 2\n{}", format!("{rgb}\n").repeat(8));
+        writer.write(cube.as_bytes(), &cancel).unwrap();
+        MonitorLut::prepare(writer.finish(&cancel).unwrap(), &ledger, &cancel).unwrap()
+    };
+    let mut pending_native_replies = vec![make_lut("1 0 0"), make_lut("0 1 0"), make_lut("0 0 1")];
+    assert!(ledger.used(None, Resource::TempBytes) > 0);
+    pending_native_replies.clear();
+    wait(|| {
+        root.is_quiescent()
+            && ledger.used(None, Resource::HostBytes) == 0
+            && ledger.used(None, Resource::TempBytes) == 0
+    });
+    drop(root);
+
+    // 2. `Playback::into_scoped` exercises the `ScopedStream` port without `Session`.
+    let grant = NetworkGrant::new(
+        "scoped-port".into(),
+        BTreeSet::new(),
+        NetworkDeclaration::default(),
+        &ledger,
+    )
+    .unwrap();
+    let factory = RemoteFactory::new(grant.clone(), ledger.clone()).unwrap();
+    let bound = BoundRelay::bind().unwrap();
+    let session = StreamSession::new(
+        new_session_id().unwrap(),
+        Generation::default(),
+        bound.authority().unwrap(),
+        factory,
+        None,
+    )
+    .unwrap();
+    let mem = |bytes: Vec<u8>| Arc::new(MemoryReader::new(bytes, "scoped-port", &ledger).unwrap());
+    session
+        .commit(session.prepare_reader(mem(vec![1u8; 64])).unwrap())
+        .unwrap();
+    let sub_url = session
+        .add_attachment("sub", "vtt", mem(b"WEBVTT\n\n".to_vec()))
+        .unwrap();
+    let playback = Arc::new(Playback {
+        relay: bound.start(session.clone()).unwrap(),
+        url: session.root_url().unwrap(),
+        profile: None,
+        kind: Kind::Video,
+        title: "PortClip".into(),
+        source_id: Some("src".into()),
+        entry_id: Some("ep".into()),
+        is_live: false,
+        attachments: vec![AttachmentView {
+            id: "sub".into(),
+            url: sub_url,
+            label: "Sub".into(),
+            lang: Some("en".into()),
+            default: true,
+            audio: false,
+        }],
+        variants: Vec::new(),
+        active_variant: None,
+    });
+    let scoped: Arc<ScopedPlayback> = playback.clone().into_scoped();
+    assert_eq!(scoped.title, "PortClip");
+    assert_eq!(scoped.attachments.len(), 1);
+    scoped.stream.advance_seek().unwrap();
+    assert_eq!(session.generation().seek, Id(1));
+    scoped.stream.stop();
+    wait(|| playback.relay.is_quiescent());
+    drop((scoped, playback, session, grant));
+    assert_eq!(ledger.used(None, Resource::HostBytes), 0);
+    assert_eq!(ledger.used(None, Resource::RelayWorker), 0);
+}

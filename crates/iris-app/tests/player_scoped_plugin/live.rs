@@ -1,51 +1,65 @@
-use super::*;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
+
+use futures::channel::mpsc::UnboundedReceiver;
+use iris_api::SourceEntryKind;
+use iris_core::{
+    player::{Command, ScopedPlayback, Session, SessionEvent, SessionUpdate},
+    settings::Settings,
+    vault::CredentialVault,
+};
+use iris_plugin_host::{BrowseTarget, Notice, PluginHost, WindowSession};
+
+use super::{TempDir, plugin_uri, wait_until};
 
 #[test]
 #[ignore = "live bilibili + libmpv end-to-end verification"]
 fn live_bilibili_popular_video_plays_in_libmpv() {
     let pkg_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../target/plugin-v2/examples/community.bilibili.irisplugin");
-    let bytes = std::fs::read(&pkg_path).expect("built community.bilibili.irisplugin");
+    assert!(
+        pkg_path.is_file(),
+        "expected built community.bilibili.irisplugin at {}",
+        pkg_path.display()
+    );
     let root = TempDir::new("bili-live");
-    let resources = Resources::new().unwrap();
-    let package = Package::from_zip(&bytes, Provenance::User).unwrap();
-    let mut installer = Installer::new(root.join("packages"), resources.ledger.clone());
-    let approval = Approval {
-        digest: package.digest,
-        grants: package.manifest.permissions.into_iter().collect(),
-        network: package.manifest.network,
-        previous: None,
-    };
-    installer.install(&bytes, approval).unwrap();
-    let hub = Hub::new(Config {
-        installer,
-        bootstrap: None,
-        disabled: BTreeSet::new(),
-        runtime: Setup {
-            resources,
-            state_directory: root.join("state"),
-            temporary_directory: root.join("temp"),
-            vault: CredentialVault::in_memory(),
-            wake: Arc::new(|| {}),
-        },
-    })
-    .unwrap();
-    let (client, _) = hub.open_window(Generation::default(), None).unwrap();
-    let mut manager = WindowSession::new(client, None);
-    wait_until(Duration::from_secs(60), "bilibili ready", || {
-        manager.poll();
-        manager.client().is_ready("community.bilibili")
+    let host = PluginHost::open_in(&root, CredentialVault::in_memory(), &[], false).unwrap();
+    let (mut manager, _wake) = host.open_window(&[], "graphite");
+    manager.review_package(pkg_path).unwrap();
+
+    let mut review_id = None;
+    let mut grants = BTreeSet::new();
+    wait_until(Duration::from_secs(20), "bilibili review", || {
+        for notice in manager.poll().notices {
+            if let Notice::Review(summary) = notice {
+                review_id = Some(summary.id);
+                grants = summary.manifest.permissions.iter().copied().collect();
+            }
+        }
+        review_id.is_some()
     });
+    manager
+        .approve_review(review_id.unwrap(), grants, false)
+        .unwrap();
+
+    wait_until(Duration::from_secs(60), "bilibili ready", || {
+        let live_ready = manager.is_ready("community.bilibili");
+        let _ = manager.poll();
+        live_ready
+            && manager.list().iter().any(|p| {
+                p.id == "community.bilibili" && p.status == iris_plugin_host::PluginStatus::Ready
+            })
+    });
+
     let browse = BrowseTarget {
         source: "popular".into(),
         folder: None,
         query: None,
         filters: BTreeMap::new(),
     };
-    let (_, browse_req) = manager
-        .client()
-        .browse("community.bilibili", browse)
-        .unwrap();
+    let (_, browse_req) = manager.browse("community.bilibili", browse).unwrap();
     let mut chosen = Vec::new();
     wait_until(Duration::from_secs(25), "browse popular", || {
         for notice in manager.poll().notices {
@@ -55,7 +69,7 @@ fn live_bilibili_popular_video_plays_in_libmpv() {
                         .page
                         .entries
                         .iter()
-                        .filter(|e| e.kind == iris_api::SourceEntryKind::Video)
+                        .filter(|e| e.kind == SourceEntryKind::Video)
                         .take(2)
                         .map(|e| (e.id.clone(), e.name.clone()))
                         .collect();
@@ -71,40 +85,48 @@ fn live_bilibili_popular_video_plays_in_libmpv() {
     let ((entry_id, entry_name), (second_id, second_name)) = (chosen[0].clone(), chosen[1].clone());
     assert!(!entry_id.is_empty() && !second_id.is_empty());
 
-    let resolve_video = |manager: &mut WindowSession, id: &str, name: &str| {
+    let resolve_and_open = |manager: &mut WindowSession,
+                            player: &mut Session,
+                            id: &str,
+                            name: &str|
+     -> Arc<ScopedPlayback> {
         let req = manager
-            .client()
             .resolve("community.bilibili", "popular", None, id, None)
             .unwrap();
-        let mut resolved = None;
+        let mut opened = None;
         wait_until(Duration::from_secs(30), "resolve video", || {
             for notice in manager.poll().notices {
                 match notice {
                     Notice::Playback {
-                        ticket, playback, ..
-                    } if ticket.id == req => resolved = Some(Arc::new(playback)),
+                        generation,
+                        ticket,
+                        playback,
+                        ..
+                    } if ticket.id == req => {
+                        assert!(!playback.variants.is_empty() && playback.active_variant.is_some());
+                        let uri = plugin_uri("community.bilibili", "popular", id);
+                        manager
+                            .admit_playback("community.bilibili", generation, playback, |scoped| {
+                                opened = Some(scoped.clone());
+                                player.open_scoped(scoped, uri, &Settings::default(), 0.)
+                            })
+                            .unwrap()
+                            .unwrap();
+                    }
                     Notice::Error { code, message, .. } => {
                         panic!("resolve {id} ({name}) failed: {code:?} {message:?}")
                     }
                     _ => {}
                 }
             }
-            resolved.is_some()
+            opened.is_some()
         });
-        resolved.unwrap()
+        opened.unwrap()
     };
 
-    let playback = resolve_video(&mut manager, &entry_id, &entry_name);
-    assert!(!playback.variants.is_empty() && playback.active_variant.is_some());
     let mut player = Session::new_headless(false).unwrap();
     let mut events = player.events().unwrap();
-    let open_bili = |player: &mut Session, pb: &Arc<Playback>, id: &str| {
-        let uri = plugin_uri("community.bilibili", "popular", id);
-        player
-            .open_scoped(pb.clone().into_scoped(), uri, &Settings::default(), 0.)
-            .unwrap();
-    };
-    open_bili(&mut player, &playback, &entry_id);
+    let scoped1 = resolve_and_open(&mut manager, &mut player, &entry_id, &entry_name);
 
     let wait_advance = |player: &mut Session,
                         events: &mut UnboundedReceiver<SessionUpdate>,
@@ -144,18 +166,14 @@ fn live_bilibili_popular_video_plays_in_libmpv() {
         (back - 3.0).max(0.0),
         Some(fwd - 0.5),
     );
-    let old_gen = manager.generation();
-    let next_gen = Generation {
-        media: Id(old_gen.media.0 + 1),
-        seek: Id(0),
-        context: old_gen.context,
-    };
-    manager.client().advance(next_gen).unwrap();
+    manager.advance_media().unwrap();
     player.release_scoped();
-    let playback2 = resolve_video(&mut manager, &second_id, &second_name);
-    open_bili(&mut player, &playback2, &second_id);
+    let scoped2 = resolve_and_open(&mut manager, &mut player, &second_id, &second_name);
     wait_advance(&mut player, &mut events, "switch to video 2", 0.3, None);
     player.stop().unwrap();
+    player.release_scoped();
     player.shutdown();
-    drop((player, events, playback, playback2, manager, hub));
+    manager.shutdown();
+    host.shutdown();
+    drop((player, events, scoped1, scoped2, manager, host));
 }

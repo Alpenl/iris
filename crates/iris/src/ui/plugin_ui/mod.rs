@@ -209,8 +209,12 @@ pub(in crate::ui) fn render_plugin_modal(
     let modal_w = (f32::from(vp.width) - 24.).clamp(0., 460.);
     let max_h = (f32::from(vp.height) - 24.).clamp(0., 540.);
 
-    let is_submitting = m.plugin_view.modal.is_submitting(&pid, &modal.id);
-    let modal_error = m.plugin_view.modal.error.clone();
+    let is_submitting = m.plugins.modal().is_submitting(&pid, &modal.id);
+    let modal_error = m
+        .plugins
+        .modal()
+        .error()
+        .map(|err| SharedString::from(err.to_owned()));
 
     let submit_label = if is_submitting {
         "处理中…".into()

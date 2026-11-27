@@ -4,6 +4,7 @@
 use super::{
     hub::{Client, Config, Hub},
     installation::Installer,
+    ledger::Resource,
     runtime::{Resources, Setup},
     selection::HostAnnotationJob,
     ui::WindowSession,
@@ -42,6 +43,30 @@ impl PluginHost {
         }
     }
 
+    /// Initializes an isolated host context rooted at `data_dir` and `vault`
+    /// (`include_bundled` controls whether embedded official plugins are unpacked).
+    pub fn open_in(
+        data_dir: &std::path::Path,
+        vault: iris_core::vault::CredentialVault,
+        disabled: &[String],
+        include_bundled: bool,
+    ) -> Result<Self, ErrorCode> {
+        let resources = Resources::new()?;
+        let disabled_set: BTreeSet<String> = disabled.iter().cloned().collect();
+        let hub = make_hub_in(
+            &resources,
+            data_dir.to_path_buf(),
+            data_dir.join("plugins-v2"),
+            vault,
+            disabled_set,
+            include_bundled,
+        )?;
+        Ok(Self {
+            resources: Ok(resources),
+            hub: Mutex::new(Some(hub)),
+        })
+    }
+
     /// Wraps caller-provided `Resources` and `Hub` for deterministic isolated tests.
     pub fn from_parts(resources: Resources, hub: Hub) -> Self {
         Self {
@@ -52,6 +77,30 @@ impl PluginHost {
 
     pub fn resources(&self) -> Result<Resources, ErrorCode> {
         self.resources.clone()
+    }
+
+    /// Returns currently reserved `HostBytes` across this host instance.
+    pub fn host_bytes_used(&self) -> u64 {
+        self.resources
+            .as_ref()
+            .map_or(0, |r| r.ledger.used(None, Resource::HostBytes))
+    }
+
+    /// Returns `true` when all dynamic memory, temp-file, stream, relay, and track reservations are zero.
+    pub fn is_ledger_empty(&self) -> bool {
+        let Ok(resources) = &self.resources else {
+            return true;
+        };
+        [
+            Resource::HostBytes,
+            Resource::TempBytes,
+            Resource::PlaybackSession,
+            Resource::RelayWorker,
+            Resource::EnhancementTrack,
+            Resource::Handle,
+        ]
+        .into_iter()
+        .all(|res| resources.ledger.used(None, res) == 0)
     }
 
     pub fn open_window(
@@ -113,15 +162,40 @@ impl Drop for PluginHost {
 fn make_hub(resources: &Resources, disabled: BTreeSet<String>) -> Result<Hub, ErrorCode> {
     let root = iris_core::fs_util::data_dir().ok_or(ErrorCode::IoError)?;
     let packages = plugins_dir().ok_or(ErrorCode::IoError)?;
-    let bootstrap = super::official::Bootstrap::embedded(root.clone())?;
+    make_hub_in(
+        resources,
+        root,
+        packages,
+        iris_core::vault::CredentialVault::system(),
+        disabled,
+        true,
+    )
+}
+
+fn make_hub_in(
+    resources: &Resources,
+    root: std::path::PathBuf,
+    packages: std::path::PathBuf,
+    vault: iris_core::vault::CredentialVault,
+    disabled: BTreeSet<String>,
+    include_bundled: bool,
+) -> Result<Hub, ErrorCode> {
+    let (installer, bootstrap) = if include_bundled {
+        let bootstrap = super::official::Bootstrap::embedded(root.clone())?;
+        let installer =
+            Installer::with_bundled(packages, resources.ledger.clone(), bootstrap.pins());
+        (installer, Some(bootstrap))
+    } else {
+        (Installer::new(packages, resources.ledger.clone()), None)
+    };
     Hub::new(Config {
-        installer: Installer::with_bundled(packages, resources.ledger.clone(), bootstrap.pins()),
-        bootstrap: Some(bootstrap),
+        installer,
+        bootstrap,
         runtime: Setup {
             resources: resources.clone(),
             state_directory: root.join("plugin-v2-state"),
             temporary_directory: root.join("plugin-v2-temp"),
-            vault: iris_core::vault::CredentialVault::system(),
+            vault,
             wake: Arc::new(|| {}),
         },
         disabled,

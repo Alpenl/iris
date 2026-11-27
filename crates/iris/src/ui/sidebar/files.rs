@@ -69,7 +69,7 @@ impl Sidebar {
         let favorite_items_empty = m.catalog.favorite_items.is_empty();
         let dir_scroll = m.catalog.dir_scroll.clone();
         let search_open = m.text_inputs.search_open;
-        let has_source_filters = !m.plugin_view.source_filters.is_empty();
+        let has_source_filters = !m.plugins.source_filters().is_empty();
 
         let source_banner = match &m.catalog.active_source {
             ActiveSource::Local => None,

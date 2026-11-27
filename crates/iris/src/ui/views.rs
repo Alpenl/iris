@@ -4,7 +4,7 @@
 
 use gpui::{App, Context, Entity, IntoElement, Render, WeakEntity, Window};
 use iris_core::library::Kind;
-use iris_plugin_host::ui::DirtySlots;
+use iris_plugin_host::DirtySlots;
 
 use super::kit::text_field::ActiveSlot;
 use super::{AppModel, IrisWindow};
@@ -304,7 +304,7 @@ mod tests {
     };
     use crate::ui::kit::text_field::ActiveSlot;
     use iris_core::library::Kind;
-    use iris_plugin_host::ui::DirtySlots;
+    use iris_plugin_host::DirtySlots;
 
     #[test]
     fn regional_dirty_routing_isolates_plugin_slots_ticks_and_text_inputs() {

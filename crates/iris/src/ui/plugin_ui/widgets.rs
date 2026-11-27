@@ -135,7 +135,7 @@ fn dispatch_widget_value(
     let (pid, id, action_id, modal_key) = target;
     let explicit_act = action_id.filter(|a| !a.is_empty());
     if let Some(mk) = modal_key {
-        this.plugin_view.modal.clear_feedback();
+        this.plugins.modal_mut().clear_feedback();
         this.set_form_value(mk, next_val.clone());
         if let Some(act) = explicit_act {
             this.invoke_plugin_widget_action(pid, act, Some(next_val), w, cx);

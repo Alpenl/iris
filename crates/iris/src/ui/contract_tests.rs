@@ -380,7 +380,7 @@ fn overlay_mutual_exclusion_and_escape_priority_never_skip_or_stall() {
 
 #[test]
 fn plugin_modal_async_submit_retains_inputs_until_close_or_cancel() {
-    let mut modal_state = super::plugin_runtime::PluginModalState::default();
+    let mut modal_state = iris_app::PluginModalState::default();
     let mut buf = TextInputBuffers::default();
     let modal = sample_plugin_modal();
     buf.form_fields
@@ -398,7 +398,11 @@ fn plugin_modal_async_submit_retains_inputs_until_close_or_cancel() {
 
     // 1. Submit marks submitting state, debounces rapid re-click, and preserves inputs.
     let vals = modal_state
-        .begin_submit(&buf, "iris.webdav", &modal)
+        .begin_submit(
+            "iris.webdav",
+            &modal,
+            buf.collect_modal_values("iris.webdav", &modal),
+        )
         .expect("first submit proceeds");
     assert_eq!(
         vals.get("url").map(String::as_str),
@@ -408,7 +412,11 @@ fn plugin_modal_async_submit_retains_inputs_until_close_or_cancel() {
     assert_eq!(vals.get("ro").map(String::as_str), Some("true"));
     assert!(
         modal_state
-            .begin_submit(&buf, "iris.webdav", &modal)
+            .begin_submit(
+                "iris.webdav",
+                &modal,
+                buf.collect_modal_values("iris.webdav", &modal),
+            )
             .is_none()
     );
 
@@ -427,11 +435,16 @@ fn plugin_modal_async_submit_retains_inputs_until_close_or_cancel() {
     // 2. Retry succeeds and plugin emits `CloseModal` -> cleans `modal:*`, keeps `sb:*`.
     assert!(
         modal_state
-            .begin_submit(&buf, "iris.webdav", &modal)
+            .begin_submit(
+                "iris.webdav",
+                &modal,
+                buf.collect_modal_values("iris.webdav", &modal),
+            )
             .is_some()
     );
-    modal_state.cancel(&mut buf);
-    assert!(modal_state.submitting.is_none());
+    modal_state.on_cancel();
+    buf.clear_modal_fields();
+    assert!(!modal_state.is_submitting("iris.webdav", "webdav-auth"));
     assert!(!buf.form_fields.keys().any(|k| k.starts_with("modal:")));
     assert_eq!(buf.form_fields["sb:notes:draft"].text(), "keep");
 
@@ -439,11 +452,16 @@ fn plugin_modal_async_submit_retains_inputs_until_close_or_cancel() {
     assert!(buf.sync_plugin_modal(Some(("iris.webdav", &modal))));
     assert!(
         modal_state
-            .begin_submit(&buf, "iris.webdav", &modal)
+            .begin_submit(
+                "iris.webdav",
+                &modal,
+                buf.collect_modal_values("iris.webdav", &modal),
+            )
             .is_some()
     );
-    modal_state.cancel(&mut buf);
-    assert!(modal_state.submitting.is_none());
+    modal_state.on_cancel();
+    buf.clear_modal_fields();
+    assert!(!modal_state.is_submitting("iris.webdav", "webdav-auth"));
     assert!(buf.active_form_key.is_none());
     assert!(!buf.form_fields.keys().any(|k| k.starts_with("modal:")));
 }
@@ -482,18 +500,22 @@ fn inline_destructive_confirmation_arms_confirms_and_expires() {
 
 #[test]
 fn plugin_modal_feedback_clears_inline_error_on_non_text_edit() {
-    let mut modal_state = super::plugin_runtime::PluginModalState::default();
+    let mut modal_state = iris_app::PluginModalState::default();
     let buf = TextInputBuffers::default();
     let modal = sample_plugin_modal();
     assert!(
         modal_state
-            .begin_submit(&buf, "iris.webdav", &modal)
+            .begin_submit(
+                "iris.webdav",
+                &modal,
+                buf.collect_modal_values("iris.webdav", &modal),
+            )
             .is_some()
     );
-    modal_state.error = Some("验证失败".into());
+    modal_state.set_error("验证失败");
     modal_state.clear_feedback();
-    assert!(modal_state.submitting.is_none());
-    assert!(modal_state.error.is_none());
+    assert!(!modal_state.is_submitting("iris.webdav", "webdav-auth"));
+    assert!(modal_state.error().is_none());
 }
 
 #[test]
@@ -551,8 +573,8 @@ fn gpu_reset_recovery_skips_vid_fallback_when_restore_vid_already_queued() {
 
 #[test]
 fn stream_meta_cleanup_clears_matching_plugin_or_source_and_variants_popover() {
-    use super::state::{ActiveStreamMeta, CatalogState};
     use iris_api::StreamVariant;
+    use iris_app::ActiveStreamMeta;
 
     let sample_meta = || ActiveStreamMeta {
         plugin_id: Some("plugin.demo".into()),
@@ -565,47 +587,32 @@ fn stream_meta_cleanup_clears_matching_plugin_or_source_and_variants_popover() {
         active_variant: Some("1080p".into()),
     };
 
-    let mut catalog = CatalogState {
-        active_stream_meta: Some(sample_meta()),
-        ..Default::default()
-    };
+    let meta = sample_meta();
     let mut overlays = OverlayState {
         popover: Some(PopoverKind::Variants),
         popover_index: Some(0),
         ..Default::default()
     };
 
-    // Removing or disabling an unrelated plugin/source leaves active stream variants intact.
-    assert!(!catalog.clear_stream_meta_for(&mut overlays, Some("plugin.other"), None));
-    assert!(!catalog.clear_stream_meta_for(&mut overlays, Some("plugin.demo"), Some("srv-b")));
-    assert!(catalog.active_stream_meta.is_some());
-    assert_eq!(overlays.popover, Some(PopoverKind::Variants));
+    assert!(!meta.matches_source(Some("plugin.other"), None));
+    assert!(!meta.matches_source(Some("plugin.demo"), Some("srv-b")));
+    assert!(meta.matches_source(Some("plugin.demo"), Some("srv-a")));
+    assert!(meta.matches_source(Some("plugin.demo"), None));
+    assert!(meta.matches_source(None, None));
 
-    // Removing the matching MediaSource clears active_stream_meta and closes PopoverKind::Variants.
-    assert!(catalog.clear_stream_meta_for(&mut overlays, Some("plugin.demo"), Some("srv-a")));
-    assert!(catalog.active_stream_meta.is_none());
+    overlays.close_variants_popover();
     assert_eq!(overlays.popover, None);
     assert_eq!(overlays.popover_index, None);
 
-    // Disabling/uninstalling the owning plugin clears active_stream_meta without closing unrelated popovers.
-    catalog.active_stream_meta = Some(sample_meta());
     overlays.popover = Some(PopoverKind::Speed);
-    assert!(catalog.clear_stream_meta_for(&mut overlays, Some("plugin.demo"), None));
-    assert!(catalog.active_stream_meta.is_none());
+    overlays.close_variants_popover();
     assert_eq!(overlays.popover, Some(PopoverKind::Speed));
-
-    // Reloading all plugins clears any active_stream_meta and closes PopoverKind::Variants.
-    catalog.active_stream_meta = Some(sample_meta());
-    overlays.popover = Some(PopoverKind::Variants);
-    assert!(catalog.clear_stream_meta_for(&mut overlays, None, None));
-    assert!(catalog.active_stream_meta.is_none());
-    assert_eq!(overlays.popover, None);
 }
 
 #[test]
 fn plugin_playlist_resolution_and_stepping_cover_url_resolver_and_expanded_entries() {
-    use super::plugin_runtime::sources::{find_plugin_playlist_index, resolve_playlist_current};
     use iris_api::v2::source::PlaylistEntry;
+    use iris_app::{find_plugin_playlist_index, resolve_playlist_current};
     use iris_core::media_uri::MediaUri;
 
     let playlist = vec![
@@ -736,12 +743,16 @@ fn stacked_consent_sheets_and_modal_error_clear_do_not_clobber_active_state() {
 
     // Unassociated plugin Notice::Error (`request.is_none()`) clears modal submitting state,
     // while unrelated catalog/origin request errors (`request.is_some()`) leave modal intact.
-    let mut modal_state = super::plugin_runtime::PluginModalState::default();
+    let mut modal_state = iris_app::PluginModalState::default();
     let buf = TextInputBuffers::default();
     let modal = sample_plugin_modal();
     assert!(
         modal_state
-            .begin_submit(&buf, "iris.webdav", &modal)
+            .begin_submit(
+                "iris.webdav",
+                &modal,
+                buf.collect_modal_values("iris.webdav", &modal),
+            )
             .is_some()
     );
     assert!(!modal_state.clear_submitting_for("other.plugin"));

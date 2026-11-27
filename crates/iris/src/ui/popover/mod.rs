@@ -196,9 +196,8 @@ impl AppModel {
         let len = match kind {
             PopoverKind::Speed => SPEED_STEPS.len(),
             PopoverKind::Variants => self
-                .catalog
-                .active_stream_meta
-                .as_ref()
+                .plugins
+                .active_stream_meta()
                 .map_or(0, |m| m.variants.len()),
             _ => return false,
         };
@@ -235,9 +234,8 @@ impl AppModel {
                     }
                     PopoverKind::Variants => {
                         let chosen = self
-                            .catalog
-                            .active_stream_meta
-                            .as_ref()
+                            .plugins
+                            .active_stream_meta()
                             .and_then(|m| m.variants.get(idx))
                             .map(|v| (v.id.clone(), v.label.clone()));
                         if let Some((vid, vlabel)) = chosen {
@@ -304,7 +302,7 @@ fn render_speed_popover(model: &Entity<AppModel>, t: ThemeTokens, cx: &App) -> i
 
 fn render_variants_popover(model: &Entity<AppModel>, t: ThemeTokens, cx: &App) -> impl IntoElement {
     let m = model.read(cx);
-    let (variants, active_var) = match &m.catalog.active_stream_meta {
+    let (variants, active_var) = match m.plugins.active_stream_meta() {
         Some(meta) => (meta.variants.clone(), meta.active_variant.clone()),
         None => (Vec::new(), None),
     };
