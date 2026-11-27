@@ -6,11 +6,12 @@ use std::sync::{Arc, Mutex, PoisonError, mpsc};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use super::VideoReset;
+use super::{VideoReset, VideoSurfaceBackend};
 use anyhow::{Context, Result, anyhow};
 use futures::channel::mpsc::{UnboundedReceiver, unbounded};
 use iris_core::logging::{self, EventLevel};
-use iris_mpv::render::{ActiveVideoTrack, RenderContext, RenderHandle};
+use iris_core::player::{ActiveVideoTrack, VideoRecoveryHandle};
+use iris_mpv::render::{RenderContext, RenderHandle};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use windows::Win32::{
     Foundation::{HMODULE, HWND, RECT},
@@ -49,7 +50,7 @@ struct Layout {
     stopped: bool,
 }
 
-pub(crate) struct VideoSurface {
+pub(super) struct WinVideoSurface {
     layout: Arc<Mutex<Layout>>,
     wake: mpsc::SyncSender<()>,
     worker: Option<JoinHandle<()>>,
@@ -57,10 +58,11 @@ pub(crate) struct VideoSurface {
     last_monitor_check: Instant,
 }
 
-impl VideoSurface {
-    pub(crate) fn attach(
+impl VideoSurfaceBackend for WinVideoSurface {
+    fn attach(
         window: &gpui::Window,
         mpv: RenderHandle,
+        recovery: VideoRecoveryHandle,
     ) -> Result<(Self, UnboundedReceiver<VideoReset>)> {
         let hwnd = match HasWindowHandle::window_handle(window)
             .map_err(|e| anyhow!("{e:?}"))?
@@ -191,7 +193,7 @@ impl VideoSurface {
                                     );
                                     let saved_vid = capture_active_vid(
                                         &renderer.render,
-                                        &render_mpv,
+                                        &recovery,
                                         &callback_wake,
                                         &shared,
                                         &rx,
@@ -209,7 +211,7 @@ impl VideoSurface {
                                     current_monitor = monitor_of(raw_hwnd);
                                     update_display_profile(current_monitor, &render_mpv);
                                     let restored_vid = match saved_vid {
-                                        Some(track) => match render_mpv.restore_vid(track) {
+                                        Some(track) => match recovery.restore_vid(track) {
                                             Ok(restored) => restored,
                                             Err(e) => {
                                                 log::warn!("queuing video track recovery: {e}");
@@ -280,12 +282,12 @@ impl VideoSurface {
         }
     }
 
-    pub(crate) fn request_redraw(&self) {
+    fn request_redraw(&self) {
         let _ = self.wake.try_send(());
     }
 
     #[cfg(any(debug_assertions, feature = "devtools"))]
-    pub(crate) fn debug_force_device_reset(&self) -> bool {
+    fn debug_force_device_reset(&self) -> bool {
         self.layout
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -294,7 +296,7 @@ impl VideoSurface {
         true
     }
 
-    pub(crate) fn set_frame(&self, x: f64, y: f64, w: f64, h: f64) {
+    fn set_frame(&self, x: f64, y: f64, w: f64, h: f64) {
         let mut layout = self.layout.lock().unwrap_or_else(PoisonError::into_inner);
         let rect = [x, y, w, h];
         if layout.rect == rect {
@@ -305,7 +307,7 @@ impl VideoSurface {
         self.request_redraw();
     }
 
-    pub(crate) fn set_scale(&mut self, scale: f64) {
+    fn set_scale(&mut self, scale: f64) {
         let scale_valid = scale.is_finite() && scale > 0.;
         let scale_changed = scale_valid && self.scale.replace(scale) != scale;
         let poll_monitor = self.last_monitor_check.elapsed() >= MONITOR_POLL_INTERVAL;
@@ -323,7 +325,9 @@ impl VideoSurface {
         drop(layout);
         self.request_redraw();
     }
+}
 
+impl WinVideoSurface {
     fn shutdown(&mut self) {
         if let Some(worker) = self.worker.take() {
             self.layout
@@ -338,7 +342,7 @@ impl VideoSurface {
     }
 }
 
-impl Drop for VideoSurface {
+impl Drop for WinVideoSurface {
     fn drop(&mut self) {
         self.shutdown();
     }
@@ -346,12 +350,12 @@ impl Drop for VideoSurface {
 
 fn capture_active_vid(
     render: &RenderContext,
-    mpv: &RenderHandle,
+    recovery: &VideoRecoveryHandle,
     wake: &mpsc::SyncSender<()>,
     layout: &Mutex<Layout>,
     rx: &mpsc::Receiver<()>,
 ) -> Option<ActiveVideoTrack> {
-    let reply = match mpv.request_active_vid(wake.clone()) {
+    let reply = match recovery.request_active_vid(wake.clone()) {
         Ok(Some(reply)) => reply,
         Ok(None) => return None,
         Err(e) => {
@@ -733,10 +737,10 @@ fn monitor_profile(monitor: isize) -> Result<String> {
         );
         anyhow::ensure!(!dc.0.is_null(), "creating monitor color context failed");
         let mut length = 0;
-        let _ = GetICMProfileW(dc, &mut length, PWSTR::null());
+        let _ = GetICMProfileW(dc, &mut length, None);
         let mut profile = vec![0u16; length as usize];
-        let found =
-            length > 0 && GetICMProfileW(dc, &mut length, PWSTR(profile.as_mut_ptr())).as_bool();
+        let found = length > 0
+            && GetICMProfileW(dc, &mut length, Some(PWSTR(profile.as_mut_ptr()))).as_bool();
         let _ = DeleteDC(dc);
         if found {
             let end = profile

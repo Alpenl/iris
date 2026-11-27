@@ -76,6 +76,7 @@ pub(in crate::ui) fn should_record_progress(resume_playback: bool, scoped_releas
 
 impl IrisWindow {
     pub(super) fn on_events(&mut self, batch: Vec<SessionUpdate>, cx: &mut Context<Self>) {
+        let batch = iris_core::player::coalesce_updates(batch);
         let was_ended = self.active().session.state().ended;
         let mut need_notify = false;
         let mut saw_position: Option<f64> = None;

@@ -9,13 +9,19 @@ use iris_mpv::{Format, Mpv};
 use crate::library::Kind;
 use crate::settings::{Hwdec, OnEof, Settings, SubLang};
 
-use super::model::{AspectMode, Command, MAX_SPEED, MIN_SPEED, PlayerActionError};
-use super::{MediaSourceState, MonitorLutFilter, Session};
+use super::machine::{FailedTransport, LoadedTransport, MediaSourceState, OpeningTransport};
+use super::model::{AspectMode, Command, PlayerActionError, RemoteMediaRequest};
+use super::scoped::ScopedPlayback;
+use super::{MonitorLutFilter, Session};
 mod commands;
 mod pump;
 mod references;
 pub(super) use pump::{EventPump, active_playlist_entry_id, spawn_event_pump};
 use pump::{HOOK_LOAD, HOOK_PRELOADED, prop};
+
+pub(in crate::player) fn disable_hls_policy(mpv: &Mpv) -> Result<()> {
+    references::disable_hls(mpv)
+}
 
 pub(super) fn create() -> Result<Arc<Mpv>> {
     create_with_options(false, false)
@@ -117,19 +123,8 @@ fn create_with_options(headless: bool, paused: bool) -> Result<Arc<Mpv>> {
 
 impl Session {
     fn effective_hwdec_str(&self) -> &'static str {
-        match self.user_hwdec.get() {
-            Hwdec::Off => "no",
-            Hwdec::AutoSafe => {
-                if (self.kind == Some(Kind::Video) && (self.state.hflip || self.state.vflip))
-                    || (matches!(self.kind, Some(Kind::Video | Kind::Photo))
-                        && self.enhancements.monitor_lut.is_some())
-                {
-                    "auto-copy"
-                } else {
-                    "auto-safe"
-                }
-            }
-        }
+        self.machine
+            .effective_hwdec_str(self.enhancements.monitor_lut.is_some())
     }
 
     pub(in crate::player) fn log_mpv_err<T>(
@@ -141,8 +136,8 @@ impl Session {
         }
     }
 
-    pub fn set_hwdec(&self, hwdec: Hwdec) {
-        self.user_hwdec.set(hwdec);
+    pub fn set_hwdec(&mut self, hwdec: Hwdec) {
+        self.machine.user_hwdec = hwdec;
         Self::log_mpv_err(
             "set hwdec",
             self.mpv
@@ -166,24 +161,16 @@ impl Session {
         );
     }
 
-    pub(super) fn loop_value(&self, live: bool) -> &'static str {
-        if !live && self.on_eof.get() == OnEof::Loop {
-            "inf"
-        } else {
-            "no"
-        }
-    }
-
-    pub fn set_on_eof_loop(&self, on_eof: OnEof) {
-        self.on_eof.set(on_eof);
+    pub fn set_on_eof_loop(&mut self, on_eof: OnEof) {
+        self.machine.on_eof = on_eof;
+        let loop_val = self.machine.loop_value(self.machine.state.is_live);
         Self::log_mpv_err(
             "set loop-file",
-            self.mpv
-                .command_async(&["set", "loop-file", self.loop_value(self.state.is_live)]),
+            self.mpv.command_async(&["set", "loop-file", loop_val]),
         );
     }
 
-    pub fn apply_settings(&self, settings: &Settings) {
+    pub fn apply_settings(&mut self, settings: &Settings) {
         self.set_hwdec(settings.hwdec);
         self.set_sub_lang(settings.sub_lang);
         self.set_sub_scale(settings.sub_scale);
@@ -201,7 +188,7 @@ impl Session {
         let Some(old) = self.enhancements.monitor_lut.take() else {
             return;
         };
-        if matches!(self.kind, Some(Kind::Video | Kind::Photo)) {
+        if matches!(self.kind(), Some(Kind::Video | Kind::Photo)) {
             Self::log_mpv_err(
                 "reset hwdec",
                 self.mpv
@@ -247,7 +234,7 @@ impl Session {
         Self::log_mpv_err(
             "reset hwdec",
             self.mpv
-                .command_async(&["set", "hwdec", self.user_hwdec.get().mpv_value()]),
+                .command_async(&["set", "hwdec", self.machine.user_hwdec.mpv_value()]),
         );
         if self.enhancements.monitor_lut.is_some() {
             self.retire_active_lut();
@@ -283,14 +270,14 @@ impl Session {
     }
 
     fn uses_filter_orientation(&self) -> bool {
-        self.photo_meta
-            .as_ref()
+        self.machine
+            .photo_meta()
             .is_some_and(crate::photo::Photo::uses_filter_orientation)
     }
 
     /// Clockwise rotation of source axes into the display axes.
     pub fn display_rotation(&self) -> u16 {
-        let base = if let Some(photo) = &self.photo_meta {
+        let base = if let Some(photo) = self.machine.photo_meta() {
             let r = photo.display_rotation();
             if r != 0
                 || photo.exif_orientation.is_some()
@@ -308,7 +295,7 @@ impl Session {
     }
 
     pub fn display_size(&self) -> (i64, i64) {
-        let (w, h) = self.state.video_size;
+        let (w, h) = self.machine.state.video_size;
         // The HEIF format filter writes rotation metadata, leaving the frame axes unchanged.
         if self.display_axes_swapped() {
             (h, w)
@@ -323,7 +310,7 @@ impl Session {
 
     /// Returns user mirror flags in horizontal/vertical display order.
     pub fn display_flips(&self) -> (bool, bool) {
-        let (hflip, vflip) = (self.state.hflip, self.state.vflip);
+        let (hflip, vflip) = (self.machine.state.hflip, self.machine.state.vflip);
         if self.display_axes_swapped() {
             (vflip, hflip)
         } else {
@@ -335,7 +322,8 @@ impl Session {
     /// This is a CPU preview transform; color-managed output is a separate stage.
     pub fn set_monitor_lut(&mut self, lut: Option<Arc<dyn MonitorLutFilter>>) -> Result<()> {
         if lut.is_some()
-            && (!self.state.loaded || !matches!(self.kind, Some(Kind::Photo | Kind::Video)))
+            && (!self.machine.state.loaded
+                || !matches!(self.kind(), Some(Kind::Photo | Kind::Video)))
         {
             return Err(PlayerActionError::NoVisualMedia.into());
         }
@@ -361,28 +349,28 @@ impl Session {
     }
 
     fn apply_vf_filters_tracked(&self, track_reply: bool) -> Result<Option<u64>> {
-        if matches!(self.kind, Some(Kind::Video | Kind::Photo)) {
+        if matches!(self.kind(), Some(Kind::Video | Kind::Photo)) {
             let _ = self
                 .mpv
                 .command_async(&["set", "hwdec", self.effective_hwdec_str()]);
         }
-        let mut vf = if self.kind == Some(Kind::Photo) {
+        let mut vf = if self.kind() == Some(Kind::Photo) {
             let filter_rot = self.uses_filter_orientation();
             let fallback = crate::photo::Photo::default();
-            let meta = self.photo_meta.as_ref().unwrap_or(&fallback);
+            let meta = self.machine.photo_meta().unwrap_or(&fallback);
             meta.vf_chain_with_transforms(
                 self.visual.extra_rotate,
-                self.state.hflip,
-                self.state.vflip,
+                self.machine.state.hflip,
+                self.machine.state.vflip,
                 filter_rot,
             )
             .unwrap_or_default()
         } else {
             let mut chain = Vec::new();
-            if self.state.hflip {
+            if self.machine.state.hflip {
                 chain.push("hflip");
             }
-            if self.state.vflip {
+            if self.machine.state.vflip {
                 chain.push("vflip");
             }
             chain.join(",")
@@ -407,13 +395,13 @@ impl Session {
         zoom: f64,
         pan: [f64; 2],
     ) {
-        if self.kind != Some(Kind::Photo) {
+        if self.kind() != Some(Kind::Photo) {
             let has_path = self
                 .mpv
                 .get_property_string("path")
                 .is_ok_and(|p| !p.is_empty());
             if has_path {
-                if self.kind == Some(Kind::Video)
+                if self.kind() == Some(Kind::Video)
                     && self
                         .mpv
                         .get_property_string("current-vo")
@@ -433,72 +421,117 @@ impl Session {
                 return;
             }
         }
+        let (err_lut, err_timeline, err_tracks) = match &mut self.machine.source {
+            MediaSourceState::Failed { enhancements, .. } => (
+                enhancements.lut.take(),
+                enhancements.timeline.take(),
+                std::mem::take(&mut enhancements.tracks),
+            ),
+            _ => (None, None, Vec::new()),
+        };
         let monitor_lut = self
             .enhancements
             .monitor_lut
             .clone()
-            .or_else(|| self.enhancements.error_lut.take().and_then(|w| w.upgrade()));
+            .or_else(|| err_lut.and_then(|w| w.upgrade()));
         let saved_timeline = self
             .enhancements
             .timeline_owner
             .clone()
-            .map(|owner| (owner, self.state.chapters.clone()))
-            .or_else(|| self.enhancements.error_timeline.take());
+            .map(|owner| (owner, self.machine.state.chapters.clone()))
+            .or(err_timeline);
         let mut saved_plugin_tracks = self.enhancements.tracks.snapshot_wanted_live();
         if saved_plugin_tracks.is_empty() {
-            saved_plugin_tracks = std::mem::take(&mut self.enhancements.error_tracks)
+            saved_plugin_tracks = err_tracks
                 .into_iter()
                 .filter_map(|w| w.upgrade())
                 .filter(|t| t.is_live())
                 .collect();
         }
-        let private_identity = self.private_identity;
-        let (ab_start, ab_end) = (self.state.ab_start, self.state.ab_end);
+        let private_identity = self.machine.private_identity();
+        let (ab_start, ab_end) = (self.machine.state.ab_start, self.machine.state.ab_end);
         let (hflip, vflip, extra_rotate, aspect, sub_delay, paused, eof_paused, pos) = (
-            self.state.hflip,
-            self.state.vflip,
+            self.machine.state.hflip,
+            self.machine.state.vflip,
             self.visual.extra_rotate,
-            self.state.aspect,
-            self.state.sub_delay,
-            self.state.paused,
-            self.eof_paused,
-            self.state.time_pos,
+            self.machine.state.aspect,
+            self.machine.state.sub_delay,
+            self.machine.state.paused,
+            self.machine.source.eof_paused(),
+            self.machine.state.time_pos,
         );
-        let reloaded = if let Some(path) = self.current.clone() {
-            let (kind, photo) = (self.kind, self.photo_meta.clone());
-            self.load(&path, kind, photo, pos).is_ok()
-        } else if let MediaSourceState::DirectRemote { last_remote, .. }
-        | MediaSourceState::StoppedRemote { last_remote } = &self.source
-        {
-            let req = (**last_remote).clone();
-            self.load_remote(req, settings, pos).is_ok()
-        } else if let MediaSourceState::PluginScoped { playback, .. } = &self.source {
-            let playback = Arc::clone(playback);
-            if playback.stream.is_cancelled() {
-                self.discard_scoped();
-                self.state.loaded = false;
-                false
-            } else {
-                self.current_media_uri().is_some_and(|uri| {
-                    self.reopen_scoped_after_gpu_reset(playback, uri, settings, pos)
-                        .is_ok()
-                })
+        enum ReloadSource {
+            Local {
+                path: std::path::PathBuf,
+                kind: Option<Kind>,
+                photo: Box<Option<crate::photo::Photo>>,
+            },
+            Remote(Box<RemoteMediaRequest>),
+            Scoped(Arc<ScopedPlayback>),
+            None,
+        }
+        let reload_src = if let Some(path) = self.current().map(std::path::Path::to_path_buf) {
+            ReloadSource::Local {
+                path,
+                kind: self.kind(),
+                photo: Box::new(self.machine.photo_meta().cloned()),
             }
         } else {
-            false
+            match &self.machine.source {
+                MediaSourceState::Opening {
+                    transport: OpeningTransport::DirectRemote { last_remote, .. },
+                    ..
+                }
+                | MediaSourceState::Loaded {
+                    transport: LoadedTransport::DirectRemote { last_remote, .. },
+                    ..
+                }
+                | MediaSourceState::Failed {
+                    transport: FailedTransport::StoppedRemote { last_remote },
+                    ..
+                } => ReloadSource::Remote(last_remote.clone()),
+                state => match state.scoped_playback() {
+                    Some(playback) => ReloadSource::Scoped(Arc::clone(playback)),
+                    None => ReloadSource::None,
+                },
+            }
+        };
+        let reloaded = match reload_src {
+            ReloadSource::Local { path, kind, photo } => {
+                self.load(&path, kind, *photo, pos).is_ok()
+            }
+            ReloadSource::Remote(req) => self.load_remote(*req, settings, pos).is_ok(),
+            ReloadSource::Scoped(playback) => {
+                if playback.stream.is_cancelled() {
+                    self.discard_scoped();
+                    self.machine.state.loaded = false;
+                    false
+                } else {
+                    self.current_media_uri().is_some_and(|uri| {
+                        self.reopen_scoped_after_gpu_reset(playback, uri, settings, pos)
+                            .is_ok()
+                    })
+                }
+            }
+            ReloadSource::None => false,
         };
         if !reloaded {
             return;
         }
-        self.private_identity = private_identity;
-        self.state.hflip = hflip;
-        self.state.vflip = vflip;
+        self.machine.set_private_identity(private_identity);
+        self.machine.state.hflip = hflip;
+        self.machine.state.vflip = vflip;
         self.visual.extra_rotate = extra_rotate;
         self.enhancements.monitor_lut = monitor_lut;
-        self.enhancements.reattach_on_load = saved_plugin_tracks;
+        if let MediaSourceState::Opening {
+            reattach_on_load, ..
+        } = &mut self.machine.source
+        {
+            *reattach_on_load = saved_plugin_tracks;
+        }
         if let Some((owner, chapters)) = saved_timeline {
             self.enhancements.timeline_owner = Some(owner);
-            self.state.chapters = chapters;
+            self.machine.state.chapters = chapters;
             self.update_plugin_chapter();
         }
         if hflip
@@ -519,9 +552,9 @@ impl Session {
         if sub_delay.abs() > 0.001 {
             let _ = self.execute(Command::SetSubDelay(sub_delay));
         }
-        if matches!(self.kind, Some(Kind::Video | Kind::Audio)) {
+        if matches!(self.kind(), Some(Kind::Video | Kind::Audio)) {
             if let (Some(start), Some(end)) = (ab_start, ab_end)
-                && !self.state.is_live
+                && !self.machine.state.is_live
                 && start < end
             {
                 Self::log_mpv_err(
@@ -536,11 +569,11 @@ impl Session {
                     "restore ab-loop-count",
                     self.mpv.command_async(&["set", "ab-loop-count", "inf"]),
                 );
-                self.state.ab_start = Some(start);
-                self.state.ab_end = Some(end);
+                self.machine.state.ab_start = Some(start);
+                self.machine.state.ab_end = Some(end);
             }
-            self.state.paused = paused;
-            self.eof_paused = eof_paused;
+            self.machine.state.paused = paused;
+            self.machine.source.set_eof_paused(eof_paused);
             let _ = self
                 .mpv
                 .command_async(&["set", "pause", if paused { "yes" } else { "no" }]);
@@ -561,6 +594,7 @@ mod tests {
     use iris_mpv::Mpv;
 
     use crate::library::Kind;
+    use crate::player::machine::{MediaIdentity, OpeningTransport};
     use crate::player::{Command, MonitorLutFilter, Session};
 
     struct StubMonitorLut(PathBuf);
@@ -610,7 +644,7 @@ mod tests {
             "memory://YUV4MPEG2 W16 H16 F10:1 Ip A1:1 C420jpeg\n{}",
             format!("FRAME\n{}", "x".repeat(384)).repeat(30)
         );
-        session
+        let entry_id = session
             .mpv
             .loadfile_with_options(&video, "replace", &[("pause", "yes")])
             .unwrap();
@@ -619,8 +653,21 @@ mod tests {
             assert!(Instant::now() < deadline);
             thread::sleep(Duration::from_millis(10));
         }
-        session.kind = Some(Kind::Video);
-        session.state.loaded = true;
+        session.machine.begin_load(
+            entry_id,
+            MediaIdentity {
+                local_path: None,
+                uri: "memory://lut-test".into(),
+                title: None,
+                private_identity: false,
+                kind: Kind::Video,
+                photo: None,
+            },
+            false,
+            OpeningTransport::Local,
+            false,
+        );
+        session.machine.state.loaded = true;
         session.set_monitor_lut(Some(Arc::clone(&lut))).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {

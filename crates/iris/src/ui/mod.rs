@@ -349,7 +349,7 @@ impl IrisWindow {
         this.sync_plugin_modal_focus(window);
         this.sync_theme_tokens(cx);
         this.rebuild_directory_rows();
-        this.active().session.apply_settings(&this.settings);
+        this.viewport.session.apply_settings(&this.settings);
         if this.settings.audio_device != "auto" && !this.settings.audio_device.is_empty() {
             this.command(
                 Command::SetAudioDevice(this.settings.audio_device.clone()),

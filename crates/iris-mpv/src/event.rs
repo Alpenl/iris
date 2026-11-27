@@ -50,6 +50,12 @@ pub enum Event {
         id: u64,
         error: i32,
     },
+    GetPropertyReply {
+        id: u64,
+        error: i32,
+        name: String,
+        value: Value,
+    },
     Log {
         prefix: String,
         level: String,
@@ -94,6 +100,25 @@ pub(crate) unsafe fn decode_event(ev: &sys::mpv_event) -> Option<Event> {
             id: ev.reply_userdata,
             error: ev.error,
         },
+        sys::MPV_EVENT_GET_PROPERTY_REPLY if ev.reply_userdata != 0 => {
+            if ev.error < 0 || ev.data.is_null() {
+                Event::GetPropertyReply {
+                    id: ev.reply_userdata,
+                    error: ev.error,
+                    name: String::new(),
+                    value: Value::None,
+                }
+            } else {
+                // SAFETY: `ev.data` is non-null and points to `mpv_event_property`.
+                let (name, value) = unsafe { decode_property(&*ev.data.cast()) };
+                Event::GetPropertyReply {
+                    id: ev.reply_userdata,
+                    error: ev.error,
+                    name,
+                    value,
+                }
+            }
+        }
         sys::MPV_EVENT_LOG_MESSAGE => {
             if ev.data.is_null() {
                 Event::Other(ev.event_id)
@@ -150,25 +175,7 @@ pub(crate) unsafe fn decode_event(ev: &sys::mpv_event) -> Option<Event> {
                 Event::Other(ev.event_id)
             } else {
                 // SAFETY: `ev.data` is non-null and points to `mpv_event_property`.
-                let p = unsafe { &*ev.data.cast::<sys::mpv_event_property>() };
-                let value = if p.data.is_null() {
-                    Value::None
-                } else {
-                    // SAFETY: `p.data` is non-null and its layout matches `p.format` per `client.h`.
-                    unsafe {
-                        match p.format {
-                            sys::MPV_FORMAT_FLAG => Value::Flag(*p.data.cast::<c_int>() != 0),
-                            sys::MPV_FORMAT_INT64 => Value::Int(*p.data.cast::<i64>()),
-                            sys::MPV_FORMAT_DOUBLE => Value::Double(*p.data.cast::<f64>()),
-                            sys::MPV_FORMAT_STRING => {
-                                Value::Str(lossy(*p.data.cast::<*const c_char>()))
-                            }
-                            _ => Value::None,
-                        }
-                    }
-                };
-                // SAFETY: `p.name` is either null or a valid NUL-terminated C string from mpv.
-                let name = unsafe { lossy(p.name) };
+                let (name, value) = unsafe { decode_property(&*ev.data.cast()) };
                 Event::PropertyChange {
                     id: ev.reply_userdata,
                     name,
@@ -229,6 +236,28 @@ pub(crate) unsafe fn load_entry_id(result: &sys::mpv_node) -> Option<i64> {
     None
 }
 
+/// # Safety
+/// `p` must point to a valid `mpv_event_property` whose `data` matches `p.format`.
+unsafe fn decode_property(p: &sys::mpv_event_property) -> (String, Value) {
+    let value = if p.data.is_null() {
+        Value::None
+    } else {
+        // SAFETY: `p.data` is non-null and its layout matches `p.format` per `client.h`.
+        unsafe {
+            match p.format {
+                sys::MPV_FORMAT_FLAG => Value::Flag(*p.data.cast::<c_int>() != 0),
+                sys::MPV_FORMAT_INT64 => Value::Int(*p.data.cast::<i64>()),
+                sys::MPV_FORMAT_DOUBLE => Value::Double(*p.data.cast::<f64>()),
+                sys::MPV_FORMAT_STRING => Value::Str(lossy(*p.data.cast::<*const c_char>())),
+                _ => Value::None,
+            }
+        }
+    };
+    // SAFETY: `p.name` is either null or a valid NUL-terminated C string from mpv.
+    let name = unsafe { lossy(p.name) };
+    (name, value)
+}
+
 /// Converts a nullable C string pointer from an mpv event into an owned `String`.
 ///
 /// # Safety
@@ -272,6 +301,22 @@ mod tests {
                 "expected Event::Other({event_id}), got {decoded:?}"
             );
         }
+
+        let prop_reply = sys::mpv_event {
+            event_id: sys::MPV_EVENT_GET_PROPERTY_REPLY,
+            error: -10,
+            reply_userdata: 42,
+            data: ptr::null_mut(),
+        };
+        assert!(matches!(
+            unsafe { decode_event(&prop_reply) },
+            Some(Event::GetPropertyReply {
+                id: 42,
+                error: -10,
+                value: Value::None,
+                ..
+            })
+        ));
 
         let none_ev = sys::mpv_event {
             event_id: sys::MPV_EVENT_NONE,

@@ -9,7 +9,7 @@ use std::sync::Arc;
 use futures::channel::mpsc::{UnboundedReceiver, unbounded};
 use gpui::RenderImage;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-use windows::Foundation::{EventRegistrationToken, TimeSpan, TypedEventHandler};
+use windows::Foundation::{TimeSpan, TypedEventHandler};
 use windows::Media::{
     MediaPlaybackStatus, MediaPlaybackType, PlaybackPositionChangeRequestedEventArgs as SeekArgs,
     SystemMediaTransportControls, SystemMediaTransportControlsButton as Button,
@@ -52,7 +52,6 @@ fn hwnd(window: &gpui::Window) -> Option<HWND> {
 
 pub(super) fn known_screenshot_dir() -> Option<PathBuf> {
     use windows::Win32::{
-        Foundation::HANDLE,
         System::Com::CoTaskMemFree,
         UI::Shell::{FOLDERID_Desktop, FOLDERID_Pictures, KF_FLAG_DEFAULT, SHGetKnownFolderPath},
     };
@@ -60,7 +59,7 @@ pub(super) fn known_screenshot_dir() -> Option<PathBuf> {
     [FOLDERID_Pictures, FOLDERID_Desktop]
         .into_iter()
         .find_map(|id| unsafe {
-            let name = SHGetKnownFolderPath(&id, KF_FLAG_DEFAULT, HANDLE::default()).ok()?;
+            let name = SHGetKnownFolderPath(&id, KF_FLAG_DEFAULT, None).ok()?;
             if name.is_null() {
                 return None;
             }
@@ -78,7 +77,7 @@ pub(crate) fn set_always_on_top(window: &gpui::Window, on: bool) {
         unsafe {
             let _ = SetWindowPos(
                 hwnd,
-                after,
+                Some(after),
                 0,
                 0,
                 0,
@@ -141,8 +140,8 @@ pub(crate) struct MediaKeyBridge {
     controls: SystemMediaTransportControls,
     display: SystemMediaTransportControlsDisplayUpdater,
     timeline: SystemMediaTransportControlsTimelineProperties,
-    buttons: EventRegistrationToken,
-    seek: EventRegistrationToken,
+    buttons: i64,
+    seek: i64,
     published: Option<(MediaPlaybackType, String)>,
     _apartment: WinRtApartment,
 }
@@ -196,7 +195,7 @@ impl MediaKeyBridge {
         let button_tx = tx.clone();
         let button_handler =
             TypedEventHandler::<SystemMediaTransportControls, ButtonArgs>::new(move |_, args| {
-                if let Some(args) = args {
+                if let Some(args) = args.as_ref() {
                     let key = match args.Button()? {
                         Button::Play => MediaKey::Play,
                         Button::Pause => MediaKey::Pause,
@@ -211,7 +210,7 @@ impl MediaKeyBridge {
         let buttons = controls.ButtonPressed(&button_handler)?;
         let seek_handler =
             TypedEventHandler::<SystemMediaTransportControls, SeekArgs>::new(move |_, args| {
-                if let Some(args) = args {
+                if let Some(args) = args.as_ref() {
                     let ticks = args.RequestedPlaybackPosition()?.Duration;
                     let _ =
                         tx.unbounded_send(MediaKey::Seek(ticks.max(0) as f64 / TICKS_PER_SECOND));
@@ -418,10 +417,10 @@ pub(crate) fn synth_mouse(
         LPARAM((((y * scale) as i32 & 0xffff) << 16 | ((x * scale) as i32 & 0xffff)) as isize);
     Some(Box::new(move || unsafe {
         let hwnd = HWND(handle as *mut _);
-        let _ = PostMessageW(hwnd, WM_MOUSEMOVE, WPARAM(0), pos);
+        let _ = PostMessageW(Some(hwnd), WM_MOUSEMOVE, WPARAM(0), pos);
         if click {
-            let _ = PostMessageW(hwnd, WM_LBUTTONDOWN, WPARAM(1), pos);
-            let _ = PostMessageW(hwnd, WM_LBUTTONUP, WPARAM(0), pos);
+            let _ = PostMessageW(Some(hwnd), WM_LBUTTONDOWN, WPARAM(1), pos);
+            let _ = PostMessageW(Some(hwnd), WM_LBUTTONUP, WPARAM(0), pos);
         }
     }))
 }
@@ -440,7 +439,7 @@ pub(crate) fn begin_window_drag(window: &gpui::Window) {
                 return;
             }
             let _ = ReleaseCapture();
-            let _ = PostMessageW(hwnd, WM_SYSCOMMAND, WPARAM(0xF012), LPARAM(0));
+            let _ = PostMessageW(Some(hwnd), WM_SYSCOMMAND, WPARAM(0xF012), LPARAM(0));
         }
     }
 }
@@ -477,11 +476,11 @@ pub(crate) fn snapshot_window(window: &gpui::Window, path: &Path) -> anyhow::Res
         anyhow::ensure!(w > 0 && h > 0, "window is not visible");
         let screen = GetDC(None);
         anyhow::ensure!(!screen.0.is_null(), "GetDC failed");
-        let memory = CreateCompatibleDC(screen);
+        let memory = CreateCompatibleDC(Some(screen));
         let bitmap = CreateCompatibleBitmap(screen, w, h);
         if memory.0.is_null() || bitmap.0.is_null() {
             if !bitmap.0.is_null() {
-                let _ = DeleteObject(bitmap);
+                let _ = DeleteObject(bitmap.into());
             }
             if !memory.0.is_null() {
                 let _ = DeleteDC(memory);
@@ -489,14 +488,14 @@ pub(crate) fn snapshot_window(window: &gpui::Window, path: &Path) -> anyhow::Res
             ReleaseDC(None, screen);
             anyhow::bail!("creating screenshot bitmap failed");
         }
-        let old = SelectObject(memory, bitmap);
+        let old = SelectObject(memory, bitmap.into());
         let copied = BitBlt(
             memory,
             0,
             0,
             w,
             h,
-            screen,
+            Some(screen),
             rect.left,
             rect.top,
             SRCCOPY | CAPTUREBLT,
@@ -528,7 +527,7 @@ pub(crate) fn snapshot_window(window: &gpui::Window, path: &Path) -> anyhow::Res
         } else {
             0
         };
-        let _ = DeleteObject(bitmap);
+        let _ = DeleteObject(bitmap.into());
         let _ = DeleteDC(memory);
         ReleaseDC(None, screen);
         copied?;

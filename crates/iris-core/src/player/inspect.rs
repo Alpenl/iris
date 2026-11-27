@@ -9,7 +9,8 @@ use super::model::{AudioDevice, BackendDiagnostics, Chapter, MediaStats, Track, 
 
 impl Session {
     pub fn tracks_of(&self, kind: TrackKind) -> Vec<&Track> {
-        self.state
+        self.machine
+            .state
             .tracks
             .iter()
             .filter(|t| t.kind == kind)
@@ -17,14 +18,16 @@ impl Session {
     }
 
     pub fn selected_track(&self, kind: TrackKind) -> Option<&Track> {
-        self.state
+        self.machine
+            .state
             .tracks
             .iter()
             .find(|t| t.kind == kind && t.selected)
     }
 
     pub fn chapter_index_at(&self, time: f64) -> Option<(usize, &Chapter)> {
-        self.state
+        self.machine
+            .state
             .chapters
             .iter()
             .enumerate()
@@ -72,11 +75,11 @@ impl Session {
 
     /// Queries detailed media / decoder stats on demand (only when Info panel is open).
     pub fn media_stats(&self) -> MediaStats {
-        let path = self.current.as_deref();
+        let path = self.current();
         let file_name = path
             .and_then(Path::file_name)
             .map(|n| n.to_string_lossy().into_owned())
-            .or_else(|| self.current_title.clone())
+            .or_else(|| self.current_title().map(str::to_owned))
             .unwrap_or_default();
         let file_size = path
             .filter(|p| !crate::library::is_slow_network_path(p))
@@ -105,14 +108,14 @@ impl Session {
             video_fps: prop_f64("estimated-vf-fps").or_else(|| prop_f64("container-fps")),
             video_bitrate: prop_f64("video-bitrate"),
             pixel_format: prop_str("video-params/pixelformat"),
-            hwdec: self.state.hwdec.clone(),
+            hwdec: self.machine.state.hwdec.clone(),
             dropped_frames: prop_i64("frame-drop-count"),
             audio_codec: prop_str("audio-codec-name"),
             audio_channels: prop_str("audio-params/channels"),
             audio_sample_rate: prop_i64("audio-params/samplerate"),
             audio_bitrate: prop_f64("audio-bitrate"),
-            photo_colour: self.state.photo_colour,
-            photo_exif: self.state.photo_exif.clone(),
+            photo_colour: self.machine.state.photo_colour,
+            photo_exif: self.machine.state.photo_exif.clone(),
         }
     }
 
@@ -132,8 +135,8 @@ impl Session {
         };
         let (w, h) = self.source_pixel_size();
         stats.resolution = (w > 0 && h > 0).then_some((w, h));
-        stats.hwdec.clone_from(&self.state.hwdec);
-        match self.kind {
+        stats.hwdec.clone_from(&self.machine.state.hwdec);
+        match self.kind() {
             Some(Kind::Video) => {
                 stats.video_fps =
                     prop_f64("estimated-vf-fps").or_else(|| prop_f64("container-fps"));
@@ -171,18 +174,18 @@ impl Session {
             return;
         }
         let Ok(raw) = self.mpv.get_property_string("chapter-list") else {
-            self.state.chapters.clear();
+            self.machine.state.chapters.clear();
             return;
         };
-        self.state.chapters = parse_chapter_list_json(&raw);
+        self.machine.state.chapters = parse_chapter_list_json(&raw);
     }
 
     pub(super) fn refresh_tracks(&mut self) {
         let Ok(raw) = self.mpv.get_property_string("track-list") else {
-            self.state.tracks.clear();
+            self.machine.state.tracks.clear();
             return;
         };
-        self.state.tracks = parse_track_list_json(&raw);
+        self.machine.state.tracks = parse_track_list_json(&raw);
     }
 }
 
@@ -281,6 +284,7 @@ pub(super) fn parse_audio_device_list_json(raw: &str) -> Vec<AudioDevice> {
 #[cfg(test)]
 mod tests {
     use crate::library::Kind;
+    use crate::player::machine::{MediaIdentity, OpeningTransport};
 
     use super::{
         Session, TrackKind, parse_audio_device_list_json, parse_chapter_list_json,
@@ -290,14 +294,26 @@ mod tests {
     #[test]
     fn heif_resolution_and_mirrors_follow_display_axes() {
         let mut session = Session::new().unwrap();
-        session.kind = Some(Kind::Photo);
-        session.photo_meta = Some(crate::photo::Photo {
-            heif: true,
-            rotate_cw: 90,
-            ..Default::default()
-        });
-        session.state.video_size = (1200, 800);
-        session.state.vflip = true;
+        session.machine.begin_load(
+            1,
+            MediaIdentity {
+                local_path: None,
+                uri: "file:///photo.heic".into(),
+                title: None,
+                private_identity: false,
+                kind: Kind::Photo,
+                photo: Some(crate::photo::Photo {
+                    heif: true,
+                    rotate_cw: 90,
+                    ..Default::default()
+                }),
+            },
+            false,
+            OpeningTransport::Local,
+            false,
+        );
+        session.machine.state.video_size = (1200, 800);
+        session.machine.state.vflip = true;
 
         assert_eq!(session.display_size(), (800, 1200));
         assert_eq!(session.display_flips(), (true, false));

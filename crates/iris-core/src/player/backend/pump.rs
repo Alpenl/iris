@@ -15,6 +15,7 @@ use crate::logging::{self, EventLevel};
 
 use super::super::ScopedStream;
 use super::super::model::{SessionEvent, SessionUpdate};
+use super::super::recovery::VideoRecoveryHandle;
 use super::super::relay::Service;
 use super::super::scoped;
 use super::references::{disable_hls, enable_hls};
@@ -53,6 +54,7 @@ pub(in crate::player) struct EventPump {
     cancel: CancelToken,
     relay: Arc<Mutex<Weak<Service>>>,
     scoped: Arc<Mutex<Weak<dyn ScopedStream>>>,
+    recovery: VideoRecoveryHandle,
     thread: Cell<Option<JoinHandle<()>>>,
 }
 
@@ -79,8 +81,7 @@ impl EventPump {
             // Continue any in-flight load hook until mpv acknowledges quit.
             if mpv.command_async(&["quit"]).is_err() {
                 self.cancel.cancel();
-                #[cfg(target_os = "windows")]
-                mpv.abort_video_recovery();
+                self.recovery.on_shutdown();
                 mpv.wakeup();
             }
             let _ = thread.join();
@@ -103,6 +104,7 @@ pub(in crate::player) fn active_playlist_entry_id(mpv: &Mpv) -> Option<i64> {
 
 pub(in crate::player) fn spawn_event_pump(
     mpv: Arc<Mpv>,
+    recovery: VideoRecoveryHandle,
 ) -> Result<(EventPump, UnboundedReceiver<SessionUpdate>)> {
     // Unbounded on purpose. mpv coalesces property changes (one pending change
     // per observed property), log lines never reach `tx`, and the remaining
@@ -119,6 +121,7 @@ pub(in crate::player) fn spawn_event_pump(
     let source = relay.clone();
     let scoped_ref = Arc::new(Mutex::new(scoped::empty_scoped()));
     let scoped_source = scoped_ref.clone();
+    let pump_recovery = recovery.clone();
     let thread = spawn_thread(ThreadRole::MpvEventPump, move || {
         let mut playing = None;
         let mut hls = false;
@@ -130,17 +133,28 @@ pub(in crate::player) fn spawn_event_pump(
                 continue;
             };
             let scope = match &raw {
-                Event::Shutdown => break,
+                Event::Shutdown => {
+                    pump_recovery.on_shutdown();
+                    break;
+                }
                 Event::CommandReply { .. } => None,
+                Event::GetPropertyReply {
+                    id, error, value, ..
+                } => {
+                    pump_recovery.on_property_reply(*id, *error, value);
+                    continue;
+                }
                 Event::StartFile(id) => {
                     hls = false;
                     restricted = false;
                     playing = Some(*id);
+                    pump_recovery.on_start_file(*id);
                     continue;
                 }
                 Event::EndFile {
                     playlist_entry_id, ..
                 } => {
+                    pump_recovery.on_end_file(*playlist_entry_id);
                     if playing == Some(*playlist_entry_id) {
                         playing = None;
                     }
@@ -196,8 +210,7 @@ pub(in crate::player) fn spawn_event_pump(
                 }
                 Event::QueueOverflow => {
                     playing = active_playlist_entry_id(&mpv);
-                    #[cfg(target_os = "windows")]
-                    mpv.reseed_video_recovery(playing);
+                    pump_recovery.on_overflow(playing);
                     log::warn!("mpv event queue overflow; resyncing active entry {playing:?}");
                     None
                 }
@@ -273,6 +286,7 @@ pub(in crate::player) fn spawn_event_pump(
             cancel,
             relay,
             scoped: scoped_ref,
+            recovery,
             thread: Cell::new(Some(thread)),
         },
         rx,

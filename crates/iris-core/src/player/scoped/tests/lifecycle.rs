@@ -12,9 +12,11 @@ use anyhow::Result;
 use super::{ScopedAttachment, ScopedPlayback, ScopedStream, empty_scoped};
 use crate::library::Kind;
 use crate::media_uri::MediaUri;
+use crate::player::machine::{
+    FailedTransport, LoadedTransport, MediaIdentity, MediaSourceState, OpeningTransport,
+};
 use crate::player::{
-    Chapter, Command, ExternalTrack, MediaSourceState, RemoteMediaRequest, Session, SessionEvent,
-    TrackKind, prepare,
+    Chapter, Command, ExternalTrack, RemoteMediaRequest, Session, SessionEvent, TrackKind, prepare,
 };
 use crate::settings::Settings;
 use crate::test_util::TestDir;
@@ -145,11 +147,34 @@ impl Drop for LoopbackAssetServer {
 fn release_scoped_preserves_local_and_idle_sources() {
     let mut session = Session::new().unwrap();
     session.release_scoped();
-    assert!(matches!(session.source, MediaSourceState::Idle));
-    session.source = MediaSourceState::Local;
+    assert!(matches!(
+        session.machine.source,
+        MediaSourceState::Idle { .. }
+    ));
+    session.machine.begin_load(
+        1,
+        MediaIdentity {
+            local_path: None,
+            uri: "file:///local.mp4".into(),
+            title: None,
+            private_identity: false,
+            kind: Kind::Video,
+            photo: None,
+        },
+        false,
+        OpeningTransport::Local,
+        false,
+    );
     session.release_scoped();
     session.release_scoped();
-    assert!(matches!(session.source, MediaSourceState::Local));
+    assert!(matches!(
+        session.machine.source,
+        MediaSourceState::Opening {
+            transport: OpeningTransport::Local,
+            ..
+        }
+    ));
+    session.shutdown();
 }
 
 #[test]
@@ -168,19 +193,35 @@ fn release_scoped_stops_plugin_stream_once_and_detaches_event_pump() {
     session
         .event_pump
         .set_scoped(Arc::downgrade(&playback.stream));
-    session.source = MediaSourceState::PluginScoped {
-        playback,
-        pending_tracks: vec![ScopedAttachment {
-            id: "subtitle".into(),
-            url: "memory://WEBVTT\n".into(),
-            label: "Subtitle".into(),
-            lang: None,
-            default: true,
-            audio: false,
-        }],
-    };
+    session.machine.begin_load(
+        1,
+        MediaIdentity {
+            local_path: None,
+            uri: "iris-plugin://stub/src/1".into(),
+            title: Some("Fixture".into()),
+            private_identity: false,
+            kind: Kind::Video,
+            photo: None,
+        },
+        false,
+        OpeningTransport::PluginScoped {
+            playback,
+            pending_tracks: vec![ScopedAttachment {
+                id: "subtitle".into(),
+                url: "memory://WEBVTT\n".into(),
+                label: "Subtitle".into(),
+                lang: None,
+                default: true,
+                audio: false,
+            }],
+        },
+        false,
+    );
     session.release_scoped();
-    assert!(matches!(session.source, MediaSourceState::Idle));
+    assert!(matches!(
+        session.machine.source,
+        MediaSourceState::Idle { .. }
+    ));
     assert!(session.scoped_stream().is_none());
     assert!(
         session
@@ -191,6 +232,7 @@ fn release_scoped_stops_plugin_stream_once_and_detaches_event_pump() {
     );
     session.release_scoped();
     assert_eq!(stream.stops.load(Ordering::SeqCst), 1);
+    session.shutdown();
 }
 
 #[test]
@@ -377,10 +419,7 @@ fn gpu_reset_reopen_of_plugin_scoped_does_not_advance_seek_and_clears_cancelled(
         1,
         "GPU-reset reopen must not spuriously call advance_seek()"
     );
-    assert!(matches!(
-        session.source,
-        MediaSourceState::PluginScoped { .. }
-    ));
+    assert!(session.machine.source.is_plugin_scoped());
 
     // When the scoped stream has expired/cancelled, GPU-reset recovery discards it cleanly.
     stream.stop();
@@ -395,7 +434,10 @@ fn gpu_reset_reopen_of_plugin_scoped_does_not_advance_seek_and_clears_cancelled(
         thread::sleep(Duration::from_millis(5));
     }
     session.recover_unloaded_after_gpu_reset(&settings, 0., [0., 0.]);
-    assert!(matches!(session.source, MediaSourceState::Idle));
+    assert!(matches!(
+        session.machine.source,
+        MediaSourceState::Idle { .. }
+    ));
     assert!(!session.state().loaded);
     assert_eq!(stream.seeks.load(Ordering::SeqCst), 1);
     session.shutdown();
@@ -763,8 +805,11 @@ fn toggle_playback_at_eof_advances_scoped_seek_and_error_preserves_gpu_reset_rec
     assert!(!session.state().loaded);
     assert!(session.state().chapters.is_empty());
     assert!(matches!(
-        session.source,
-        MediaSourceState::PluginScoped { .. }
+        session.machine.source,
+        MediaSourceState::Failed {
+            transport: FailedTransport::PluginScoped { .. },
+            ..
+        }
     ));
 
     let deadline = Instant::now() + Duration::from_secs(3);
@@ -838,8 +883,11 @@ fn toggle_playback_at_eof_advances_scoped_seek_and_error_preserves_gpu_reset_rec
     session.mpv.command(&["stop"]).unwrap();
     session.apply(&SessionEvent::Error(-13));
     assert!(matches!(
-        session.source,
-        MediaSourceState::StoppedRemote { .. }
+        session.machine.source,
+        MediaSourceState::Failed {
+            transport: FailedTransport::StoppedRemote { .. },
+            ..
+        }
     ));
     let deadline = Instant::now() + Duration::from_secs(3);
     while session
@@ -852,8 +900,14 @@ fn toggle_playback_at_eof_advances_scoped_seek_and_error_preserves_gpu_reset_rec
     }
     session.recover_unloaded_after_gpu_reset(&settings, 0., [0., 0.]);
     assert!(matches!(
-        session.source,
-        MediaSourceState::DirectRemote { .. }
+        session.machine.source,
+        MediaSourceState::Opening {
+            transport: OpeningTransport::DirectRemote { .. },
+            ..
+        } | MediaSourceState::Loaded {
+            transport: LoadedTransport::DirectRemote { .. },
+            ..
+        }
     ));
     let deadline = Instant::now() + Duration::from_secs(8);
     while !session.state().loaded {
