@@ -926,6 +926,7 @@ fn native_receipts_hold_revoked_attachments_and_release_accounting() {
     });
 
     let track1 = prepare_attachment_effect(&mut window, "demo.sub", "attach_1");
+    let weak1 = Arc::downgrade(&track1);
     let owner = track1.owner().to_owned();
     player.attach_plugin_track(track1).unwrap();
     wait_until(Duration::from_secs(8), "first plugin subtitle", || {
@@ -939,6 +940,7 @@ fn native_receipts_hold_revoked_attachments_and_release_accounting() {
 
     // Secondary plugin subtitle must not steal selection from the first.
     let track2 = prepare_attachment_effect(&mut window, "demo.sub", "attach_2");
+    let weak2 = Arc::downgrade(&track2);
     player.attach_plugin_track(track2).unwrap();
     wait_until(Duration::from_secs(8), "second plugin subtitle", || {
         drain(&mut player, &mut events);
@@ -953,14 +955,24 @@ fn native_receipts_hold_revoked_attachments_and_release_accounting() {
     player.revoke_plugin_tracks(&owner);
     wait_until(Duration::from_secs(8), "revoked tracks removed", || {
         drain(&mut player, &mut events);
-        player.tracks_of(TrackKind::Sub).is_empty()
+        player.flush_deferred();
+        weak1.strong_count() == 0
+            && weak2.strong_count() == 0
+            && player.tracks_of(TrackKind::Sub).is_empty()
     });
 
     // Revoke an addition before the asynchronous native acknowledgement arrives.
     let track3 = prepare_attachment_effect(&mut window, "demo.sub", "attach_1");
+    let weak3 = Arc::downgrade(&track3);
     player.attach_plugin_track(track3).unwrap();
     player.revoke_plugin_tracks(&owner);
+    assert_eq!(weak3.strong_count(), 1);
     assert!(!host.is_ledger_empty());
+    wait_until(Duration::from_secs(8), "pending add revocation", || {
+        drain(&mut player, &mut events);
+        player.flush_deferred();
+        weak3.strong_count() == 0 && player.tracks_of(TrackKind::Sub).is_empty()
+    });
     player.shutdown();
     drop((player, events));
     window.shutdown();
