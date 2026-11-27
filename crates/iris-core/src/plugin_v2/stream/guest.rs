@@ -6,7 +6,7 @@ use crate::{
     },
     vfs::HttpCancel,
 };
-use iris_api::v2::{Capability, ErrorCode, Generation, Id, Role, stream::StreamContext};
+use iris_api::v2::{Capability, ErrorCode, Generation, Id, Role, WireU64, stream::StreamContext};
 use std::{
     collections::BTreeSet,
     sync::{Arc, Mutex},
@@ -16,7 +16,7 @@ use std::{
 struct State {
     actor: Actor,
     generation: Generation,
-    expires: Option<Id>,
+    expires: Option<WireU64>,
 }
 pub struct StreamStore {
     state: Mutex<State>,
@@ -185,7 +185,7 @@ impl Reader for GuestReader {
         Ok(result)
     }
 }
-fn check_expiry(expires: Option<Id>) -> Result<(), ErrorCode> {
+fn check_expiry(expires: Option<WireU64>) -> Result<(), ErrorCode> {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|_| ErrorCode::Internal)?

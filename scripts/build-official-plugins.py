@@ -100,12 +100,51 @@ def _cached_rustc_sysroot(rustup_home: str, toolchain: str, path_env: str) -> Pa
     if path_env:
         query_env["PATH"] = path_env
     try:
-        out = subprocess.check_output(
-            ["rustc", "--print", "sysroot"], cwd=ROOT, env=query_env, text=True, timeout=15
-        ).strip()
+        proc = subprocess.Popen(
+            ["rustc", "--print", "sysroot"],
+            cwd=ROOT,
+            env=query_env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+        out, _ = proc.communicate(timeout=15)
+        if proc.returncode == 0 and out.strip():
+            return Path(out.strip()).resolve()
     except (OSError, subprocess.SubprocessError):
-        return None
-    return Path(out).resolve() if out else None
+        pass
+    return None
+
+
+@functools.lru_cache(maxsize=8)
+def _cached_rustc_commit_hash(rustup_home: str, toolchain: str, path_env: str) -> str:
+    query_env = os.environ.copy()
+    if rustup_home:
+        query_env["RUSTUP_HOME"] = rustup_home
+    if toolchain:
+        query_env["RUSTUP_TOOLCHAIN"] = toolchain
+    if path_env:
+        query_env["PATH"] = path_env
+    try:
+        proc = subprocess.Popen(
+            ["rustc", "-vV"],
+            cwd=ROOT,
+            env=query_env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+        vv, _ = proc.communicate(timeout=15)
+        if proc.returncode == 0:
+            for line in vv.splitlines():
+                if line.startswith("commit-hash:"):
+                    candidate = line.partition(":")[2].strip()
+                    if re.fullmatch(r"[0-9a-f]{40}", candidate):
+                        return candidate
+                    break
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return ""
 
 
 def _rustc_sysroot(env: dict[str, str] | None = None) -> Path | None:
@@ -117,8 +156,17 @@ def _rustc_sysroot(env: dict[str, str] | None = None) -> Path | None:
     )
 
 
+def _rustc_commit_hash(env: dict[str, str] | None = None) -> str:
+    source = os.environ if env is None else env
+    return _cached_rustc_commit_hash(
+        source.get("RUSTUP_HOME", ""),
+        source.get("RUSTUP_TOOLCHAIN", ""),
+        source.get("PATH", ""),
+    )
+
+
 def build_remap_rustflags(env: dict[str, str] | None = None) -> str:
-    """Build \\x1f-separated rustc --remap-path-prefix flags (later entries take precedence in rustc)."""
+    """Build \\x1f-separated rustc --remap-path-prefix fallback flags (later entries take precedence)."""
     mappings: list[tuple[Path, str]] = [(ROOT, "/iris")]
     cargo_home = _cargo_home(env)
     if cargo_home is not None:
@@ -140,6 +188,67 @@ def build_remap_rustflags(env: dict[str, str] | None = None) -> str:
     return "\x1f".join(flags)
 
 
+def write_remap_args_file(target_dir: Path, env: dict[str, str] | None = None) -> Path:
+    """Write exact per-.rs POSIX remaps so Windows/macOS/Linux and +/- rust-src emit identical Wasm."""
+    lines: list[str] = []
+    seen: set[str] = set()
+
+    def add(src: Path, posix_dest: str):
+        for form in (str(src), src.as_posix()):
+            flag = f"--remap-path-prefix={form}={posix_dest}"
+            if flag not in seen:
+                seen.add(flag)
+                lines.append(flag)
+
+    sysroot = _rustc_sysroot(env)
+    if sysroot is not None:
+        rust_src_root = sysroot / "lib/rustlib/src/rust"
+        if rust_src_root.is_dir():
+            commit_hash = _rustc_commit_hash(env)
+            if commit_hash:
+                add(rust_src_root, f"/rustc/{commit_hash}")
+                lib_dir = rust_src_root / "library"
+                if lib_dir.is_dir():
+                    for rs in sorted(lib_dir.rglob("*.rs")):
+                        add(rs, f"/rustc/{commit_hash}/library/{rs.relative_to(lib_dir).as_posix()}")
+
+    cargo_home = _cargo_home(env)
+    lock_path = ROOT / "Cargo.lock"
+    if cargo_home is not None and lock_path.is_file():
+        closure = json.loads(lock_closure(lock_path.read_text(encoding="utf-8"), OFFICIAL_SOURCE_CRATES))
+        reg_roots = sorted((cargo_home / "registry/src").glob("*")) if (cargo_home / "registry/src").is_dir() else []
+        for pkg in closure.get("package", []):
+            if not pkg.get("source"):
+                continue
+            dir_name = f"{pkg['name']}-{pkg['version']}"
+            for reg in reg_roots:
+                crate_dir = reg / dir_name
+                if crate_dir.is_dir():
+                    add(crate_dir, f"/cargo/deps/{dir_name}")
+                    for rs in sorted(crate_dir.rglob("*.rs")):
+                        add(rs, f"/cargo/deps/{dir_name}/{rs.relative_to(crate_dir).as_posix()}")
+
+    for crate_name in OFFICIAL_SOURCE_CRATES:
+        crate_dir = ROOT / "crates" / crate_name
+        if crate_dir.is_dir():
+            for rs in sorted(crate_dir.rglob("*.rs")):
+                rel = rs.relative_to(ROOT)
+                rel_posix = rel.as_posix()
+                add(rs, rel_posix)
+                win_rel = rel_posix.replace("/", "\\")
+                flag = f"--remap-path-prefix={win_rel}={rel_posix}"
+                if flag not in seen:
+                    seen.add(flag)
+                    lines.append(flag)
+
+    target_dir.mkdir(parents=True, exist_ok=True)
+    content = ("\n".join(lines) + ("\n" if lines else "")).encode("utf-8")
+    stamp = hashlib.sha256(content).hexdigest()[:16]
+    args_path = target_dir / f"official-plugin-remap-{stamp}.args"
+    args_path.write_bytes(content)
+    return args_path
+
+
 def verify_wasm_no_host_paths(
     wasm_bytes: bytes,
     env: dict[str, str] | None = None,
@@ -147,9 +256,19 @@ def verify_wasm_no_host_paths(
 ):
     if _WINDOWS_USERS_RE.search(wasm_bytes):
         raise RuntimeError("plugin.wasm leaked a Windows Users directory path")
-    for marker in (b"/Users/", b"/home/"):
+    for marker in (
+        b"/Users/",
+        b"/home/",
+        b"/rustup-sysroot",
+        b"/iris\\",
+        b"/cargo\\",
+        b"/rustup\\",
+        b"crates\\",
+        b"\\src\\",
+        b"\\library\\",
+    ):
         if marker in wasm_bytes:
-            raise RuntimeError(f"plugin.wasm leaked host path prefix {marker.decode('ascii')!r}")
+            raise RuntimeError(f"plugin.wasm leaked host or non-POSIX path prefix {marker.decode('ascii')!r}")
     candidates: list[Path] = [ROOT]
     for home_dir in (_cargo_home(env), _rustup_home(env), _rustc_sysroot(env)):
         if home_dir is not None:
@@ -201,6 +320,11 @@ def validate_official_manifest(manifest: dict):
     _require(
         network == allowed_network,
         f"{plugin_id}: official plugin changed network declaration beyond reviewed baseline: {network!r}",
+    )
+    sensitive_keys = manifest.get("sensitive_keys", [])
+    _require(
+        sensitive_keys == [],
+        f"{plugin_id}: official plugin declared unreviewed sensitive_keys: {sensitive_keys!r}",
     )
 
 
@@ -314,8 +438,7 @@ def verify_embedded(fresh_index: dict, crates: list[Path], embedded_dir: Path):
                 package_file.read("plugin.json") == expected_manifest_bytes,
                 f"Embedded plugin.json differs from source manifest for {source_manifest['id']}",
             )
-    if _is_windows_host():
-        _require(fresh_index == embedded, "Fresh Wasm build differs from embedded distribution")
+    _require(fresh_index == embedded, "Fresh Wasm build differs from embedded distribution")
     return embedded
 
 
@@ -371,7 +494,10 @@ def main():
         build_env.pop("RUSTFLAGS", None)
         build_env["CARGO_PROFILE_RELEASE_DEBUG"] = "0"
         build_env["CARGO_PROFILE_RELEASE_STRIP"] = "symbols"
-        build_env["CARGO_ENCODED_RUSTFLAGS"] = build_remap_rustflags(build_env)
+        remap_args = write_remap_args_file(target_dir, build_env)
+        build_env["CARGO_ENCODED_RUSTFLAGS"] = (
+            f"{build_remap_rustflags(build_env)}\x1f@{remap_args}"
+        )
         subprocess.run(["cargo", "build", "--locked", "--release", "--target", "wasm32-unknown-unknown",
                         *[part for crate in crates for part in ("-p", crate.name)]], cwd=ROOT, env=build_env, check=True)
     index = {"schema": 1, "source_sha256": source_hash(), "packages": [package(crate, args.output, target_dir, build_env) for crate in crates]}

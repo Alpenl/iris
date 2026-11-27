@@ -1,4 +1,4 @@
-use super::{Capability, Id};
+use super::{Capability, Id, WireU64};
 use crate::{SourceEntryKind, StreamVariant};
 use serde::{Deserialize, Serialize};
 
@@ -22,7 +22,7 @@ pub struct StreamContext {
     pub origin_grants: Vec<Id>,
     #[serde(default)]
     pub transports: Vec<Capability>,
-    pub expires_unix_ms: Option<Id>,
+    pub expires_unix_ms: Option<WireU64>,
 }
 
 /// Optional proof required before splicing bytes from fallback representations.
@@ -31,7 +31,7 @@ pub struct StreamContext {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ByteIdentity {
-    pub size: Id,
+    pub size: WireU64,
     pub chunk_bytes: u32,
     pub hashes: Id,
 }
@@ -47,7 +47,7 @@ pub enum StreamSource {
     },
     RandomAccess {
         resource_id: String,
-        size: Option<Id>,
+        size: Option<WireU64>,
         context: StreamContext,
     },
     VirtualManifest {
@@ -103,8 +103,8 @@ pub enum ResourceKind {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ByteRange {
-    pub offset: Id,
-    pub len: Id,
+    pub offset: WireU64,
+    pub len: WireU64,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -124,7 +124,7 @@ pub struct ResourceBinding {
     pub id: String,
     pub kind: ResourceKind,
     pub extension: ResourceExtension,
-    pub size: Option<Id>,
+    pub size: Option<WireU64>,
     pub source: ResourceSource,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -162,7 +162,7 @@ pub struct HlsKey {
 #[serde(deny_unknown_fields)]
 pub struct HlsSegment {
     pub resource: ResourceSpan,
-    pub duration_ms: Id,
+    pub duration_ms: WireU64,
     pub init: Option<ResourceSpan>,
     pub key: Option<HlsKey>,
     #[serde(default)]
@@ -180,9 +180,9 @@ pub struct HlsTrack {
     pub codec: Option<String>,
     #[serde(default)]
     pub default: bool,
-    pub sequence: Id,
+    pub sequence: WireU64,
     #[serde(default)]
-    pub discontinuity_sequence: Id,
+    pub discontinuity_sequence: WireU64,
     pub segments: Vec<HlsSegment>,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -190,7 +190,7 @@ pub struct HlsTrack {
 pub struct HlsVariant {
     pub video: String,
     pub audio: Option<String>,
-    pub bandwidth: Id,
+    pub bandwidth: WireU64,
     pub width: Option<u32>,
     pub height: Option<u32>,
 }

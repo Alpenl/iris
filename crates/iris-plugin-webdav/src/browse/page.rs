@@ -5,7 +5,7 @@ use super::super::{
 use iris_plugin_sdk::api::{
     SourceEntryKind,
     v2::{
-        ErrorCode, HostCommand, Id,
+        ErrorCode, HostCommand, Id, WireU64,
         source::{PlaylistEntry, ResolvedMedia, SourceEntry, SourcePage},
         stream::{Attachment, RemoteResource, StreamSource, StreamSpec},
     },
@@ -105,7 +105,7 @@ impl Cache {
                         name: f.name.clone(),
                         kind: SourceEntryKind::Folder,
                         size: None,
-                        modified_secs: (f.modified_secs > 0).then_some(Id(f.modified_secs)),
+                        modified_secs: (f.modified_secs > 0).then_some(WireU64(f.modified_secs)),
                         duration: None,
                         subtitle: None,
                         variants: Vec::new(),
@@ -115,8 +115,8 @@ impl Cache {
                         id: e.path.clone(),
                         name: e.name.clone(),
                         kind: kind(e.kind),
-                        size: Some(Id(e.size)),
-                        modified_secs: (e.modified_secs > 0).then_some(Id(e.modified_secs)),
+                        size: Some(WireU64(e.size)),
+                        modified_secs: (e.modified_secs > 0).then_some(WireU64(e.modified_secs)),
                         duration: None,
                         subtitle: None,
                         variants: Vec::new(),

@@ -184,6 +184,7 @@ dependencies = ["dep 2.0.0 (registry+https://github.com/rust-lang/crates.io-inde
             self.assertTrue(any(r.endswith("=/cargo") for r in remaps))
             self.assertTrue(any(r.endswith("=/rustup") for r in remaps))
             self.assertTrue(any(r.endswith("=/rustup-sysroot") for r in remaps))
+            self.assertTrue(remaps[-1].startswith("@") and "official-plugin-remap-" in remaps[-1])
         with zipfile.ZipFile(self.embedded / "iris.guides.irisplugin") as archive:
             self.assertEqual(archive.read("plugin.wasm"), b"\x00asm\x01\x00\x00\x00ext")
 
@@ -215,26 +216,28 @@ dependencies = ["dep 2.0.0 (registry+https://github.com/rust-lang/crates.io-inde
         with self.assertRaisesRegex(AssertionError, "network declaration"):
             self.invoke("--output", self.embedded)
 
-    def test_verification_enforces_windows_byte_equality_and_posix_manifest_and_stamp_checks(self):
+    def test_verification_enforces_byte_equality_and_manifest_checks_on_all_hosts(self):
         self.invoke("--output", self.embedded)
         before = self.snapshot()
         wasm = self.root / "target/wasm32-unknown-unknown/release/iris_plugin_webdav.wasm"
-        wasm.write_bytes(wasm.read_bytes() + b"crates/iris-api/src/v2/integer.rs")
-        with patch.object(official_plugins, "_is_windows_host", return_value=True):
-            with self.assertRaisesRegex(AssertionError, "differs"):
+        orig_wasm = wasm.read_bytes()
+        wasm.write_bytes(orig_wasm + b"/iris/crates/iris-api/src/v2/integer.rs")
+        for is_win in (True, False):
+            with patch.object(official_plugins, "_is_windows_host", return_value=is_win):
+                with self.assertRaisesRegex(AssertionError, "differs"):
+                    self.invoke("--verify-embedded")
+        wasm.write_bytes(orig_wasm)
+        for is_win in (True, False):
+            with patch.object(official_plugins, "_is_windows_host", return_value=is_win):
                 self.invoke("--verify-embedded")
-        # On POSIX (e.g. macOS CI), OS Location::caller() slash differences are tolerated
-        # only when source_sha256, embedded archive hashes, manifests, and leak checks all pass.
-        with patch.object(official_plugins, "_is_windows_host", return_value=False):
+        # Changing source manifest without rebuilding embedded bundle is rejected before byte check.
+        webdav_manifest = self.root / "crates/iris-plugin-webdav/plugin.json"
+        webdav_manifest.write_text(json.dumps({
+            "id": "iris.webdav", "version": "0.0.2", "protocol": 2, "abi": 2,
+            "entry": "plugin.wasm", "permissions": ["media_source"],
+        }), encoding="utf-8", newline="\n")
+        with self.assertRaisesRegex(AssertionError, "plugin.json differs"):
             self.invoke("--verify-embedded")
-            # Changing source manifest without rebuilding embedded bundle is still rejected on POSIX.
-            webdav_manifest = self.root / "crates/iris-plugin-webdav/plugin.json"
-            webdav_manifest.write_text(json.dumps({
-                "id": "iris.webdav", "version": "0.0.2", "protocol": 2, "abi": 2,
-                "entry": "plugin.wasm", "permissions": ["media_source"],
-            }), encoding="utf-8", newline="\n")
-            with self.assertRaisesRegex(AssertionError, "plugin.json differs"):
-                self.invoke("--verify-embedded")
         self.assertEqual(self.snapshot(), before)
 
     def test_in_place_verification_fails_before_building_or_mutating_embedded_packages(self):
@@ -282,7 +285,12 @@ class PluginRuntimeTests(unittest.TestCase):
             root = Path(directory)
             frameworks = root / "Frameworks"
             frameworks.mkdir()
-            with patch.object(package, "run", return_value="<?xml version=\"1.0\"?><plist version=\"1.0\"><dict/></plist>"):
+            rogue_plist = (
+                '<?xml version="1.0"?><plist version="1.0"><dict>'
+                '<key>com.apple.security.cs.allow-unsigned-executable-memory</key><true/>'
+                '</dict></plist>'
+            )
+            with patch.object(package, "run", return_value=rogue_plist):
                 with self.assertRaisesRegex(RuntimeError, "entitlements"):
                     package.sign_payload(root, root / "iris", frameworks, root, {}, "macos-arm64", "local", "0.0.1", False, root)
 

@@ -1,5 +1,5 @@
 use super::{
-    Capability, Generation, Id, Role,
+    Capability, Generation, Id, Role, WireU64,
     enhance::{AnnotationEdit, Chapter, EnhancementResource, OverlayWindow, SubtitleFormat},
     source::{PlaybackSnapshot, ResolvedMedia, SourceDescriptor, SourcePage},
     stream::{ManifestFormat, StreamContext},
@@ -110,7 +110,7 @@ pub enum HostEvent<T> {
         request_id: Id,
         generation: Generation,
         resource_id: String,
-        offset: Id,
+        offset: WireU64,
         len: u32,
     },
     StreamReadCancelled {

@@ -3,9 +3,10 @@ use super::redact::redact_url;
 use super::writer::{RotatingFile, backup_path};
 use super::{
     EVENT_SCHEMA_VERSION, EventLevel, TelemetryEvent, TelemetrySink, format_log_line, redact_json,
-    redact_text, should_flush_level, url_host,
+    redact_text, register_sensitive_keys, should_flush_level, url_host,
 };
 use crate::test_util::TestDir;
+use crate::vault::CredentialVault;
 use serde_json::{Value, json};
 use std::sync::{Arc, Mutex};
 
@@ -325,4 +326,47 @@ fn concurrent_event_writes_produce_clean_uncorrupted_jsonl() {
         .map(|l| serde_json::from_str::<Value>(l).unwrap())
         .collect();
     assert_eq!(lines.len(), 100);
+}
+
+#[test]
+fn plugin_declared_sensitive_keys_and_vault_secret_values_redact_without_hardcoded_host_names() {
+    // 1. Plugin-specific key names are declared via manifest/registration rather than hardcoded in host.
+    assert_eq!(
+        redact_text("custom_plugin_sid=bili_live_val_42"),
+        "custom_plugin_sid=bili_live_val_42"
+    );
+    register_sensitive_keys(["custom_plugin_sid", "sessdata", "bili_jct"]);
+    assert_eq!(
+        redact_text("custom_plugin_sid=bili_live_val_42; SESSDATA=sec_99; bili_jct=csrf_11"),
+        "custom_plugin_sid=<redacted>; SESSDATA=<redacted>; bili_jct=<redacted>"
+    );
+    let json_val = redact_json(json!({
+        "Custom_Plugin_Sid": "bili_live_val_42",
+        "ok_field": "visible"
+    }));
+    assert_eq!(json_val["Custom_Plugin_Sid"], "<redacted>");
+    assert_eq!(json_val["ok_field"], "visible");
+
+    // 2. CredentialVault automatically registers secret values so bare/keyless leaks are scrubbed.
+    let vault = CredentialVault::in_memory();
+    let opaque_secret = "opaque-vault-credential-value-987654321";
+    vault
+        .set_secret("plugin.custom", "arbitrary_slot", Some(opaque_secret))
+        .unwrap();
+    let scrubbed_text = redact_text(&format!(
+        "upstream rejected header {opaque_secret} on retry"
+    ));
+    assert!(!scrubbed_text.contains(opaque_secret), "{scrubbed_text}");
+    assert_eq!(
+        scrubbed_text,
+        "upstream rejected header <redacted> on retry"
+    );
+
+    let scrubbed_json = redact_json(json!({
+        "unrecognized_field": format!("raw={opaque_secret}"),
+        "safe": "unchanged"
+    }));
+    assert!(!scrubbed_json.to_string().contains(opaque_secret));
+    assert_eq!(scrubbed_json["unrecognized_field"], "raw=<redacted>");
+    assert_eq!(scrubbed_json["safe"], "unchanged");
 }

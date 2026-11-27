@@ -445,7 +445,7 @@ impl Mailbox {
         let generation = state.generation;
         let bytes = serde_json::to_vec(
             &serde_json::json!({"event":"stream_read","request_id":Id(request),
-            "generation":generation,"resource_id":resource,"offset":Id(offset),"len":len}),
+            "generation":generation,"resource_id":resource,"offset":iris_api::v2::WireU64(offset),"len":len}),
         )
         .map_err(|_| ErrorCode::Internal)?;
         let slot = ReadSlot::new();

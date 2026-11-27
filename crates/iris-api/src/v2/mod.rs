@@ -11,7 +11,7 @@ pub mod task_result;
 pub mod wire;
 pub use wire::{HostCommand, HostEvent, LogLevel};
 
-pub use integer::Id;
+pub use integer::{Id, WireU64};
 pub use manifest::{Capability, HostRule, Manifest, NetworkDeclaration};
 use serde::{Deserialize, Serialize};
 

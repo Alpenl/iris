@@ -28,7 +28,25 @@ cargo build --locked --release -p iris
 python -B scripts/benchmark-plugin-v2.py target/release/iris.exe --runs 5 --output target/v2-contracts/jit-benchmark.json --baseline docs/benchmarks/plugin-v2-windows-jit-2026-11-24.json
 ```
 
-运行时须按仓库说明设置 `MPV_LIB_DIR` 和动态库搜索路径。机器或工具链不一致时脚本拒绝直接比较预算。macOS Intel/ARM 签名后 JIT 必须在对应发行环境运行 `--check-plugin-runtime`，Windows 记录不能替代它。
+运行时须按仓库说明设置 `MPV_LIB_DIR` 和动态库搜索路径。机器或工具链不一致时脚本拒绝直接比较预算。macOS Intel/ARM 签名后运行时必须在对应发行环境运行 `--check-plugin-runtime`（同时校验签名 entitlements 为空 `<dict/>`），Windows 记录不能替代它。
+
+## Pulley64 只读字节码切换与对比基线（2026-11-27）
+
+为彻底移除主进程 `com.apple.security.cs.allow-unsigned-executable-memory` 豁免，`RuntimeEngine` 已由 Cranelift 原生 JIT 切换为 `pulley64` 字节码解释器。在相同机器（Windows 11 build 26300、Intel Family 6 Model 154、16 逻辑处理器、Rust 1.100.0 `release`）下的五轮独立进程采样与同进程 1,000 次 `iris_on_event` 调度对比如下：
+
+| 指标 | Cranelift JIT（切换前同机复测） | Pulley (`pulley64`) |
+| --- | ---: | ---: |
+| 整个进程墙钟时间 p50 / p95 | 1,719 ms / 1,828 ms | 2,344 ms / 2,485 ms |
+| 整个进程峰值工作集 p50 / p95 | 54.86 MiB / 55.11 MiB | 49.96 MiB / 50.05 MiB |
+| Guides 冷编译 p50 / p95 | 519.75 ms / 565.70 ms | 692.89 ms / 996.18 ms |
+| WebDAV 冷编译 p50 / p95 | 1,073.74 ms / 1,095.93 ms | 1,324.68 ms / 1,393.39 ms |
+| Guides 实例化 / 单次回调 p50 | 0.20 ms / 0.09 ms | 0.25 ms / 0.11 ms |
+| WebDAV 实例化 / 单次回调 p50 | 0.11 ms / 0.04 ms | 0.16 ms / 0.10 ms |
+| Guides 1,000 次调度总耗时 | 4.14 ms | 26.45 ms |
+| WebDAV 1,000 次调度总耗时 | 1.91 ms | 29.65 ms |
+| Bilibili（1.61 MiB）1,000 次调度总耗时 | 2.41 ms | 34.24 ms |
+
+更新同机器、OS、工具链、`release` profile 下的 `pulley64` 试运行回归预算：墙钟 p95 ≤ 3,106.25 ms，峰值工作集 p95 ≤ 65,607,680 bytes（采样 p95 的 1.25 倍）。
 
 ## 4K 素材十分钟传输（2026-11-25）
 

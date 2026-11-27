@@ -9,7 +9,7 @@ use crate::{
 use iris_plugin_sdk::api::{
     StreamVariant,
     v2::{
-        CHUNK_LIMIT, ErrorCode, Id,
+        CHUNK_LIMIT, ErrorCode, Id, WireU64,
         source::ResolvedMedia,
         stream::{
             ByteRange, HlsKey, HlsSegment, HlsTrack, ManifestFormat, RemoteResource,
@@ -170,7 +170,7 @@ pub fn compile_m3u8_to_virtual_hls(m3u8: &str, base_url: &str) -> Result<Virtual
                     id: kid.clone(),
                     kind: ResourceKind::Key,
                     extension: ResourceExtension::Key,
-                    size: Some(Id(16)),
+                    size: Some(WireU64(16)),
                     source: ResourceSource::Remote {
                         request: RemoteResource {
                             url: abs.to_string(),
@@ -208,8 +208,8 @@ pub fn compile_m3u8_to_virtual_hls(m3u8: &str, base_url: &str) -> Result<Virtual
                 let range = extract_quoted_attr(rest, "BYTERANGE").and_then(|br| {
                     let (l, o) = br.split_once('@')?;
                     Some(ByteRange {
-                        len: Id(l.parse::<u64>().ok()?),
-                        offset: Id(o.parse::<u64>().ok()?),
+                        len: WireU64(l.parse::<u64>().ok()?),
+                        offset: WireU64(o.parse::<u64>().ok()?),
                     })
                 });
                 current_init = Some(ResourceSpan {
@@ -259,8 +259,8 @@ pub fn compile_m3u8_to_virtual_hls(m3u8: &str, base_url: &str) -> Result<Virtual
                         .map_or(0, |r| r.offset.0.saturating_add(r.len.0))
                 });
                 ByteRange {
-                    offset: Id(offset),
-                    len: Id(len),
+                    offset: WireU64(offset),
+                    len: WireU64(len),
                 }
             });
             let seg_seq = sequence.saturating_add(segments.len() as u64);
@@ -273,7 +273,7 @@ pub fn compile_m3u8_to_virtual_hls(m3u8: &str, base_url: &str) -> Result<Virtual
                     resource_id: sid,
                     range,
                 },
-                duration_ms: Id(duration_ms),
+                duration_ms: WireU64(duration_ms),
                 init: current_init.clone(),
                 key,
                 discontinuity: std::mem::take(&mut pending_discontinuity),
@@ -295,8 +295,8 @@ pub fn compile_m3u8_to_virtual_hls(m3u8: &str, base_url: &str) -> Result<Virtual
             lang: None,
             codec: None,
             default: true,
-            sequence: Id(sequence),
-            discontinuity_sequence: Id(discontinuity_sequence),
+            sequence: WireU64(sequence),
+            discontinuity_sequence: WireU64(discontinuity_sequence),
             segments,
         }],
         variants: Vec::new(),

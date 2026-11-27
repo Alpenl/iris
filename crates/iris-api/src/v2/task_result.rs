@@ -1,4 +1,4 @@
-use super::Id;
+use super::{Id, WireU64};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -32,14 +32,14 @@ pub struct StoreWrite {
 pub enum HttpResult {
     Upload {
         stream_handle: Id,
-        written: Option<Id>,
+        written: Option<WireU64>,
     },
     Response {
         stream_handle: Id,
         status: u16,
         url: String,
         headers: Vec<(String, String)>,
-        written: Option<Id>,
+        written: Option<WireU64>,
     },
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -52,7 +52,7 @@ pub struct ReadResult {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WriteResult {
-    pub written: Id,
+    pub written: WireU64,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -86,7 +86,7 @@ pub struct AuthRejected {
 #[serde(deny_unknown_fields)]
 pub struct ArtifactResult {
     pub artifact: Id,
-    pub bytes: Id,
+    pub bytes: WireU64,
     pub format: String,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -99,5 +99,5 @@ pub struct ArtifactWriterResult {
 pub struct HashResult {
     pub algorithm: String,
     pub digest: String,
-    pub bytes: Id,
+    pub bytes: WireU64,
 }

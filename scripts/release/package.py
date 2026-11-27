@@ -683,15 +683,15 @@ def sign_payload(payload, executable, frameworks, notices, graph, target, mode, 
         json.dumps(record, indent=2) + "\n", encoding="utf-8", newline="\n"
     )
     if not windows:
-        # Locked Wasmtime 51 uses mmap + mprotect for code, not MAP_JIT.
-        # Do not disable library validation or general executable page protection.
+        # Pulley64 executes Wasm bytecode in read-only memory without JIT executable pages.
+        # Resources/Iris.entitlements stays an empty <dict/>; reject any unapproved entitlement.
         entitlements = ROOT / "Resources/Iris.entitlements"
         run(["codesign", "--force", "--sign", identity, *signing, "--entitlements", entitlements, payload])
         run(["codesign", "--verify", "--deep", "--strict", payload])
         signed = run(["codesign", "--display", "--entitlements", ":-", payload])
         begin, end = signed.find("<?xml"), signed.rfind("</plist>")
         if begin < 0 or end < begin or plistlib.loads(signed[begin:end + len("</plist>")].encode()) != plistlib.loads(entitlements.read_bytes()):
-            raise RuntimeError("Signed plugin JIT entitlements differ from the reviewed policy")
+            raise RuntimeError("Signed bundle entitlements differ from the reviewed policy")
         if release:
             details = run(["codesign", "--display", "--verbose=4", payload])
             if "Authority=Developer ID Application:" not in details or "runtime" not in details:

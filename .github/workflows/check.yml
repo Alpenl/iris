@@ -72,9 +72,8 @@ jobs:
       - uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756
         with:
           arch: x64
-      # rust-src changes the official plugin Wasm: with it, rustc records std panic
-      # locations against the local copy (remapped to /rustup-sysroot) instead of
-      # /rustc/<hash>. Resources/Plugins was built with it, and this job compares bytes.
+      # Windows keeps rust-src while macOS uses minimal profile so `--verify-embedded`
+      # continuously proves byte-for-byte Wasm reproducibility across OSes and +/- rust-src.
       - name: Install Rust toolchain
         shell: bash
         run: |

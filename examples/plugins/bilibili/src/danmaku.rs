@@ -5,7 +5,7 @@
 use iris_plugin_sdk::api::{
     Color,
     v2::{
-        Id,
+        WireU64,
         enhance::{Chapter, CueContent, CueLayout, OverlayWindow, TimedCue},
     },
 };
@@ -170,8 +170,8 @@ pub fn cues_for_window(
         let color = Color::Hex(format!("#{:06X}{alpha:02X}", item.rgb));
         out.push(TimedCue {
             id: item.id.clone(),
-            start_ms: Id(item.start_ms),
-            duration_ms: Id(dur),
+            start_ms: WireU64(item.start_ms),
+            duration_ms: WireU64(dur),
             layout: item.layout.clone(),
             content: CueContent::Text {
                 text: item.text.clone(),
@@ -199,7 +199,7 @@ pub fn parse_player_v2_info(json: &Value) -> (Vec<Chapter>, Vec<SubtitleTrackMet
                 .filter(|s| !s.is_empty())
                 .unwrap_or_else(|| "章节".into());
             chapters.push(Chapter {
-                start_ms: Id(from.saturating_mul(1000)),
+                start_ms: WireU64(from.saturating_mul(1000)),
                 title: content,
             });
         }

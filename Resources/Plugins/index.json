@@ -1,20 +1,20 @@
 {
   "schema": 1,
-  "source_sha256": "9655d29e615801a56d52f88cfb84e58678813328b00c29ad61380285e2e9f7b6",
+  "source_sha256": "dfc27d793e0ad2dd2f6ffee35d10e22e86622899a8f37aedc635972db528a6a5",
   "packages": [
     {
       "id": "iris.guides",
       "version": "0.0.2",
       "file": "iris.guides.irisplugin",
-      "sha256": "85adf93b8991c9ad70fd2e5d0515a7c3ea2f9710c9c943199274afb61a1d7c0b",
-      "content_sha256": "f45828472e267c421bcfa06e32dd2b084881f10444c2d42a9f5e137cacf22609"
+      "sha256": "e28e3ef7b47fd1c2ec0f18a8a6810c7326677db2eac561df1ff4f16b813b957a",
+      "content_sha256": "ff44e95e8a663761658f2cdab41e416153a42d0a1dde869a9dbc54be671e0829"
     },
     {
       "id": "iris.webdav",
       "version": "0.0.2",
       "file": "iris.webdav.irisplugin",
-      "sha256": "e90807397ae102c03dd2f4988f097261367ab8529e678dd21afcd4d5d37df264",
-      "content_sha256": "67b75ae1a3daced6a4fee9250497dd980cd628c409bbb4c541083f14a0e1089e"
+      "sha256": "7ab683ca505b33634d657b73167e7a8454466bacb27153832b1c227b0c51ac6a",
+      "content_sha256": "7a0f67b565a08886e53e7bc7382696e259a50a522e7b694b318089594526fa99"
     }
   ]
 }

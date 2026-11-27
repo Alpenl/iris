@@ -4,7 +4,7 @@ use crate::auth::{REFERER, USER_AGENT};
 use iris_plugin_sdk::api::{
     SelectOption, SourceEntryKind,
     v2::{
-        Id,
+        WireU64,
         source::{SourceEntry, SourceFilter},
         stream::RemoteResource,
     },
@@ -55,7 +55,7 @@ pub(super) fn parse_video_card(item: &Value) -> Option<SourceEntry> {
             SourceEntryKind::Video
         },
         size: None,
-        modified_secs: item.get("pubdate").and_then(Value::as_u64).map(Id),
+        modified_secs: item.get("pubdate").and_then(Value::as_u64).map(WireU64),
         duration,
         subtitle: (!sub_parts.is_empty()).then(|| sub_parts.join(" · ")),
         variants: Vec::new(),

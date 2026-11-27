@@ -152,8 +152,9 @@ fn handle(value: Value) -> Result<Vec<HostCommand>, ErrorCode> {
         Some("stream_read") => {
             let request: Id = serde_json::from_value(value["request_id"].clone())
                 .map_err(|_| ErrorCode::InvalidArgument)?;
-            let offset: Id = serde_json::from_value(value["offset"].clone())
-                .map_err(|_| ErrorCode::InvalidArgument)?;
+            let offset: iris_plugin_sdk::api::v2::WireU64 =
+                serde_json::from_value(value["offset"].clone())
+                    .map_err(|_| ErrorCode::InvalidArgument)?;
             let len = value["len"].as_u64().ok_or(ErrorCode::InvalidArgument)? as usize;
             if value["resource_id"] == "delayed" {
                 let operation = slow()?;

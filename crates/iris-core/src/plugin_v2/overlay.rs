@@ -7,7 +7,7 @@ use super::{
 };
 pub use clock::OverlayClock;
 use iris_api::v2::{
-    ErrorCode, Generation, Id,
+    ErrorCode, Generation, Id, WireU64,
     enhance::{CueContent, CueLayout, OverlayWindow, TimedCue},
 };
 use std::{
@@ -331,8 +331,8 @@ impl OverlayBank {
 fn window(revision: Id, position: u64) -> OverlayWindow {
     OverlayWindow {
         revision,
-        start_ms: Id(position.saturating_sub(30_000)),
-        end_ms: Id(position.saturating_add(120_000)),
+        start_ms: WireU64(position.saturating_sub(30_000)),
+        end_ms: WireU64(position.saturating_add(120_000)),
     }
 }
 fn estimate_overlay_node_bytes(node: &iris_api::OverlayNode) -> usize {

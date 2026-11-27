@@ -173,6 +173,7 @@ impl Package {
         if manifest.entry.is_some() != files.contains_key("plugin.wasm") {
             return Err(ErrorCode::InvalidArgument);
         }
+        crate::logging::register_sensitive_keys(&manifest.sensitive_keys);
         let mut hash = Context::new(&SHA256);
         for (path, bytes) in &files {
             hash.update(&(path.len() as u64).to_le_bytes());
