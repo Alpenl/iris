@@ -1503,6 +1503,82 @@ class CheckProjectHelperTests(unittest.TestCase):
         with self.assertRaisesRegex(AssertionError, "iris-beta-"):
             check_project.check_thread_inventory_docs(sample_concurrency, "Threads: `iris-alpha` only.")
 
+    def test_run_cargo_tree_falls_back_when_offline_cache_is_empty(self):
+        extra = ["-p", "iris-app", "-e", "normal,build,dev", "--target", "all"]
+        fake_cwd = Path("/tmp/fake-iris-root")
+
+        with patch.object(
+            check_project.subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess(
+                ["cargo", "tree", "--offline", "--locked", *extra],
+                0,
+                stdout="iris-app v0.0.2\n",
+                stderr="",
+            ),
+        ) as mocked:
+            out = check_project.run_cargo_tree(extra, cwd=fake_cwd)
+            self.assertEqual(out, "iris-app v0.0.2\n")
+            self.assertEqual(mocked.call_count, 1)
+            self.assertEqual(
+                mocked.call_args.args[0],
+                ["cargo", "tree", "--offline", "--locked", *extra],
+            )
+            self.assertEqual(mocked.call_args.kwargs["cwd"], fake_cwd)
+
+        with patch.object(
+            check_project.subprocess,
+            "run",
+            side_effect=[
+                subprocess.CompletedProcess(
+                    ["cargo", "tree", "--offline", "--locked", *extra],
+                    101,
+                    stdout="",
+                    stderr="error: attempting to make an HTTP request, but --offline was specified\n",
+                ),
+                subprocess.CompletedProcess(
+                    ["cargo", "tree", "--locked", *extra],
+                    0,
+                    stdout="iris-app v0.0.2\n└── iris-core v0.0.2\n",
+                    stderr="    Updating crates.io index\n",
+                ),
+            ],
+        ) as mocked:
+            out = check_project.run_cargo_tree(extra, cwd=fake_cwd)
+            self.assertEqual(out, "iris-app v0.0.2\n└── iris-core v0.0.2\n")
+            self.assertEqual(mocked.call_count, 2)
+            self.assertEqual(
+                [call.args[0] for call in mocked.call_args_list],
+                [
+                    ["cargo", "tree", "--offline", "--locked", *extra],
+                    ["cargo", "tree", "--locked", *extra],
+                ],
+            )
+
+        with patch.object(
+            check_project.subprocess,
+            "run",
+            side_effect=[
+                subprocess.CompletedProcess(
+                    ["cargo", "tree", "--offline", "--locked", *extra],
+                    101,
+                    stdout="",
+                    stderr="offline failure",
+                ),
+                subprocess.CompletedProcess(
+                    ["cargo", "tree", "--locked", *extra],
+                    101,
+                    stdout="",
+                    stderr="error: the lock file Cargo.lock needs to be updated but --locked was passed\n",
+                ),
+            ],
+        ):
+            with self.assertRaises(subprocess.CalledProcessError) as ctx:
+                check_project.run_cargo_tree(extra, cwd=fake_cwd)
+            self.assertEqual(ctx.exception.returncode, 101)
+            self.assertEqual(ctx.exception.cmd, ["cargo", "tree", "--locked", *extra])
+            self.assertIn("--locked", ctx.exception.stderr)
+
 
 class MediaFixtureScriptTests(unittest.TestCase):
     def test_make_webp_test_media_rejects_missing_explicit_icc_overrides_without_falling_back(self):

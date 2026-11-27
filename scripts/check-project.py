@@ -921,6 +921,36 @@ def check_app_plugin_host_facade_only(rel: Path, raw_text: str):
     )
 
 
+def run_cargo_tree(extra_args: list[str], *, cwd: Path = ROOT) -> str:
+    """Run `cargo tree --locked`, trying `--offline` first and falling back to online when uncached."""
+    offline_cmd = ["cargo", "tree", "--offline", "--locked", *extra_args]
+    offline = subprocess.run(
+        offline_cmd,
+        cwd=cwd,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if offline.returncode == 0:
+        return offline.stdout
+    online_cmd = ["cargo", "tree", "--locked", *extra_args]
+    online = subprocess.run(
+        online_cmd,
+        cwd=cwd,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if online.returncode != 0:
+        raise subprocess.CalledProcessError(
+            online.returncode,
+            online_cmd,
+            output=online.stdout,
+            stderr=online.stderr or offline.stderr,
+        )
+    return online.stdout
+
+
 def check_no_transitive_gpui(tree_output: str):
     """Reject any transitive `gpui` dependency in `cargo tree -p iris-app -e normal,build,dev --target all`."""
     hit = re.search(r"(?m)(?:^|\s)gpui\s+v[0-9]", tree_output)
@@ -1108,13 +1138,7 @@ def main():
     forbidden_app = forbidden_headless | {"iris-mpv", "iris"}
     _require(not (app_deps & forbidden_app), f"iris-app must stay headless and mpv-free, found {app_deps & forbidden_app}")
 
-    app_tree = subprocess.run(
-        ["cargo", "tree", "--offline", "--locked", "-p", "iris-app", "-e", "normal,build,dev", "--target", "all"],
-        cwd=ROOT,
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout
+    app_tree = run_cargo_tree(["-p", "iris-app", "-e", "normal,build,dev", "--target", "all"])
     check_no_transitive_gpui(app_tree)
 
     # 3b. Wildcard-super ban across all headless & guest crates + top-level module cycle ratchet
