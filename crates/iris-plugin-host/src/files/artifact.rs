@@ -377,7 +377,7 @@ impl ArtifactCleaner {
     }
 }
 
-pub struct TempRoot {
+pub(crate) struct TempRoot {
     _standalone_owner: Option<ArtifactCleaner>,
     cleaner: CleanerQueue,
     handle: Arc<TempDirHandle>,
@@ -388,12 +388,6 @@ pub struct TempRoot {
 }
 
 impl TempRoot {
-    pub fn new(parent: &Path, owner: String, ledger: Ledger) -> Result<Arc<Self>, ErrorCode> {
-        let cleaner = ArtifactCleaner::new();
-        let queue = cleaner.queue();
-        Self::build(parent, owner, ledger, queue, Some(cleaner))
-    }
-
     pub(crate) fn with_cleaner(
         parent: &Path,
         owner: String,
@@ -446,7 +440,7 @@ impl TempRoot {
         }))
     }
 
-    pub fn owner(&self) -> &str {
+    pub(crate) fn owner(&self) -> &str {
         &self.owner
     }
 
@@ -454,11 +448,11 @@ impl TempRoot {
         self.handle.directory()
     }
 
-    pub fn is_quiescent(&self) -> bool {
+    pub(crate) fn is_quiescent(&self) -> bool {
         self.activity.is_idle()
     }
 
-    pub fn writer(self: &Arc<Self>, format: &str) -> Result<ArtifactWriter, ErrorCode> {
+    pub(crate) fn writer(self: &Arc<Self>, format: &str) -> Result<ArtifactWriter, ErrorCode> {
         if !matches!(
             format,
             "wav"
@@ -509,7 +503,7 @@ impl TempRoot {
     }
 }
 
-pub struct ArtifactWriter {
+pub(crate) struct ArtifactWriter {
     file: Option<File>,
     root: Arc<TempRoot>,
     pub(super) name: String,
@@ -525,7 +519,7 @@ impl ArtifactWriter {
         self
     }
 
-    pub fn write(&mut self, bytes: &[u8], cancel: &HttpCancel) -> Result<(), ErrorCode> {
+    pub(crate) fn write(&mut self, bytes: &[u8], cancel: &HttpCancel) -> Result<(), ErrorCode> {
         if cancel.is_cancelled() {
             return Err(ErrorCode::Cancelled);
         }
@@ -542,7 +536,7 @@ impl ArtifactWriter {
         Ok(())
     }
 
-    pub fn finish(mut self, cancel: &HttpCancel) -> Result<Arc<Artifact>, ErrorCode> {
+    pub(crate) fn finish(mut self, cancel: &HttpCancel) -> Result<Arc<Artifact>, ErrorCode> {
         if cancel.is_cancelled() {
             return Err(ErrorCode::Cancelled);
         }
@@ -577,7 +571,7 @@ impl Drop for ArtifactWriter {
     }
 }
 
-pub struct Artifact {
+pub(crate) struct Artifact {
     pub id: iris_api::v2::Id,
     file: Option<PinnedFile>,
     root: Arc<TempRoot>,
@@ -588,19 +582,19 @@ pub struct Artifact {
 }
 
 impl Artifact {
-    pub fn size(&self) -> u64 {
+    pub(crate) fn size(&self) -> u64 {
         self.file.as_ref().map_or(0, |f| f.initial.size)
     }
 
-    pub fn owner(&self) -> &str {
+    pub(crate) fn owner(&self) -> &str {
         self.root.owner()
     }
 
-    pub fn path(&self) -> PathBuf {
+    pub(crate) fn path(&self) -> PathBuf {
         self.root.path.join(&self.name)
     }
 
-    pub fn read_at(
+    pub(crate) fn read_at(
         &self,
         offset: u64,
         bytes: &mut [u8],
@@ -645,9 +639,22 @@ fn queue(
 #[cfg(test)]
 mod tests {
     use super::{
-        ArtifactCleaner, CleanerOwner, CleanerShared, CleanerState, DrainPolicy, Phase, RemoveFn,
+        ArtifactCleaner, CleanerOwner, CleanerShared, CleanerState, DrainPolicy, ErrorCode, Ledger,
+        Path, Phase, RemoveFn, TempRoot,
     };
     use std::sync::{Arc, Condvar, Mutex};
+
+    impl TempRoot {
+        pub(crate) fn new(
+            parent: &Path,
+            owner: String,
+            ledger: Ledger,
+        ) -> Result<Arc<Self>, ErrorCode> {
+            let cleaner = ArtifactCleaner::new();
+            let queue = cleaner.queue();
+            Self::build(parent, owner, ledger, queue, Some(cleaner))
+        }
+    }
 
     impl ArtifactCleaner {
         pub(crate) fn with_test_hooks(policy: DrainPolicy, remover: Arc<RemoveFn>) -> Self {

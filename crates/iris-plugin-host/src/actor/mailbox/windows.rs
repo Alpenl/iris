@@ -8,7 +8,7 @@ fn same(a: Generation, b: Generation) -> bool {
     a.media == b.media && a.seek == b.seek
 }
 impl Mailbox {
-    pub fn contexts(&self) -> (Generation, BTreeMap<Id, Generation>) {
+    pub(crate) fn contexts(&self) -> (Generation, BTreeMap<Id, Generation>) {
         let state = self.lock();
         (
             state.generation,
@@ -19,7 +19,7 @@ impl Mailbox {
                 .collect(),
         )
     }
-    pub fn is_current(&self, window: Option<Id>, generation: Generation) -> bool {
+    pub(crate) fn is_current(&self, window: Option<Id>, generation: Generation) -> bool {
         let state = self.lock();
         if self.cancel.is_cancelled() {
             return false;
@@ -31,7 +31,7 @@ impl Mailbox {
             None => same(state.generation, generation),
         }
     }
-    pub fn is_session_current(&self, generation: Generation) -> Option<Generation> {
+    pub(crate) fn is_session_current(&self, generation: Generation) -> Option<Generation> {
         let state = self.lock();
         if self.cancel.is_cancelled() || state.generation.media != generation.media {
             None
@@ -39,60 +39,10 @@ impl Mailbox {
             Some(state.generation)
         }
     }
-    /// Window IDs come from the host's monotonic allocator, never reused; at most one
-    /// active window session may be open at a time.
-    pub fn open_window(&self, window: Id, generation: Generation) -> Result<(), ErrorCode> {
-        if self.role != Role::Control || window.0 == 0 {
-            return Err(ErrorCode::Denied);
-        }
-        let lease = self.ledger.reserve(
-            &self.owner,
-            &[(Resource::Handle, 1), (Resource::HostBytes, 4096)],
-        )?;
-        {
-            let mut state = self.lock();
-            if self.cancel.is_cancelled() {
-                return Err(ErrorCode::Cancelled);
-            }
-            if let Some((active, _)) = &state.window {
-                return Err(if *active == window {
-                    ErrorCode::BadState
-                } else {
-                    ErrorCode::QuotaExceeded
-                });
-            }
-            if state.closed.len() >= 8 {
-                return Err(ErrorCode::QuotaExceeded);
-            }
-            state.window = Some((
-                window,
-                WindowContext {
-                    generation,
-                    cancel: HttpCancel::default(),
-                    ready: false,
-                    _lease: lease,
-                },
-            ));
-        }
-        // Executor changes run outside the mailbox lock; cancellation can wake
-        // a completing operation. Admission remains closed during this interval.
-        self.executor.window_changed(window, Some(generation));
-        let mut state = self.lock();
-        let Some((_, scope)) = state.window.as_mut().filter(|(id, _)| *id == window) else {
-            drop(state);
-            self.executor.window_changed(window, None);
-            return Err(ErrorCode::StaleHandle);
-        };
-        if scope.generation != generation {
-            return Err(ErrorCode::StaleHandle);
-        }
-        scope.ready = true;
-        Ok(())
-    }
     /// Atomically opens `window` and queues its initial `WindowOpened` event.
     /// If admission fails (e.g. mailbox event backpressure or byte quota), rolls
     /// back without queueing a phantom `Message::Closed` notification.
-    pub fn open_window_with_event(
+    pub(crate) fn open_window_with_event(
         &self,
         window: Id,
         generation: Generation,
@@ -189,7 +139,11 @@ impl Mailbox {
         self.changed.notify_one();
         Ok(())
     }
-    pub fn advance_window(&self, window: Id, generation: Generation) -> Result<(), ErrorCode> {
+    pub(crate) fn advance_window(
+        &self,
+        window: Id,
+        generation: Generation,
+    ) -> Result<(), ErrorCode> {
         let cancel = {
             let mut state = self.lock();
             if self.cancel.is_cancelled() {
@@ -236,7 +190,7 @@ impl Mailbox {
         self.changed.notify_one();
         Ok(())
     }
-    pub fn close_window(&self, window: Id) -> Result<(), ErrorCode> {
+    pub(crate) fn close_window(&self, window: Id) -> Result<(), ErrorCode> {
         let cancel = {
             let mut state = self.lock();
             if state.window.as_ref().is_none_or(|(id, _)| *id != window) {
@@ -260,7 +214,7 @@ impl Mailbox {
         (self.wake)();
         Ok(())
     }
-    pub fn send_window(
+    pub(crate) fn send_window(
         &self,
         window: Id,
         generation: Generation,
@@ -268,7 +222,7 @@ impl Mailbox {
     ) -> Result<(), ErrorCode> {
         self.send_cancellable(window, generation, bytes, None)
     }
-    pub fn send_cancellable(
+    pub(crate) fn send_cancellable(
         &self,
         window: Id,
         generation: Generation,
@@ -336,5 +290,63 @@ impl super::super::Actor {
     ) -> Result<(), ErrorCode> {
         self.shared
             .open_window_with_event(window, generation, bytes)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ErrorCode, Generation, HttpCancel, Id, Mailbox, Resource, Role, WindowContext};
+
+    impl Mailbox {
+        pub(crate) fn open_window(
+            &self,
+            window: Id,
+            generation: Generation,
+        ) -> Result<(), ErrorCode> {
+            if self.role != Role::Control || window.0 == 0 {
+                return Err(ErrorCode::Denied);
+            }
+            let lease = self.ledger.reserve(
+                &self.owner,
+                &[(Resource::Handle, 1), (Resource::HostBytes, 4096)],
+            )?;
+            {
+                let mut state = self.lock();
+                if self.cancel.is_cancelled() {
+                    return Err(ErrorCode::Cancelled);
+                }
+                if let Some((active, _)) = &state.window {
+                    return Err(if *active == window {
+                        ErrorCode::BadState
+                    } else {
+                        ErrorCode::QuotaExceeded
+                    });
+                }
+                if state.closed.len() >= 8 {
+                    return Err(ErrorCode::QuotaExceeded);
+                }
+                state.window = Some((
+                    window,
+                    WindowContext {
+                        generation,
+                        cancel: HttpCancel::default(),
+                        ready: false,
+                        _lease: lease,
+                    },
+                ));
+            }
+            self.executor.window_changed(window, Some(generation));
+            let mut state = self.lock();
+            let Some((_, scope)) = state.window.as_mut().filter(|(id, _)| *id == window) else {
+                drop(state);
+                self.executor.window_changed(window, None);
+                return Err(ErrorCode::StaleHandle);
+            };
+            if scope.generation != generation {
+                return Err(ErrorCode::StaleHandle);
+            }
+            scope.ready = true;
+            Ok(())
+        }
     }
 }

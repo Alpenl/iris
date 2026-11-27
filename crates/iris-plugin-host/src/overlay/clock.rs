@@ -1,6 +1,6 @@
 use std::time::Instant;
 /// Interpolate the host playback clock between native position notifications.
-pub struct OverlayClock {
+pub(crate) struct OverlayClock {
     position: f64,
     anchor: Instant,
     speed: f64,
@@ -19,7 +19,7 @@ impl Default for OverlayClock {
     }
 }
 impl OverlayClock {
-    pub fn update(
+    pub(crate) fn update(
         &mut self,
         position: f64,
         speed: f64,
@@ -42,7 +42,7 @@ impl OverlayClock {
         self.anchor = now;
         self.duration = (duration.is_finite() && duration > 0.).then_some(duration);
     }
-    pub fn position_ms(&self, now: Instant) -> u64 {
+    pub(crate) fn position_ms(&self, now: Instant) -> u64 {
         let elapsed = if self.paused {
             0.
         } else {
@@ -51,19 +51,16 @@ impl OverlayClock {
         let position = self.position + elapsed;
         (self.duration.map_or(position, |end| position.min(end)) * 1000.) as u64
     }
-    pub fn paused(&self) -> bool {
-        self.paused
-    }
     fn duration_ms(&self) -> Option<u64> {
         self.duration.map(|d| (d * 1000.) as u64)
     }
-    pub fn effectively_paused(&self, now: Instant) -> bool {
+    pub(crate) fn effectively_paused(&self, now: Instant) -> bool {
         self.paused
             || self
                 .duration_ms()
                 .is_some_and(|end| self.position_ms(now) >= end)
     }
-    pub fn speed(&self) -> f64 {
+    pub(crate) fn speed(&self) -> f64 {
         self.speed
     }
 }

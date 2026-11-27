@@ -7,7 +7,7 @@ use super::{
     json_error,
     ledger::{Ledger, Resource},
 };
-pub use executor::StorageExecutor;
+pub(crate) use executor::StorageExecutor;
 use iris_api::v2::{ErrorCode, Id};
 use iris_base::net::http_client::HttpCancel;
 use iris_core::bounded_json;
@@ -34,7 +34,7 @@ struct Record {
     revision: Id,
     entries: BTreeMap<String, String>,
 }
-pub struct Storage {
+pub(crate) struct Storage {
     owner: String,
     path: PathBuf,
     vault: CredentialVault,
@@ -42,7 +42,7 @@ pub struct Storage {
     serial: Arc<serial::Serial>,
 }
 impl Storage {
-    pub fn new(
+    pub(crate) fn new(
         root: PathBuf,
         installation: String,
         vault: CredentialVault,
@@ -59,7 +59,7 @@ impl Storage {
             serial: Arc::new(serial::Serial::default()),
         })
     }
-    pub fn owner(&self) -> &str {
+    pub(crate) fn owner(&self) -> &str {
         &self.owner
     }
     fn scope(&self) -> String {
@@ -96,7 +96,7 @@ impl Storage {
     }
     /// Host migration/startup workers may use the same typed operations as the
     /// guest executor. No UI or Wasm import may call these blocking methods.
-    pub fn read_state(
+    pub(crate) fn read_state(
         &self,
         key: &str,
         cancel: &HttpCancel,
@@ -110,7 +110,7 @@ impl Storage {
         check(cancel)?;
         Ok((record.entries.get(key).cloned(), record.revision))
     }
-    pub fn write_state(
+    pub(crate) fn write_state(
         &self,
         key: &str,
         value: Option<&str>,

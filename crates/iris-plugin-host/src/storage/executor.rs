@@ -30,9 +30,9 @@ struct Inner {
     binding: Mutex<BindingState>,
 }
 #[derive(Clone)]
-pub struct StorageExecutor(Arc<Inner>);
+pub(crate) struct StorageExecutor(Arc<Inner>);
 impl StorageExecutor {
-    pub fn new(
+    pub(crate) fn new(
         store: Arc<Storage>,
         network: NetworkGrant,
         capabilities: BTreeSet<Capability>,

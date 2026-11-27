@@ -43,9 +43,10 @@ impl WindowSession {
         &self,
         plugin_id: &str,
         generation: Generation,
-        playback: Playback,
+        mut playback: Playback,
         open: impl FnOnce(Arc<ScopedPlayback>) -> Result<R, E>,
     ) -> Result<Result<R, E>, ErrorCode> {
+        let _notice_lease = playback.notice_lease.take();
         if !self.is_connected() {
             playback.relay.stop();
             return Err(ErrorCode::Cancelled);

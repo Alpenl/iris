@@ -5,7 +5,7 @@ use super::{
     ledger::{Ledger, Reservation, Resource},
     validation,
 };
-pub use clock::OverlayClock;
+pub(crate) use clock::OverlayClock;
 use iris_api::v2::{
     ErrorCode, Generation, Id, WireU64,
     enhance::{CueContent, CueLayout, OverlayWindow, TimedCue},
@@ -58,7 +58,7 @@ impl OverlayFrame {
             .map(|lease| OverlayGlyphLease { _lease: lease })
     }
 }
-pub struct OverlayBank {
+pub(crate) struct OverlayBank {
     ledger: Ledger,
     media: Id,
     generation: Generation,
@@ -67,7 +67,7 @@ pub struct OverlayBank {
     tracks: BTreeMap<(String, String), Track>,
 }
 impl OverlayBank {
-    pub fn new(ledger: Ledger, media: Id, generation: Generation, position_ms: u64) -> Self {
+    pub(crate) fn new(ledger: Ledger, media: Id, generation: Generation, position_ms: u64) -> Self {
         Self {
             ledger,
             media,
@@ -77,15 +77,15 @@ impl OverlayBank {
             tracks: BTreeMap::new(),
         }
     }
-    pub fn window(&self) -> &OverlayWindow {
+    pub(crate) fn window(&self) -> &OverlayWindow {
         &self.window
     }
-    pub fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.tracks.is_empty()
     }
     /// A changed media/seek clears old submissions. Clock motion moves the
     /// window every 15 seconds; retained overlapping cues keep their identity.
-    pub fn advance(
+    pub(crate) fn advance(
         &mut self,
         media: Id,
         generation: Generation,
@@ -138,7 +138,7 @@ impl OverlayBank {
         Ok(true)
     }
     #[allow(clippy::too_many_arguments)]
-    pub fn submit(
+    pub(crate) fn submit(
         &mut self,
         owner: &str,
         media: Id,
@@ -238,7 +238,7 @@ impl OverlayBank {
         }
         Ok(())
     }
-    pub fn clear(
+    pub(crate) fn clear(
         &mut self,
         owner: &str,
         media: Id,
@@ -249,10 +249,10 @@ impl OverlayBank {
         self.tracks.remove(&(owner.into(), name.into()));
         Ok(())
     }
-    pub fn revoke(&mut self, owner: &str) {
+    pub(crate) fn revoke(&mut self, owner: &str) {
         self.tracks.retain(|(id, _), _| id != owner);
     }
-    pub fn frame(
+    pub(crate) fn frame(
         &self,
         position_ms: u64,
         paused: bool,

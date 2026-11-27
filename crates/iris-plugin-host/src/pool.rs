@@ -44,7 +44,7 @@ impl Drop for Dispatcher {
 }
 
 #[derive(Clone)]
-pub struct IoPool {
+pub(crate) struct IoPool {
     control: Arc<Dispatcher>,
     stream: Arc<Dispatcher>,
 }
@@ -63,7 +63,7 @@ impl WorkPool {
 }
 
 impl IoPool {
-    pub fn new() -> Result<Self, ErrorCode> {
+    pub(crate) fn new() -> Result<Self, ErrorCode> {
         Ok(Self {
             control: workers("control", budget::PLUGIN_CONTROL_IO_WORKERS, 96, 32, 2),
             stream: workers("stream", budget::PLUGIN_STREAM_IO_WORKERS, 32, 16, 4),

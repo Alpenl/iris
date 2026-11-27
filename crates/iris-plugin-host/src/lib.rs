@@ -1,38 +1,51 @@
 //! Sandboxed protocol-2 runtime, installation, capabilities and presentation.
-pub mod actor;
-pub mod auth;
-pub mod crypto;
-pub mod engine;
-pub mod enhancement;
-pub mod files;
-pub mod hub;
-mod imports;
-pub mod installation;
-pub mod instance;
-pub mod ledger;
-pub mod lut;
-pub mod network;
-pub mod official;
-pub mod overlay;
-pub mod package;
-pub mod pool;
-pub mod product;
-pub mod requests;
-pub mod runtime;
-pub mod selection;
-pub mod services;
-pub mod storage;
-pub mod stream;
-pub mod ui;
-pub mod url_resolver;
-pub mod validation;
+#![deny(unreachable_pub, unnameable_types, private_interfaces, private_bounds)]
 
-pub use hub::{Binding, Notice, OriginSummary, PluginInfo, PluginStatus, ReviewSummary};
+mod actor;
+mod auth;
+mod crypto;
+mod engine;
+mod enhancement;
+mod files;
+mod hub;
+mod imports;
+mod installation;
+mod instance;
+mod ledger;
+mod lut;
+mod network;
+mod official;
+mod overlay;
+mod package;
+mod pool;
+mod product;
+mod requests;
+mod runtime;
+mod selection;
+mod services;
+mod storage;
+mod stream;
+#[cfg(feature = "test-support")]
+mod test_support;
+mod ui;
+mod url_resolver;
+mod validation;
+
+pub use hub::{
+    Binding, Commands, Notice, OriginSummary, PluginInfo, PluginStatus, ReviewSummary,
+    SourceSnapshot,
+};
+pub use installation::{ArchivedIdentity, Installed};
+pub use network::consent::SavedOrigin;
+pub use official::smoke::check as check_embedded_runtime;
 pub use overlay::{OverlayFrame, OverlayGlyphLease, PaintCue};
 pub use product::{PluginHost, plugins_dir};
 pub use requests::{AcceptedPage, BrowseTarget, RequestTarget, RequestTicket};
 pub use runtime::BackgroundResult;
 pub use selection::{HostAnnotationJob, HostAnnotationLease, annotation_error_code};
+pub use stream::prepare::{AttachmentView, Playback};
+#[cfg(feature = "test-support")]
+pub use test_support::{StreamReadMemoryProbe, open_host_with_bundled_package};
 pub use ui::{
     ActionKind, DirtySlots, EnhancementOutcome, EnhancementRequest, Event, OverlayStep,
     POLL_ACTION_LIMIT, POLL_EFFECT_LIMIT, POLL_NOTICE_LIMIT, PollReport, REMOTE_THUMB_LEASE_BYTES,
@@ -103,42 +116,4 @@ pub fn catalog_item_from_source_entry(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::catalog_item_from_source_entry;
-    use iris_api::{SourceEntryKind, StreamVariant, v2::WireU64, v2::source::SourceEntry};
-    use iris_core::catalog::CatalogItemKind;
-    use iris_core::library::Kind;
-    use iris_core::media_uri::MediaUri;
-
-    #[test]
-    fn catalog_item_maps_v2_source_entry_fields() {
-        let entry = SourceEntry {
-            id: "ep1".into(),
-            name: "Episode 1".into(),
-            kind: SourceEntryKind::Video,
-            size: Some(WireU64(4096)),
-            modified_secs: Some(WireU64(1_700_000_000)),
-            duration: Some(123.5),
-            subtitle: Some("1080p".into()),
-            variants: vec![StreamVariant {
-                id: "hd".into(),
-                label: "HD".into(),
-            }],
-            thumbnail: None,
-        };
-        let item = catalog_item_from_source_entry("iris.webdav", "nas", &entry);
-        assert_eq!(
-            item.uri,
-            MediaUri::Plugin {
-                plugin_id: "iris.webdav".into(),
-                source_id: "nas".into(),
-                entry_id: "ep1".into(),
-            }
-        );
-        assert_eq!(item.kind, CatalogItemKind::Media(Kind::Video));
-        assert_eq!(item.size, 4096);
-        assert_eq!(item.modified_secs, 1_700_000_000);
-        assert_eq!(item.duration, Some(123.5));
-        assert_eq!(item.variants.len(), 1);
-    }
-}
+mod tests;

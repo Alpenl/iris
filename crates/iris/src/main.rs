@@ -117,7 +117,7 @@ fn main() -> ExitCode {
             return print_cli_line(format_args!("Iris {}", env!("CARGO_PKG_VERSION")));
         }
         Ok(Invocation::CheckPluginRuntime) => {
-            return match iris_plugin_host::official::smoke::check() {
+            return match iris_plugin_host::check_embedded_runtime() {
                 Ok(receipt) => print_cli_line(format_args!("{receipt}")),
                 Err(error) => {
                     attach_parent_console(true);

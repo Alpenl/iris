@@ -33,12 +33,12 @@ const WAKE: Token = Token(1);
 const HEADER_LIMIT: usize = 24 << 10;
 const PRE_BODY_TIMEOUT: Duration = Duration::from_secs(5);
 
-pub struct BoundRelay {
+pub(crate) struct BoundRelay {
     listener: mio::net::TcpListener,
     poll: Poll,
 }
 impl BoundRelay {
-    pub fn bind() -> Result<Self, ErrorCode> {
+    pub(crate) fn bind() -> Result<Self, ErrorCode> {
         let listener =
             mio::net::TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).map_err(io)?;
         Ok(Self {
@@ -46,10 +46,10 @@ impl BoundRelay {
             poll: Poll::new().map_err(io)?,
         })
     }
-    pub fn authority(&self) -> Result<SocketAddr, ErrorCode> {
+    pub(crate) fn authority(&self) -> Result<SocketAddr, ErrorCode> {
         self.listener.local_addr().map_err(io)
     }
-    pub fn start(self, session: Arc<StreamSession>) -> Result<Relay, ErrorCode> {
+    pub(crate) fn start(self, session: Arc<StreamSession>) -> Result<Relay, ErrorCode> {
         self.start_with_timeout(session, PRE_BODY_TIMEOUT)
     }
     pub(super) fn start_with_timeout(
@@ -91,24 +91,16 @@ impl BoundRelay {
         Ok(Relay { service })
     }
 }
-pub struct Relay {
+pub(crate) struct Relay {
     service: Arc<Service>,
 }
 impl Relay {
-    pub fn session(&self) -> &Arc<StreamSession> {
+    pub(crate) fn session(&self) -> &Arc<StreamSession> {
         &self.service.session
     }
-    pub fn stop(&self) {
+    pub(crate) fn stop(&self) {
         self.service.session.cancel();
         let _ = self.service.wake.wake();
-    }
-    pub fn is_quiescent(&self) -> bool {
-        self.service.done.load(Ordering::Acquire)
-            && self.service.active.load(Ordering::Acquire) == 0
-            // A worker/listener can publish completion just before its captured
-            // Arc drops. Do not report release while it still owns the session.
-            && Arc::strong_count(&self.service) == 1
-            && self.service.session.is_quiescent()
     }
 }
 impl Drop for Relay {
@@ -607,5 +599,19 @@ fn io(error: std::io::Error) -> ErrorCode {
         ErrorCode::Timeout
     } else {
         ErrorCode::IoError
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Arc, Ordering, Relay};
+
+    impl Relay {
+        pub(crate) fn is_quiescent(&self) -> bool {
+            self.service.done.load(Ordering::Acquire)
+                && self.service.active.load(Ordering::Acquire) == 0
+                && Arc::strong_count(&self.service) == 1
+                && self.service.session.is_quiescent()
+        }
     }
 }

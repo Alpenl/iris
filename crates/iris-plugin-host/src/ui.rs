@@ -73,7 +73,7 @@ pub struct WindowSession {
 }
 
 impl WindowSession {
-    pub fn new(client: Client, selected_theme: Option<String>) -> Self {
+    pub(crate) fn new(client: Client, selected_theme: Option<String>) -> Self {
         let catalog = client.catalog();
         let generation = client.generation();
         Self {
@@ -88,10 +88,6 @@ impl WindowSession {
             active_stream: Mutex::new(None),
             enhance: enhance::EnhancementState::new(generation),
         }
-    }
-
-    pub fn client(&self) -> &Client {
-        &self.client
     }
 
     pub fn is_connected(&self) -> bool {

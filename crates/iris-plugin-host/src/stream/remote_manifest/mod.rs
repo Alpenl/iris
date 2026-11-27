@@ -1,27 +1,26 @@
 //! Remote HLS playlists are converted to the same validated structured model as
 //! guest manifests. Network URLs remain only in authorized resource bindings.
 mod hls;
-mod hls_parse;
-pub mod live;
+pub(crate) mod hls_parse;
+pub(crate) mod live;
 use super::{
     manifest,
     remote::{Fetched, RemoteFactory},
 };
 use crate::ledger::Resource;
-pub use hls_parse::{attributes as parse_hls_attributes, parse_media as parse_hls_media};
 use iris_api::v2::{ErrorCode, stream::*};
 use iris_base::net::http_client::HttpCancel;
 use std::collections::BTreeMap;
 use url::Url;
 
-pub struct Converted {
+pub(crate) struct Converted {
     pub format: ManifestFormat,
     pub bytes: Vec<u8>,
     pub live: bool,
     pub refresh_after: std::time::Duration,
     _memory: crate::ledger::Reservation,
 }
-pub fn convert(
+pub(crate) fn convert(
     factory: &RemoteFactory,
     resource: &RemoteResource,
     cancel: &HttpCancel,

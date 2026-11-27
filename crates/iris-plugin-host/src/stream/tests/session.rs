@@ -91,7 +91,7 @@ fn refresh_preserves_unchanged_routes_and_revokes_rebound_or_removed_resources()
     assert_eq!(session.revision(), Id(3));
     drop(old_access);
     session.cancel();
-    assert_eq!(ledger.used(None, Resource::StreamResource), 0);
+    assert_eq!(ledger.used(None, Resource::StreamEntry), 0);
     assert!(session.open(&path(&root), &HttpCancel::default()).is_err());
     drop(session);
     drop(grant);

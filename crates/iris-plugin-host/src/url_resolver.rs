@@ -2,10 +2,12 @@
 //! Patterns select a resolver; they never grant network access. Queries/fragments
 //! are not part of a routing pattern.
 mod policy;
-pub use policy::{Origin, TransportKind, normalize_url, parse_consent_origin_url};
-pub(crate) use policy::{matches_host, validate_declaration, validate_headers};
+pub(crate) use policy::{
+    Origin, TransportKind, matches_host, normalize_url, parse_consent_origin_url,
+    validate_declaration, validate_headers,
+};
 
-pub fn valid_pattern(pattern: &str) -> bool {
+pub(crate) fn valid_pattern(pattern: &str) -> bool {
     parse_pattern(pattern, "https").is_some()
 }
 
@@ -70,7 +72,7 @@ fn parse_pattern<'a>(pattern: &'a str, fallback_scheme: &str) -> Option<ParsedPa
     })
 }
 
-pub fn matches(pattern: &str, raw: &str) -> bool {
+pub(crate) fn matches(pattern: &str, raw: &str) -> bool {
     if raw.len() > 8192 {
         return false;
     }

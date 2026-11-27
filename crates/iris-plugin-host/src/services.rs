@@ -20,7 +20,7 @@ use std::{
 };
 
 #[derive(Clone)]
-pub struct Resources {
+pub(crate) struct Resources {
     pub engine: RuntimeEngine,
     pub io: IoPool,
     pub ledger: Ledger,
@@ -28,7 +28,7 @@ pub struct Resources {
 }
 
 impl Resources {
-    pub fn new() -> Result<Self, ErrorCode> {
+    pub(crate) fn new() -> Result<Self, ErrorCode> {
         Ok(Self {
             engine: RuntimeEngine::new()?,
             io: IoPool::new()?,
@@ -39,13 +39,13 @@ impl Resources {
 
     /// Drains pending artifact deletions within bounded retries/time and joins
     /// this host's cleanup worker within bounded timeout.
-    pub fn shutdown(&self) {
+    pub(crate) fn shutdown(&self) {
         self.cleaner.shutdown();
     }
 }
 
 #[derive(Clone)]
-pub struct Setup {
+pub(crate) struct Setup {
     pub resources: Resources,
     pub state_directory: PathBuf,
     pub temporary_directory: PathBuf,

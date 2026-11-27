@@ -9,7 +9,7 @@ use super::{
 };
 use iris_api::v2::{Capability, ErrorCode, MESSAGE_LIMIT, Manifest, NetworkDeclaration};
 use iris_core::bounded_json::decode;
-pub use review::Review;
+pub(crate) use review::Review;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -24,7 +24,7 @@ pub struct Installed {
     pub plugin_id: String,
     pub installation_id: String,
     pub digest: [u8; 32],
-    pub object: String,
+    pub(crate) object: String,
     pub grants: BTreeSet<Capability>,
     pub network: NetworkDeclaration,
 }
@@ -41,7 +41,7 @@ pub struct ArchivedIdentity {
 
 /// A host approval pins the exact reviewed contents and optional prior identity.
 /// Reinstallation without an explicit previous identity always gets a fresh ID.
-pub struct Approval {
+pub(crate) struct Approval {
     pub digest: [u8; 32],
     pub grants: BTreeSet<Capability>,
     pub network: NetworkDeclaration,
@@ -49,17 +49,17 @@ pub struct Approval {
 }
 
 #[derive(Clone)]
-pub struct Installer {
+pub(crate) struct Installer {
     root: PathBuf,
     ledger: Ledger,
     bundled: BTreeMap<String, [u8; 32]>,
 }
-pub struct InstallationEntry {
+pub(crate) struct InstallationEntry {
     pub plugin_id: String,
     pub record: Result<Installed, ErrorCode>,
 }
 impl Installer {
-    pub fn new(root: PathBuf, ledger: Ledger) -> Self {
+    pub(crate) fn new(root: PathBuf, ledger: Ledger) -> Self {
         Self {
             root,
             ledger,
@@ -68,7 +68,7 @@ impl Installer {
     }
     /// The index is embedded by the host distribution, never read from a user
     /// package or installation record. User installation still uses User provenance.
-    pub fn with_bundled(
+    pub(crate) fn with_bundled(
         root: PathBuf,
         ledger: Ledger,
         bundled: BTreeMap<String, [u8; 32]>,
@@ -80,11 +80,7 @@ impl Installer {
         }
     }
 
-    pub fn install(&mut self, bytes: &[u8], approval: Approval) -> Result<Installed, ErrorCode> {
-        self.install_from(bytes, approval, Provenance::User, None, None)
-            .map(|(installed, _)| installed)
-    }
-    pub fn install_bundled(
+    pub(crate) fn install_bundled(
         &mut self,
         bytes: &[u8],
         approval: Approval,
@@ -119,11 +115,11 @@ impl Installer {
         self.install_from(bytes, approval, provenance, expected, expected_archived)
     }
 
-    pub fn is_bundled(&self, id: &str) -> bool {
+    pub(crate) fn is_bundled(&self, id: &str) -> bool {
         self.bundled.contains_key(id) || id.to_ascii_lowercase().starts_with("iris.")
     }
 
-    pub fn archived(&self, id: &str) -> Result<Option<ArchivedIdentity>, ErrorCode> {
+    pub(crate) fn archived(&self, id: &str) -> Result<Option<ArchivedIdentity>, ErrorCode> {
         if !iris_api::is_valid_id(id) {
             return Err(ErrorCode::InvalidArgument);
         }
@@ -149,7 +145,11 @@ impl Installer {
     /// Bundled official plugins (`iris.*`) cannot be uninstalled.
     /// When `keep_identity` is true, archives `(plugin_id, installation_id, digest)`
     /// so a future reinstall can explicitly opt in to restore preserved state/secrets.
-    pub fn uninstall(&self, id: &str, keep_identity: bool) -> Result<Option<Installed>, ErrorCode> {
+    pub(crate) fn uninstall(
+        &self,
+        id: &str,
+        keep_identity: bool,
+    ) -> Result<Option<Installed>, ErrorCode> {
         if !iris_api::is_valid_id(id) {
             return Err(ErrorCode::InvalidArgument);
         }
@@ -325,7 +325,7 @@ impl Installer {
         Ok((record, superseded))
     }
 
-    pub fn record(&self, id: &str) -> Result<Option<Installed>, ErrorCode> {
+    pub(crate) fn record(&self, id: &str) -> Result<Option<Installed>, ErrorCode> {
         if !iris_api::is_valid_id(id) {
             return Err(ErrorCode::InvalidArgument);
         }
@@ -355,7 +355,7 @@ impl Installer {
         Ok(Some(record))
     }
 
-    pub fn load(&self, record: &Installed) -> Result<Package, ErrorCode> {
+    pub(crate) fn load(&self, record: &Installed) -> Result<Package, ErrorCode> {
         let current = self
             .record(&record.plugin_id)?
             .ok_or(ErrorCode::StaleHandle)?;
@@ -391,7 +391,7 @@ impl Installer {
 
     /// Managed installation records only. One damaged record is reported on its
     /// own row and never interpreted as authorization to execute a package.
-    pub fn entries(&self) -> Result<Vec<InstallationEntry>, ErrorCode> {
+    pub(crate) fn entries(&self) -> Result<Vec<InstallationEntry>, ErrorCode> {
         let entries = match std::fs::read_dir(self.root.join("installed")) {
             Ok(entries) => entries,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -446,7 +446,7 @@ impl Installer {
             .then(|| package.manifest.permissions.into_iter().collect())
     }
 
-    pub fn read_candidate(path: &Path) -> Result<Vec<u8>, ErrorCode> {
+    pub(crate) fn read_candidate(path: &Path) -> Result<Vec<u8>, ErrorCode> {
         let file = std::fs::File::open(path).map_err(|_| ErrorCode::IoError)?;
         super::package::read_bounded(file, PACKAGE_LIMIT)
     }

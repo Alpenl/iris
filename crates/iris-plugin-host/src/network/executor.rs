@@ -54,9 +54,9 @@ struct Inner {
 /// Create one executor per Store. It rejects cross-instance reuse even when the
 /// plugin identity is the same; stream origins are explicit context capabilities.
 #[derive(Clone)]
-pub struct NetworkExecutor(Arc<Inner>);
+pub(crate) struct NetworkExecutor(Arc<Inner>);
 impl NetworkExecutor {
-    pub fn new(
+    pub(crate) fn new(
         grant: NetworkGrant,
         ledger: Ledger,
         stream_origins: BTreeSet<Id>,

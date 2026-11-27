@@ -45,12 +45,12 @@ struct Snapshot {
     resources: BTreeMap<String, Arc<Entry>>,
     tokens: BTreeMap<String, Arc<Entry>>,
 }
-pub struct Prepared {
+pub(crate) struct Prepared {
     stamp: Id,
     expected: Id,
     snapshot: Arc<Snapshot>,
 }
-pub struct Access {
+pub(crate) struct Access {
     pub reader: Arc<dyn Reader>,
     pub cancel: HttpCancel,
     pub profile: Option<Profile>,
@@ -71,7 +71,7 @@ impl Drop for Access {
     }
 }
 
-pub struct StreamSession {
+pub(crate) struct StreamSession {
     pub id: Id,
     generation: Mutex<(Generation, HttpCancel)>,
     pub factory: RemoteFactory,
@@ -86,7 +86,7 @@ pub struct StreamSession {
     _reservation: Reservation,
 }
 impl StreamSession {
-    pub fn new(
+    pub(crate) fn new(
         id: Id,
         generation: Generation,
         authority: SocketAddr,
@@ -126,7 +126,7 @@ impl StreamSession {
     pub(crate) fn enable_guest_manifest_updates(&self) {
         self.guest_manifest_updates.store(true, Ordering::Release);
     }
-    pub fn allows_guest_manifest_updates(&self) -> bool {
+    pub(crate) fn allows_guest_manifest_updates(&self) -> bool {
         self.guest_manifest_updates.load(Ordering::Acquire)
             && self
                 .refresh
@@ -134,7 +134,7 @@ impl StreamSession {
                 .unwrap_or_else(|e| e.into_inner())
                 .is_none()
     }
-    pub fn cancel(&self) {
+    pub(crate) fn cancel(&self) {
         self.cancel.cancel();
         if let Some(store) = &self.store {
             store.stop();
@@ -149,21 +149,16 @@ impl StreamSession {
             tokens: BTreeMap::new(),
         });
     }
-    pub fn cancellation(&self) -> &HttpCancel {
+    pub(crate) fn cancellation(&self) -> &HttpCancel {
         &self.cancel
     }
-    pub fn is_quiescent(&self) -> bool {
-        self.activity.is_idle()
-            && self.factory.is_quiescent()
-            && self.store.as_ref().is_none_or(|s| s.is_quiescent())
-    }
-    pub fn authority(&self) -> SocketAddr {
+    pub(crate) fn authority(&self) -> SocketAddr {
         self.authority
     }
-    pub fn revision(&self) -> Id {
+    pub(crate) fn revision(&self) -> Id {
         self.snapshot().revision
     }
-    pub fn root_url(&self) -> Result<String, ErrorCode> {
+    pub(crate) fn root_url(&self) -> Result<String, ErrorCode> {
         let state = self.snapshot();
         let root = state
             .resources
@@ -171,7 +166,7 @@ impl StreamSession {
             .ok_or(ErrorCode::BadState)?;
         Ok(self.url(&root.token, &root.extension))
     }
-    pub fn profile(&self) -> Option<Profile> {
+    pub(crate) fn profile(&self) -> Option<Profile> {
         self.snapshot().profile
     }
     fn snapshot(&self) -> Arc<Snapshot> {
@@ -180,7 +175,11 @@ impl StreamSession {
     fn url(&self, token: &str, ext: &str) -> String {
         format!("http://{}/v2/{}/{token}.{ext}", self.authority, self.id.0)
     }
-    pub fn open(&self, path: &str, request_cancel: &HttpCancel) -> Result<Access, ErrorCode> {
+    pub(crate) fn open(
+        &self,
+        path: &str,
+        request_cancel: &HttpCancel,
+    ) -> Result<Access, ErrorCode> {
         if path.len() > 256 || self.cancel.is_cancelled() || request_cancel.is_cancelled() {
             return Err(ErrorCode::Cancelled);
         }
@@ -240,7 +239,7 @@ impl StreamSession {
             _activity: activity,
         })
     }
-    pub fn prepare_manifest(
+    pub(crate) fn prepare_manifest(
         &self,
         expected: Id,
         format: ManifestFormat,
@@ -354,7 +353,7 @@ impl StreamSession {
     }
     /// Caller has already selected safe demuxer behavior or converted a detected
     /// remote manifest. Opaque sources retain access-references=no in mpv.
-    pub fn prepare_reader(&self, reader: Arc<dyn Reader>) -> Result<Prepared, ErrorCode> {
+    pub(crate) fn prepare_reader(&self, reader: Arc<dyn Reader>) -> Result<Prepared, ErrorCode> {
         if self.revision() != Id(0) {
             return Err(ErrorCode::BadState);
         }
@@ -365,7 +364,7 @@ impl StreamSession {
             BTreeMap::from([(manifest::ROOT.into(), entry)]),
         )
     }
-    pub fn add_attachment(
+    pub(crate) fn add_attachment(
         &self,
         id: &str,
         extension: &str,
@@ -389,7 +388,7 @@ impl StreamSession {
         self.replace_attachments(resources)?;
         Ok(url)
     }
-    pub fn set_refresh(&self, refresh: Arc<dyn Refresh>) -> Result<(), ErrorCode> {
+    pub(crate) fn set_refresh(&self, refresh: Arc<dyn Refresh>) -> Result<(), ErrorCode> {
         if self.cancel.is_cancelled() {
             return Err(ErrorCode::Cancelled);
         }
@@ -475,7 +474,7 @@ impl StreamSession {
         let memory = self.factory.ledger().reserve(
             self.factory.owner(),
             &[
-                (Resource::StreamResource, 1),
+                (Resource::StreamEntry, 1),
                 (Resource::HostBytes, 2048 + retained as u64),
             ],
         )?;
@@ -528,7 +527,7 @@ impl StreamSession {
             }),
         })
     }
-    pub fn commit(&self, prepared: Prepared) -> Result<Id, ErrorCode> {
+    pub(crate) fn commit(&self, prepared: Prepared) -> Result<Id, ErrorCode> {
         if prepared.stamp != self.stamp {
             return Err(ErrorCode::Denied);
         }
@@ -551,7 +550,7 @@ impl StreamSession {
         }
         Ok(prepared.snapshot.revision)
     }
-    pub fn refresh_context(
+    pub(crate) fn refresh_context(
         &self,
         expected: Id,
         context: &StreamContext,
@@ -565,13 +564,13 @@ impl StreamSession {
             .ok_or(ErrorCode::BadState)?
             .refresh(expected, context, blob)
     }
-    pub fn generation(&self) -> Generation {
+    pub(crate) fn generation(&self) -> Generation {
         self.store.as_ref().map_or_else(
             || self.generation.lock().unwrap_or_else(|e| e.into_inner()).0,
             |s| s.generation(),
         )
     }
-    pub fn advance_seek(&self) -> Result<Generation, ErrorCode> {
+    pub(crate) fn advance_seek(&self) -> Result<Generation, ErrorCode> {
         let cancel = {
             let mut state = self.generation.lock().unwrap_or_else(|e| e.into_inner());
             let seek = Id(state
@@ -601,7 +600,7 @@ impl Drop for StreamSession {
     }
 }
 /// Runs on relay workers, never inside a Store or an application event callback.
-pub trait Refresh: Send + Sync {
+pub(crate) trait Refresh: Send + Sync {
     fn refresh(&self, cancel: &HttpCancel) -> Result<(), ErrorCode>;
 }
 fn token() -> Result<String, ErrorCode> {
@@ -611,7 +610,7 @@ fn token() -> Result<String, ErrorCode> {
         .map_err(|_| ErrorCode::Internal)?;
     Ok(URL_SAFE_NO_PAD.encode(bytes))
 }
-pub fn new_session_id() -> Result<Id, ErrorCode> {
+pub(crate) fn new_session_id() -> Result<Id, ErrorCode> {
     next_id().map(Id)
 }
 fn extension(ext: ResourceExtension) -> &'static str {
@@ -627,5 +626,18 @@ fn extension(ext: ResourceExtension) -> &'static str {
         ResourceExtension::Ass => "ass",
         ResourceExtension::Key => "key",
         ResourceExtension::M3u8 => "m3u8",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::StreamSession;
+
+    impl StreamSession {
+        pub(crate) fn is_quiescent(&self) -> bool {
+            self.activity.is_idle()
+                && self.factory.is_quiescent()
+                && self.store.as_ref().is_none_or(|s| s.is_quiescent())
+        }
     }
 }

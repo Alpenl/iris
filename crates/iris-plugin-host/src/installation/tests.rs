@@ -1,6 +1,17 @@
 use super::*;
 use std::io::Cursor;
 
+impl Installer {
+    pub(crate) fn install(
+        &mut self,
+        bytes: &[u8],
+        approval: Approval,
+    ) -> Result<Installed, ErrorCode> {
+        self.install_from(bytes, approval, Provenance::User, None, None)
+            .map(|(installed, _)| installed)
+    }
+}
+
 fn archive(extra: &str) -> Vec<u8> {
     archive_id("test.install", extra)
 }

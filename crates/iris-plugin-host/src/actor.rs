@@ -4,9 +4,9 @@ mod mailbox;
 mod operation;
 mod read;
 use bridge::Bridge;
-pub use operation::{Completion, Operation};
+pub(crate) use operation::{Completion, Operation};
 use read::ReadSlot;
-pub use read::{ReadResult, ReadTicket};
+pub(crate) use read::{ReadResult, ReadTicket};
 
 use super::{
     engine::{CompiledModule, RuntimeEngine},
@@ -30,7 +30,7 @@ use std::{
     time::Duration,
 };
 
-pub struct TaskContext {
+pub(crate) struct TaskContext {
     pub instance_id: Id,
     pub window: Option<Id>,
     pub owner: String,
@@ -40,14 +40,14 @@ pub struct TaskContext {
     pub ledger: Ledger,
 }
 
-pub struct IoOutcome {
+pub(crate) struct IoOutcome {
     pub value: serde_json::Value,
     pub blob: Option<Arc<Blob>>,
     pub(crate) pending: Option<Box<dyn Send>>,
     discard: Option<Discard>,
 }
 impl IoOutcome {
-    pub fn new(value: serde_json::Value, blob: Option<Arc<Blob>>) -> Self {
+    pub(crate) fn new(value: serde_json::Value, blob: Option<Arc<Blob>>) -> Self {
         Self {
             value,
             blob,
@@ -55,7 +55,7 @@ impl IoOutcome {
             discard: None,
         }
     }
-    pub fn on_discard(mut self, cleanup: impl FnOnce() + Send + 'static) -> Self {
+    pub(crate) fn on_discard(mut self, cleanup: impl FnOnce() + Send + 'static) -> Self {
         self.discard = Some(Discard(Some(Box::new(cleanup))));
         self
     }
@@ -76,7 +76,7 @@ impl Drop for Discard {
 
 /// prepare/close only perform bounded validation and state transitions. The
 /// returned operation owns all reservations until I/O and delivery are finished.
-pub trait Executor: Send + Sync {
+pub(crate) trait Executor: Send + Sync {
     fn prepare(
         &self,
         task: Task,
@@ -97,7 +97,7 @@ pub trait Executor: Send + Sync {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Status {
+pub(crate) enum Status {
     Initializing,
     Ready,
     Stopping,
@@ -105,7 +105,7 @@ pub enum Status {
     Failed(ErrorCode),
 }
 
-pub struct Update {
+pub(crate) struct Update {
     pub commands: Vec<HostCommand>,
     pub blobs: BTreeMap<Id, DetachedBlob>,
     pub generation: Generation,
@@ -114,7 +114,7 @@ pub struct Update {
     _memory: Reservation,
 }
 impl Update {
-    pub fn is_cancelled(&self) -> bool {
+    pub(crate) fn is_cancelled(&self) -> bool {
         self.request_cancel
             .as_ref()
             .is_some_and(HttpCancel::is_cancelled)
@@ -129,12 +129,12 @@ struct UpdateQueue {
 
 type SharedUpdates = Arc<(Mutex<UpdateQueue>, Condvar)>;
 
-pub struct Actor {
+pub(crate) struct Actor {
     shared: Arc<Mailbox>,
     updates: SharedUpdates,
 }
 
-pub struct Spawn {
+pub(crate) struct Spawn {
     pub engine: RuntimeEngine,
     pub module: Arc<CompiledModule>,
     pub role: Role,
@@ -149,7 +149,7 @@ pub struct Spawn {
 }
 
 impl Actor {
-    pub fn spawn(config: Spawn) -> Result<Self, ErrorCode> {
+    pub(crate) fn spawn(config: Spawn) -> Result<Self, ErrorCode> {
         let reservation = Instance::reserve(&config.ledger, &config.owner, config.role)?;
         let shared = Arc::new(Mailbox::new(
             config.owner.clone(),
@@ -206,20 +206,21 @@ impl Actor {
         Ok(Self { shared, updates })
     }
 
-    pub fn send(&self, bytes: Vec<u8>) -> Result<(), ErrorCode> {
+    pub(crate) fn send(&self, bytes: Vec<u8>) -> Result<(), ErrorCode> {
         self.shared.send(bytes, None)
     }
-    pub fn open_window(&self, window: Id, generation: Generation) -> Result<(), ErrorCode> {
-        self.shared.open_window(window, generation)
-    }
-    pub fn advance_window(&self, window: Id, generation: Generation) -> Result<(), ErrorCode> {
+    pub(crate) fn advance_window(
+        &self,
+        window: Id,
+        generation: Generation,
+    ) -> Result<(), ErrorCode> {
         self.shared.advance_window(window, generation)
     }
-    pub fn close_window(&self, window: Id) -> Result<(), ErrorCode> {
+    pub(crate) fn close_window(&self, window: Id) -> Result<(), ErrorCode> {
         self.shared.close_window(window)
     }
     /// Bytes contain an unwrapped HostEvent. Only the host can select a window.
-    pub fn send_window(
+    pub(crate) fn send_window(
         &self,
         window: Id,
         generation: Generation,
@@ -227,7 +228,7 @@ impl Actor {
     ) -> Result<(), ErrorCode> {
         self.shared.send_window(window, generation, bytes)
     }
-    pub fn send_cancellable(
+    pub(crate) fn send_cancellable(
         &self,
         window: Id,
         generation: Generation,
@@ -240,7 +241,7 @@ impl Actor {
     /// Host-controlled attachment field, never a guest-selected destination.
     /// A fresh handle is reserved before queueing; cancellation drops it with
     /// the event. The original Blob bytes remain charged through all owners.
-    pub fn send_context(
+    pub(crate) fn send_context(
         &self,
         mut event: serde_json::Value,
         blob: Arc<Blob>,
@@ -261,7 +262,7 @@ impl Actor {
         let bytes = iris_core::bounded_json::encode(&event, MESSAGE_LIMIT).map_err(json_error)?;
         self.shared.send(bytes, Some((id, blob)))
     }
-    pub fn poll(&self) -> Option<Update> {
+    pub(crate) fn poll(&self) -> Option<Update> {
         let (lock, cv) = &*self.updates;
         let mut queue = lock.lock().unwrap_or_else(|e| e.into_inner());
         while let Some(update) = queue.items.pop_front() {
@@ -275,7 +276,7 @@ impl Actor {
         }
         None
     }
-    pub fn refresh_context(
+    pub(crate) fn refresh_context(
         &self,
         session: Id,
         expected: Generation,
@@ -295,13 +296,13 @@ impl Actor {
         self.shared
             .refresh_context(expected, generation, bytes, (id, blob))
     }
-    pub fn status(&self) -> Status {
+    pub(crate) fn status(&self) -> Status {
         self.shared.status()
     }
-    pub fn initialized(&self) -> bool {
+    pub(crate) fn initialized(&self) -> bool {
         self.shared.initialized.load(Ordering::Acquire)
     }
-    pub fn stop(&self) {
+    pub(crate) fn stop(&self) {
         self.shared.stop();
         let (lock, cv) = &*self.updates;
         let mut queue = lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -309,7 +310,7 @@ impl Actor {
         queue.items.clear();
         cv.notify_all();
     }
-    pub fn is_quiescent(&self) -> bool {
+    pub(crate) fn is_quiescent(&self) -> bool {
         if self.shared.cancel.is_cancelled() {
             let (lock, cv) = &*self.updates;
             let mut queue = lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -320,11 +321,11 @@ impl Actor {
             && self.shared.outstanding.load(Ordering::Acquire) == 0
             && self.shared.executor.is_quiescent()
     }
-    pub fn advance(&self, generation: Generation) -> Result<(), ErrorCode> {
+    pub(crate) fn advance(&self, generation: Generation) -> Result<(), ErrorCode> {
         self.shared.advance(generation)
     }
 
-    pub fn read(
+    pub(crate) fn read(
         &self,
         resource: String,
         offset: u64,

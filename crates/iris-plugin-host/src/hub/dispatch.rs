@@ -10,7 +10,7 @@ use iris_api::v2::{Capability, ErrorCode, Generation, HostCommand, HostEvent, Id
 use std::{collections::BTreeSet, sync::Arc};
 
 impl Worker {
-    pub fn command(&mut self, command: Command) {
+    pub(crate) fn command(&mut self, command: Command) {
         if self.shutdown {
             return;
         }
@@ -337,7 +337,7 @@ impl Worker {
         result
     }
 
-    pub fn cancellations(&mut self) {
+    pub(crate) fn cancellations(&mut self) {
         let mut failed = Vec::new();
         if let Some(window) = &self.window {
             let window_id = window.inbox.id;
@@ -377,7 +377,7 @@ impl Worker {
         }
     }
 
-    pub fn deliver(&mut self, plugin: &str, update: Update) {
+    pub(crate) fn deliver(&mut self, plugin: &str, update: Update) {
         if update.is_cancelled() {
             return;
         }
@@ -594,14 +594,16 @@ impl Worker {
                     return;
                 }
                 let notice = match result {
-                    Ok(playback) => Notice::Playback {
-                        binding,
-                        generation: update.generation,
-                        ticket,
-                        playback,
-                        playlist: media.playlist,
-                        _memory: memory,
-                    },
+                    Ok(mut playback) => {
+                        playback.notice_lease = Some(memory);
+                        Notice::Playback {
+                            binding,
+                            generation: update.generation,
+                            ticket,
+                            playback,
+                            playlist: media.playlist,
+                        }
+                    }
                     Err(code) => Notice::Error {
                         plugin: Some(binding.installed.plugin_id.clone()),
                         request: Some(request),

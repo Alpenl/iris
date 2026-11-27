@@ -22,16 +22,15 @@ use iris_base::net::http_client::HttpCancel;
 use std::sync::{Arc, Mutex};
 
 #[derive(Default)]
-pub struct AttachmentRegistry {
+pub(crate) struct AttachmentRegistry {
     relay: Mutex<Option<Arc<Relay>>>,
 }
-pub struct Attachment {
+pub(crate) struct Attachment {
     pub owner: String,
     pub id: String,
     pub label: String,
     pub lang: Option<String>,
     pub audio: bool,
-    pub generation: Generation,
     url: String,
     route: String,
     registry: Arc<AttachmentRegistry>,
@@ -39,7 +38,7 @@ pub struct Attachment {
     _lease: Reservation,
 }
 impl Attachment {
-    pub fn is_live(&self) -> bool {
+    pub(crate) fn is_live(&self) -> bool {
         !self.relay.session().cancellation().is_cancelled()
     }
 }
@@ -77,7 +76,7 @@ impl Drop for Attachment {
         let _ = self.relay.session().remove_attachment(&self.route);
     }
 }
-pub struct AttachmentSpec {
+pub(crate) struct AttachmentSpec {
     pub id: String,
     pub label: String,
     pub lang: Option<String>,
@@ -188,7 +187,6 @@ pub(crate) fn prepare_attachment(
         label: spec.label,
         lang: spec.lang,
         audio: spec.subtitle.is_none(),
-        generation: ctx.generation,
         url,
         route,
         registry: ctx.attachments.clone(),

@@ -7,7 +7,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-pub struct ReadResult {
+pub(crate) struct ReadResult {
     pub blob: Arc<Blob>,
     pub eof: bool,
 }
@@ -36,7 +36,7 @@ impl ReadSlot {
     }
 }
 
-pub struct ReadTicket {
+pub(crate) struct ReadTicket {
     pub(super) request: u64,
     shared: Arc<Mailbox>,
     slot: Arc<ReadSlot>,
@@ -51,28 +51,8 @@ impl ReadTicket {
         }
     }
 
-    /// PlaybackRelay calls this on its worker, never while holding a Store.
-    pub fn receive(&self, timeout: Duration) -> Result<ReadResult, ErrorCode> {
-        let deadline = Instant::now() + timeout;
-        let mut guard = self.slot.value.lock().unwrap_or_else(|e| e.into_inner());
-        loop {
-            if let Some(result) = guard.take() {
-                return result;
-            }
-            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-                return Err(ErrorCode::Timeout);
-            };
-            guard = self
-                .slot
-                .ready
-                .wait_timeout(guard, remaining)
-                .unwrap_or_else(|e| e.into_inner())
-                .0;
-        }
-    }
-
     /// Immediate Condvar wakeup on either reply delivery or `cancel`.
-    pub fn receive_cancellable(
+    pub(crate) fn receive_cancellable(
         &self,
         cancel: &HttpCancel,
         timeout: Duration,
@@ -112,5 +92,31 @@ impl ReadTicket {
 impl Drop for ReadTicket {
     fn drop(&mut self) {
         self.shared.cancel_read(self.request);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Duration, ErrorCode, Instant, ReadResult, ReadTicket};
+
+    impl ReadTicket {
+        pub(crate) fn receive(&self, timeout: Duration) -> Result<ReadResult, ErrorCode> {
+            let deadline = Instant::now() + timeout;
+            let mut guard = self.slot.value.lock().unwrap_or_else(|e| e.into_inner());
+            loop {
+                if let Some(result) = guard.take() {
+                    return result;
+                }
+                let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                    return Err(ErrorCode::Timeout);
+                };
+                guard = self
+                    .slot
+                    .ready
+                    .wait_timeout(guard, remaining)
+                    .unwrap_or_else(|e| e.into_inner())
+                    .0;
+            }
+        }
     }
 }

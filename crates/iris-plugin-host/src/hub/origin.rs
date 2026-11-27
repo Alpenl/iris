@@ -40,7 +40,7 @@ pub(super) struct PendingOrigin {
     pub expires: Instant,
 }
 impl Worker {
-    pub fn request_origin(
+    pub(crate) fn request_origin(
         &mut self,
         window: Id,
         binding: Arc<Binding>,
@@ -103,7 +103,7 @@ impl Worker {
         self.origin_slots.insert(id);
         Ok(())
     }
-    pub fn origin_reviewed(&mut self, id: Id, result: Result<OriginReview, ErrorCode>) {
+    pub(crate) fn origin_reviewed(&mut self, id: Id, result: Result<OriginReview, ErrorCode>) {
         let active = self
             .window
             .as_ref()
@@ -138,7 +138,7 @@ impl Worker {
             self.origin_applied(id, Err(error));
         }
     }
-    pub fn confirm_origin(
+    pub(crate) fn confirm_origin(
         &mut self,
         window: Id,
         id: Id,
@@ -184,7 +184,7 @@ impl Worker {
         }
         Ok(())
     }
-    pub fn origin_applied(&mut self, id: Id, result: Result<OriginResult, ErrorCode>) {
+    pub(crate) fn origin_applied(&mut self, id: Id, result: Result<OriginResult, ErrorCode>) {
         self.origin_slots.remove(&id);
         let Some(pending) = self.origins.remove(&id) else {
             return;
@@ -239,7 +239,7 @@ impl Worker {
             }
         }
     }
-    pub fn expire_origins(&mut self) {
+    pub(crate) fn expire_origins(&mut self) {
         let active = self.window.as_ref().map(|w| (w.inbox.id, w.generation));
         let expired: Vec<_> = self
             .origins

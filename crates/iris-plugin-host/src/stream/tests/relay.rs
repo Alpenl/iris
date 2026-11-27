@@ -65,7 +65,7 @@ fn actual_relay_handles_head_ranges_empty_files_and_browser_denial() {
     relay.stop();
     until(|| relay.is_quiescent());
     assert_eq!(ledger.used(None, Resource::RelayWorker), 0);
-    assert_eq!(ledger.used(None, Resource::StreamResource), 0);
+    assert_eq!(ledger.used(None, Resource::StreamEntry), 0);
     drop(relay);
     drop(session);
     drop(grant);

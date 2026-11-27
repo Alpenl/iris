@@ -10,15 +10,15 @@ use std::{
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct FileId(pub u64, pub u64);
+pub(crate) struct FileId(pub u64, pub u64);
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Stamp {
+pub(crate) struct Stamp {
     pub id: FileId,
     pub size: u64,
     modified: SystemTime,
     changed: u64,
 }
-pub fn stamp(file: &File) -> Result<Stamp, ErrorCode> {
+pub(crate) fn stamp(file: &File) -> Result<Stamp, ErrorCode> {
     let meta = file.metadata().map_err(|_| ErrorCode::IoError)?;
     if !meta.is_file() {
         return Err(ErrorCode::Denied);
@@ -114,7 +114,7 @@ fn platform(_file: &File, meta: &Metadata) -> Result<(FileId, u64, u64), ErrorCo
             .wrapping_add(meta.ctime_nsec() as u64),
     ))
 }
-pub fn path_without_links(path: &Path) -> Result<PathBuf, ErrorCode> {
+pub(crate) fn path_without_links(path: &Path) -> Result<PathBuf, ErrorCode> {
     use std::path::Component;
     if !path.is_absolute() {
         return Err(ErrorCode::Denied);
@@ -146,18 +146,17 @@ pub fn path_without_links(path: &Path) -> Result<PathBuf, ErrorCode> {
     }
     path.canonicalize().map_err(|_| ErrorCode::IoError)
 }
-pub fn canonical_host_dir(path: &Path) -> Result<PathBuf, ErrorCode> {
+pub(crate) fn canonical_host_dir(path: &Path) -> Result<PathBuf, ErrorCode> {
     let canonical = path.canonicalize().map_err(|_| ErrorCode::IoError)?;
     path_without_links(&canonical)
 }
-pub struct PinnedFile {
-    pub path: PathBuf,
+pub(crate) struct PinnedFile {
     pub initial: Stamp,
     file: Mutex<File>,
 }
 impl PinnedFile {
     /// Blocking host operation: only after user/current-media authorization.
-    pub fn open(path: &Path) -> Result<Self, ErrorCode> {
+    pub(crate) fn open(path: &Path) -> Result<Self, ErrorCode> {
         let path = path_without_links(path)?;
         #[cfg(windows)]
         let file = {
@@ -201,19 +200,18 @@ impl PinnedFile {
         };
         let initial = stamp(&file)?;
         Ok(Self {
-            path,
             initial,
             file: Mutex::new(file),
         })
     }
-    pub fn unchanged(&self) -> Result<(), ErrorCode> {
+    pub(crate) fn unchanged(&self) -> Result<(), ErrorCode> {
         let file = self.file.lock().unwrap_or_else(|e| e.into_inner());
         if stamp(&file)? != self.initial {
             return Err(ErrorCode::StaleHandle);
         }
         Ok(())
     }
-    pub fn read_at(
+    pub(crate) fn read_at(
         &self,
         offset: u64,
         bytes: &mut [u8],

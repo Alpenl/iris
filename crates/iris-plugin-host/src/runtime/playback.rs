@@ -8,14 +8,14 @@ use iris_api::v2::{Capability, ErrorCode, Generation, Id, stream::StreamSpec};
 use iris_base::net::http_client::HttpCancel;
 use std::collections::BTreeMap;
 
-pub struct PlaybackPermit {
+pub(crate) struct PlaybackPermit {
     preparation: Preparation,
     media: HttpCancel,
 }
 impl Control {
     /// Host source-request validation precedes this admission. Only this
     /// installation's grant/module can be used for the returned playback.
-    pub fn playback_permit(
+    pub(crate) fn playback_permit(
         &self,
         window: Id,
         generation: Generation,
@@ -62,7 +62,7 @@ impl Control {
 impl PlaybackPermit {
     /// Background worker only. Task cancellation ends with preparation; the
     /// ready relay remains bound to installation/window/media lifetime.
-    pub fn prepare(
+    pub(crate) fn prepare(
         self,
         spec: &StreamSpec,
         blobs: &BTreeMap<Id, DetachedBlob>,

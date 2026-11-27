@@ -53,16 +53,16 @@ python3 scripts/icc-report.py out/
 
 仓库严格区分以下三类测试，不互相替代：
 
-1. **确定性语料回放**：`crates/iris-plugin-host/tests/plugin_v2_fuzz.rs` 通过单一发现入口同时遍历 `crates/iris-plugin-host/tests/corpus/plugin-v2/` 与 `fuzz/corpus/{hls,range,http_head,chunked,doh}/`（目录布局兼容 `cargo-fuzz`，两处种子不重复），并在测试外层设置单一总看门狗（回放前将当前用例标识写入原子变量，超时打印用例标识并调用 `std::process::abort()` 终止进程）。同时使用 `fuzz/corpus/hls/` 固化 `iris-core`（`playlist.rs`）与 `iris-plugin-host`（`hls_parse.rs`）在「接受/拒绝」与「提取 URI 列表」上的差分基线，供 `R-06` 合并语法时逐项对照。
+1. **确定性语料回放**：`crates/iris-plugin-host/src/tests/fuzz.rs` 通过单一发现入口同时遍历 `crates/iris-plugin-host/tests/corpus/plugin-v2/` 与 `fuzz/corpus/{hls,range,http_head,chunked,doh}/`（目录布局兼容 `cargo-fuzz`，两处种子不重复），并在测试外层设置单一总看门狗（回放前将当前用例标识写入原子变量，超时打印用例标识并调用 `std::process::abort()` 终止进程）。同时使用 `fuzz/corpus/hls/` 固化 `iris-core`（`playlist.rs`）与 `iris-plugin-host`（`hls_parse.rs`）在「接受/拒绝」与「提取 URI 列表」上的差分基线，供 `R-06` 合并语法时逐项对照。
 2. **有界确定性 PRNG 变异**：在同一测试目标内按 `IRIS_FUZZ_SEED`（默认 `0x495249535632`）与 `IRIS_FUZZ_ITERATIONS`（默认 `2000`，上限 `20_000_000`）对全部种子做有界确定性字节变异回放。
 3. **覆盖率引导的持续 fuzz**：需要独立插桩工具链与常驻战役，归入下方「遗留验收」表（`L-02`）在首发 `0.1.0` 前执行。
 
 ```bash
 # 运行确定性语料回放、HLS 差分基线、看门狗死循环自检与默认 2000 轮有界变异
-cargo test --locked -p iris-plugin-host --test plugin_v2_fuzz -- --nocapture
+cargo test --locked -p iris-plugin-host --lib tests::fuzz:: -- --nocapture
 
 # 加大有界变异轮数（例如 100,000 轮）
-IRIS_FUZZ_ITERATIONS=100000 cargo test --release --locked -p iris-plugin-host --test plugin_v2_fuzz -- --nocapture
+IRIS_FUZZ_ITERATIONS=100000 cargo test --release --locked -p iris-plugin-host --lib tests::fuzz:: -- --nocapture
 ```
 
 ### 回环 Relay 合成吞吐基线

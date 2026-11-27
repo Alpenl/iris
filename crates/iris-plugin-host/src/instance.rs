@@ -1,4 +1,4 @@
-pub use super::imports::{Blob, DetachedBlob};
+pub(crate) use super::imports::{Blob, DetachedBlob};
 use super::{
     engine::{CompiledModule, RuntimeEngine},
     imports::{HostCallbacks, State, checked_range},
@@ -37,7 +37,7 @@ pub(crate) fn next_id() -> Result<u64, ErrorCode> {
         .map_err(|_| ErrorCode::QuotaExceeded)
 }
 
-pub struct InstanceConfig {
+pub(crate) struct InstanceConfig {
     pub engine: RuntimeEngine,
     pub module: Arc<CompiledModule>,
     pub role: Role,
@@ -47,7 +47,7 @@ pub struct InstanceConfig {
     pub cancel: CancelToken,
 }
 
-pub struct Instance {
+pub(crate) struct Instance {
     engine: RuntimeEngine,
     _module: Arc<CompiledModule>,
     store: Store<State>,
@@ -114,7 +114,7 @@ impl Instance {
         )
     }
 
-    pub fn new(config: InstanceConfig) -> Result<Self, ErrorCode> {
+    pub(crate) fn new(config: InstanceConfig) -> Result<Self, ErrorCode> {
         let reservation = Self::reserve(&config.ledger, &config.owner, config.role)?;
         Self::with_reservation(config, None, reservation)
     }
@@ -222,7 +222,7 @@ impl Instance {
         })
     }
 
-    pub fn deliver_blob(&mut self, blob: Arc<Blob>) -> Result<u64, ErrorCode> {
+    pub(crate) fn deliver_blob(&mut self, blob: Arc<Blob>) -> Result<u64, ErrorCode> {
         if !self.healthy {
             return Err(ErrorCode::BadState);
         }
@@ -240,10 +240,10 @@ impl Instance {
         Ok(id)
     }
 
-    pub fn on_event(&mut self, input: &[u8]) -> Result<Reply<HostCommand>, ErrorCode> {
+    pub(crate) fn on_event(&mut self, input: &[u8]) -> Result<Reply<HostCommand>, ErrorCode> {
         self.call(input, Duration::from_secs(2))
     }
-    pub fn detach_blobs(
+    pub(crate) fn detach_blobs(
         &mut self,
         ids: &BTreeSet<Id>,
     ) -> Result<BTreeMap<Id, DetachedBlob>, ErrorCode> {

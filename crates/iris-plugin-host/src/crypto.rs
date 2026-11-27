@@ -13,7 +13,7 @@ use ring::{
     rand::{SecureRandom, SystemRandom},
 };
 
-pub fn compute(
+pub(crate) fn compute(
     spec: &CryptoSpec,
     input: &[u8],
     capacity: usize,

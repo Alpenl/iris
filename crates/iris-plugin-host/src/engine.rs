@@ -15,7 +15,7 @@ use wasmtime::{Config, Engine, ExternType, Linker, Module};
 
 const CACHE_LIMIT: usize = 256 << 20;
 
-pub struct CompiledModule {
+pub(crate) struct CompiledModule {
     pub(crate) module: Module,
     cost: usize,
 }
@@ -38,13 +38,13 @@ struct Inner {
 }
 
 #[derive(Clone)]
-pub struct RuntimeEngine(Arc<Inner>);
+pub(crate) struct RuntimeEngine(Arc<Inner>);
 pub(crate) struct ExecutionGuard(RuntimeEngine);
 
 impl RuntimeEngine {
-    pub const TARGET: &'static str = "pulley64";
+    pub(crate) const TARGET: &'static str = "pulley64";
 
-    pub fn new() -> Result<Self, ErrorCode> {
+    pub(crate) fn new() -> Result<Self, ErrorCode> {
         Self::with_pulley(true)
     }
 
@@ -139,7 +139,7 @@ impl RuntimeEngine {
 
     /// Run only on a background worker. Compilation cannot be epoch-interrupted;
     /// queued cancellation is observed and the two compiler slots are bounded.
-    pub fn compile(
+    pub(crate) fn compile(
         &self,
         bytes: &[u8],
         cancel: &CancelToken,

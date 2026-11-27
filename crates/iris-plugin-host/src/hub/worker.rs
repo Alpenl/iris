@@ -31,7 +31,7 @@ pub(super) struct Plugin {
     pub preparing: Option<Id>,
 }
 impl Plugin {
-    pub fn stop(&mut self) {
+    pub(crate) fn stop(&mut self) {
         if let Some((_, cancel)) = &self.loading {
             cancel.cancel();
         }
@@ -45,7 +45,7 @@ impl Plugin {
         self.preparing = None;
         self.sources = None;
     }
-    pub fn wants_control_reap(&self, has_window: bool) -> bool {
+    pub(crate) fn wants_control_reap(&self, has_window: bool) -> bool {
         let Some(control) = &self.control else {
             return false;
         };
@@ -91,7 +91,7 @@ pub(super) struct Worker {
     pub jobs: usize,
 }
 impl Worker {
-    pub fn new(shared: Arc<Shared>, config: Config) -> Result<Self, ErrorCode> {
+    pub(crate) fn new(shared: Arc<Shared>, config: Config) -> Result<Self, ErrorCode> {
         Ok(Self {
             shared,
             config,
@@ -119,15 +119,15 @@ impl Worker {
         })
     }
 
-    pub fn active_window(&self, id: Id) -> Option<&Window> {
+    pub(crate) fn active_window(&self, id: Id) -> Option<&Window> {
         self.window.as_ref().filter(|w| w.inbox.id == id)
     }
 
-    pub fn active_window_mut(&mut self, id: Id) -> Option<&mut Window> {
+    pub(crate) fn active_window_mut(&mut self, id: Id) -> Option<&mut Window> {
         self.window.as_mut().filter(|w| w.inbox.id == id)
     }
 
-    pub fn run(mut self) {
+    pub(crate) fn run(mut self) {
         loop {
             let (commands, completed, shutdown) = {
                 let mut gate = self.shared.gate.lock().unwrap_or_else(|e| e.into_inner());
@@ -424,7 +424,7 @@ impl Worker {
         }
     }
 
-    pub fn publish(&mut self) {
+    pub(crate) fn publish(&mut self) {
         if !self.dirty {
             return;
         }
@@ -487,7 +487,7 @@ impl Worker {
         }
     }
 
-    pub fn error(
+    pub(crate) fn error(
         &self,
         window: Id,
         plugin: Option<String>,
@@ -505,7 +505,7 @@ impl Worker {
         }
     }
 
-    pub fn fail_plugin(&mut self, id: &str, error: ErrorCode) {
+    pub(crate) fn fail_plugin(&mut self, id: &str, error: ErrorCode) {
         let mut installation_id = None;
         if let Some(plugin) = self.plugins.get_mut(id) {
             plugin.stop();

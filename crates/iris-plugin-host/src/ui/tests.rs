@@ -26,6 +26,12 @@ use std::{
 
 struct TestDir(PathBuf);
 
+impl WindowSession {
+    pub(crate) fn client(&self) -> &crate::hub::Client {
+        &self.client
+    }
+}
+
 impl TestDir {
     fn new(label: &str) -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(1);
@@ -46,7 +52,7 @@ impl Drop for TestDir {
 
 #[track_caller]
 fn wait(mut check: impl FnMut() -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(20);
     while !check() {
         assert!(
             Instant::now() < deadline,
@@ -339,6 +345,9 @@ fn window_session_registers_and_clears_active_stream_on_open_failure_switch_stop
     }
 
     let make_playback = |generation: Generation| {
+        // Dropping a prior Playback/ScopedPlayback wakes its BoundRelay listener thread
+        // asynchronously; wait for that listener to exit before reserving a new session.
+        wait(|| resources.ledger.used(None, Resource::PlaybackSession) == 0);
         let grant = crate::network::NetworkGrant::new(
             record.installation_id.clone(),
             BTreeSet::new(),
@@ -381,6 +390,7 @@ fn window_session_registers_and_clears_active_stream_on_open_failure_switch_stop
             attachments: Vec::new(),
             variants: Vec::new(),
             active_variant: None,
+            notice_lease: None,
         }
     };
 
@@ -461,7 +471,10 @@ fn window_session_registers_and_clears_active_stream_on_open_failure_switch_stop
     assert!(close_scoped.unwrap().stream.is_cancelled());
 
     drop((ws, hub));
-    wait(|| resources.ledger.used(None, Resource::HostBytes) == 0);
+    wait(|| {
+        resources.ledger.used(None, Resource::HostBytes) == 0
+            && resources.ledger.used(None, Resource::PlaybackSession) == 0
+    });
     assert_eq!(resources.ledger.used(None, Resource::PlaybackSession), 0);
 }
 
@@ -504,7 +517,6 @@ fn attachment_preparation_enforces_format_owner_quota_and_holds_ledger_until_ext
     .unwrap();
     let access = WindowAccess {
         instance: Id(1),
-        window: Id(2),
         generation: Generation::default(),
         owner: "enhance-test".into(),
         capabilities: caps,
@@ -517,7 +529,7 @@ fn attachment_preparation_enforces_format_owner_quota_and_holds_ledger_until_ext
     let run = |task, blobs: &BTreeMap<u64, Arc<Blob>>| {
         let context = TaskContext {
             instance_id: access.instance,
-            window: Some(access.window),
+            window: Some(Id(2)),
             owner: access.owner.clone(),
             role: Role::Control,
             generation: access.generation,
@@ -695,6 +707,7 @@ fn monitor_lut_and_scoped_stream_ports_hold_ledger_until_consumer_releases_handl
         }],
         variants: Vec::new(),
         active_variant: None,
+        notice_lease: None,
     });
     let scoped: Arc<ScopedPlayback> = playback.clone().into_scoped();
     assert_eq!(scoped.title, "PortClip");

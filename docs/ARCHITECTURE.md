@@ -25,7 +25,7 @@ crates/
 3. `crates/iris/clippy.toml`、`crates/iris-app/clippy.toml`、`crates/iris-core/clippy.toml` 与 `crates/iris-plugin-host/clippy.toml` 通过 `disallowed-types` / `disallowed-methods` 强制约束 `iris_mpv::*`、`Session` 与 `RenderHandle::new` / `Session::{render_handle, video_recovery}` 的调用边界，扫描全仓 `crates/*` 的 `src/` 与 `tests/` 禁止越权 `allow/expect(clippy::disallowed_*)`（仅显式豁免 `crates/iris/src/video/` 与 `crates/iris-core/src/player/mod.rs` 的 `render_handle` / `video_recovery` 两处，`iris-app` 与 `iris-plugin-host` 零豁免），且全仓非测试生产代码禁止 `use super::*;`；
 4. `crates/iris/src/ui/` 禁止散落 `target_os` 条件编译，且通用组件库 `crates/iris/src/ui/kit/` 禁止引用根窗口 `IrisWindow` 或业务宿主 `AppModel`；
 5. 全仓生产代码禁止直接调用 `std::thread::spawn` 或未登记的 `std::thread::Builder`，所有 OS 线程必须通过 `iris_base::rt::{spawn_thread, spawn_thread_named}` 按 `ThreadRole` 登记，且每个角色的线程名必须记录在本文第 6 节；
-6. `devtools` 控制管道门禁未被默认特性或普通发布版绕过；
+6. `devtools` 控制管道门禁与 `iris-plugin-host` 的 `test-support` 测试辅助特性未被默认特性或普通发布版绕过；
 7. 全仓 `.rs` 有效代码行（SLOC，剥离注释与空白行）预算（生产代码超过 650 SLOC 提示、硬上限 850 SLOC，尾部内联 `#[cfg(test)] mod tests` 硬上限 400 SLOC，独立测试文件硬上限 1,500 SLOC）、`crates/*/src` 顶层模块环单向棘轮、本文与双语 `README` 的成员同步门禁，以及图标、官方嵌入插件源码摘要隔离与示例插件清单一致性。
 
 ### 核心模块职责

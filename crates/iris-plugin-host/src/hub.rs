@@ -13,7 +13,7 @@ use super::{
     runtime::{Control, Setup},
     stream::prepare::Playback,
 };
-pub use client::Client;
+pub(crate) use client::Client;
 use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
 use iris_api::v2::{
     Capability, ErrorCode, Generation, HostEvent, Id, Manifest,
@@ -29,7 +29,7 @@ use std::{
     },
 };
 
-pub struct Config {
+pub(crate) struct Config {
     pub installer: Installer,
     pub bootstrap: Option<super::official::Bootstrap>,
     pub runtime: Setup,
@@ -68,7 +68,7 @@ pub struct SourceSnapshot {
     pub sources: Vec<SourceDescriptor>,
     _lease: Reservation,
 }
-pub struct Catalog {
+pub(crate) struct Catalog {
     pub revision: u64,
     pub plugins: Vec<PluginInfo>,
 }
@@ -81,11 +81,11 @@ pub struct ReviewSummary {
     _lease: Reservation,
 }
 pub struct Commands {
-    pub binding: Arc<Binding>,
-    pub update: Arc<Update>,
+    pub(crate) binding: Arc<Binding>,
+    pub(crate) update: Arc<Update>,
     /// Source results are consumed by the coordinator; only these indices may
     /// be applied by the UI. The Arc retains all decoded-message reservations.
-    pub indices: Vec<usize>,
+    pub(crate) indices: Vec<usize>,
 }
 pub enum Notice {
     Commands(Commands),
@@ -101,7 +101,6 @@ pub enum Notice {
         ticket: Arc<RequestTicket>,
         playback: Playback,
         playlist: Vec<PlaylistEntry>,
-        _memory: Reservation,
     },
     Error {
         plugin: Option<String>,
@@ -317,9 +316,9 @@ impl Drop for Connection {
 }
 
 #[derive(Clone)]
-pub struct Hub(Arc<Connection>);
+pub(crate) struct Hub(Arc<Connection>);
 impl Hub {
-    pub fn new(mut config: Config) -> Result<Self, ErrorCode> {
+    pub(crate) fn new(mut config: Config) -> Result<Self, ErrorCode> {
         let ledger = config.runtime.resources.ledger.clone();
         let lease = ledger.reserve("host-coordinator", &[(Resource::HostBytes, 32 << 20)])?;
         let shared = Arc::new(Shared {
@@ -346,7 +345,7 @@ impl Hub {
         Ok(Self(Arc::new(Connection(shared))))
     }
 
-    pub fn open_window(
+    pub(crate) fn open_window(
         &self,
         generation: Generation,
         snapshot: Option<PlaybackSnapshot>,
@@ -405,7 +404,7 @@ impl Hub {
         self.0.0.enqueue(Command::SyncDisabled { disabled })
     }
 
-    pub fn catalog(&self) -> Arc<Catalog> {
+    pub(crate) fn catalog(&self) -> Arc<Catalog> {
         self.0
             .0
             .catalog

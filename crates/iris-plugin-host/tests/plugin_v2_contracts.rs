@@ -1,114 +1,46 @@
-//! Run with scripts/test-plugin-v2.py, which builds both real guest languages.
-use iris_api::v2::{Capability, ErrorCode, Generation, HostCommand, Reply, Role, task::Task};
-use iris_base::rt::CancelToken;
-use iris_plugin_host::{
-    actor::{Actor, Executor, IoOutcome, Operation, Spawn, Status, TaskContext},
-    engine::RuntimeEngine,
-    instance::{Blob, Instance, InstanceConfig},
-    ledger::{Ledger, Resource},
-    pool::IoPool,
-};
+//! Black-box protocol-2 host contract tests exercising [`PluginHost`] and
+//! [`WindowSession`] strictly through the public root facade.
+//! Run `scripts/test-plugin-v2.py` to execute the compiled Rust guest cases.
+
+use iris_api::v2::{Capability, ErrorCode, HostEvent, Id, source::PlaybackSnapshot};
+use iris_core::vault::CredentialVault;
+use iris_plugin_host::{ActionKind, Notice, PluginHost, PluginStatus, WindowSession};
 use std::{
-    collections::{BTreeMap, BTreeSet},
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
+    io::{Cursor, Read, Write},
+    net::TcpStream,
+    path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
     time::{Duration, Instant},
 };
-#[path = "plugin_v2_contracts/runtime.rs"]
-mod runtime;
-#[path = "plugin_v2_contracts/wat_abi.rs"]
-mod wat_abi;
-#[path = "plugin_v2_contracts/windows.rs"]
-mod windows;
+use zip::{ZipWriter, write::SimpleFileOptions};
 
-fn guest(name: &str) -> Vec<u8> {
-    std::fs::read(
-        std::env::var(name).expect("run scripts/test-plugin-v2.py to compile language fixtures"),
-    )
-    .unwrap()
+static NEXT_DIR: AtomicU64 = AtomicU64::new(1);
+
+struct TempDir(PathBuf);
+
+impl TempDir {
+    fn new(prefix: &str) -> Self {
+        let id = NEXT_DIR.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("{prefix}-{}-{id}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        Self(dir)
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
 }
 
-#[test]
-#[ignore = "requires compiled Rust/C guests; run scripts/test-plugin-v2.py"]
-fn rust_and_c_share_decimal_and_ownership_vectors() {
-    let engine = RuntimeEngine::new().unwrap();
-    for name in ["IRIS_V2_RUST_GUEST", "IRIS_V2_C_GUEST"] {
-        let cancel = CancelToken::new();
-        let module = engine.compile(&guest(name), &cancel).unwrap();
-        let mut instance = Instance::new(InstanceConfig {
-            engine: engine.clone(),
-            module,
-            role: Role::Control,
-            owner: name.into(),
-            grants: BTreeSet::new(),
-            ledger: Ledger::default(),
-            cancel,
-        })
-        .unwrap();
-        for _ in 0..50 {
-            for id in [
-                "0",
-                "9007199254740993",
-                "9223372036854775807",
-                "18446744073709551615",
-            ] {
-                let bytes =
-                    serde_json::to_vec(&serde_json::json!({"vector":"decimal","id":id})).unwrap();
-                let Reply::Ok { ok } = instance.on_event(&bytes).unwrap() else {
-                    panic!("failed {name}");
-                };
-                assert!(
-                    matches!(ok.as_slice(), [HostCommand::ShowToast { message }] if message == id)
-                );
-            }
-        }
-        for id in ["01", "+1", "-1", "18446744073709551616", ""] {
-            let bytes =
-                serde_json::to_vec(&serde_json::json!({"vector":"decimal","id":id})).unwrap();
-            assert!(
-                matches!(instance.on_event(&bytes), Ok(Reply::Error { error }) if error.code == -1)
-            );
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        if self.0.starts_with(std::env::temp_dir()) {
+            let _ = std::fs::remove_dir_all(&self.0);
         }
     }
 }
 
-struct Delay {
-    started: Arc<AtomicBool>,
-    cleanup_delay: Duration,
-}
-impl Executor for Delay {
-    fn prepare(
-        &self,
-        task: Task,
-        _: &BTreeMap<u64, Arc<Blob>>,
-        context: TaskContext,
-    ) -> Result<Operation, ErrorCode> {
-        if !matches!(task, Task::HttpStart { .. }) {
-            return Err(ErrorCode::Unsupported);
-        }
-        let started = self.started.clone();
-        let cleanup_delay = self.cleanup_delay;
-        Ok(Operation::blocking(move || {
-            started.store(true, Ordering::Release);
-            let until = Instant::now() + Duration::from_secs(5);
-            while Instant::now() < until {
-                if context.cancel.is_cancelled() {
-                    std::thread::sleep(cleanup_delay);
-                    return Err(ErrorCode::Cancelled);
-                }
-                std::thread::sleep(Duration::from_millis(5));
-            }
-            Ok(IoOutcome::new(serde_json::json!({"status":200}), None))
-        }))
-    }
-    fn close(&self, _: u64) -> Result<(), ErrorCode> {
-        Err(ErrorCode::StaleHandle)
-    }
-    fn stop(&self) {}
-}
-
+#[track_caller]
 fn until(mut condition: impl FnMut() -> bool, timeout: Duration) {
     let end = Instant::now() + timeout;
     while !condition() {
@@ -117,274 +49,481 @@ fn until(mut condition: impl FnMut() -> bool, timeout: Duration) {
     }
 }
 
-#[test]
-#[ignore = "requires compiled Rust guest; run scripts/test-plugin-v2.py"]
-fn control_io_and_dead_loop_do_not_block_four_stream_reads() {
-    let engine = RuntimeEngine::new().unwrap();
-    let module = engine
-        .compile(&guest("IRIS_V2_RUST_GUEST"), &CancelToken::new())
-        .unwrap();
-    let ledger = Ledger::default();
-    let io = IoPool::new().unwrap();
-    let started = Arc::new(AtomicBool::new(false));
-    let config = |role| Spawn {
-        engine: engine.clone(),
-        module: module.clone(),
-        role,
-        owner: "dual".into(),
-        grants: BTreeSet::from([Capability::NetHttp, Capability::Notifications]),
-        ledger: ledger.clone(),
-        io: io.clone(),
-        executor: Arc::new(Delay {
-            started: started.clone(),
-            cleanup_delay: Duration::ZERO,
-        }),
-        generation: Generation::default(),
-        wake: Arc::new(|| {}),
-    };
-    let control = Actor::spawn(config(Role::Control)).unwrap();
-    let stream = Actor::spawn(config(Role::Stream)).unwrap();
-    control.send(br#"{"event":"slow"}"#.to_vec()).unwrap();
-    until(|| started.load(Ordering::Acquire), Duration::from_secs(2));
-    let start = Instant::now();
-    let reads: Vec<_> = (0..4)
-        .map(|i| stream.read("av".into(), i * 64, 64, None).unwrap())
-        .collect();
-    for (i, read) in reads.iter().enumerate() {
-        let result = read.receive(Duration::from_secs(2)).unwrap();
-        assert_eq!(
-            result.blob.bytes,
-            (0..64).map(|n| (i * 64 + n) as u8).collect::<Vec<_>>()
-        );
-    }
-    assert!(start.elapsed() < Duration::from_secs(3));
-    let context = Arc::new(Blob::new(&ledger, "dual", vec![0xa5]).unwrap());
-    stream.send_context(serde_json::json!({"event":"stream_init","session":"1","generation":Generation::default()}), context).unwrap();
-    let result = stream
-        .read("av".into(), 32, 64, None)
-        .unwrap()
-        .receive(Duration::from_secs(1))
-        .unwrap();
-    assert_eq!(
-        result.blob.bytes,
-        (32..96).map(|v| v ^ 0xa5).collect::<Vec<u8>>()
-    );
-    drop(result);
-    assert_eq!(control.status(), Status::Ready);
-    until(|| control.poll().is_some(), Duration::from_secs(6));
-    control.send(br#"{"event":"spin"}"#.to_vec()).unwrap();
-    assert!(
-        stream
-            .read("av".into(), 256, 64, None)
-            .unwrap()
-            .receive(Duration::from_secs(1))
-            .is_ok()
-    );
-    until(
-        || matches!(control.status(), Status::Failed(ErrorCode::Timeout)),
-        Duration::from_secs(3),
-    );
-    assert!(
-        stream
-            .read("av".into(), 320, 64, None)
-            .unwrap()
-            .receive(Duration::from_secs(1))
-            .is_ok()
-    );
-    drop(reads);
-    control.stop();
-    stream.stop();
-    until(
-        || control.is_quiescent() && stream.is_quiescent(),
-        Duration::from_secs(2),
-    );
-    assert_eq!(ledger.used(None, Resource::WasmBytes), 0);
-    assert_eq!(ledger.used(None, Resource::Task), 0);
-    assert_eq!(ledger.used(None, Resource::Handle), 0);
-    assert_eq!(ledger.used(None, Resource::HostBytes), 0);
+fn guest(name: &str) -> Vec<u8> {
+    std::fs::read(
+        std::env::var(name).expect("run scripts/test-plugin-v2.py to compile language fixtures"),
+    )
+    .unwrap()
 }
 
-#[test]
-#[ignore = "requires compiled Rust guest; run scripts/test-plugin-v2.py"]
-fn cancelling_does_not_release_running_io_quota_early() {
-    let engine = RuntimeEngine::new().unwrap();
-    let module = engine
-        .compile(&guest("IRIS_V2_RUST_GUEST"), &CancelToken::new())
+fn write_plugin_zip(path: &Path, manifest: &serde_json::Value, wasm: &[u8]) {
+    let mut zip = ZipWriter::new(Cursor::new(Vec::new()));
+    zip.start_file("plugin.json", SimpleFileOptions::default())
         .unwrap();
-    let ledger = Ledger::default();
-    let started = Arc::new(AtomicBool::new(false));
-    let actor = Actor::spawn(Spawn {
-        engine,
-        module,
-        role: Role::Control,
-        owner: "cancel".into(),
-        grants: BTreeSet::from([Capability::NetHttp]),
-        ledger: ledger.clone(),
-        io: IoPool::new().unwrap(),
-        executor: Arc::new(Delay {
-            started: started.clone(),
-            cleanup_delay: Duration::from_millis(250),
-        }),
-        generation: Generation::default(),
-        wake: Arc::new(|| {}),
-    })
-    .unwrap();
-    actor.send(br#"{"event":"slow"}"#.to_vec()).unwrap();
-    until(|| started.load(Ordering::Acquire), Duration::from_secs(2));
-    let start = Instant::now();
-    actor.stop();
-    assert!(start.elapsed() < Duration::from_millis(100));
-    assert_eq!(ledger.used(None, Resource::Task), 1);
-    assert!(!actor.is_quiescent());
-    until(|| actor.is_quiescent(), Duration::from_secs(2));
-    assert_eq!(ledger.used(None, Resource::Task), 0);
-    assert_eq!(ledger.used(None, Resource::HostBytes), 0);
+    zip.write_all(&serde_json::to_vec(manifest).unwrap())
+        .unwrap();
+    zip.start_file("plugin.wasm", SimpleFileOptions::default())
+        .unwrap();
+    zip.write_all(wasm).unwrap();
+    let archive = zip.finish().unwrap().into_inner();
+    std::fs::write(path, archive).unwrap();
 }
 
-#[test]
-#[ignore = "requires compiled Rust guest; run scripts/test-plugin-v2.py"]
-fn random_access_relay_refresh_preserves_inflight_context_and_cancellation() {
-    use iris_api::v2::{Id, NetworkDeclaration, stream::StreamContext};
-    use iris_base::net::http_client::HttpCancel;
-    use iris_plugin_host::{
-        network::NetworkGrant,
-        stream::{
-            guest::StreamStore,
-            relay::BoundRelay,
-            remote::RemoteFactory,
-            session::{StreamSession, new_session_id},
+fn is_synced_ready(session: &mut WindowSession, plugin_id: &str) -> bool {
+    let ready = session.is_ready(plugin_id);
+    session.poll();
+    ready
+        && session
+            .list()
+            .iter()
+            .any(|p| p.id == plugin_id && p.status == PluginStatus::Ready)
+}
+
+fn install_and_wait_ready(session: &mut WindowSession, pkg_path: &Path, plugin_id: &str) {
+    let review_id = session.review_package(pkg_path.to_path_buf()).unwrap();
+    let mut review = None;
+    until(
+        || {
+            for notice in session.poll().notices {
+                match notice {
+                    Notice::Review(r) if r.id == review_id => review = Some(r),
+                    Notice::Error { code, .. } => panic!("review failed: {code:?}"),
+                    _ => {}
+                }
+            }
+            review.is_some()
         },
-    };
-    use std::{
-        io::{Read, Write},
-        net::TcpStream,
-    };
-    let engine = RuntimeEngine::new().unwrap();
-    let module = engine
-        .compile(&guest("IRIS_V2_RUST_GUEST"), &CancelToken::new())
-        .unwrap();
-    let ledger = Ledger::default();
-    let started = Arc::new(AtomicBool::new(false));
-    let context = StreamContext {
-        version: Id(1),
-        blob: Id(1),
-        origin_grants: Vec::new(),
-        transports: vec![Capability::NetHttp],
-        expires_unix_ms: None,
-    };
-    let id = new_session_id().unwrap();
-    let store = Arc::new(
-        StreamStore::spawn(
-            Spawn {
-                engine,
-                module,
-                role: Role::Stream,
-                owner: "stream-context".into(),
-                grants: BTreeSet::from([Capability::NetHttp]),
-                ledger: ledger.clone(),
-                io: IoPool::new().unwrap(),
-                executor: Arc::new(Delay {
-                    started: started.clone(),
-                    cleanup_delay: Duration::from_millis(250),
-                }),
-                generation: Generation::default(),
-                wake: Arc::new(|| {}),
-            },
-            id,
-            &context,
-            Arc::new(Blob::new(&ledger, "stream-context", vec![0xa5]).unwrap()),
-        )
-        .unwrap(),
+        Duration::from_secs(60),
     );
-    let delayed = store.reader("delayed".into(), Some(512)).unwrap();
-    let delayed_thread =
-        std::thread::spawn(move || delayed.read_at(8, 32, &HttpCancel::default()).unwrap());
-    until(|| started.load(Ordering::Acquire), Duration::from_secs(2));
-    let updated = StreamContext {
-        version: Id(2),
-        ..context.clone()
-    };
-    store
-        .refresh(
-            Id(1),
-            &updated,
-            Arc::new(Blob::new(&ledger, "stream-context", vec![0x3c]).unwrap()),
-        )
-        .unwrap();
-    assert!(
-        store
-            .refresh(
-                Id(1),
-                &context,
-                Arc::new(Blob::new(&ledger, "stream-context", vec![0]).unwrap())
-            )
-            .is_err()
+    let summary = review.unwrap();
+    let grants = summary.manifest.permissions.iter().copied().collect();
+    session.approve_review(review_id, grants, false).unwrap();
+    until(
+        || is_synced_ready(session, plugin_id),
+        Duration::from_secs(60),
     );
-    let grant = NetworkGrant::new(
-        "stream-context".into(),
-        BTreeSet::from([Capability::NetHttp]),
-        NetworkDeclaration::default(),
-        &ledger,
-    )
-    .unwrap();
-    let factory = RemoteFactory::new(grant.clone(), ledger.clone()).unwrap();
-    let bound = BoundRelay::bind().unwrap();
-    let session = StreamSession::new(
-        id,
-        Generation::default(),
-        bound.authority().unwrap(),
-        factory,
-        Some(store.clone()),
-    )
-    .unwrap();
-    session
-        .commit(
-            session
-                .prepare_reader(store.reader("av".into(), Some(512)).unwrap())
-                .unwrap(),
-        )
-        .unwrap();
-    let relay = bound.start(session.clone()).unwrap();
-    let url = url::Url::parse(&session.root_url().unwrap()).unwrap();
-    let mut client = TcpStream::connect(session.authority()).unwrap();
-    client
-        .set_read_timeout(Some(Duration::from_secs(2)))
-        .unwrap();
+}
+
+fn read_loopback_range(url_str: &str, start: u64, len: u64) -> Result<Vec<u8>, std::io::Error> {
+    let parsed = url::Url::parse(url_str).unwrap();
+    let authority = format!(
+        "{}:{}",
+        parsed.host_str().unwrap(),
+        parsed.port_or_known_default().unwrap()
+    );
+    let mut stream = TcpStream::connect(&authority)?;
+    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+    let end = start + len - 1;
     write!(
-        client,
-        "GET {} HTTP/1.1\r\nHost: {}\r\nRange: bytes=17-48\r\n\r\n",
-        url.path(),
-        session.authority()
-    )
+        stream,
+        "GET {} HTTP/1.1\r\nHost: {authority}\r\nRange: bytes={start}-{end}\r\nConnection: close\r\n\r\n",
+        parsed.path()
+    )?;
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw)?;
+    if !raw.starts_with(b"HTTP/1.1 206 ") {
+        return Err(std::io::Error::other(format!(
+            "unexpected HTTP status: {}",
+            String::from_utf8_lossy(&raw[..raw.len().min(64)])
+        )));
+    }
+    let body_start = raw
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .ok_or_else(|| std::io::Error::other("missing header separator"))?
+        + 4;
+    Ok(raw[body_start..].to_vec())
+}
+
+const WAT_FIND_FN: &str = r#"(func $find (param $hp i32) (param $hl i32) (param $np i32) (param $nl i32) (result i32)
+            (local $i i32)
+            (local $j i32)
+            (local $limit i32)
+            (if (i32.gt_u (local.get $nl) (local.get $hl))
+                (then (return (i32.const -1))))
+            (local.set $limit (i32.sub (local.get $hl) (local.get $nl)))
+            (block $done
+                (loop $outer
+                    (br_if $done (i32.gt_u (local.get $i) (local.get $limit)))
+                    (local.set $j (i32.const 0))
+                    (block $mismatch
+                        (loop $inner
+                            (if (i32.eq (local.get $j) (local.get $nl))
+                                (then (return (i32.add (i32.add (local.get $hp) (local.get $i)) (local.get $nl)))))
+                            (br_if $mismatch
+                                (i32.ne
+                                    (i32.load8_u (i32.add (i32.add (local.get $hp) (local.get $i)) (local.get $j)))
+                                    (i32.load8_u (i32.add (local.get $np) (local.get $j)))))
+                            (local.set $j (i32.add (local.get $j) (i32.const 1)))
+                            (br $inner)))
+                    (local.set $i (i32.add (local.get $i) (i32.const 1)))
+                    (br $outer)))
+            (i32.const -1))"#;
+
+#[test]
+fn wat_ws_request_origin_returns_notice_without_quarantining_plugin() {
+    let empty = r#"{"ok":[]}"#;
+    let trigger = r#""connect""#;
+    let esc = |s: &str| -> String { s.as_bytes().iter().map(|b| format!("\\{b:02x}")).collect() };
+    let empty_packed = (1024_u64 << 32) | empty.len() as u64;
+    let reply_json = r#"{"ok":[{"command":"request_origin","request_id":"1","origin":"ws://192.168.1.50:8080/chat"}]}"#;
+    let reply_packed = (2048_u64 << 32) | reply_json.len() as u64;
+
+    let wasm = wat::parse_str(format!(
+        r#"(module
+        (memory (export "memory") 4 8)
+        (data (i32.const 1024) "{empty_esc}")
+        (data (i32.const 1100) "{trigger_esc}")
+        (data (i32.const 2048) "{reply_esc}")
+        (func (export "iris_abi_version") (result i32) i32.const 2)
+        (func (export "iris_alloc") (param i32) (result i32) i32.const 32768)
+        (func (export "iris_dealloc") (param i32 i32))
+        {WAT_FIND_FN}
+        (func (export "iris_on_event") (param $ptr i32) (param $len i32) (result i64)
+            (if (result i64) (i32.ge_s (call $find (local.get $ptr) (local.get $len) (i32.const 1100) (i32.const {trigger_len})) (i32.const 0))
+                (then (i64.const {reply_packed}))
+                (else (i64.const {empty_packed})))))"#,
+        empty_esc = esc(empty),
+        trigger_esc = esc(trigger),
+        reply_esc = esc(reply_json),
+        trigger_len = trigger.len(),
+    ))
     .unwrap();
-    let mut response = Vec::new();
-    client.read_to_end(&mut response).unwrap();
-    assert!(response.starts_with(b"HTTP/1.1 206"));
-    assert!(response.ends_with(&(17..49).map(|n| n ^ 0x3c).collect::<Vec<u8>>()));
-    let old = delayed_thread.join().unwrap();
-    assert_eq!(
-        old.blob.bytes,
-        (8..40).map(|n| n ^ 0xa5).collect::<Vec<u8>>()
+
+    let plugin_id = "wat.origin.ws";
+    let dir = TempDir::new("iris-wat-ws-origin");
+    let pkg_path = dir.path().join("ws-origin.irisplugin");
+    let manifest = serde_json::json!({
+        "id": plugin_id,
+        "name": "WAT WS Origin Fixture",
+        "version": "1.0.0",
+        "protocol": 2,
+        "abi": 2,
+        "entry": "plugin.wasm",
+        "permissions": [Capability::UiModal, Capability::NetWs],
+    });
+    write_plugin_zip(&pkg_path, &manifest, &wasm);
+
+    let host = PluginHost::open_in(dir.path(), CredentialVault::in_memory(), &[], false).unwrap();
+    let (mut session, _) = host.open_window(&[], "dark");
+    install_and_wait_ready(&mut session, &pkg_path, plugin_id);
+
+    let initial = session.send_to(
+        plugin_id,
+        HostEvent::Command {
+            id: "connect".into(),
+            snapshot: None,
+        },
     );
-    drop(old);
-    started.store(false, Ordering::Release);
-    let cancel = HttpCancel::default();
-    let worker_cancel = cancel.clone();
-    let delayed = store.reader("delayed".into(), Some(512)).unwrap();
-    let waiter = std::thread::spawn(move || delayed.read_at(0, 32, &worker_cancel));
-    until(|| started.load(Ordering::Acquire), Duration::from_secs(2));
-    cancel.cancel();
-    assert!(matches!(waiter.join().unwrap(), Err(ErrorCode::Cancelled)));
-    assert_eq!(ledger.used(None, Resource::Task), 1);
-    assert_eq!(ledger.used(None, Resource::StreamRead), 1);
-    relay.stop();
-    until(|| relay.is_quiescent(), Duration::from_secs(2));
-    drop(relay);
+    assert!(initial.notices.is_empty());
+
+    let mut summary = None;
+    until(
+        || {
+            for notice in session.poll().notices {
+                match notice {
+                    Notice::Origin(s) => summary = Some(s),
+                    Notice::Error { code, .. } => {
+                        panic!("unexpected host error for ws:// RequestOrigin: {code:?}");
+                    }
+                    _ => {}
+                }
+            }
+            for plugin in session.list() {
+                if plugin.id == plugin_id {
+                    assert!(
+                        !matches!(plugin.status, PluginStatus::Failed(_)),
+                        "ws:// RequestOrigin quarantined plugin: {:?}",
+                        plugin.status
+                    );
+                }
+            }
+            summary.is_some()
+        },
+        Duration::from_secs(20),
+    );
+
+    let summary = summary.unwrap();
+    assert_eq!(summary.origin, "http://192.168.1.50:8080");
+    assert_eq!(
+        summary.ips,
+        vec!["192.168.1.50".parse::<std::net::IpAddr>().unwrap()]
+    );
+    assert!(summary.private && summary.plaintext);
+
+    let origin_id = summary.id;
+    drop(summary);
+    session.confirm_origin(origin_id, true, false).unwrap();
+    let mut closed = false;
+    until(
+        || {
+            for notice in session.poll().notices {
+                if let Notice::OriginClosed(id) = notice
+                    && id == origin_id
+                {
+                    closed = true;
+                }
+            }
+            closed
+        },
+        Duration::from_secs(20),
+    );
+    assert!(session.is_ready(plugin_id));
+
+    session.shutdown();
     drop(session);
-    drop(store);
-    drop(grant);
-    assert_eq!(ledger.used(None, Resource::Task), 0);
-    assert_eq!(ledger.used(None, Resource::StreamRead), 0);
-    assert_eq!(ledger.used(None, Resource::HostBytes), 0);
-    assert_eq!(ledger.used(None, Resource::WasmBytes), 0);
+    host.shutdown();
+    until(|| host.host_bytes_used() == 0, Duration::from_secs(20));
+}
+
+fn send_runtime_command(session: &mut WindowSession, command: &str) -> String {
+    let report = session.send_to(
+        "test.runtime",
+        HostEvent::Command {
+            id: command.into(),
+            snapshot: Some(PlaybackSnapshot {
+                uri: Some("file:///must-remain-private.mov".into()),
+                ..PlaybackSnapshot::default()
+            }),
+        },
+    );
+    assert!(report.notices.is_empty());
+    let mut toast = None;
+    until(
+        || {
+            for action in session.poll().actions {
+                if let ActionKind::ShowToast { message } = action.kind {
+                    toast = Some(message);
+                }
+            }
+            toast.is_some()
+        },
+        Duration::from_secs(20),
+    );
+    toast.unwrap()
+}
+
+fn setup_runtime_package(dir: &TempDir) -> PathBuf {
+    let pkg_path = dir.path().join("test.runtime.irisplugin");
+    let manifest = serde_json::json!({
+        "id": "test.runtime",
+        "name": "Rust runtime",
+        "version": "1",
+        "protocol": 2,
+        "abi": 2,
+        "entry": "plugin.wasm",
+        "permissions": ["notifications", "media_source"]
+    });
+    write_plugin_zip(&pkg_path, &manifest, &guest("IRIS_V2_RUST_GUEST"));
+    pkg_path
+}
+
+#[test]
+#[ignore = "requires compiled Rust guest; run scripts/test-plugin-v2.py"]
+fn installed_guest_persists_state_without_read_state_and_cannot_receive_local_snapshot() {
+    let dir = TempDir::new("iris-runtime-guest");
+    let pkg_path = setup_runtime_package(&dir);
+    let vault = CredentialVault::in_memory();
+
+    let host = PluginHost::open_in(dir.path(), vault.clone(), &[], false).unwrap();
+    let (mut session, _) = host.open_window(&[], "dark");
+    install_and_wait_ready(&mut session, &pkg_path, "test.runtime");
+    assert_eq!(send_runtime_command(&mut session, "snapshot"), "none");
+    assert_eq!(send_runtime_command(&mut session, "store_read"), "absent");
+    assert_eq!(
+        send_runtime_command(&mut session, "store_write"),
+        "persistent-value"
+    );
+    session.shutdown();
+    drop(session);
+    host.shutdown();
+    until(
+        || host.host_bytes_used() == 0 && host.control_stores_used() == 0,
+        Duration::from_secs(20),
+    );
+    drop(host);
+
+    let reopened_host = PluginHost::open_in(dir.path(), vault, &[], false).unwrap();
+    let (mut reopened, _) = reopened_host.open_window(&[], "dark");
+    until(
+        || is_synced_ready(&mut reopened, "test.runtime"),
+        Duration::from_secs(60),
+    );
+    assert_eq!(
+        send_runtime_command(&mut reopened, "store_read"),
+        "persistent-value"
+    );
+    reopened.shutdown();
+    drop(reopened);
+    reopened_host.shutdown();
+    until(
+        || reopened_host.host_bytes_used() == 0 && reopened_host.control_stores_used() == 0,
+        Duration::from_secs(20),
+    );
+}
+
+#[test]
+#[ignore = "requires compiled Rust guest; run scripts/test-plugin-v2.py"]
+fn admitted_playback_survives_request_cancel_and_control_timeout_until_explicit_stop() {
+    let dir = TempDir::new("iris-runtime-survive");
+    let pkg_path = setup_runtime_package(&dir);
+    let host = PluginHost::open_in(dir.path(), CredentialVault::in_memory(), &[], false).unwrap();
+    let (mut session, _) = host.open_window(&[], "dark");
+    install_and_wait_ready(&mut session, &pkg_path, "test.runtime");
+
+    let req = session
+        .resolve("test.runtime", "fixture.source", None, "av", None)
+        .unwrap();
+    let mut playback_notice = None;
+    until(
+        || {
+            for notice in session.poll().notices {
+                match notice {
+                    Notice::Playback {
+                        ticket, playback, ..
+                    } if ticket.id == req => {
+                        playback_notice = Some((ticket, playback));
+                    }
+                    Notice::Error { code, .. } => panic!("resolve failed: {code:?}"),
+                    _ => {}
+                }
+            }
+            playback_notice.is_some()
+        },
+        Duration::from_secs(60),
+    );
+    let (ticket, playback) = playback_notice.unwrap();
+    let url = playback.url.clone();
+    // Preparation cancellation scope ends once admitted; cancelling `ticket.cancel` does not kill the stream.
+    ticket.cancel.cancel();
+    drop(ticket);
+
+    assert_eq!(
+        read_loopback_range(&url, 5, 16).unwrap(),
+        (5..21).map(|n| (n as u8) ^ 0xa5).collect::<Vec<_>>()
+    );
+
+    // Trigger a 2s dead-loop timeout in ControlStore; admitted StreamStore + Relay must survive!
+    let _ = session.send_to(
+        "test.runtime",
+        HostEvent::Command {
+            id: "spin".into(),
+            snapshot: None,
+        },
+    );
+    until(
+        || {
+            session.poll();
+            session.list().iter().any(|p| {
+                p.id == "test.runtime" && p.status == PluginStatus::Failed(ErrorCode::Timeout)
+            })
+        },
+        Duration::from_secs(20),
+    );
+
+    assert_eq!(
+        read_loopback_range(&url, 40, 16).unwrap(),
+        (40..56).map(|n| (n as u8) ^ 0xa5).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        session.precheck_capability("test.runtime", Capability::MediaSource),
+        Err(ErrorCode::Timeout)
+    );
+
+    // Explicit window/host teardown cancels the relay.
+    session.shutdown();
+    drop((playback, session));
+    host.shutdown();
+    until(
+        || read_loopback_range(&url, 0, 16).is_err(),
+        Duration::from_secs(20),
+    );
+    until(|| host.is_ledger_empty(), Duration::from_secs(20));
+}
+
+#[test]
+#[ignore = "requires compiled Rust guest; run scripts/test-plugin-v2.py"]
+fn coordinator_routes_live_source_requests_and_stops_stream_on_window_close() {
+    let dir = TempDir::new("iris-runtime-coord");
+    let pkg_path = setup_runtime_package(&dir);
+    let host = PluginHost::open_in(dir.path(), CredentialVault::in_memory(), &[], false).unwrap();
+    let (mut first, _) = host.open_window(&[], "dark");
+    let (mut second, _) = host.open_window(&[], "dark");
+    assert!(!second.is_connected());
+    assert!(matches!(
+        second.poll().notices.as_slice(),
+        [Notice::Error {
+            code: ErrorCode::Backpressure,
+            ..
+        }]
+    ));
+    drop(second);
+
+    install_and_wait_ready(&mut first, &pkg_path, "test.runtime");
+    assert_eq!(host.control_stores_used(), 1);
+    assert!(
+        first
+            .media_sources()
+            .iter()
+            .any(|(pid, _, src)| *pid == "test.runtime" && src.id == "fixture.source")
+    );
+
+    // A UI-supplied SourceResolve event cannot bypass the coordinator's source request table.
+    let spoofed = first.send_to(
+        "test.runtime",
+        HostEvent::SourceResolve {
+            request_id: Id(999),
+            source_id: "fixture.source".into(),
+            folder_id: None,
+            entry_id: "av".into(),
+            variant: None,
+        },
+    );
+    assert!(matches!(
+        spoofed.notices.as_slice(),
+        [Notice::Error {
+            code: ErrorCode::Denied,
+            ..
+        }]
+    ));
+
+    let request = first
+        .resolve("test.runtime", "fixture.source", None, "av", None)
+        .unwrap();
+    let mut playback = None;
+    until(
+        || {
+            for notice in first.poll().notices {
+                match notice {
+                    Notice::Playback {
+                        ticket,
+                        playback: ready,
+                        ..
+                    } => {
+                        assert_eq!(ticket.id, request);
+                        playback = Some(ready);
+                    }
+                    Notice::Error { code, .. } => panic!("source preparation: {code:?}"),
+                    _ => {}
+                }
+            }
+            playback.is_some()
+        },
+        Duration::from_secs(60),
+    );
+    let playback = playback.unwrap();
+    let url = playback.url.clone();
+    assert_eq!(
+        read_loopback_range(&url, 5, 16).unwrap(),
+        (5..21).map(|n| (n as u8) ^ 0xa5).collect::<Vec<_>>()
+    );
+
+    first.shutdown();
+    until(
+        || read_loopback_range(&url, 5, 16).is_err(),
+        Duration::from_secs(20),
+    );
+    drop((playback, first));
+    host.shutdown();
+    until(|| host.host_bytes_used() == 0, Duration::from_secs(20));
 }

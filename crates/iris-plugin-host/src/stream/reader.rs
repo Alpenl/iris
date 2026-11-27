@@ -8,12 +8,12 @@ use iris_base::net::http_client::HttpCancel;
 use std::sync::Arc;
 
 /// Incremental upstream stream owned by one loopback relay response.
-pub trait StreamSlice: Send {
+pub(crate) trait StreamSlice: Send {
     fn read_chunk(&mut self, out: &mut [u8]) -> Result<usize, ErrorCode>;
 }
 
 /// Pre-validated stream opened before committing loopback HTTP headers.
-pub struct OpenedStream {
+pub(crate) struct OpenedStream {
     pub first: Vec<u8>,
     pub eof: bool,
     pub total: Option<u64>,
@@ -22,7 +22,7 @@ pub struct OpenedStream {
 }
 
 /// Runs only on relay/file workers. The Store is never held during this wait.
-pub trait Reader: Send + Sync {
+pub(crate) trait Reader: Send + Sync {
     fn size(&self, cancel: &HttpCancel) -> Result<Option<u64>, ErrorCode>;
     fn read_at(&self, offset: u64, len: u32, cancel: &HttpCancel) -> Result<ReadResult, ErrorCode>;
     fn open_stream(
@@ -43,7 +43,7 @@ pub(crate) fn check_read(offset: u64, len: u32, cancel: &HttpCancel) -> Result<(
     }
     Ok(())
 }
-pub struct MemoryReader {
+pub(crate) struct MemoryReader {
     bytes: Vec<u8>,
     owner: String,
     ledger: Ledger,
@@ -52,7 +52,7 @@ pub struct MemoryReader {
 impl MemoryReader {
     /// Caller reserves parse/render scratch before building these bytes. The
     /// resident allocation gets its own lease before that scratch is released.
-    pub fn new(bytes: Vec<u8>, owner: &str, ledger: &Ledger) -> Result<Self, ErrorCode> {
+    pub(crate) fn new(bytes: Vec<u8>, owner: &str, ledger: &Ledger) -> Result<Self, ErrorCode> {
         if bytes.len() > super::manifest::OUTPUT_LIMIT {
             return Err(ErrorCode::QuotaExceeded);
         }

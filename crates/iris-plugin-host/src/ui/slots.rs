@@ -72,7 +72,7 @@ pub(super) struct Slots {
     pub modal_order: u64,
 }
 impl Slots {
-    pub fn new(binding: Arc<Binding>) -> Self {
+    pub(crate) fn new(binding: Arc<Binding>) -> Self {
         Self {
             binding,
             sidebar: None,
@@ -84,37 +84,37 @@ impl Slots {
             modal_order: 0,
         }
     }
-    pub fn sidebar(&self) -> Option<&SidebarPanel> {
+    pub(crate) fn sidebar(&self) -> Option<&SidebarPanel> {
         match self.sidebar.as_ref()?.command() {
             HostCommand::SetSidebar { panel } => panel.as_deref(),
             _ => None,
         }
     }
-    pub fn status(&self) -> Option<&StatusBadge> {
+    pub(crate) fn status(&self) -> Option<&StatusBadge> {
         match self.status.as_ref()?.command() {
             HostCommand::SetStatus { badge } => badge.as_deref(),
             _ => None,
         }
     }
-    pub fn toolbar(&self) -> &[ToolbarButton] {
+    pub(crate) fn toolbar(&self) -> &[ToolbarButton] {
         match self.toolbar.as_ref().map(Slot::command) {
             Some(HostCommand::SetToolbar { buttons }) => buttons,
             _ => &[],
         }
     }
-    pub fn overlay(&self) -> &[OverlayNode] {
+    pub(crate) fn overlay(&self) -> &[OverlayNode] {
         match self.overlay.as_ref().map(Slot::command) {
             Some(HostCommand::SetOverlay { nodes }) => nodes,
             _ => &[],
         }
     }
-    pub fn modal(&self) -> Option<&PluginModal> {
+    pub(crate) fn modal(&self) -> Option<&PluginModal> {
         match self.modal.as_ref()?.command() {
             HostCommand::OpenModal { modal } => Some(modal),
             _ => None,
         }
     }
-    pub fn theme(&self) -> Option<&UiThemeSpec> {
+    pub(crate) fn theme(&self) -> Option<&UiThemeSpec> {
         if !self.binding.installed.grants.contains(&Capability::UiTheme) {
             return None;
         }
@@ -123,7 +123,7 @@ impl Slots {
             _ => self.binding.manifest.theme.as_ref(),
         }
     }
-    pub fn chrome(&self) -> Option<&ChromeLayoutSpec> {
+    pub(crate) fn chrome(&self) -> Option<&ChromeLayoutSpec> {
         if !self.binding.installed.grants.contains(&Capability::UiTheme) {
             return None;
         }
@@ -132,10 +132,10 @@ impl Slots {
             _ => self.binding.manifest.chrome.as_ref(),
         }
     }
-    pub fn dismiss_modal(&mut self) {
+    pub(crate) fn dismiss_modal(&mut self) {
         self.modal = None;
     }
-    pub fn apply(
+    pub(crate) fn apply(
         &mut self,
         update: &Arc<Update>,
         index: usize,

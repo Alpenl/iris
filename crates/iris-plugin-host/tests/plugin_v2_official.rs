@@ -2,21 +2,12 @@
 //! substitutes. Run scripts/test-plugin-v2-official.py to supply these fixtures.
 use iris_api::{
     OverlayNode,
-    v2::{Generation, HostEvent},
+    v2::{ErrorCode, HostEvent, source::PlaybackSnapshot},
 };
-use iris_core::vault::CredentialVault;
-use iris_plugin_host::{
-    hub::{Config, Hub},
-    installation::{Approval, Installer},
-    ledger::Resource,
-    package::{Package, Provenance},
-    runtime::{Resources, Setup},
-    ui::WindowSession,
-};
+use iris_plugin_host::{Notice, PluginHost, WindowSession, open_host_with_bundled_package};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     path::PathBuf,
-    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -28,7 +19,9 @@ fn wait(mut check: impl FnMut() -> bool) {
         std::thread::sleep(Duration::from_millis(10));
     }
 }
+
 struct TestDir(PathBuf);
+
 impl TestDir {
     fn new(prefix: &str) -> Self {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -43,10 +36,12 @@ impl TestDir {
         ));
         Self(path)
     }
+
     fn path(&self) -> &std::path::Path {
         &self.0
     }
 }
+
 impl Drop for TestDir {
     fn drop(&mut self) {
         if self.0.starts_with(std::env::temp_dir()) {
@@ -57,79 +52,30 @@ impl Drop for TestDir {
 
 struct Fixture {
     root: TestDir,
-    resources: Resources,
-    hub: Option<Hub>,
+    host: PluginHost,
 }
+
 impl Fixture {
     fn load(variable: &str) -> Self {
         let path = std::env::var_os(variable).expect("official package fixture environment");
         let bytes = std::fs::read(path).unwrap();
         let root = TestDir::new("iris-official");
-        let resources = Resources::new().unwrap();
-        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(&bytes)).unwrap();
-        let mut hash = ring::digest::Context::new(&ring::digest::SHA256);
-        use std::io::Read;
-        for name in ["plugin.json", "plugin.wasm"] {
-            let mut content = Vec::new();
-            archive
-                .by_name(name)
-                .unwrap()
-                .read_to_end(&mut content)
-                .unwrap();
-            hash.update(&(name.len() as u64).to_le_bytes());
-            hash.update(name.as_bytes());
-            hash.update(&(content.len() as u64).to_le_bytes());
-            hash.update(&content);
-        }
-        let digest: [u8; 32] = hash.finish().as_ref().try_into().unwrap();
         let plugin = match variable {
             "IRIS_V2_GUIDES_PACKAGE" => "iris.guides",
             "IRIS_V2_WEBDAV_PACKAGE" => "iris.webdav",
             _ => panic!("unknown official fixture"),
         };
-        let index = BTreeMap::from([(plugin.into(), digest)]);
-        let package = Package::from_zip(&bytes, Provenance::Bundled(&index)).unwrap();
-        let mut installer = Installer::with_bundled(
-            root.path().join("packages"),
-            resources.ledger.clone(),
-            index,
-        );
-        installer
-            .install_bundled(
-                &bytes,
-                Approval {
-                    digest,
-                    grants: package.manifest.permissions.into_iter().collect(),
-                    network: package.manifest.network,
-                    previous: None,
-                },
-            )
-            .unwrap();
-        let hub = Hub::new(Config {
-            bootstrap: None,
-            installer,
-            disabled: BTreeSet::new(),
-            runtime: Setup {
-                resources: resources.clone(),
-                state_directory: root.path().join("state"),
-                temporary_directory: root.path().join("temp"),
-                vault: CredentialVault::in_memory(),
-                wake: Arc::new(|| {}),
-            },
-        })
-        .unwrap();
-        Self {
-            root,
-            resources,
-            hub: Some(hub),
-        }
+        let host = open_host_with_bundled_package(root.path(), plugin, &bytes).unwrap();
+        Self { root, host }
     }
-    fn hub(&self) -> &Hub {
-        self.hub.as_ref().expect("hub active")
+
+    fn open_window(&self) -> WindowSession {
+        self.host.open_window(&[], "dark").0
     }
-    fn shutdown(mut self) {
-        drop(self.hub.take());
-        wait(|| self.resources.ledger.used(None, Resource::HostBytes) == 0);
+
+    fn shutdown(self) {
+        self.host.shutdown();
+        wait(|| self.host.host_bytes_used() == 0);
     }
 }
 
@@ -139,27 +85,34 @@ mod bootstrap;
 mod webdav;
 #[path = "support/official_webdav_config.rs"]
 mod webdav_config;
+
 #[test]
 #[ignore = "build official packages with scripts/test-plugin-v2-official.py"]
 fn official_guides_wasm_persists_state_across_single_window_reopen() {
     let fixture = Fixture::load("IRIS_V2_GUIDES_PACKAGE");
-    let (one, _) = fixture
-        .hub()
-        .open_window(Generation::default(), None)
-        .unwrap();
+    let mut one = fixture.open_window();
+    let mut second = fixture.open_window();
+    assert!(!second.is_connected());
     assert!(matches!(
-        fixture.hub().open_window(Generation::default(), None),
-        Err(iris_api::v2::ErrorCode::Backpressure)
+        second.poll().notices.as_slice(),
+        [Notice::Error {
+            code: ErrorCode::Backpressure,
+            ..
+        }]
     ));
-    let mut one = WindowSession::new(one, None);
+    drop(second);
+
     wait(|| {
+        let ready = one.is_ready("iris.guides");
         one.poll();
-        one.client().is_ready("iris.guides") && !one.sidebar_panels().is_empty()
+        ready
+            && one
+                .list()
+                .iter()
+                .any(|p| p.id == "iris.guides" && p.status == iris_plugin_host::PluginStatus::Ready)
+            && !one.sidebar_panels().is_empty()
     });
-    assert_eq!(
-        fixture.resources.ledger.used(None, Resource::ControlStore),
-        1
-    );
+    assert_eq!(fixture.host.control_stores_used(), 1);
     one.send_to(
         "iris.guides",
         HostEvent::Command {
@@ -205,23 +158,35 @@ fn official_guides_wasm_persists_state_across_single_window_reopen() {
             })
     });
     drop(one);
-    wait(|| fixture.resources.ledger.used(None, Resource::ControlStore) == 0);
-    let (reopened, _) = fixture
-        .hub()
-        .open_window(Generation::default(), None)
-        .unwrap();
-    let mut reopened = WindowSession::new(reopened, None);
+    wait(|| fixture.host.control_stores_used() == 0);
+    let mut reopened = fixture.open_window();
     wait(|| {
         reopened.poll();
         reopened
             .overlay_nodes()
             .any(|(_, node)| matches!(node, OverlayNode::Crosshair { .. }))
     });
-    reopened.client().set_enabled("iris.guides", false).unwrap();
+    reopened.set_enabled_with_snapshot("iris.guides", false, PlaybackSnapshot::default());
     wait(|| {
         reopened.poll();
         reopened.overlay_nodes().count() == 0
     });
     drop(reopened);
     fixture.shutdown();
+}
+
+#[test]
+fn check_embedded_runtime_verifies_both_official_plugins() {
+    let receipt = iris_plugin_host::check_embedded_runtime().unwrap();
+    assert_eq!(receipt["status"], "ok");
+    assert_eq!(receipt["protocol"], 2);
+    assert_eq!(receipt["abi"], 2);
+    let mut ids: Vec<&str> = receipt["plugins"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|row| row["plugin"].as_str())
+        .collect();
+    ids.sort_unstable();
+    assert_eq!(ids, vec!["iris.guides", "iris.webdav"]);
 }

@@ -3,11 +3,10 @@
 mod artifact;
 mod executor;
 mod hashing;
-pub mod identity;
-pub use artifact::{Artifact, ArtifactWriter, TempRoot};
-pub(crate) use artifact::{ArtifactCleaner, CleanerQueue};
-pub use executor::{FileExecutor, FileSetup};
-pub use hashing::hash_media;
+pub(crate) mod identity;
+pub(crate) use artifact::{Artifact, ArtifactCleaner, ArtifactWriter, CleanerQueue, TempRoot};
+pub(crate) use executor::{FileExecutor, FileSetup};
+pub(crate) use hashing::hash_media;
 
 #[cfg(test)]
 mod tests;

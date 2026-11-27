@@ -3,21 +3,25 @@ use crate::pool::IoPool;
 use iris_api::v2::{ErrorCode, Role};
 use std::sync::{Arc, Mutex};
 
-pub type Completion = Box<dyn FnOnce(Result<IoOutcome, ErrorCode>) + Send>;
+pub(crate) type Completion = Box<dyn FnOnce(Result<IoOutcome, ErrorCode>) + Send>;
 type Blocking = Box<dyn FnOnce() -> Result<IoOutcome, ErrorCode> + Send>;
 type Deferred = Box<dyn FnOnce(Completion) -> Result<(), ErrorCode> + Send>;
 
 /// Deferred operations only enqueue bounded work and wake an existing reactor.
 /// They must never perform I/O, wait, or call guest code on the submitting thread.
-pub enum Operation {
+pub(crate) enum Operation {
     Blocking(Blocking),
     Deferred(Deferred),
 }
 impl Operation {
-    pub fn blocking(f: impl FnOnce() -> Result<IoOutcome, ErrorCode> + Send + 'static) -> Self {
+    pub(crate) fn blocking(
+        f: impl FnOnce() -> Result<IoOutcome, ErrorCode> + Send + 'static,
+    ) -> Self {
         Self::Blocking(Box::new(f))
     }
-    pub fn deferred(f: impl FnOnce(Completion) -> Result<(), ErrorCode> + Send + 'static) -> Self {
+    pub(crate) fn deferred(
+        f: impl FnOnce(Completion) -> Result<(), ErrorCode> + Send + 'static,
+    ) -> Self {
         Self::Deferred(Box::new(f))
     }
     pub(crate) fn dispatch(

@@ -4,7 +4,7 @@ use iris_api::v2::ErrorCode;
 use iris_base::net::range::{HttpRange, parse_decimal_u64};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Range {
+pub(crate) struct Range {
     pub offset: u64,
     pub len: Option<u64>,
     pub partial: bool,
@@ -12,7 +12,7 @@ pub struct Range {
 }
 
 impl Range {
-    pub fn parse(header: Option<&str>, size: Option<u64>) -> Result<Self, ErrorCode> {
+    pub(crate) fn parse(header: Option<&str>, size: Option<u64>) -> Result<Self, ErrorCode> {
         let parsed = HttpRange::parse(header, size).map_err(|_| ErrorCode::RangeInvalid)?;
         Ok(Self {
             offset: parsed.offset,
@@ -22,7 +22,7 @@ impl Range {
         })
     }
 
-    pub fn content_range(&self) -> Option<String> {
+    pub(crate) fn content_range(&self) -> Option<String> {
         HttpRange {
             offset: self.offset,
             len: self.len,

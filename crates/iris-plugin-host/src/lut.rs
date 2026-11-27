@@ -7,13 +7,12 @@ use super::{
 use iris_api::v2::ErrorCode;
 use iris_base::net::http_client::HttpCancel;
 use std::sync::Arc;
-pub struct MonitorLut {
+pub(crate) struct MonitorLut {
     artifact: Arc<Artifact>,
-    pub dimension: u32,
 }
 impl MonitorLut {
     /// Background-only file validation, bound to an already authorized artifact.
-    pub fn prepare(
+    pub(crate) fn prepare(
         artifact: Arc<Artifact>,
         ledger: &Ledger,
         cancel: &HttpCancel,
@@ -31,11 +30,8 @@ impl MonitorLut {
             }
             offset += n;
         }
-        let dimension = validate(&bytes)?;
-        Ok(Arc::new(Self {
-            artifact,
-            dimension,
-        }))
+        validate(&bytes)?;
+        Ok(Arc::new(Self { artifact }))
     }
     pub(crate) fn filter(&self) -> Result<String, ErrorCode> {
         let path = self.artifact.path();

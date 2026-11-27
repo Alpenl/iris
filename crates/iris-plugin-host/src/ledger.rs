@@ -11,7 +11,7 @@ use std::{
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub enum Resource {
+pub(crate) enum Resource {
     WasmBytes,
     HostBytes,
     ControlStore,
@@ -28,7 +28,7 @@ pub enum Resource {
     Dns,
     Auth,
     PlaybackSession,
-    StreamResource,
+    StreamEntry,
     RelayWorker,
     OverlayCues,
     OverlayBytes,
@@ -71,7 +71,7 @@ impl Resource {
                 budget::PLUGIN_RELAY_LISTENERS_PER_PLUGIN,
                 budget::PLUGIN_RELAY_LISTENERS_GLOBAL,
             ),
-            Self::StreamResource => (45_000, 180_000),
+            Self::StreamEntry => (45_000, 180_000),
             Self::RelayWorker => (
                 budget::PLUGIN_RELAY_WORKERS_PER_RELAY as u64,
                 budget::PLUGIN_RELAY_WORKERS_GLOBAL,
@@ -87,14 +87,14 @@ type Counts = BTreeMap<Resource, u64>;
 
 /// Tracks workers that can outlive an accepted task (notably system DNS).
 #[derive(Clone, Default)]
-pub struct Activity(Arc<AtomicUsize>);
-pub struct ActivityLease(Arc<AtomicUsize>);
+pub(crate) struct Activity(Arc<AtomicUsize>);
+pub(crate) struct ActivityLease(Arc<AtomicUsize>);
 impl Activity {
-    pub fn start(&self) -> ActivityLease {
+    pub(crate) fn start(&self) -> ActivityLease {
         self.0.fetch_add(1, Ordering::AcqRel);
         ActivityLease(self.0.clone())
     }
-    pub fn is_idle(&self) -> bool {
+    pub(crate) fn is_idle(&self) -> bool {
         self.0.load(Ordering::Acquire) == 0
     }
 }
@@ -110,10 +110,10 @@ struct State {
 }
 
 #[derive(Clone, Default)]
-pub struct Ledger(Arc<Mutex<State>>);
+pub(crate) struct Ledger(Arc<Mutex<State>>);
 
 /// Non-cloneable ownership token; transfers move the token with the resource.
-pub struct Reservation {
+pub(crate) struct Reservation {
     ledger: Ledger,
     owner: String,
     counts: Counts,
@@ -171,7 +171,7 @@ impl Reservation {
         Ok(())
     }
     /// Atomically grow an existing lease before allocating/writing more data.
-    pub fn extend(&mut self, amounts: &[(Resource, u64)]) -> Result<(), ErrorCode> {
+    pub(crate) fn extend(&mut self, amounts: &[(Resource, u64)]) -> Result<(), ErrorCode> {
         let mut extra = self.ledger.reserve(&self.owner, amounts)?;
         for (kind, amount) in std::mem::take(&mut extra.counts) {
             *self.counts.entry(kind).or_default() += amount;
@@ -181,7 +181,7 @@ impl Reservation {
 }
 
 impl Ledger {
-    pub fn reserve(
+    pub(crate) fn reserve(
         &self,
         owner: &str,
         amounts: &[(Resource, u64)],
@@ -226,7 +226,7 @@ impl Ledger {
         })
     }
 
-    pub fn used(&self, owner: Option<&str>, kind: Resource) -> u64 {
+    pub(crate) fn used(&self, owner: Option<&str>, kind: Resource) -> u64 {
         let state = self.0.lock().unwrap_or_else(|e| e.into_inner());
         match owner {
             Some(owner) => state

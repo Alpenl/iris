@@ -2,13 +2,12 @@
 mod ui;
 use iris_api::v2::{ErrorCode, HostCommand, source::SourcePage};
 use std::collections::BTreeSet;
-pub(crate) use ui::overlay_with_limit;
-pub use ui::{overlay, theme, widgets};
+pub(crate) use ui::{overlay, overlay_with_limit, theme, widgets};
 
 fn is_bidi_control(c: char) -> bool {
     matches!(c, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
 }
-pub fn text(value: &str, limit: usize) -> Result<(), ErrorCode> {
+pub(crate) fn text(value: &str, limit: usize) -> Result<(), ErrorCode> {
     if value.len() > limit {
         return Err(ErrorCode::QuotaExceeded);
     }
@@ -20,7 +19,7 @@ pub fn text(value: &str, limit: usize) -> Result<(), ErrorCode> {
     }
     Ok(())
 }
-pub fn single_line(value: &str, limit: usize) -> Result<(), ErrorCode> {
+pub(crate) fn single_line(value: &str, limit: usize) -> Result<(), ErrorCode> {
     if value.len() > limit {
         return Err(ErrorCode::QuotaExceeded);
     }
@@ -29,7 +28,7 @@ pub fn single_line(value: &str, limit: usize) -> Result<(), ErrorCode> {
     }
     Ok(())
 }
-pub fn chrome(chrome: &iris_api::ChromeLayoutSpec) -> Result<(), ErrorCode> {
+pub(crate) fn chrome(chrome: &iris_api::ChromeLayoutSpec) -> Result<(), ErrorCode> {
     if chrome.hidden_dock_buttons.len() > 64 {
         return Err(ErrorCode::QuotaExceeded);
     }
@@ -38,7 +37,7 @@ pub fn chrome(chrome: &iris_api::ChromeLayoutSpec) -> Result<(), ErrorCode> {
     }
     Ok(())
 }
-pub fn manifest(manifest: &iris_api::v2::Manifest) -> Result<(), ErrorCode> {
+pub(crate) fn manifest(manifest: &iris_api::v2::Manifest) -> Result<(), ErrorCode> {
     single_line(&manifest.name, 256)?;
     single_line(&manifest.version, 64)?;
     text(&manifest.author, 256)?;
@@ -78,7 +77,7 @@ pub fn manifest(manifest: &iris_api::v2::Manifest) -> Result<(), ErrorCode> {
     }
     Ok(())
 }
-pub fn identifier(value: &str) -> Result<(), ErrorCode> {
+pub(crate) fn identifier(value: &str) -> Result<(), ErrorCode> {
     if !iris_api::is_valid_id(value) || value.len() > 256 {
         return Err(ErrorCode::InvalidArgument);
     }
@@ -90,7 +89,7 @@ fn finite(value: f64, min: f64, max: f64) -> Result<(), ErrorCode> {
     }
     Ok(())
 }
-pub fn page(page: &SourcePage) -> Result<(), ErrorCode> {
+pub(crate) fn page(page: &SourcePage) -> Result<(), ErrorCode> {
     identifier(&page.source_id)?;
     text(&page.title, 1024)?;
     for value in page
@@ -167,11 +166,11 @@ fn variants(values: &[iris_api::StreamVariant]) -> Result<(), ErrorCode> {
     }
     Ok(())
 }
-pub fn remote(resource: &iris_api::v2::stream::RemoteResource) -> Result<(), ErrorCode> {
+pub(crate) fn remote(resource: &iris_api::v2::stream::RemoteResource) -> Result<(), ErrorCode> {
     super::url_resolver::normalize_url(&resource.url, super::url_resolver::TransportKind::Http)?;
     super::url_resolver::validate_headers(&resource.headers)
 }
-pub fn command(command: &HostCommand) -> Result<(), ErrorCode> {
+pub(crate) fn command(command: &HostCommand) -> Result<(), ErrorCode> {
     use HostCommand::*;
     match command {
         RequestOrigin { request_id, origin } => {
@@ -455,7 +454,7 @@ fn timeline_ranges(ranges: impl Iterator<Item = (u64, u64)>) -> Result<(), Error
     }
     Ok(())
 }
-pub fn annotation(edit: &iris_api::v2::enhance::AnnotationEdit) -> Result<(), ErrorCode> {
+pub(crate) fn annotation(edit: &iris_api::v2::enhance::AnnotationEdit) -> Result<(), ErrorCode> {
     use iris_api::v2::enhance::AnnotationEdit::*;
     match edit {
         Rating { rating } if *rating > 5 => Err(ErrorCode::InvalidArgument),
