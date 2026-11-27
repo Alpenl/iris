@@ -1,5 +1,6 @@
 //! Platform video surfaces. Each one puts mpv's picture *under* the GPUI
 //! window content, so GPUI can paint panels and overlays on top of it.
+#![allow(clippy::disallowed_types, clippy::disallowed_methods)]
 
 /// Notification emitted after a GPU surface reset and rebuild completes.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -17,3 +18,13 @@ pub(crate) use mac::VideoSurface;
 mod windows;
 #[cfg(target_os = "windows")]
 pub(crate) use windows::VideoSurface;
+
+pub(crate) fn attach(
+    window: &gpui::Window,
+    session: &iris_core::player::Session,
+) -> anyhow::Result<(
+    VideoSurface,
+    futures::channel::mpsc::UnboundedReceiver<VideoReset>,
+)> {
+    VideoSurface::attach(window, session.render_handle())
+}

@@ -13,9 +13,9 @@ use iris_core::library::{self, Kind};
 use iris_core::media_uri::MediaUri;
 use iris_core::photo;
 use iris_core::player::RemoteMediaRequest;
-use iris_core::plugin_v2::requests::BrowseTarget;
 use iris_core::preset::SidebarMode;
 use iris_core::vfs::{self, PinnedBookmark};
+use iris_plugin_host::requests::BrowseTarget;
 
 use super::IrisWindow;
 use super::state::{ActiveSource, PendingBrowse, PendingResolve, PluginSourceView, RemoteLoad};

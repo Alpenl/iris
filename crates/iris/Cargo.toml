@@ -14,7 +14,9 @@ gpui.workspace = true
 anyhow.workspace = true
 iris-mpv = { path = "../iris-mpv" }
 iris-api = { path = "../iris-api" }
+iris-net = { path = "../iris-net" }
 iris-core = { path = "../iris-core" }
+iris-plugin-host = { path = "../iris-plugin-host" }
 futures = "0.3"
 unicode-segmentation = "1.12"
 raw-window-handle = "0.6"

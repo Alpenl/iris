@@ -1092,7 +1092,7 @@ class CheckProjectHelperTests(unittest.TestCase):
         self.assertFalse(check_project.is_standalone_test_file(Path("crates/iris/src/debug.rs"), Path("crates/iris/src/debug.rs")))
 
     def test_thread_spawn_and_inventory_gates_reject_unregistered_threads_and_undocumented_roles(self):
-        rel_registry = Path("crates/iris-core/src/concurrency.rs")
+        rel_registry = Path("crates/iris-net/src/concurrency.rs")
         rel_other = Path("crates/iris-core/src/demo.rs")
         check_project.check_thread_spawns(rel_registry, 'fn ok() { let _ = std::thread::Builder::new(); }\n')
         check_project.check_thread_spawns(

@@ -1,7 +1,7 @@
 use super::super::IrisWindow;
 use gpui::Context;
 use iris_api::v2::{ErrorCode, Generation, HostCommand, HostEvent, Id};
-use iris_core::plugin_v2::{
+use iris_plugin_host::{
     enhancement::{Attachment, AttachmentSpec},
     hub::Binding,
     lut::MonitorLut,
@@ -22,14 +22,14 @@ pub(super) struct EnhancementView {
     pub bindings: BTreeMap<String, Arc<Binding>>,
     pub pending: BTreeMap<(String, String), Id>,
     pub lut_owner: Option<String>,
-    pub timeline: Option<(String, Arc<iris_core::plugin_v2::actor::Update>, usize)>,
+    pub timeline: Option<(String, Arc<iris_plugin_host::actor::Update>, usize)>,
     pub bank: Option<Arc<Mutex<OverlayBank>>>,
     pub clock: OverlayClock,
     pub overlay_generation: Generation,
     pub frame: Option<Arc<OverlayFrame>>,
     pub wake: Option<gpui::Task<()>>,
     pub glyphs: super::overlay::GlyphCache,
-    pub ledger: Option<iris_core::plugin_v2::ledger::Ledger>,
+    pub ledger: Option<iris_plugin_host::ledger::Ledger>,
     pub annotations: super::annotations::AnnotationView,
 }
 impl EnhancementView {
@@ -55,7 +55,7 @@ pub(super) enum Effect {
     Stream,
     Annotations(
         Option<iris_core::store::AnnotationSnapshot>,
-        Box<iris_core::plugin_v2::ui::Event>,
+        Box<iris_plugin_host::ui::Event>,
     ),
 }
 impl IrisWindow {
@@ -282,7 +282,7 @@ impl IrisWindow {
                 document,
             } => {
                 let current =
-                    iris_core::plugin_v2::stream::prepare::stream_session(&self.active().session)
+                    iris_plugin_host::stream::prepare::stream_session(&self.active().session)
                         .filter(|s| {
                             s.id == session
                                 && s.factory.owner() == owner
@@ -317,7 +317,7 @@ impl IrisWindow {
                 context,
             } => {
                 let current =
-                    iris_core::plugin_v2::stream::prepare::stream_session(&self.active().session)
+                    iris_plugin_host::stream::prepare::stream_session(&self.active().session)
                         .filter(|s| s.id == session && s.factory.owner() == owner)
                         .ok_or(ErrorCode::Denied)?;
                 let blob = action
@@ -505,7 +505,7 @@ impl IrisWindow {
         cx: &mut Context<Self>,
     ) {
         if let Some(session) =
-            iris_core::plugin_v2::stream::prepare::stream_session(&self.active().session)
+            iris_plugin_host::stream::prepare::stream_session(&self.active().session)
         {
             let generation = session.generation();
             let event = HostEvent::StreamStatus {

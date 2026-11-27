@@ -1,0 +1,4 @@
+# Only Session::render_handle may wrap Arc<Mpv> into RenderHandle inside iris-core.
+disallowed-methods = [
+    { path = "iris_mpv::RenderHandle::new", reason = "Only Session::render_handle may construct RenderHandle" },
+]

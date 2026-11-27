@@ -1,13 +1,11 @@
 use super::super::IrisWindow;
 use gpui::{Context, RenderImage};
 use iris_api::v2::{Capability, ErrorCode};
-use iris_core::{
-    media_uri::MediaUri,
-    plugin_v2::{
-        ledger::{Reservation, Resource},
-        stream::remote::RemoteFactory,
-    },
-    vfs::HttpCancel,
+use iris_core::media_uri::MediaUri;
+use iris_core::vfs::HttpCancel;
+use iris_plugin_host::{
+    ledger::{Reservation, Resource},
+    stream::remote::RemoteFactory,
 };
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -190,7 +188,7 @@ mod tests {
     };
     use gpui::RenderImage;
     use image::{Frame, RgbaImage};
-    use iris_core::plugin_v2::ledger::{Ledger, Resource};
+    use iris_plugin_host::ledger::{Ledger, Resource};
     use std::{sync::Arc, time::Instant};
 
     #[test]

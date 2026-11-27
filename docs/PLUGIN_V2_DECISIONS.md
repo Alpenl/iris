@@ -68,6 +68,12 @@
 
 取消遵循“撤销能力、拒绝新请求 → 中断 I/O 与 Guest 执行 → 后台等待在途调用退出 → 释放资源”。UI 不阻塞等待析构。Epoch 是粗粒度时间中断；Fuel 可作为执行量预算，两者都不是精确 CPU 秒数，也不能代替宿主 I/O 超时。
 
+### 3.4 显式 `PluginHost`、单窗口收敛与 `Inbox` 单锁快照（#13）
+
+1. **移除进程级可变单例**：废除 `static HUB`、`Resources::global()` 以及播放器侧 `NEXT_COMMAND_RECEIPT` / `ACTIVE_WORKERS` 全局可变静态变量。应用在启动时显式构造 `PluginHost` 并传入窗口，退出与析构通过 `PluginHost::shutdown` / `Drop` 按序回收，单元测试与集成测试各自独立持有隔离的宿主与播放器实例。
+2. **多窗口收回到单窗口会话**：依据 [DECISIONS.md](DECISIONS.md) §3.1，Iris 的同屏对比采用**单系统窗口内的多视口模型**，而非打开多个系统窗口。原先运行时提前支持的 4 窗口并发多路复用（`Hub`、`Control`、`ControlServices`、`AuthExecutor`、`StorageExecutor`、`Mailbox` 各维护一张窗口表）在无多窗口产品需求下增加了生命周期与背压复杂度。决议将宿主运行时收敛为**单一活跃窗口会话**（并发打开第二个窗口直接拒绝）；线上协议保留单调递增的 `window: Id` 会话纪元令牌与 `WindowOpened` / `WindowClosed` 事件，用于关窗重开时的旧句柄隔离并保持已发布 ABI v2 Guest 零改动兼容。
+3. **`Inbox` 单锁状态快照**：将窗口 `Inbox` 原有的 7 把互斥锁与 2 个原子布尔合并为单一 `Mutex<InboxState>`，使 `(generation, access, cancelled, closed)` 读取天然构成一致快照，并消除 `Client::poll()` 中的跨锁顺序隐式约定。
+
 ## 四、四项复审抉择的最终结论
 
 ### 4.1 外部工具：已于 `0.0.2` 精简移除

@@ -6,19 +6,21 @@
 
 ```
 crates/
-  iris-mpv/   libmpv 的手写 FFI（不用 bindgen）：client API + mpv_node 结构化传参 + RenderHandle 窄能力封装
-  iris-api/   无头插件协议（protocol: 2 / ABI: 2）：虚拟数据源（含动态多实例）、参数化 UI 工作台、视口叠层与线协议（仅依赖 serde）
-  iris-core/  无头内核：会话、统一目录与独立队列、稀疏工作区预设、键位引擎、照片探测、插件运行时与通用网络/凭据底座；不许依赖 GPUI
-  iris/       GPUI 应用：窗口、ThemeTokens 动态令牌、ui/kit 共用原语、平台视频层与系统桥接、单实例、调试管道
+  iris-mpv/          libmpv 的手写 FFI（不用 bindgen）：client API + mpv_node 结构化传参 + RenderHandle 窄能力封装
+  iris-api/          无头插件协议（protocol: 2 / ABI: 2）：虚拟数据源（含动态多实例）、参数化 UI 工作台、视口叠层与线协议（仅依赖 serde）
+  iris-net/          通用网络与并发底座：HTTP/HTTPS 客户端、DNS/DoH（RFC 8484）、本地回环 HTTP 服务、WebSocket/原始 TCP 双工帧与 CancelToken/Deadline/ThreadRole
+  iris-core/         无头领域核心：会话、统一目录与独立队列、稀疏工作区预设、键位引擎、照片探测、凭据库与日志脱敏；不依赖 GPUI、iris-api 或插件运行时
+  iris-plugin-host/  Wasm 插件宿主运行时（pulley64）：显式 PluginHost、单窗口会话生命周期、能力授权、有界网络/私有产物与三模流中继；不依赖 GPUI 或 iris-mpv
+  iris/              GPUI 应用：窗口、ThemeTokens 动态令牌、ui/kit 共用原语、平台视频层与系统桥接、单实例、调试管道
 ```
 
-依赖方向严格单向：`iris` → `iris-core` → `iris-mpv`，且 `iris` / `iris-core` → `iris-api`；`iris-plugin-sdk` 仅由 Wasm Guest 插件引用，宿主零反向依赖（`iris` 仅在 `src/video/` 中使用窄能力 `iris_mpv::RenderHandle`，业务与 UI 代码显式引用 `iris_core::*`）。`scripts/check-project.py` 自动检查：
+依赖方向严格单向：`iris` → `iris-plugin-host` → `iris-core` → `iris-net`，`iris-core` → `iris-mpv`，且 `iris` / `iris-plugin-host` → `iris-api`；`iris-plugin-sdk` 仅由 Wasm Guest 插件引用，宿主零反向依赖（`iris` 仅在 `src/video/` 中通过 `clippy.toml` 豁免使用窄能力 `iris_mpv::RenderHandle`，业务与 UI 代码由编译器强制禁止触碰 `iris_mpv` 或构造 `RenderHandle`）。`scripts/check-project.py` 与 `clippy` 自动检查：
 
-1. `iris-core` 不依赖 GPUI、`iris-plugin-sdk` 或原生窗口/图像库；
+1. Cargo 依赖图强制隔离：`iris-net` 零领域依赖，`iris-core` 不依赖 GPUI、`iris-plugin-host`、`iris-api` 或 `wasmtime`，`iris-plugin-host` 不依赖 GPUI 或 `iris-mpv`；
 2. `iris-api` 常规依赖仅限 `serde`（不依赖 GPUI 或 `iris-mpv`）；
-3. `crates/iris/src/` 除 `video/` 外递归禁止出现 `iris_mpv` 或原始 mpv 调用，且 `crates/iris/src/` 与 `crates/iris-core/src/` 全量非测试代码禁止 `use super::*;`；
-4. `crates/iris-core/src/` 中 18 个核心域模块（含其单元测试）禁止反向依赖 `plugin_v2` 或 `iris_api`；
-5. 全仓生产代码禁止直接调用 `std::thread::spawn` 或未登记的 `std::thread::Builder`，所有 OS 线程必须通过 `iris_core::concurrency::{spawn_thread, spawn_thread_named}` 按 `ThreadRole` 登记，且每个角色的线程名必须记录在本文第 6 节；
+3. `crates/iris/clippy.toml` 与 `crates/iris-core/clippy.toml` 通过 `disallowed-types` / `disallowed-methods` 强制约束 `iris_mpv::*` 与 `RenderHandle::new` / `Session::render_handle` 仅限视频层使用，全仓非测试生产代码禁止 `use super::*;`；
+4. `crates/iris/src/ui/` 禁止散落 `target_os` 条件编译；
+5. 全仓生产代码禁止直接调用 `std::thread::spawn` 或未登记的 `std::thread::Builder`，所有 OS 线程必须通过 `iris_net::concurrency::{spawn_thread, spawn_thread_named}` 按 `ThreadRole` 登记，且每个角色的线程名必须记录在本文第 6 节；
 6. `devtools` 控制管道门禁未被默认特性或普通发布版绕过；
 7. 全仓 `.rs` 模块行数预算（超过 650 行生产代码提示，生产代码上限 850 行、总行数上限 1,000 行），以及图标、官方嵌入插件摘要与示例插件清单一致性。
 

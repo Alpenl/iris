@@ -255,14 +255,14 @@ def check_lock_poisoning(rel: Path, text: str):
 
 
 def check_thread_spawns(rel: Path, text: str):
-    """Production code must spawn OS threads only via `iris_core::concurrency::{spawn_thread, spawn_thread_named}`."""
-    if rel.as_posix() == "crates/iris-core/src/concurrency.rs":
+    """Production code must spawn OS threads only via `iris_net::concurrency::{spawn_thread, spawn_thread_named}`."""
+    if rel.as_posix() == "crates/iris-net/src/concurrency.rs":
         return
     match = RAW_THREAD_SPAWN_RE.search(prod_prefix(text))
     _require(
         match is None,
         f"{rel} spawns an unregistered OS thread via `{match.group(0) if match else ''}`; "
-        "use `iris_core::concurrency::{spawn_thread, spawn_thread_named}`",
+        "use `iris_net::concurrency::{spawn_thread, spawn_thread_named}`",
     )
 
 
@@ -349,19 +349,30 @@ def main():
         text=True,
     )
 
-    # 2. Recursive UI & app layer isolation (no raw mpv outside src/video/, no wildcard super, no UI target_os)
+    # 2. Recursive UI & app layer isolation (`clippy.toml` `disallowed_*`, no wildcard super, no UI target_os)
     iris_src = ROOT / "crates/iris/src"
     video_dir = iris_src / "video"
     ui_dir = iris_src / "ui"
 
-    mpv_needles = (
-        "iris_mpv",
-        "command_async(",
-        "loadfile_with_options(",
-        "get_property_string(",
-        "set_property",
-        "self.mpv",
-        "this.mpv",
+    root_cargo = tomllib.loads((ROOT / "Cargo.toml").read_text(encoding="utf-8"))
+    clippy_lints = root_cargo.get("workspace", {}).get("lints", {}).get("clippy", {})
+    for lint in ("disallowed_methods", "disallowed_types"):
+        _require(
+            clippy_lints.get(lint) == "deny",
+            f"Workspace Cargo.toml must deny `clippy::{lint}`",
+        )
+    iris_clippy = (ROOT / "crates/iris/clippy.toml").read_text(encoding="utf-8")
+    for required_rule in (
+        "iris_mpv::Mpv",
+        "iris_mpv::RenderHandle",
+        "iris_mpv::RenderHandle::new",
+        "iris_core::player::Session::render_handle",
+    ):
+        _require(required_rule in iris_clippy, f"crates/iris/clippy.toml must disallow `{required_rule}`")
+    core_clippy = (ROOT / "crates/iris-core/clippy.toml").read_text(encoding="utf-8")
+    _require(
+        "iris_mpv::RenderHandle::new" in core_clippy,
+        "crates/iris-core/clippy.toml must disallow `iris_mpv::RenderHandle::new`",
     )
 
     for path in sorted(iris_src.rglob("*.rs")):
@@ -369,8 +380,10 @@ def main():
         raw = path.read_text(encoding="utf-8")
         code = strip_comments(raw)
         if not is_under(path, video_dir):
-            for needle in mpv_needles:
-                _require(needle not in code, f"{rel} breaks playback boundary via `{needle}`")
+            _require(
+                not re.search(r"\b(?:allow|expect)\s*\([^)]*disallowed_(?:methods|types)", code),
+                f"{rel} suppresses `clippy::disallowed_*` outside `crates/iris/src/video/`",
+            )
         if not is_standalone_test_file(path, rel):
             prod_code = prod_prefix(raw)
             _require("use super::*;" not in prod_code, f"{rel} uses forbidden wildcard `use super::*;`")
@@ -428,7 +441,7 @@ def main():
     api_normal = [d["name"] for d in pkgs["iris-api"]["dependencies"] if d["kind"] is None]
     _require(api_normal == ["serde"], f"iris-api normal deps must be ['serde'] only, got {api_normal}")
 
-    forbidden_core = {
+    forbidden_headless = {
         "gpui",
         "cocoa",
         "objc",
@@ -439,51 +452,23 @@ def main():
         "image",
         "iris-plugin-sdk",
     }
+    net_deps = {d["name"] for d in pkgs["iris-net"]["dependencies"]}
+    forbidden_net = forbidden_headless | {"iris-core", "iris-plugin-host", "iris-api", "iris-mpv"}
+    _require(not (net_deps & forbidden_net), f"iris-net must stay domain-free, found {net_deps & forbidden_net}")
+
     core_deps = {d["name"] for d in pkgs["iris-core"]["dependencies"]}
-    _require(not (core_deps & forbidden_core), f"iris-core must stay headless and SDK-free, found {core_deps & forbidden_core}")
+    forbidden_core = forbidden_headless | {"iris-plugin-host", "iris-api", "wasmtime"}
+    _require(not (core_deps & forbidden_core), f"iris-core must stay headless and plugin-free, found {core_deps & forbidden_core}")
 
-    # 3b. Headless core domain dependency direction & wildcard-super ban
-    core_src = ROOT / "crates/iris-core/src"
-    isolated_core_domains = {
-        "bounded_json",
-        "catalog",
-        "concurrency",
-        "fs_util",
-        "geometry",
-        "input",
-        "keymap",
-        "library",
-        "logging",
-        "loopback_http",
-        "media_uri",
-        "photo",
-        "player",
-        "preset",
-        "settings",
-        "store",
-        "vault",
-        "vfs",
-    }
-    core_forbidden_plugin_refs = ("crate::plugin_v2", "crate::plugin::", "iris_api", "iris_plugin_sdk")
-    for path in sorted(core_src.rglob("*.rs")):
-        rel = path.relative_to(ROOT)
-        rel_core = path.relative_to(core_src)
-        parts = rel_core.parts
-        text = path.read_text(encoding="utf-8")
-        top_domain = parts[0].removesuffix(".rs")
-        if not is_standalone_test_file(path, rel_core):
-            prod_code = prod_prefix(text)
-            _require("use super::*;" not in prod_code, f"{rel} uses forbidden wildcard `use super::*;`")
-        if top_domain in isolated_core_domains:
-            # Enforce core->plugin isolation across both production code and in-crate unit tests.
-            full_code = strip_comments(text)
-            for needle in core_forbidden_plugin_refs:
-                _require(
-                    needle not in full_code,
-                    f"{rel} breaks core->plugin dependency direction via `{needle}`",
-                )
+    host_deps = {d["name"] for d in pkgs["iris-plugin-host"]["dependencies"]}
+    forbidden_host = forbidden_headless | {"iris-mpv"}
+    _require(not (host_deps & forbidden_host), f"iris-plugin-host must stay headless and mpv-free, found {host_deps & forbidden_host}")
 
+    # 3b. Wildcard-super ban across all headless & guest crates
     for crate_dir in (
+        ROOT / "crates/iris-net/src",
+        ROOT / "crates/iris-core/src",
+        ROOT / "crates/iris-plugin-host/src",
         ROOT / "crates/iris-api/src",
         ROOT / "crates/iris-mpv/src",
         ROOT / "crates/iris-plugin-sdk/src",
@@ -510,7 +495,7 @@ def main():
                 check_thread_spawns(rel, text)
 
     check_thread_inventory_docs(
-        (ROOT / "crates/iris-core/src/concurrency.rs").read_text(encoding="utf-8"),
+        (ROOT / "crates/iris-net/src/concurrency.rs").read_text(encoding="utf-8"),
         (ROOT / "docs/ARCHITECTURE.md").read_text(encoding="utf-8"),
     )
 
