@@ -380,12 +380,9 @@ fn admitted_playback_survives_request_cancel_and_control_timeout_until_explicit_
             for notice in session.poll().notices {
                 match notice {
                     Notice::Playback {
-                        binding,
-                        ticket,
-                        playback,
-                        ..
+                        ticket, playback, ..
                     } if ticket.id == req => {
-                        playback_notice = Some((binding, ticket, playback));
+                        playback_notice = Some((ticket, playback));
                     }
                     Notice::Error { code, .. } => panic!("resolve failed: {code:?}"),
                     _ => {}
@@ -395,7 +392,7 @@ fn admitted_playback_survives_request_cancel_and_control_timeout_until_explicit_
         },
         Duration::from_secs(60),
     );
-    let (_binding, ticket, playback) = playback_notice.unwrap();
+    let (ticket, playback) = playback_notice.unwrap();
     let url = playback.url.clone();
     // Preparation cancellation scope ends once admitted; cancelling `ticket.cancel` does not kill the stream.
     ticket.cancel.cancel();
