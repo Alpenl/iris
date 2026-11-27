@@ -570,15 +570,77 @@ def lock_closure(lock_text: str, roots) -> bytes:
     return json.dumps(closure, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
 
+def _collect_inherited_workspace_deps(manifest: dict) -> set[str]:
+    inherited: set[str] = set()
+    tables = [
+        manifest.get("dependencies", {}),
+        manifest.get("build-dependencies", {}),
+    ]
+    target_table = manifest.get("target", {})
+    if isinstance(target_table, dict):
+        for cfg_table in target_table.values():
+            if isinstance(cfg_table, dict):
+                tables.append(cfg_table.get("dependencies", {}))
+                tables.append(cfg_table.get("build-dependencies", {}))
+    for table in tables:
+        if isinstance(table, dict):
+            for dep_key, spec in table.items():
+                if isinstance(spec, dict) and spec.get("workspace") is True:
+                    inherited.add(dep_key)
+    return inherited
+
+
+def root_cargo_closure(root_cargo_text: str, crate_cargo_texts) -> bytes:
+    """Canonical bytes of root Cargo.toml sections that affect official Wasm plugin builds.
+
+    Ignores host-only workspace members, default-members, [workspace.lints], [profile.dev],
+    and [workspace.dependencies] entries not inherited (`workspace = true`) by any official
+    plugin source crate.
+    """
+    root_manifest = tomllib.loads(root_cargo_text)
+    workspace = root_manifest.get("workspace", {})
+    ws_deps = workspace.get("dependencies", {})
+
+    inherited_keys: set[str] = set()
+    for text in crate_cargo_texts:
+        inherited_keys |= _collect_inherited_workspace_deps(tomllib.loads(text))
+
+    missing = sorted(inherited_keys - set(ws_deps))
+    _require(not missing, f"Official plugin crates inherit missing workspace.dependencies: {missing}")
+
+    filtered: dict[str, object] = {
+        "workspace": {
+            "resolver": workspace.get("resolver"),
+            "package": workspace.get("package"),
+            "dependencies": {key: ws_deps[key] for key in sorted(inherited_keys)},
+        },
+        "profile_release": root_manifest.get("profile", {}).get("release"),
+    }
+    if root_manifest.get("patch"):
+        filtered["patch"] = root_manifest["patch"]
+    if root_manifest.get("replace"):
+        filtered["replace"] = root_manifest["replace"]
+    return json.dumps(filtered, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
 def source_hash() -> str:
-    paths = [ROOT / name for name in ("Cargo.toml", "rust-toolchain.toml", "scripts/build-official-plugins.py")]
+    paths = [ROOT / name for name in ("rust-toolchain.toml", "scripts/build-official-plugins.py")]
+    crate_cargo_texts: list[str] = []
     for name in OFFICIAL_SOURCE_CRATES:
         crate = ROOT / "crates" / name
-        paths += [crate / "Cargo.toml", *sorted((crate / "src").rglob("*.rs"))]
+        crate_manifest = crate / "Cargo.toml"
+        crate_cargo_texts.append(crate_manifest.read_text(encoding="utf-8"))
+        paths += [crate_manifest, *sorted((crate / "src").rglob("*.rs"))]
         if (crate / "plugin.json").is_file():
             paths.append(crate / "plugin.json")
+    for cargo_cfg_name in (".cargo/config.toml", ".cargo/config"):
+        cargo_cfg = ROOT / cargo_cfg_name
+        if cargo_cfg.is_file():
+            paths.append(cargo_cfg)
     # Git checkouts may use CRLF. The digest describes source content.
     entries = [(path.relative_to(ROOT).as_posix(), path.read_bytes().replace(b"\r\n", b"\n")) for path in paths]
+    root_cargo_text = (ROOT / "Cargo.toml").read_text(encoding="utf-8")
+    entries.append(("Cargo.toml#official-plugins", root_cargo_closure(root_cargo_text, crate_cargo_texts)))
     # Only the plugins' own dependency closure is stamped, so a host-only
     # dependency bump does not force rebuilding the committed archives.
     lock_text = (ROOT / "Cargo.lock").read_text(encoding="utf-8")
