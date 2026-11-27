@@ -2,20 +2,20 @@ use super::{
     Binding, Catalog, Config, Inbox, Notice, PluginInfo, PluginStatus, Shared, SourceSnapshot,
     jobs::{Completed, Work},
 };
-use crate::plugin_v2::{
-    actor::Status,
-    installation::{Installed, Review},
-    ledger::Resource,
-    pool::WorkPool,
-    runtime::Control,
+use crate::{
+    concurrency::{CancelToken, Deadline},
+    plugin_v2::{
+        actor::Status,
+        installation::{Installed, Review},
+        ledger::Resource,
+        pool::WorkPool,
+        runtime::Control,
+    },
 };
 use iris_api::v2::{ErrorCode, Generation, Id, source::PlaybackSnapshot};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::{Arc, atomic::Ordering},
     time::{Duration, Instant},
 };
 
@@ -27,7 +27,7 @@ pub(super) struct Plugin {
     pub binding: Option<Arc<Binding>>,
     pub sources: Option<Arc<SourceSnapshot>>,
     pub control: Option<Control>,
-    pub loading: Option<(Id, Arc<AtomicBool>)>,
+    pub loading: Option<(Id, CancelToken)>,
     pub restart: bool,
     pub attached: BTreeSet<Id>,
     pub preparing: BTreeSet<Id>,
@@ -35,7 +35,7 @@ pub(super) struct Plugin {
 impl Plugin {
     pub fn stop(&mut self) {
         if let Some((_, cancel)) = &self.loading {
-            cancel.store(true, Ordering::Release);
+            cancel.cancel();
         }
         if let Some(binding) = &self.binding {
             binding.alive.store(false, Ordering::Release);
@@ -67,8 +67,8 @@ pub(super) struct Window {
 }
 pub(super) struct PendingReview {
     pub window: Id,
-    pub cancel: Arc<AtomicBool>,
-    pub expires: Instant,
+    pub cancel: CancelToken,
+    pub expires: Deadline,
     pub review: Option<Review>,
 }
 pub(super) struct Worker {
@@ -97,8 +97,16 @@ impl Worker {
         Ok(Self {
             shared,
             config,
-            load_pool: WorkPool::new("package", 2, 4)?,
-            disk_pool: WorkPool::new("setup", 2, 8)?,
+            load_pool: WorkPool::new(
+                "package",
+                crate::concurrency::budget::PLUGIN_PACKAGE_IO_WORKERS,
+                4,
+            )?,
+            disk_pool: WorkPool::new(
+                "setup",
+                crate::concurrency::budget::PLUGIN_SETUP_IO_WORKERS,
+                8,
+            )?,
             plugins: BTreeMap::new(),
             windows: BTreeMap::new(),
             reviews: BTreeMap::new(),
@@ -175,7 +183,11 @@ impl Worker {
             } else {
                 self.reviews
                     .values()
-                    .map(|r| r.expires.saturating_duration_since(Instant::now()))
+                    .map(|r| {
+                        r.expires
+                            .instant()
+                            .saturating_duration_since(Instant::now())
+                    })
                     .chain(
                         self.origins
                             .values()
@@ -243,18 +255,17 @@ impl Worker {
             .reviews
             .iter()
             .filter_map(|(id, r)| {
-                (r.expires <= Instant::now() || !self.windows.contains_key(&r.window))
-                    .then_some(*id)
+                (r.expires.is_expired() || !self.windows.contains_key(&r.window)).then_some(*id)
             })
             .collect();
         for id in stale {
             if let Some(review) = self.reviews.remove(&id) {
-                let expired = review.expires <= Instant::now();
+                let expired = review.expires.is_expired();
                 let window_gone = !self.windows.contains_key(&review.window);
                 if review.review.is_some() {
                     self.review_slots.remove(&id);
                 }
-                review.cancel.store(true, Ordering::Release);
+                review.cancel.cancel();
                 if window_gone
                     && !expired
                     && let Some(inner) = review.review
@@ -349,9 +360,7 @@ impl Worker {
             if self
                 .submit(false, "scan", move || {
                     Work::Scanned(super::jobs::guarded(|| match bootstrap {
-                        Some(bootstrap) => {
-                            bootstrap.scan(installer, &setup, &AtomicBool::new(false))
-                        }
+                        Some(bootstrap) => bootstrap.scan(installer, &setup, &CancelToken::new()),
                         None => installer.entries().map(|entries| {
                             super::super::official::BootstrapScan {
                                 entries,

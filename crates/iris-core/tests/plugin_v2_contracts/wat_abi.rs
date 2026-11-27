@@ -137,7 +137,7 @@ impl WatFixture {
             &self.installer,
             self.installed.clone(),
             self.setup.clone(),
-            &AtomicBool::new(false),
+            &CancelToken::new(),
         )
         .unwrap()
     }
@@ -152,7 +152,7 @@ impl Drop for WatFixture {
 #[test]
 fn wat_abi_v2_handshake_and_return_pointer_bounds() {
     let engine = RuntimeEngine::new().unwrap();
-    let cancel = Arc::new(AtomicBool::new(false));
+    let cancel = CancelToken::new();
     let new_inst = |source: &str| {
         let wasm = wat::parse_str(source).unwrap();
         let module = engine.compile(&wasm, &cancel).unwrap();
@@ -414,14 +414,15 @@ fn wat_pixel_grid_and_view_timer_validation_boundaries() {
         );
         if ctrl.status() == Status::Ready {
             fixture.open_window(&mut ctrl, win);
-            ctrl.send(
+            if let Err(err) = ctrl.send(
                 win,
                 HostEvent::Command {
                     id: "trigger".into(),
                     snapshot: None,
                 },
-            )
-            .unwrap();
+            ) {
+                assert_eq!(err, ErrorCode::Cancelled);
+            }
             until(
                 || {
                     let _ = ctrl.poll();
@@ -843,7 +844,7 @@ fn wat_stream_role_abi_replies_and_fails_cleanly() {
     }
 
     let engine = RuntimeEngine::new().unwrap();
-    let module = engine.compile(&wasm, &AtomicBool::new(false)).unwrap();
+    let module = engine.compile(&wasm, &CancelToken::new()).unwrap();
     let ledger = Ledger::default();
     let context = StreamContext {
         version: Id(1),

@@ -1,9 +1,8 @@
 //! Background libmpv event pump, load/preloaded hooks, and event translation.
 
 use std::cell::Cell;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, Weak};
-use std::thread::{self, JoinHandle};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -11,6 +10,7 @@ use futures::channel::mpsc::{UnboundedReceiver, unbounded};
 use iris_mpv::{Event, Mpv, Value};
 use serde_json::json;
 
+use crate::concurrency::{CancelToken, ThreadRole, spawn_thread};
 use crate::logging::{self, EventLevel};
 
 use super::super::ScopedStream;
@@ -50,7 +50,7 @@ pub(super) mod prop {
 }
 
 pub(in crate::player) struct EventPump {
-    done: Arc<AtomicBool>,
+    cancel: CancelToken,
     relay: Arc<Mutex<Weak<Service>>>,
     scoped: Arc<Mutex<Weak<dyn ScopedStream>>>,
     thread: Cell<Option<JoinHandle<()>>>,
@@ -78,7 +78,7 @@ impl EventPump {
         if let Some(thread) = self.thread.take() {
             // Continue any in-flight load hook until mpv acknowledges quit.
             if mpv.command_async(&["quit"]).is_err() {
-                self.done.store(true, Ordering::Release);
+                self.cancel.cancel();
                 #[cfg(target_os = "windows")]
                 mpv.abort_video_recovery();
                 mpv.wakeup();
@@ -113,171 +113,164 @@ pub(in crate::player) fn spawn_event_pump(
     // drop updates such as `EndFile` and `CommandReply` that the session state
     // relies on.
     let (tx, rx) = unbounded();
-    let done = Arc::new(AtomicBool::new(false));
-    let stopped = done.clone();
+    let cancel = CancelToken::new();
+    let stopped = cancel.clone();
     let relay = Arc::new(Mutex::new(Weak::<Service>::new()));
     let source = relay.clone();
     let scoped_ref = Arc::new(Mutex::new(scoped::empty_scoped()));
     let scoped_source = scoped_ref.clone();
-    let thread = thread::Builder::new()
-        .name("iris-mpv-events".into())
-        .spawn(move || {
-            let mut playing = None;
-            let mut hls = false;
-            let mut restricted = false;
-            let mut last_decode_burst: Option<Instant> = None;
-            let mut suppressed_decode_errors: u32 = 0;
-            while !stopped.load(Ordering::Acquire) {
-                let Some(raw) = mpv.wait_event(-1.0) else {
+    let thread = spawn_thread(ThreadRole::MpvEventPump, move || {
+        let mut playing = None;
+        let mut hls = false;
+        let mut restricted = false;
+        let mut last_decode_burst: Option<Instant> = None;
+        let mut suppressed_decode_errors: u32 = 0;
+        while !stopped.is_cancelled() {
+            let Some(raw) = mpv.wait_event(-1.0) else {
+                continue;
+            };
+            let scope = match &raw {
+                Event::Shutdown => break,
+                Event::CommandReply { .. } => None,
+                Event::StartFile(id) => {
+                    hls = false;
+                    restricted = false;
+                    playing = Some(*id);
                     continue;
-                };
-                let scope = match &raw {
-                    Event::Shutdown => break,
-                    Event::CommandReply { .. } => None,
-                    Event::StartFile(id) => {
-                        hls = false;
-                        restricted = false;
-                        playing = Some(*id);
-                        continue;
+                }
+                Event::EndFile {
+                    playlist_entry_id, ..
+                } => {
+                    if playing == Some(*playlist_entry_id) {
+                        playing = None;
                     }
-                    Event::EndFile {
-                        playlist_entry_id, ..
-                    } => {
-                        if playing == Some(*playlist_entry_id) {
-                            playing = None;
-                        }
-                        Some(*playlist_entry_id)
-                    }
-                    Event::Hook { userdata, id } => {
-                        match *userdata {
-                            HOOK_LOAD => {
-                                restricted = scoped_source
-                                    .lock()
-                                    .unwrap_or_else(PoisonError::into_inner)
-                                    .upgrade()
-                                    .is_some_and(|session| {
-                                        session.root_url().ok()
-                                            == mpv.get_property_string("stream-open-filename").ok()
-                                    });
-                                let service = source
-                                    .lock()
-                                    .unwrap_or_else(PoisonError::into_inner)
-                                    .upgrade();
-                                if let Some(service) = service {
-                                    match enable_hls(&mpv, &service) {
-                                        Ok(prepared) => hls = prepared,
-                                        Err(_) => {
-                                            let _ = disable_hls(&mpv);
-                                            log::warn!("could not prepare scoped HLS playback");
-                                        }
+                    Some(*playlist_entry_id)
+                }
+                Event::Hook { userdata, id } => {
+                    match *userdata {
+                        HOOK_LOAD => {
+                            restricted = scoped_source
+                                .lock()
+                                .unwrap_or_else(PoisonError::into_inner)
+                                .upgrade()
+                                .is_some_and(|session| {
+                                    session.root_url().ok()
+                                        == mpv.get_property_string("stream-open-filename").ok()
+                                });
+                            let service = source
+                                .lock()
+                                .unwrap_or_else(PoisonError::into_inner)
+                                .upgrade();
+                            if let Some(service) = service {
+                                match enable_hls(&mpv, &service) {
+                                    Ok(prepared) => hls = prepared,
+                                    Err(_) => {
+                                        let _ = disable_hls(&mpv);
+                                        log::warn!("could not prepare scoped HLS playback");
                                     }
                                 }
                             }
-                            HOOK_PRELOADED if restricted => {
-                                if scoped::restore_attachment_policy(&mpv).is_err() {
-                                    log::error!("could not restore scoped attachment policy");
-                                    let _ = mpv.command_async(&["stop"]);
-                                }
-                                restricted = false;
-                            }
-                            HOOK_PRELOADED if hls => {
-                                // The HLS demuxer captures its open policy. Future
-                                // attachments must see the restrictive defaults.
-                                if disable_hls(&mpv).is_err() {
-                                    log::error!("could not restore mpv reference policy");
-                                    let _ = mpv.command_async(&["stop"]);
-                                }
-                                hls = false;
-                            }
-                            _ => (),
                         }
-                        // SAFETY: This event came from this handle's wait_event call, and this
-                        // is its only continuation after completing the hook's work.
-                        let _ = unsafe { mpv.continue_hook(*id) };
-                        continue;
+                        HOOK_PRELOADED if restricted => {
+                            if scoped::restore_attachment_policy(&mpv).is_err() {
+                                log::error!("could not restore scoped attachment policy");
+                                let _ = mpv.command_async(&["stop"]);
+                            }
+                            restricted = false;
+                        }
+                        HOOK_PRELOADED if hls => {
+                            // The HLS demuxer captures its open policy. Future
+                            // attachments must see the restrictive defaults.
+                            if disable_hls(&mpv).is_err() {
+                                log::error!("could not restore mpv reference policy");
+                                let _ = mpv.command_async(&["stop"]);
+                            }
+                            hls = false;
+                        }
+                        _ => (),
                     }
-                    Event::QueueOverflow => {
-                        playing = active_playlist_entry_id(&mpv);
-                        #[cfg(target_os = "windows")]
-                        mpv.reseed_video_recovery(playing);
-                        log::warn!("mpv event queue overflow; resyncing active entry {playing:?}");
-                        None
-                    }
-                    Event::Log {
-                        prefix,
-                        level,
-                        text,
-                    } => {
-                        let detail = logging::redact_text(text.trim_end());
-                        let mapped = match level.as_str() {
-                            "fatal" | "error" => log::Level::Error,
-                            "warn" => log::Level::Warn,
-                            "info" => log::Level::Info,
-                            _ => log::Level::Debug,
-                        };
-                        log::log!(target: "iris::mpv", mapped, "{prefix}/{level}: {detail}");
-                        if prefix == "vd" && detail.contains("Attempting next decoding method") {
+                    // SAFETY: This event came from this handle's wait_event call, and this
+                    // is its only continuation after completing the hook's work.
+                    let _ = unsafe { mpv.continue_hook(*id) };
+                    continue;
+                }
+                Event::QueueOverflow => {
+                    playing = active_playlist_entry_id(&mpv);
+                    #[cfg(target_os = "windows")]
+                    mpv.reseed_video_recovery(playing);
+                    log::warn!("mpv event queue overflow; resyncing active entry {playing:?}");
+                    None
+                }
+                Event::Log {
+                    prefix,
+                    level,
+                    text,
+                } => {
+                    let detail = logging::redact_text(text.trim_end());
+                    let mapped = match level.as_str() {
+                        "fatal" | "error" => log::Level::Error,
+                        "warn" => log::Level::Warn,
+                        "info" => log::Level::Info,
+                        _ => log::Level::Debug,
+                    };
+                    log::log!(target: "iris::mpv", mapped, "{prefix}/{level}: {detail}");
+                    if prefix == "vd" && detail.contains("Attempting next decoding method") {
+                        logging::event(
+                            EventLevel::Warn,
+                            "player",
+                            "decode_fallback",
+                            json!({ "prefix": prefix, "detail": detail }),
+                        );
+                    } else if matches!(prefix.as_str(), "vd" | "vo" | "d3d11")
+                        || (prefix == "ffmpeg" && level == "error")
+                    {
+                        let now = Instant::now();
+                        let due = last_decode_burst
+                            .is_none_or(|t| now.duration_since(t) >= Duration::from_secs(5));
+                        if due {
+                            let skipped = std::mem::take(&mut suppressed_decode_errors);
+                            last_decode_burst = Some(now);
                             logging::event(
                                 EventLevel::Warn,
                                 "player",
-                                "decode_fallback",
-                                json!({ "prefix": prefix, "detail": detail }),
+                                "mpv_diagnostic",
+                                json!({
+                                    "prefix": prefix,
+                                    "mpv_level": level,
+                                    "detail": detail,
+                                    "suppressed_since_last": skipped,
+                                }),
                             );
-                        } else if matches!(prefix.as_str(), "vd" | "vo" | "d3d11")
-                            || (prefix == "ffmpeg" && level == "error")
-                        {
-                            let now = Instant::now();
-                            let due = last_decode_burst
-                                .is_none_or(|t| now.duration_since(t) >= Duration::from_secs(5));
-                            if due {
-                                let skipped = std::mem::take(&mut suppressed_decode_errors);
-                                last_decode_burst = Some(now);
-                                logging::event(
-                                    EventLevel::Warn,
-                                    "player",
-                                    "mpv_diagnostic",
-                                    json!({
-                                        "prefix": prefix,
-                                        "mpv_level": level,
-                                        "detail": detail,
-                                        "suppressed_since_last": skipped,
-                                    }),
-                                );
-                            } else {
-                                suppressed_decode_errors =
-                                    suppressed_decode_errors.saturating_add(1);
-                            }
+                        } else {
+                            suppressed_decode_errors = suppressed_decode_errors.saturating_add(1);
                         }
-                        continue;
                     }
-                    Event::PropertyChange { id, .. }
-                        if matches!(
-                            *id,
-                            prop::PAUSE
-                                | prop::VOLUME
-                                | prop::MUTE
-                                | prop::SPEED
-                                | prop::SUB_VISIBLE
-                        ) =>
-                    {
-                        None
-                    }
-                    _ => match playing {
-                        Some(id) => Some(id),
-                        None => continue,
-                    },
-                };
-                if let Some(event) = SessionEvent::from_backend(raw) {
-                    let _ = tx.unbounded_send(SessionUpdate {
-                        playlist_entry_id: scope,
-                        event,
-                    });
+                    continue;
                 }
+                Event::PropertyChange { id, .. }
+                    if matches!(
+                        *id,
+                        prop::PAUSE | prop::VOLUME | prop::MUTE | prop::SPEED | prop::SUB_VISIBLE
+                    ) =>
+                {
+                    None
+                }
+                _ => match playing {
+                    Some(id) => Some(id),
+                    None => continue,
+                },
+            };
+            if let Some(event) = SessionEvent::from_backend(raw) {
+                let _ = tx.unbounded_send(SessionUpdate {
+                    playlist_entry_id: scope,
+                    event,
+                });
             }
-        })?;
+        }
+    })?;
     Ok((
         EventPump {
-            done,
+            cancel,
             relay,
             scoped: scoped_ref,
             thread: Cell::new(Some(thread)),

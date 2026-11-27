@@ -172,7 +172,7 @@ fn wasm_fixture_recognizes_both_json_member_orders() {
     };
     let package = Package::from_zip(&package("test.order"), Provenance::User).unwrap();
     let engine = RuntimeEngine::new().unwrap();
-    let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let cancel = crate::concurrency::CancelToken::new();
     let module = engine.compile(package.wasm().unwrap(), &cancel).unwrap();
     let mut guest = Instance::new(InstanceConfig {
         engine,

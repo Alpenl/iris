@@ -86,7 +86,7 @@ impl Fixture {
             &self.installer,
             self.installed.clone(),
             self.setup.clone(),
-            &AtomicBool::new(false),
+            &CancelToken::new(),
         )
         .unwrap()
     }
@@ -114,7 +114,7 @@ fn controls_share_global_budget_and_window_media_lifetimes_are_independent() {
             &f.installer,
             f.installed.clone(),
             f.setup.clone(),
-            &AtomicBool::new(false)
+            &CancelToken::new()
         )
         .is_err()
     );

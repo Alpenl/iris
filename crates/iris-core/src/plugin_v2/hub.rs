@@ -282,10 +282,11 @@ impl Hub {
             }
         });
         let worker = worker::Worker::new(shared.clone(), config)?;
-        std::thread::Builder::new()
-            .name("iris-plugin-coordinator".into())
-            .spawn(move || worker.run())
-            .map_err(|_| ErrorCode::Internal)?;
+        crate::concurrency::spawn_thread(
+            crate::concurrency::ThreadRole::PluginCoordinator,
+            move || worker.run(),
+        )
+        .map_err(|_| ErrorCode::Internal)?;
         Ok(Self(Arc::new(Connection(shared))))
     }
     pub fn open_window(

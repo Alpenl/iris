@@ -1,5 +1,6 @@
 //! Reservations cover queued, running and undelivered resources. Cancellation
 //! never releases a reservation before its owner actually finishes.
+use crate::concurrency::budget;
 use iris_api::v2::ErrorCode;
 use std::{
     collections::BTreeMap,
@@ -39,21 +40,42 @@ impl Resource {
         match self {
             Self::WasmBytes => (512 << 20, 1024 << 20),
             Self::HostBytes => (128 << 20, 512 << 20),
-            Self::ControlStore => (1, 64),
-            Self::StreamStore => (2, 8),
+            Self::ControlStore => (
+                budget::PLUGIN_CONTROL_STORES_PER_PLUGIN,
+                budget::PLUGIN_CONTROL_STORES_GLOBAL,
+            ),
+            Self::StreamStore => (
+                budget::PLUGIN_STREAM_STORES_PER_PLUGIN,
+                budget::PLUGIN_STREAM_STORES_GLOBAL,
+            ),
             Self::Task => (32, 128),
             Self::Handle => (128, 1024),
             Self::Http => (12, 68),
             Self::ControlHttp => (8, 56),
-            Self::WebSocket | Self::Tcp => (4, 16),
+            Self::WebSocket | Self::Tcp => (
+                budget::PLUGIN_SOCKET_PUMPS_PER_KIND_PLUGIN,
+                budget::PLUGIN_SOCKET_PUMPS_PER_KIND_GLOBAL,
+            ),
             Self::StreamRead => (8, 32),
             Self::FileHash => (1, 2),
             Self::TempBytes => (1 << 30, 4 << 30),
-            Self::Dns => (6, 16),
-            Self::Auth => (1, 4),
-            Self::PlaybackSession => (4, 12),
+            Self::Dns => (
+                budget::PLUGIN_ORIGIN_DNS_PER_PLUGIN,
+                budget::PLUGIN_ORIGIN_DNS_GLOBAL,
+            ),
+            Self::Auth => (
+                budget::PLUGIN_AUTH_CALLBACKS_PER_PLUGIN,
+                budget::PLUGIN_AUTH_CALLBACKS_GLOBAL,
+            ),
+            Self::PlaybackSession => (
+                budget::PLUGIN_RELAY_LISTENERS_PER_PLUGIN,
+                budget::PLUGIN_RELAY_LISTENERS_GLOBAL,
+            ),
             Self::StreamResource => (45_000, 180_000),
-            Self::RelayWorker => (8, 32),
+            Self::RelayWorker => (
+                budget::PLUGIN_RELAY_WORKERS_PER_RELAY as u64,
+                budget::PLUGIN_RELAY_WORKERS_GLOBAL,
+            ),
             Self::OverlayCues => (10_000, 40_000),
             Self::OverlayBytes => (4 << 20, 16 << 20),
             Self::EnhancementTrack => (8, 64),

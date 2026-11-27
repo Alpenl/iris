@@ -4,8 +4,9 @@ use super::{
     AddressKind, NetworkGrant, Origin, TransportKind, address_kind, grant::validate_pins,
     normalize_url,
 };
-use crate::bounded_json;
 use crate::{
+    bounded_json,
+    concurrency::{Deadline, ThreadRole, spawn_thread},
     fs_util,
     plugin_v2::{
         installation::valid_identity,
@@ -52,7 +53,7 @@ pub struct OriginReview {
     origin: String,
     ips: Vec<IpAddr>,
     previous: Option<SavedOrigin>,
-    expires: Instant,
+    expires: Deadline,
     _memory: Reservation,
 }
 impl OriginReview {
@@ -169,7 +170,7 @@ impl OriginStore {
             origin: origin_display,
             ips,
             previous,
-            expires: Instant::now() + Duration::from_secs(300),
+            expires: Deadline::after(Duration::from_secs(300)),
             _memory: memory,
         })
     }
@@ -186,7 +187,7 @@ impl OriginStore {
         self.check(grant, cancel)?;
         if review.owner != self.owner
             || review.version != grant.version()
-            || Instant::now() >= review.expires
+            || review.expires.is_expired()
         {
             return Err(ErrorCode::StaleHandle);
         }
@@ -295,54 +296,51 @@ fn resolve(
     let host = origin.host.clone();
     let job_cancel = cancel.clone();
     let (tx, rx) = mpsc::sync_channel(1);
-    std::thread::Builder::new()
-        .name("iris-origin-dns".into())
-        .spawn(move || {
-            let _reservation = reservation;
-            let result = (host.as_str(), 0)
-                .to_socket_addrs()
-                .map_err(|_| ErrorCode::IoError)
-                .and_then(|addrs| {
-                    let addresses: Vec<_> = addrs.take(65).collect();
-                    if addresses.len() > 64 {
-                        return Err(ErrorCode::QuotaExceeded);
-                    }
-                    let mut ips: BTreeSet<_> = addresses
-                        .iter()
-                        .map(|a| a.ip().to_canonical())
-                        .filter(|ip| !matches!(ip, IpAddr::V6(v6) if v6.is_unicast_link_local()))
-                        .collect();
-                    let snapshot: Vec<_> = ips.iter().copied().collect();
-                    if crate::vfs::http_client::doh::use_fallback(&host, &snapshot) {
-                        let doh_deadline = Instant::now() + Duration::from_secs(8);
-                        let real = crate::vfs::http_client::doh::resolve_a_records(
-                            &host,
-                            &job_cancel,
-                            || doh_deadline,
-                        )
+    spawn_thread(ThreadRole::PluginOriginDns, move || {
+        let _reservation = reservation;
+        let result = (host.as_str(), 0)
+            .to_socket_addrs()
+            .map_err(|_| ErrorCode::IoError)
+            .and_then(|addrs| {
+                let addresses: Vec<_> = addrs.take(65).collect();
+                if addresses.len() > 64 {
+                    return Err(ErrorCode::QuotaExceeded);
+                }
+                let mut ips: BTreeSet<_> = addresses
+                    .iter()
+                    .map(|a| a.ip().to_canonical())
+                    .filter(|ip| !matches!(ip, IpAddr::V6(v6) if v6.is_unicast_link_local()))
+                    .collect();
+                let snapshot: Vec<_> = ips.iter().copied().collect();
+                if crate::vfs::http_client::doh::use_fallback(&host, &snapshot) {
+                    let doh_deadline = Instant::now() + Duration::from_secs(8);
+                    let real =
+                        crate::vfs::http_client::doh::resolve_a_records(&host, &job_cancel, || {
+                            doh_deadline
+                        })
                         .map_err(|_| ErrorCode::IoError)?;
-                        ips = real.into_iter().map(|ip| ip.to_canonical()).collect();
-                    }
-                    if ips.is_empty() {
-                        return Err(ErrorCode::Denied);
-                    }
-                    if ips.len() > 32 {
-                        return Err(ErrorCode::QuotaExceeded);
-                    }
-                    Ok(ips.into_iter().collect())
-                });
-            let _ = tx.send(result);
-        })
-        .map_err(|_| ErrorCode::Internal)?;
-    let deadline = Instant::now() + Duration::from_secs(10);
+                    ips = real.into_iter().map(|ip| ip.to_canonical()).collect();
+                }
+                if ips.is_empty() {
+                    return Err(ErrorCode::Denied);
+                }
+                if ips.len() > 32 {
+                    return Err(ErrorCode::QuotaExceeded);
+                }
+                Ok(ips.into_iter().collect())
+            });
+        let _ = tx.send(result);
+    })
+    .map_err(|_| ErrorCode::Internal)?;
+    let deadline = Deadline::after(Duration::from_secs(10));
     loop {
         if cancel.is_cancelled() {
             return Err(ErrorCode::Cancelled);
         }
         let left = deadline
-            .checked_duration_since(Instant::now())
-            .ok_or(ErrorCode::Timeout)?;
-        match rx.recv_timeout(left.min(Duration::from_millis(50))) {
+            .remaining_capped(Duration::from_millis(50))
+            .map_err(|_| ErrorCode::Timeout)?;
+        match rx.recv_timeout(left) {
             Ok(result) => return result,
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(_) => return Err(ErrorCode::Internal),

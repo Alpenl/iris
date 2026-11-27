@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use crate::fs_util;
 use crate::library::{SortBy, SortOrder};
 use crate::player::{MAX_SPEED, MIN_SPEED};
+use crate::vfs::{DEFAULT_DOH_RESOLVERS, normalize_doh_resolver};
 
 pub const DEFAULT_DIRECTORY_WIDTH: f32 = 288.;
 pub const MIN_DIRECTORY_WIDTH: f32 = 220.;
@@ -157,8 +158,17 @@ pub struct Settings {
     pub ui_font_scale: f32,
     /// When a local TUN proxy answers DNS with benchmark Fake-IPs, resolve the
     /// hostname through public DoH resolvers instead of refusing the request.
-    /// This discloses the hostname to those resolvers, so users can opt out.
+    /// Off by default so private hostnames are never disclosed without opt-in.
     pub fake_ip_doh_fallback: bool,
+    /// Configured numeric public DoH resolver endpoints (`1..=8` entries).
+    pub doh_resolvers: Vec<String>,
+}
+
+fn default_doh_resolvers() -> Vec<String> {
+    DEFAULT_DOH_RESOLVERS
+        .iter()
+        .map(|&entry| entry.to_owned())
+        .collect()
 }
 
 impl Default for Settings {
@@ -198,7 +208,8 @@ impl Default for Settings {
             hidden_dock_buttons: Vec::new(),
             audio_device: "auto".into(),
             ui_font_scale: DEFAULT_UI_FONT_SCALE,
-            fake_ip_doh_fallback: true,
+            fake_ip_doh_fallback: false,
+            doh_resolvers: default_doh_resolvers(),
         }
     }
 }
@@ -402,6 +413,22 @@ impl Settings {
                         s.fake_ip_doh_fallback = b;
                     }
                 }
+                ("doh_resolvers", v) => {
+                    let mut parsed = Vec::new();
+                    for item in v.split(',') {
+                        if let Some(clean) = normalize_doh_resolver(item)
+                            && !parsed.contains(&clean)
+                        {
+                            parsed.push(clean);
+                            if parsed.len() >= 8 {
+                                break;
+                            }
+                        }
+                    }
+                    if !parsed.is_empty() {
+                        s.doh_resolvers = parsed;
+                    }
+                }
                 _ => {}
             }
         }
@@ -562,6 +589,21 @@ impl Settings {
             "fake_ip_doh_fallback = {}\n",
             self.fake_ip_doh_fallback
         ));
+        let mut clean_doh = Vec::new();
+        for entry in &self.doh_resolvers {
+            if let Some(clean) = normalize_doh_resolver(entry)
+                && !clean_doh.contains(&clean)
+            {
+                clean_doh.push(clean);
+                if clean_doh.len() >= 8 {
+                    break;
+                }
+            }
+        }
+        if clean_doh.is_empty() {
+            clean_doh = default_doh_resolvers();
+        }
+        text.push_str(&format!("doh_resolvers = {}\n", clean_doh.join(",")));
 
         fs_util::atomic_write(path, &text)
     }
@@ -609,7 +651,7 @@ fn parse_bool(v: &str) -> Option<bool> {
 mod tests {
     use super::{
         DEFAULT_UI_FONT_SCALE, Hwdec, MAX_DIRECTORY_WIDTH, MAX_UI_FONT_SCALE, OnEof, PhotoDefault,
-        Settings, Side, SubLang, VideoWheel,
+        Settings, Side, SubLang, VideoWheel, default_doh_resolvers,
     };
     use crate::library::{SortBy, SortOrder};
 
@@ -653,7 +695,8 @@ mod tests {
             hidden_dock_buttons: vec!["screenshot".into(), "loop".into()],
             audio_device: "coreaudio/BuiltInSpeakerDevice".into(),
             ui_font_scale: 1.15,
-            fake_ip_doh_fallback: false,
+            fake_ip_doh_fallback: true,
+            doh_resolvers: vec!["1.1.1.1".into(), "8.8.8.8".into()],
         };
         custom.save_to(&file).unwrap();
         let loaded = Settings::load_from(&file);
@@ -661,7 +704,7 @@ mod tests {
 
         std::fs::write(
             &file,
-            "directory_width = 9999\nfullscreen_hide_ms = 50\nsub_scale = NaN\nvolume = 180\ntheme_id =   \naudio_device = \nui_font_scale = 9.5\n",
+            "directory_width = 9999\nfullscreen_hide_ms = 50\nsub_scale = NaN\nvolume = 180\ntheme_id =   \naudio_device = \nui_font_scale = 9.5\ndoh_resolvers = 192.168.1.1,198.18.0.1,dns.alidns.com\n",
         )
         .unwrap();
         let clamped = Settings::load_from(&file);
@@ -678,14 +721,15 @@ mod tests {
         assert_eq!(clamped.audio_device, "auto");
         assert_eq!(clamped.ui_font_scale, MAX_UI_FONT_SCALE);
         assert!(
-            clamped.fake_ip_doh_fallback,
-            "the DoH fallback defaults to on"
+            !clamped.fake_ip_doh_fallback,
+            "the DoH fallback defaults to off"
         );
+        assert_eq!(clamped.doh_resolvers, default_doh_resolvers());
 
         std::fs::write(&file, "fake_ip_doh_fallback = maybe\n").unwrap();
-        assert!(Settings::load_from(&file).fake_ip_doh_fallback);
-        std::fs::write(&file, "fake_ip_doh_fallback = off\n").unwrap();
         assert!(!Settings::load_from(&file).fake_ip_doh_fallback);
+        std::fs::write(&file, "fake_ip_doh_fallback = on\n").unwrap();
+        assert!(Settings::load_from(&file).fake_ip_doh_fallback);
 
         std::fs::write(&file, "ui_font_scale = NaN\n").unwrap();
         assert_eq!(

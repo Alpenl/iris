@@ -218,6 +218,16 @@ impl IrisWindow {
 
         let ui_scale = s.ui_font_scale;
         let fake_ip_doh = s.fake_ip_doh_fallback;
+        let doh_resolvers_text = s.doh_resolvers.join(", ");
+        let doh_preset: u8 = if s.doh_resolvers == ["223.5.5.5", "1.12.12.12", "1.1.1.1"] {
+            0
+        } else if s.doh_resolvers == ["223.5.5.5", "1.12.12.12"] {
+            1
+        } else if s.doh_resolvers == ["1.1.1.1", "8.8.8.8", "9.9.9.9"] {
+            2
+        } else {
+            3
+        };
         let confirm_recent = self.is_confirming("clear-recent");
         let confirm_progress = self.is_confirming("clear-progress");
 
@@ -524,7 +534,7 @@ impl IrisWindow {
             ))
             .child(setting_row(
                 "Fake-IP 代理下使用公共 DoH",
-                "系统 DNS 返回 Fake-IP 时经阿里、DNSPod、Cloudflare 公共 DoH 解析；关闭后不外发主机名，此类请求将被拒绝",
+                "默认关闭以保护私有源域名隐私；开启后系统 DNS 返回 Fake-IP 时改经下方公共 DoH 解析器查询真实地址",
                 toggle(
                     "set-fake-ip-doh",
                     fake_ip_doh,
@@ -537,6 +547,45 @@ impl IrisWindow {
                         this.preset_rt.record_user_edit(&this.settings);
                         cx.notify();
                     }),
+                ),
+                t,
+            ))
+            .child(setting_row(
+                "公共 DoH 解析器列表",
+                format!("当前端点：{doh_resolvers_text}（也可在 settings.conf 自定义 doh_resolvers）"),
+                segmented(
+                    "set-doh-resolvers",
+                    if doh_preset == 3 {
+                        &[
+                            ("国内优先", 0u8),
+                            ("阿里+腾讯", 1u8),
+                            ("国际公共", 2u8),
+                            ("自定义", 3u8),
+                        ][..]
+                    } else {
+                        &[
+                            ("国内优先", 0u8),
+                            ("阿里+腾讯", 1u8),
+                            ("国际公共", 2u8),
+                        ][..]
+                    },
+                    doh_preset,
+                    t,
+                    cx,
+                    |this, preset, cx| {
+                        let next: Option<Vec<String>> = match preset {
+                            0 => Some(vec!["223.5.5.5".into(), "1.12.12.12".into(), "1.1.1.1".into()]),
+                            1 => Some(vec!["223.5.5.5".into(), "1.12.12.12".into()]),
+                            2 => Some(vec!["1.1.1.1".into(), "8.8.8.8".into(), "9.9.9.9".into()]),
+                            _ => None,
+                        };
+                        if let Some(resolvers) = next {
+                            this.settings.doh_resolvers = resolvers;
+                            let _ = iris_core::vfs::set_doh_resolvers(&this.settings.doh_resolvers);
+                            this.preset_rt.record_user_edit(&this.settings);
+                            cx.notify();
+                        }
+                    },
                 ),
                 t,
             ))

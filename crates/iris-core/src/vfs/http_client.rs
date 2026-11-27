@@ -39,6 +39,61 @@ pub(crate) fn sanitize_header_value(value: &str) -> String {
         .to_string()
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HeaderValidationError {
+    QuotaExceeded,
+    InvalidName,
+    InvalidValue,
+    ForbiddenHeader,
+}
+
+/// Single request-header policy shared by host HTTP clients and plugin `RawRequest`/socket APIs.
+/// Enforces count (`<= 128`), wire budget (`<= 64 KiB`), RFC 9110 `tchar` names, Latin-1
+/// non-control values, and forbidden hop-by-hop / framing header names.
+pub(crate) fn validate_header_pairs<'a, I>(
+    headers: I,
+) -> std::result::Result<(), (&'a str, HeaderValidationError)>
+where
+    I: IntoIterator<Item = (&'a str, &'a str)>,
+{
+    let mut count = 0usize;
+    let mut total = 0usize;
+    for (name, value) in headers {
+        count += 1;
+        if count > 128 {
+            return Err((name, HeaderValidationError::QuotaExceeded));
+        }
+        total = total.saturating_add(name.len() + value.len() + 4);
+        if name.is_empty() || !name.bytes().all(is_tchar) {
+            return Err((name, HeaderValidationError::InvalidName));
+        }
+        if value.bytes().any(|b| b == 0x7f || (b < 0x20 && b != b'\t'))
+            || value.chars().any(|c| u32::from(c) > 255)
+        {
+            return Err((name, HeaderValidationError::InvalidValue));
+        }
+        if matches!(
+            name.to_ascii_lowercase().as_str(),
+            "host"
+                | "connection"
+                | "content-length"
+                | "transfer-encoding"
+                | "proxy-authorization"
+                | "proxy-connection"
+                | "upgrade"
+                | "te"
+                | "trailer"
+                | "expect"
+        ) {
+            return Err((name, HeaderValidationError::ForbiddenHeader));
+        }
+        if total > 65536 {
+            return Err((name, HeaderValidationError::QuotaExceeded));
+        }
+    }
+    Ok(())
+}
+
 /// Validates caller-supplied request headers. Invalid names and control bytes
 /// are rejected instead of rewritten: truncating `X-A\r\nHost: b` or dropping
 /// characters would silently send something other than what the caller asked
@@ -46,18 +101,27 @@ pub(crate) fn sanitize_header_value(value: &str) -> String {
 pub(crate) fn validate_request_headers(
     headers: &BTreeMap<String, String>,
 ) -> Result<BTreeMap<String, String>> {
-    let mut clean = BTreeMap::new();
-    for (name, value) in headers {
-        if name.is_empty() || !name.bytes().all(is_tchar) {
-            bail!("invalid HTTP request header name");
-        }
-        if value.bytes().any(|b| b == 0x7f || (b < 0x20 && b != b'\t')) {
-            // The value itself may be a credential; name the header only.
-            bail!("invalid HTTP request header value for {name}");
-        }
-        clean.insert(name.clone(), value.trim_matches([' ', '\t']).to_owned());
-    }
-    Ok(clean)
+    validate_header_pairs(headers.iter().map(|(k, v)| (k.as_str(), v.as_str()))).map_err(
+        |(name, kind)| match kind {
+            HeaderValidationError::QuotaExceeded => {
+                anyhow::anyhow!("HTTP request headers exceed quota")
+            }
+            HeaderValidationError::InvalidName => {
+                anyhow::anyhow!("invalid HTTP request header name")
+            }
+            HeaderValidationError::InvalidValue => {
+                // The value itself may be a credential; name the header only.
+                anyhow::anyhow!("invalid HTTP request header value for {name}")
+            }
+            HeaderValidationError::ForbiddenHeader => {
+                anyhow::anyhow!("forbidden hop-by-hop or framing HTTP header: {name}")
+            }
+        },
+    )?;
+    Ok(headers
+        .iter()
+        .map(|(name, value)| (name.clone(), value.trim_matches([' ', '\t']).to_owned()))
+        .collect())
 }
 
 pub(crate) fn origin_headers(
@@ -106,25 +170,21 @@ fn ensure_identity_headers(headers: &BTreeMap<String, String>) -> Result<()> {
 
 pub(crate) type ResponseReader = io::Chain<Cursor<Vec<u8>>, connection::Transport>;
 
-pub(crate) struct ChunkedReader {
-    inner: BufReader<ResponseReader>,
+pub(crate) struct ChunkedReader<R = ResponseReader> {
+    inner: BufReader<R>,
     remaining: u64,
     need_crlf: bool,
     eof: bool,
 }
 
-impl ChunkedReader {
-    pub(crate) fn new(inner: ResponseReader) -> Self {
+impl<R: Read> ChunkedReader<R> {
+    pub(crate) fn new(inner: R) -> Self {
         Self {
             inner: BufReader::new(inner),
             remaining: 0,
             need_crlf: false,
             eof: false,
         }
-    }
-
-    pub(crate) fn transport_mut(&mut self) -> &mut connection::Transport {
-        self.inner.get_mut().get_mut().1
     }
 
     fn read_line_capped(&mut self) -> io::Result<Vec<u8>> {
@@ -164,7 +224,13 @@ impl ChunkedReader {
     }
 }
 
-impl Read for ChunkedReader {
+impl ChunkedReader<ResponseReader> {
+    pub(crate) fn transport_mut(&mut self) -> &mut connection::Transport {
+        self.inner.get_mut().get_mut().1
+    }
+}
+
+impl<R: Read> Read for ChunkedReader<R> {
     fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
         if out.is_empty() || self.eof {
             return Ok(0);
@@ -292,6 +358,59 @@ pub(crate) fn open_stream(
     open_stream_with_credentials(req, scope.source(), scope, cancel, deadline)
 }
 
+pub(crate) type ParsedResponseHead = (u16, usize, BTreeMap<String, String>);
+
+/// Parses buffered HTTP/1.1 response blocks, skipping up to 8 informational `1xx` (`101` rejected).
+pub(crate) fn parse_response_head(raw: &[u8]) -> Result<Option<ParsedResponseHead>> {
+    if raw.len() > MAX_RESPONSE_HEADER_BYTES {
+        bail!("HTTP response headers exceed limit");
+    }
+    let mut header_start = 0usize;
+    let mut interim = 0usize;
+    loop {
+        let Some(i) = raw[header_start..]
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+        else {
+            return Ok(None);
+        };
+        let end = header_start + i + 4;
+        let mut slots = [httparse::EMPTY_HEADER; 128];
+        let mut parsed = httparse::Response::new(&mut slots);
+        if !parsed.parse(&raw[header_start..end])?.is_complete() {
+            bail!("incomplete HTTP response headers");
+        }
+        let status = parsed.code.context("missing HTTP status")?;
+        if (100..200).contains(&status) {
+            interim += 1;
+            if status == 101 || interim > 8 {
+                bail!("unsupported HTTP informational response");
+            }
+            header_start = end;
+            continue;
+        }
+        let mut values = BTreeMap::<String, String>::new();
+        for h in parsed.headers {
+            let val = sanitize_header_value(&String::from_utf8_lossy(h.value));
+            let name = h.name.to_ascii_lowercase();
+            if let Some(prev) = values.get_mut(&name) {
+                match name.as_str() {
+                    "content-length" | "content-range" | "content-type" | "location" => {
+                        bail!("duplicate HTTP {name} header");
+                    }
+                    _ => {
+                        prev.push_str(", ");
+                        prev.push_str(&val);
+                    }
+                }
+            } else {
+                values.insert(name, val);
+            }
+        }
+        return Ok(Some((status, end, values)));
+    }
+}
+
 fn open_stream_with_credentials(
     req: Request<'_>,
     credential_origin: &Url,
@@ -310,8 +429,10 @@ fn open_stream_with_credentials(
     if cur_method.is_empty() || !cur_method.bytes().all(is_tchar) {
         bail!("invalid HTTP method");
     }
+    // Validate caller headers unconditionally even when cross-origin stripping drops them.
+    let validated = validate_request_headers(headers)?;
     let mut cur_headers = if url.origin() == credential_origin.origin() {
-        origin_headers(credential_origin, headers)?
+        origin_headers(credential_origin, &validated)?
     } else {
         BTreeMap::new()
     };
@@ -370,59 +491,20 @@ fn open_stream_with_credentials(
         transport.flush()?;
 
         let (mut raw, mut tmp) = (Vec::with_capacity(2048), [0u8; 4096]);
-        let mut header_start = 0;
-        let mut scan = 0;
-        let mut interim = 0;
         let (status, header_end, mut resp_headers) = loop {
             remaining_timeout(cancel, Some(header_deadline), IO_TIMEOUT)?;
-            let Some(i) = raw[scan..].windows(4).position(|w| w == b"\r\n\r\n") else {
-                if raw.len() >= MAX_RESPONSE_HEADER_BYTES {
-                    bail!("HTTP response headers exceed limit");
-                }
-                scan = raw.len().saturating_sub(3).max(header_start);
-                let n = transport
-                    .read(&mut tmp[..(MAX_RESPONSE_HEADER_BYTES - raw.len()).min(4096)])?;
-                if n == 0 {
-                    bail!("unexpected EOF reading HTTP response headers");
-                }
-                raw.extend_from_slice(&tmp[..n]);
-                continue;
-            };
-            let end = scan + i + 4;
-            let mut slots = [httparse::EMPTY_HEADER; 128];
-            let mut parsed = httparse::Response::new(&mut slots);
-            if !parsed.parse(&raw[header_start..end])?.is_complete() {
-                bail!("incomplete HTTP response headers");
+            if let Some(parsed) = parse_response_head(&raw)? {
+                break parsed;
             }
-            let status = parsed.code.context("missing HTTP status")?;
-            if (100..200).contains(&status) {
-                interim += 1;
-                if status == 101 || interim > 8 {
-                    bail!("unsupported HTTP informational response");
-                }
-                header_start = end;
-                scan = end;
-                continue;
+            if raw.len() >= MAX_RESPONSE_HEADER_BYTES {
+                bail!("HTTP response headers exceed limit");
             }
-            let mut values = BTreeMap::<String, String>::new();
-            for h in parsed.headers {
-                let val = sanitize_header_value(&String::from_utf8_lossy(h.value));
-                let name = h.name.to_ascii_lowercase();
-                if let Some(prev) = values.get_mut(&name) {
-                    match name.as_str() {
-                        "content-length" | "content-range" | "content-type" | "location" => {
-                            bail!("duplicate HTTP {name} header");
-                        }
-                        _ => {
-                            prev.push_str(", ");
-                            prev.push_str(&val);
-                        }
-                    }
-                } else {
-                    values.insert(name, val);
-                }
+            let n =
+                transport.read(&mut tmp[..(MAX_RESPONSE_HEADER_BYTES - raw.len()).min(4096)])?;
+            if n == 0 {
+                bail!("unexpected EOF reading HTTP response headers");
             }
-            break (status, end, values);
+            raw.extend_from_slice(&tmp[..n]);
         };
 
         if matches!(status, 301 | 302 | 303 | 307 | 308)
@@ -647,12 +729,39 @@ mod tests {
             ("Cookie", "SESSDATA=secret\r\nX-Injected: 1"),
             ("Cookie", "secret\0tail"),
             ("Cookie", "secret\u{7f}"),
+            ("Cookie", "secret\u{0100}"),
+            ("Host", "evil.example"),
+            ("Transfer-Encoding", "chunked"),
+            ("Proxy-Authorization", "Basic secret"),
+            ("Upgrade", "websocket"),
         ] {
             let error = validate_request_headers(&one(name, value)).unwrap_err();
             assert!(!error.to_string().contains("secret"), "{error}");
         }
+        let too_many: BTreeMap<String, String> = (0..129)
+            .map(|i| (format!("X-Hdr-{i}"), "ok".to_owned()))
+            .collect();
+        assert!(validate_request_headers(&too_many).is_err());
         let url = validate_stream_url("https://user:pass@a.example/v.mp4").unwrap();
+        let other_origin = validate_stream_url("https://b.example/sub.vtt").unwrap();
         assert!(origin_headers(&url, &one("Cookie", "a\nb")).is_err());
+        assert!(
+            super::open_stream_with_credentials(
+                Request {
+                    method: "GET",
+                    url: other_origin.clone(),
+                    headers: &one("Cookie", "secret\r\nEvil: 1"),
+                    body: None,
+                    range: None,
+                },
+                &url,
+                &NetworkScope::new(other_origin),
+                &HttpCancel::default(),
+                None,
+            )
+            .is_err(),
+            "cross-origin credential calls must still validate caller headers before connecting"
+        );
         let with_basic = origin_headers(&url, &BTreeMap::new()).unwrap();
         assert!(with_basic["Authorization"].starts_with("Basic "));
     }

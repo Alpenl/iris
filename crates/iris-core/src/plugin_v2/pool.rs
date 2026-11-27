@@ -1,4 +1,5 @@
 //! Blocking I/O stays outside Store threads; stream workers are reserved.
+use crate::concurrency::{ThreadRole, budget, spawn_thread_named};
 use iris_api::v2::{ErrorCode, Role};
 use std::{
     collections::{BTreeMap, VecDeque},
@@ -64,8 +65,8 @@ impl WorkPool {
 impl IoPool {
     pub fn new() -> Result<Self, ErrorCode> {
         Ok(Self {
-            control: workers("control", 4, 96, 32, 2),
-            stream: workers("stream", 8, 32, 16, 4),
+            control: workers("control", budget::PLUGIN_CONTROL_IO_WORKERS, 96, 32, 2),
+            stream: workers("stream", budget::PLUGIN_STREAM_IO_WORKERS, 32, 16, 4),
         })
     }
     pub(crate) fn submit(&self, role: Role, owner: &str, job: Job) -> Result<(), ErrorCode> {
@@ -105,10 +106,12 @@ fn submit(lane: &Arc<Lane>, owner: &str, job: Job) -> Result<(), ErrorCode> {
         state.next_worker = state.next_worker.wrapping_add(1);
         state.spawned += 1;
         let thread_lane = lane.clone();
-        if std::thread::Builder::new()
-            .name(format!("iris-v2-{}-io-{worker_id}", lane.name))
-            .spawn(move || worker(thread_lane))
-            .is_err()
+        if spawn_thread_named(
+            ThreadRole::PluginPoolWorker,
+            &format!("{}-io-{worker_id}", lane.name),
+            move || worker(thread_lane),
+        )
+        .is_err()
         {
             state.spawned -= 1;
             if state.spawned == 0 {

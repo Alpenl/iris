@@ -239,6 +239,9 @@ fn run(initial: Vec<PathBuf>) -> ExitCode {
         let (active_settings, preset_rt, init_plugin_cmds) =
             PresetRuntime::restore_on_startup(&presets, loaded_settings);
         iris_core::vfs::set_fake_ip_doh_fallback(active_settings.fake_ip_doh_fallback);
+        if let Err(e) = iris_core::vfs::set_doh_resolvers(&active_settings.doh_resolvers) {
+            log::warn!("applying configured DoH resolvers: {e:#}");
+        }
         cx.set_global(theme::ThemeTokens::resolve(&active_settings.theme_id, None));
 
         let use_saved_size =

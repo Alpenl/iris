@@ -1,7 +1,7 @@
 use super::{Mailbox, Message, WindowContext};
 use crate::{plugin_v2::ledger::Resource, vfs::http_client::HttpCancel};
 use iris_api::v2::{ErrorCode, Generation, Id, MESSAGE_LIMIT, Role};
-use std::{collections::BTreeMap, sync::atomic::Ordering};
+use std::collections::BTreeMap;
 
 fn same(a: Generation, b: Generation) -> bool {
     a.media == b.media && a.seek == b.seek
@@ -20,7 +20,7 @@ impl Mailbox {
     }
     pub fn is_current(&self, window: Option<Id>, generation: Generation) -> bool {
         let state = self.lock();
-        if self.cancel.load(Ordering::Acquire) {
+        if self.cancel.is_cancelled() {
             return false;
         }
         match window {
@@ -33,7 +33,7 @@ impl Mailbox {
     }
     pub fn is_session_current(&self, generation: Generation) -> Option<Generation> {
         let state = self.lock();
-        if self.cancel.load(Ordering::Acquire) || state.generation.media != generation.media {
+        if self.cancel.is_cancelled() || state.generation.media != generation.media {
             None
         } else {
             Some(state.generation)
@@ -50,7 +50,7 @@ impl Mailbox {
         )?;
         {
             let mut state = self.lock();
-            if self.cancel.load(Ordering::Acquire) {
+            if self.cancel.is_cancelled() {
                 return Err(ErrorCode::Cancelled);
             }
             if state.windows.contains_key(&window) {
@@ -118,7 +118,7 @@ impl Mailbox {
         }
         {
             let mut state = self.lock();
-            if self.cancel.load(Ordering::Acquire) {
+            if self.cancel.is_cancelled() {
                 return Err(ErrorCode::Cancelled);
             }
             if state.windows.contains_key(&window) {
@@ -142,7 +142,7 @@ impl Mailbox {
         }
         self.executor.window_changed(window, Some(generation));
         let mut state = self.lock();
-        if self.cancel.load(Ordering::Acquire) {
+        if self.cancel.is_cancelled() {
             return Err(ErrorCode::Cancelled);
         }
         let Some(scope) = state.windows.get(&window) else {
@@ -183,7 +183,7 @@ impl Mailbox {
     pub fn advance_window(&self, window: Id, generation: Generation) -> Result<(), ErrorCode> {
         let cancel = {
             let mut state = self.lock();
-            if self.cancel.load(Ordering::Acquire) {
+            if self.cancel.is_cancelled() {
                 return Err(ErrorCode::Cancelled);
             }
             let scope = state
@@ -288,7 +288,7 @@ impl Mailbox {
             return Err(ErrorCode::InvalidArgument);
         }
         let mut state = self.lock();
-        if self.cancel.load(Ordering::Acquire) {
+        if self.cancel.is_cancelled() {
             return Err(ErrorCode::Cancelled);
         }
         let scope = state.windows.get(&window).ok_or(ErrorCode::StaleHandle)?;

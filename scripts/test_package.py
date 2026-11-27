@@ -1091,6 +1091,30 @@ class CheckProjectHelperTests(unittest.TestCase):
         self.assertTrue(check_project.is_standalone_test_file(Path("examples/plugins/baidupan/src/tests.rs"), Path("examples/plugins/baidupan/src/tests.rs")))
         self.assertFalse(check_project.is_standalone_test_file(Path("crates/iris/src/debug.rs"), Path("crates/iris/src/debug.rs")))
 
+    def test_thread_spawn_and_inventory_gates_reject_unregistered_threads_and_undocumented_roles(self):
+        rel_registry = Path("crates/iris-core/src/concurrency.rs")
+        rel_other = Path("crates/iris-core/src/demo.rs")
+        check_project.check_thread_spawns(rel_registry, 'fn ok() { let _ = std::thread::Builder::new(); }\n')
+        check_project.check_thread_spawns(
+            rel_other,
+            "fn ok() {}\n#[cfg(test)]\nmod tests { #[test] fn t() { let _ = std::thread::spawn(|| {}); } }\n",
+        )
+        for bad in (
+            "fn f() { let _ = std::thread::spawn(|| {}); }\n",
+            'fn f() { let _ = std::thread::Builder::new().name("x".into()).spawn(|| {}); }\n',
+            "use std::thread::spawn;\nfn f() {}\n",
+        ):
+            with self.assertRaisesRegex(AssertionError, "unregistered OS thread"):
+                check_project.check_thread_spawns(rel_other, bad)
+
+        sample_concurrency = (
+            "pub const COUNT: usize = 2;\n"
+            'fn n() { match x { Self::Alpha => "iris-alpha", Self::Beta => "iris-beta-" } }\n'
+        )
+        check_project.check_thread_inventory_docs(sample_concurrency, "Threads: `iris-alpha`, `iris-beta-Control`.")
+        with self.assertRaisesRegex(AssertionError, "iris-beta-"):
+            check_project.check_thread_inventory_docs(sample_concurrency, "Threads: `iris-alpha` only.")
+
 
 class MediaFixtureScriptTests(unittest.TestCase):
     def test_make_webp_test_media_rejects_missing_explicit_icc_overrides_without_falling_back(self):

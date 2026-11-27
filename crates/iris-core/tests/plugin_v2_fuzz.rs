@@ -43,6 +43,7 @@ fn exercise(input: &[u8]) {
         });
     }
     let _ = prepare::subtitle_format(input);
+    iris_core::vfs::fuzz_net::exercise(input);
     if let Ok(command) = decode_exact::<HostCommand>(input, MESSAGE_LIMIT) {
         let _ = validation::command(&command);
     }
@@ -104,10 +105,33 @@ fn seeded_plugin_parser_mutations() {
         .collect();
     files.sort();
     let mut seeds: Vec<Vec<u8>> = files.iter().map(|p| std::fs::read(p).unwrap()).collect();
+    let http_206_seed = b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-3/10\r\nContent-Length: 4\r\nContent-Type: video/mp4\r\n\r\nabcd";
+    let chunked_seed = b"4;ext=val\r\nWiki\r\n5\r\npedia\r\n0\r\nX-Trailer: ok\r\n\r\n";
+    let loopback_req_seed =
+        b"GET /m/1/abc.mp4 HTTP/1.1\r\nHost: 127.0.0.1:18080\r\nRange: bytes=0-1023\r\n\r\n";
+    let mut doh_resp_seed = Vec::new();
+    let dns_wire = [
+        0u8, 0, 0x81, 0x80, 0, 1, 0, 1, 0, 0, 0, 0, 7, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 3,
+        b'c', b'o', b'm', 0, 0, 1, 0, 1, 0xC0, 0x0C, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 93, 184, 216,
+        34,
+    ];
+    doh_resp_seed.extend_from_slice(
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/dns-message\r\nContent-Length: {}\r\n\r\n",
+            dns_wire.len()
+        )
+        .as_bytes(),
+    );
+    doh_resp_seed.extend_from_slice(&dns_wire);
     seeds.push(hls_media_seed.as_bytes().to_vec());
     seeds.push(vtt_seed.to_vec());
     seeds.push(srt_seed.to_vec());
     seeds.push(ass_seed.to_vec());
+    seeds.push(http_206_seed.to_vec());
+    seeds.push(chunked_seed.to_vec());
+    seeds.push(loopback_req_seed.to_vec());
+    seeds.push(doh_resp_seed);
+    seeds.push(dns_wire.to_vec());
     for seed in &seeds {
         exercise(seed);
     }

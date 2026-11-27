@@ -10,12 +10,43 @@ use serde::{Deserialize, Serialize};
 use crate::fs_util;
 use crate::media_uri::MediaUri;
 
+pub use crate::concurrency::{CancelToken, Deadline, WaitError};
+pub use http_client::doh::{
+    DEFAULT_DOH_RESOLVERS, active_resolvers as active_doh_resolvers, normalize_doh_resolver,
+};
 pub(crate) use http_client::fetch_range;
 pub use http_client::{HttpCancel, validate_stream_url};
 
 /// Applies `Settings::fake_ip_doh_fallback` to every host and plugin HTTP client.
 pub fn set_fake_ip_doh_fallback(enabled: bool) {
     http_client::doh::set_fallback_enabled(enabled);
+}
+
+/// Applies `Settings::doh_resolvers` to every host and plugin HTTP client.
+pub fn set_doh_resolvers(resolvers: &[String]) -> anyhow::Result<()> {
+    http_client::doh::set_resolvers(resolvers)
+}
+
+/// Bounded, zero-network parser entry points exercised by `tests/plugin_v2_fuzz.rs`.
+#[doc(hidden)]
+pub mod fuzz_net {
+    use std::io::{Cursor, Read};
+
+    pub fn exercise(input: &[u8]) {
+        let _ = super::http_client::parse_response_head(input);
+        let mut decoded = Vec::new();
+        let _ = super::http_client::ChunkedReader::new(Cursor::new(input))
+            .take(64 * 1024)
+            .read_to_end(&mut decoded);
+        let _ = crate::loopback_http::parse_http_request(input, "127.0.0.1:18080");
+        let _ = super::http_client::doh::parse_doh_response_bytes(input);
+        let _ = super::http_client::doh::parse_dns_a_response(input);
+        if let Ok(text) = std::str::from_utf8(input) {
+            let _ = super::http_client::doh::encode_dns_a_query(text);
+            let _ = super::http_client::doh::normalize_doh_resolver(text);
+            let _ = super::validate_stream_url(text);
+        }
+    }
 }
 
 /// User-pinned local folder, network share, or `MediaSource` plugin folder.

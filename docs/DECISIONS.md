@@ -33,6 +33,7 @@
 | 2.10 | 运行日志统一走 `log` + 结构化本地 JSONL 事件流（`logging/`），GUI 发布版写入系统应用日志目录（4 MiB × 5 份按大小轮转），全部文本与事件经 `redact_text`/`redact_json` 单一脱敏收口。 | 已完成（`logging/`）；控制协议回复仍写 stderr |
 | 2.11 | 调试控制使用跨平台本地流：macOS Unix socket，Windows 同用户命名管道。 | 已完成；普通 release 忽略 `IRIS_CONTROL`，测试需 `devtools` |
 | 2.12 | `deny.toml` 检查 RustSec 公告、许可证和依赖来源。C 依赖由锁定的 HTTPS 源码、SPDX 许可表和发布清单约束。 | CI `Release recipe policy` 持续检查 |
+| 2.13 | Fake-IP 代理下公共 DoH 回退**默认关闭**（`fake_ip_doh_fallback = false`），避免自建 WebDAV / NAS 等私有源主机名在未经显式同意时发往公共解析器或绕过代理的域名分流规则；用户显式开启后可经 `doh_resolvers` 配置数字公网 IP / HTTPS DoH 端点（强制校验 `AddressKind::Public`）；`198.18.0.0/15` 与 `2001:2::/48` 永久保持 `AddressKind::Forbidden`，不开放直连信任 Fake-IP 段的开关。 | 已完成（`doh.rs` + `settings.rs`） |
 
 ## 3. 五个“单向门”
 

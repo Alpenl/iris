@@ -1,13 +1,11 @@
 //! In-memory compilation only. Active modules are part of the cache budget.
 use super::{imports, instance::State, package::WASM_LIMIT};
+use crate::concurrency::{CancelToken, ThreadRole, spawn_thread};
 use iris_api::v2::ErrorCode;
 use ring::digest::{SHA256, digest};
 use std::{
     collections::BTreeMap,
-    sync::{
-        Arc, Condvar, Mutex,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::{Arc, Condvar, Mutex},
     time::Duration,
 };
 use wasmtime::{Config, Engine, ExternType, Linker, Module};
@@ -89,9 +87,7 @@ impl RuntimeEngine {
     }
     pub(crate) fn execution(&self) -> Result<ExecutionGuard, ErrorCode> {
         self.execution_with(|job| {
-            std::thread::Builder::new()
-                .name("iris-wasm-epoch".into())
-                .spawn(job)
+            spawn_thread(ThreadRole::WasmEpochTimer, job)
                 .map(|_| ())
                 .map_err(|_| ErrorCode::Internal)
         })
@@ -143,7 +139,7 @@ impl RuntimeEngine {
     pub fn compile(
         &self,
         bytes: &[u8],
-        cancel: &AtomicBool,
+        cancel: &CancelToken,
     ) -> Result<Arc<CompiledModule>, ErrorCode> {
         if bytes.len() > WASM_LIMIT {
             return Err(ErrorCode::QuotaExceeded);
@@ -156,7 +152,7 @@ impl RuntimeEngine {
             .try_into()
             .map_err(|_| ErrorCode::Internal)?;
         let mut cache = self.0.cache.lock().unwrap_or_else(|e| e.into_inner());
-        if cancel.load(Ordering::Acquire) {
+        if cancel.is_cancelled() {
             return Err(ErrorCode::Cancelled);
         }
         if let Some(module) = cache.modules.get(&key) {
@@ -167,7 +163,7 @@ impl RuntimeEngine {
                 return Err(ErrorCode::Backpressure);
             }
             cache.waiting += 1;
-            while cache.compiling >= 2 && !cancel.load(Ordering::Acquire) {
+            while cache.compiling >= 2 && !cancel.is_cancelled() {
                 cache = self
                     .0
                     .changed
@@ -176,7 +172,7 @@ impl RuntimeEngine {
                     .0;
             }
             cache.waiting -= 1;
-            if cancel.load(Ordering::Acquire) {
+            if cancel.is_cancelled() {
                 return Err(ErrorCode::Cancelled);
             }
             if let Some(module) = cache.modules.get(&key) {
@@ -197,7 +193,7 @@ impl RuntimeEngine {
         cache.compiling -= 1;
         self.0.changed.notify_all();
         let module = result?;
-        if cancel.load(Ordering::Acquire) {
+        if cancel.is_cancelled() {
             return Err(ErrorCode::Cancelled);
         }
         if let Some(existing) = cache.modules.get(&key) {
@@ -273,15 +269,15 @@ fn validate_module(module: Module) -> Result<Module, ErrorCode> {
 #[cfg(test)]
 mod tests {
     use super::RuntimeEngine;
-    use crate::plugin_v2::{
-        instance::{Instance, InstanceConfig},
-        ledger::{Ledger, Resource},
+    use crate::{
+        concurrency::CancelToken,
+        plugin_v2::{
+            instance::{Instance, InstanceConfig},
+            ledger::{Ledger, Resource},
+        },
     };
     use iris_api::v2::{ErrorCode, Role};
-    use std::{
-        collections::BTreeSet,
-        sync::{Arc, atomic::AtomicBool},
-    };
+    use std::collections::BTreeSet;
 
     impl RuntimeEngine {
         pub(crate) fn cached_bytes(&self) -> usize {
@@ -308,7 +304,7 @@ mod tests {
             (func (export "iris_on_event") (param i32 i32) (result i64) i64.const 0))"#,
         )
         .unwrap();
-        let module = engine.compile(&wasm, &AtomicBool::new(false)).unwrap();
+        let module = engine.compile(&wasm, &CancelToken::new()).unwrap();
         let ledger = Ledger::default();
 
         assert_eq!(
@@ -332,7 +328,7 @@ mod tests {
             owner: "epoch-ok".into(),
             grants: BTreeSet::new(),
             ledger: ledger.clone(),
-            cancel: Arc::new(AtomicBool::new(false)),
+            cancel: CancelToken::new(),
         })
         .unwrap();
         assert!(
@@ -386,7 +382,7 @@ mod tests {
                 };
                 let pkg = Package::from_zip(zip_bytes, prov).unwrap();
                 let wasm = pkg.wasm().unwrap();
-                let cancel = Arc::new(AtomicBool::new(false));
+                let cancel = CancelToken::new();
                 let t0 = Instant::now();
                 let module = engine.compile(wasm, &cancel).unwrap();
                 let compile_ms = t0.elapsed().as_secs_f64() * 1000.0;

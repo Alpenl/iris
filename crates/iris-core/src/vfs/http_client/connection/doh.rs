@@ -2,27 +2,30 @@
 //! port-53 DNS with IANA benchmark Fake-IPs (`198.18.0.0/15`, `2001:2::/48`).
 //!
 //! Privacy boundary: the fallback sends the hostname to the public resolvers in
-//! [`DOH_SERVERS`] and then connects to the real address, which can bypass a
-//! proxy's domain rules. It is on by default, announced once in the log, and
-//! users can turn it off (`fake_ip_doh_fallback = false`); Fake-IP answers then
-//! stay forbidden and the request fails instead of leaving the proxy.
+//! [`active_resolvers`] and then connects to the real address, which can bypass a
+//! proxy's domain rules. It is **off by default** (`fake_ip_doh_fallback = false`)
+//! so private media hostnames (e.g. self-hosted WebDAV/NAS) are never silently
+//! disclosed to third-party resolvers; users can explicitly opt in.
 //!
-//! Security boundary: Fake-IP ranges remain `AddressKind::Forbidden`. We never
-//! relax `address_kind` or `RequestGrant::check_address`; instead we resolve the
-//! domain's real authoritative `A` records over verified TLS to numeric public
+//! Security boundary: Fake-IP ranges remain `AddressKind::Forbidden` permanently.
+//! We never relax `address_kind` or `RequestGrant::check_address` to connect
+//! directly to `198.18.0.0/15` or `2001:2::/48`; instead, when opted in, we
+//! resolve authoritative `A` records over verified TLS to numeric `AddressKind::Public`
 //! DoH resolvers and subject those real IPs to the exact same SSRF/grant checks.
 
 use std::collections::BTreeMap;
-use std::io::{BufReader, Cursor, Read, Write};
+use std::io::{Cursor, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use rustls_pki_types::{IpAddr as PkiIpAddr, ServerName};
+use url::{Host, Url};
 
+use super::super::address::{AddressKind, address_kind};
 use super::super::{ChunkedReader, parse_decimal_u64};
 use super::{HttpCancel, TimedSocket, connect_tcp, remaining_timeout, tls_config};
 
@@ -30,15 +33,124 @@ const DOH_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(4);
 const MAX_DOH_HEADER_BYTES: usize = 16 * 1024;
 const MAX_DOH_BODY_BYTES: usize = 4096;
 const MAX_CACHE_ENTRIES: usize = 128;
+const MAX_DOH_RESOLVERS: usize = 8;
 const MIN_TTL_SECS: u64 = 15;
 const MAX_TTL_SECS: u64 = 300;
 
-/// Public numeric DoH endpoints with IP SANs in their TLS certificates.
-const DOH_SERVERS: [Ipv4Addr; 3] = [
-    Ipv4Addr::new(223, 5, 5, 5),  // AliDNS
-    Ipv4Addr::new(1, 12, 12, 12), // DNSPod
-    Ipv4Addr::new(1, 1, 1, 1),    // Cloudflare
+/// Default numeric public DoH endpoints with IP SANs in their TLS certificates.
+pub const DEFAULT_DOH_RESOLVERS: [&str; 3] = [
+    "223.5.5.5",  // AliDNS
+    "1.12.12.12", // DNSPod
+    "1.1.1.1",    // Cloudflare
 ];
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DohEndpoint {
+    pub ip: IpAddr,
+    pub port: u16,
+    pub path: String,
+}
+
+impl DohEndpoint {
+    fn host_header(&self) -> String {
+        match (self.ip, self.port) {
+            (IpAddr::V4(v4), 443) => v4.to_string(),
+            (IpAddr::V4(v4), port) => format!("{v4}:{port}"),
+            (IpAddr::V6(v6), 443) => format!("[{v6}]"),
+            (IpAddr::V6(v6), port) => format!("[{v6}]:{port}"),
+        }
+    }
+
+    fn canonical_string(&self) -> String {
+        if self.port == 443 && self.path == "/dns-query" {
+            return self.ip.to_string();
+        }
+        let host = match self.ip {
+            IpAddr::V4(v4) => v4.to_string(),
+            IpAddr::V6(v6) => format!("[{v6}]"),
+        };
+        if self.port == 443 {
+            format!("https://{host}{}", self.path)
+        } else {
+            format!("https://{host}:{}{}", self.port, self.path)
+        }
+    }
+}
+
+fn default_endpoints() -> Vec<DohEndpoint> {
+    DEFAULT_DOH_RESOLVERS
+        .iter()
+        .map(|raw| parse_doh_endpoint(raw).expect("valid default DoH endpoint"))
+        .collect()
+}
+
+fn valid_doh_path(path: &str) -> bool {
+    !path.is_empty()
+        && path.len() <= 128
+        && path.starts_with('/')
+        && !path.starts_with("//")
+        && path
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"/-_.".contains(&b))
+}
+
+pub(crate) fn parse_doh_endpoint(raw: &str) -> Option<DohEndpoint> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.len() > 256 || trimmed.bytes().any(|b| b < 0x20 || b == 0x7f) {
+        return None;
+    }
+    let (ip, port, path) = if let Ok(ip) = trimmed.parse::<IpAddr>() {
+        (ip.to_canonical(), 443, "/dns-query".to_owned())
+    } else if let Ok(sock) = trimmed.parse::<SocketAddr>() {
+        if sock.port() == 0 {
+            return None;
+        }
+        (
+            sock.ip().to_canonical(),
+            sock.port(),
+            "/dns-query".to_owned(),
+        )
+    } else if trimmed.starts_with("https://") {
+        let parsed = Url::parse(trimmed).ok()?;
+        if parsed.scheme() != "https"
+            || !parsed.username().is_empty()
+            || parsed.password().is_some()
+            || parsed.query().is_some()
+            || parsed.fragment().is_some()
+        {
+            return None;
+        }
+        let ip = match parsed.host()? {
+            Host::Ipv4(v4) => IpAddr::V4(v4),
+            Host::Ipv6(v6) => IpAddr::V6(v6).to_canonical(),
+            Host::Domain(_) => return None,
+        };
+        let port = parsed.port_or_known_default()?;
+        if port == 0 {
+            return None;
+        }
+        let path = if parsed.path() == "/" {
+            "/dns-query".to_owned()
+        } else {
+            parsed.path().to_owned()
+        };
+        if !valid_doh_path(&path) {
+            return None;
+        }
+        (ip, port, path)
+    } else {
+        return None;
+    };
+    if address_kind(ip) != AddressKind::Public {
+        return None;
+    }
+    Some(DohEndpoint { ip, port, path })
+}
+
+/// Validates and normalizes one public numeric DoH resolver entry for `settings.conf`.
+pub fn normalize_doh_resolver(raw: &str) -> Option<String> {
+    parse_doh_endpoint(raw).map(|ep| ep.canonical_string())
+}
 
 struct CachedDns {
     ips: Vec<IpAddr>,
@@ -118,17 +230,68 @@ fn parse_doh_framing(headers: &[httparse::Header<'_>]) -> Result<DohFraming> {
 }
 
 static DOH_CACHE: Mutex<BTreeMap<String, CachedDns>> = Mutex::new(BTreeMap::new());
-static FALLBACK_ENABLED: AtomicBool = AtomicBool::new(true);
+static DOH_ENDPOINTS: Mutex<Option<Vec<DohEndpoint>>> = Mutex::new(None);
+static FALLBACK_ENABLED: AtomicBool = AtomicBool::new(false);
 static FALLBACK_NOTICE: AtomicBool = AtomicBool::new(false);
+
+fn current_endpoints() -> Vec<DohEndpoint> {
+    DOH_ENDPOINTS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone()
+        .unwrap_or_else(default_endpoints)
+}
+
+/// Applies a validated list of public numeric DoH resolvers (`1..=8` entries).
+pub fn set_resolvers(resolvers: &[String]) -> Result<()> {
+    if resolvers.is_empty() || resolvers.len() > MAX_DOH_RESOLVERS {
+        bail!("DoH resolver list must contain 1..={MAX_DOH_RESOLVERS} entries");
+    }
+    let mut parsed = Vec::with_capacity(resolvers.len());
+    for raw in resolvers {
+        let ep = parse_doh_endpoint(raw)
+            .ok_or_else(|| anyhow!("invalid or non-public DoH resolver: {raw}"))?;
+        if !parsed.contains(&ep) {
+            parsed.push(ep);
+        }
+    }
+    let changed = {
+        let mut guard = DOH_ENDPOINTS.lock().unwrap_or_else(PoisonError::into_inner);
+        let prev = guard.clone().unwrap_or_else(default_endpoints);
+        if prev == parsed {
+            false
+        } else {
+            *guard = Some(parsed);
+            true
+        }
+    };
+    if changed {
+        DOH_CACHE
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
+        FALLBACK_NOTICE.store(false, Ordering::Release);
+    }
+    Ok(())
+}
+
+pub fn active_resolvers() -> Vec<String> {
+    current_endpoints()
+        .into_iter()
+        .map(|ep| ep.canonical_string())
+        .collect()
+}
 
 /// Applies the user's `fake_ip_doh_fallback` setting. Turning it off also drops
 /// cached DoH answers so no earlier public resolution is reused.
 pub fn set_fallback_enabled(enabled: bool) {
     if FALLBACK_ENABLED.swap(enabled, Ordering::AcqRel) != enabled {
         if !enabled {
-            DOH_CACHE.lock().unwrap_or_else(|e| e.into_inner()).clear();
+            DOH_CACHE
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clear();
         }
-        // A changed choice deserves a fresh notice the next time it matters.
         FALLBACK_NOTICE.store(false, Ordering::Release);
     }
 }
@@ -146,15 +309,16 @@ pub(crate) fn use_fallback(host: &str, resolved: &[IpAddr]) -> bool {
     let enabled = fallback_enabled();
     if !FALLBACK_NOTICE.swap(true, Ordering::AcqRel) {
         if enabled {
+            let servers = active_resolvers().join(", ");
             log::info!(
                 "system DNS returned benchmark Fake-IP addresses (local TUN proxy?); \
-                 resolving through public DoH resolvers (AliDNS, DNSPod, Cloudflare). \
+                 resolving through configured public DoH resolvers ({servers}). \
                  Set fake_ip_doh_fallback = false to keep hostnames on the system resolver"
             );
         } else {
             log::warn!(
                 "system DNS returned benchmark Fake-IP addresses and the public DoH \
-                 fallback is disabled; requests to such hosts are refused"
+                 fallback is disabled (default); requests to such hosts are refused"
             );
         }
     }
@@ -194,11 +358,28 @@ pub(crate) fn resolve_a_records(
     cancel: &HttpCancel,
     current_deadline: impl Fn() -> Instant,
 ) -> Result<Vec<IpAddr>> {
+    resolve_a_records_with(host, cancel, current_deadline, query_single_server)
+}
+
+fn resolve_a_records_with(
+    host: &str,
+    cancel: &HttpCancel,
+    current_deadline: impl Fn() -> Instant,
+    mut query_fn: impl FnMut(
+        &DohEndpoint,
+        &str,
+        &HttpCancel,
+        &dyn Fn() -> Instant,
+    ) -> Result<(Vec<IpAddr>, u64)>,
+) -> Result<Vec<IpAddr>> {
+    if !fallback_enabled() {
+        bail!("public DoH fallback is disabled");
+    }
     let key = host.trim_end_matches('.').to_ascii_lowercase();
     let now = Instant::now();
     if let Some(hit) = DOH_CACHE
         .lock()
-        .unwrap_or_else(|e| e.into_inner())
+        .unwrap_or_else(PoisonError::into_inner)
         .get(&key)
         .filter(|entry| entry.expires > now)
         .map(|entry| entry.ips.clone())
@@ -208,10 +389,18 @@ pub(crate) fn resolve_a_records(
 
     let wire_query = encode_dns_a_query(&key)?;
     let dns_param = URL_SAFE_NO_PAD.encode(&wire_query);
-    let (ips, ttl_secs) = query_servers(cancel, current_deadline, |server_ip, deadline_fn| {
-        query_single_server(server_ip, &dns_param, cancel, deadline_fn)
-    })?;
-    let mut cache = DOH_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    let servers = current_endpoints();
+    let (ips, ttl_secs) = query_servers(
+        &servers,
+        cancel,
+        current_deadline,
+        |endpoint, deadline_fn| query_fn(endpoint, &dns_param, cancel, deadline_fn),
+    )?;
+    let mut cache = DOH_CACHE.lock().unwrap_or_else(PoisonError::into_inner);
+    if !fallback_enabled() {
+        cache.clear();
+        bail!("public DoH fallback disabled during lookup");
+    }
     let now = Instant::now();
     let expires = now + Duration::from_secs(ttl_secs.clamp(MIN_TTL_SECS, MAX_TTL_SECS));
     cache_insert(
@@ -226,23 +415,25 @@ pub(crate) fn resolve_a_records(
 }
 
 fn query_servers<T>(
+    servers: &[DohEndpoint],
     cancel: &HttpCancel,
     current_deadline: impl Fn() -> Instant,
-    mut query: impl FnMut(Ipv4Addr, &dyn Fn() -> Instant) -> Result<T>,
+    mut query: impl FnMut(&DohEndpoint, &dyn Fn() -> Instant) -> Result<T>,
 ) -> Result<T> {
     let mut last_err = anyhow!("all DoH resolvers failed");
     loop {
         let round_deadline = current_deadline();
-        for server_ip in DOH_SERVERS {
-            if cancel.is_cancelled() || Instant::now() >= current_deadline() {
+        for endpoint in servers {
+            if !fallback_enabled() || cancel.is_cancelled() || Instant::now() >= current_deadline()
+            {
                 break;
             }
-            match query(server_ip, &current_deadline) {
+            match query(endpoint, &current_deadline) {
                 Ok(val) => return Ok(val),
                 Err(err) => last_err = err,
             }
         }
-        if cancel.is_cancelled() {
+        if !fallback_enabled() || cancel.is_cancelled() {
             break;
         }
         let latest = current_deadline();
@@ -253,8 +444,55 @@ fn query_servers<T>(
     Err(last_err)
 }
 
+/// Parses a complete buffered HTTP/1.1 DoH response (`200 OK`, framing, and RFC 1035 DNS body).
+pub(crate) fn parse_doh_response_bytes(raw: &[u8]) -> Result<(Vec<IpAddr>, u64)> {
+    let Some(i) = raw
+        .get(..raw.len().min(MAX_DOH_HEADER_BYTES))
+        .and_then(|s| s.windows(4).position(|w| w == b"\r\n\r\n"))
+    else {
+        bail!("missing or oversized DoH HTTP header terminator");
+    };
+    let header_end = i + 4;
+    let mut slots = [httparse::EMPTY_HEADER; 64];
+    let mut parsed = httparse::Response::new(&mut slots);
+    if !parsed.parse(&raw[..header_end])?.is_complete() {
+        bail!("incomplete DoH HTTP headers");
+    }
+    if parsed.code != Some(200) {
+        bail!("DoH HTTP status {:?}", parsed.code);
+    }
+    let framing = parse_doh_framing(parsed.headers)?;
+    read_doh_body_and_parse(framing, Cursor::new(&raw[header_end..]))
+}
+
+fn read_doh_body_and_parse<R: Read>(framing: DohFraming, reader: R) -> Result<(Vec<IpAddr>, u64)> {
+    let mut body = Vec::with_capacity(512);
+    match framing {
+        DohFraming::Chunked => {
+            ChunkedReader::new(reader)
+                .take(MAX_DOH_BODY_BYTES as u64 + 1)
+                .read_to_end(&mut body)?;
+        }
+        DohFraming::Fixed(len) => {
+            reader.take(len as u64).read_to_end(&mut body)?;
+            if body.len() != len {
+                bail!("truncated DoH body");
+            }
+        }
+        DohFraming::CloseDelimited => {
+            reader
+                .take(MAX_DOH_BODY_BYTES as u64 + 1)
+                .read_to_end(&mut body)?;
+        }
+    }
+    if body.len() > MAX_DOH_BODY_BYTES {
+        bail!("DoH body exceeds limit");
+    }
+    parse_dns_a_response(&body)
+}
+
 fn query_single_server(
-    server_ip: Ipv4Addr,
+    endpoint: &DohEndpoint,
     dns_param: &str,
     cancel: &HttpCancel,
     current_deadline: &dyn Fn() -> Instant,
@@ -263,7 +501,7 @@ fn query_single_server(
     let step_end = || current_deadline().min(attempt_cap);
     let step_timeout = remaining_timeout(cancel, Some(step_end()), DOH_ATTEMPT_TIMEOUT)?;
     let tcp = connect_tcp(
-        SocketAddr::new(IpAddr::V4(server_ip), 443),
+        SocketAddr::new(endpoint.ip, endpoint.port),
         cancel,
         Some(step_end()),
     )?;
@@ -277,7 +515,7 @@ fn query_single_server(
         deadline: Some(step_end()),
         idle_timeout: DOH_ATTEMPT_TIMEOUT,
     };
-    let sni = ServerName::IpAddress(PkiIpAddr::from(server_ip));
+    let sni = ServerName::IpAddress(PkiIpAddr::from(endpoint.ip));
     let mut tls_conn = rustls::ClientConnection::new(tls_config()?, sni)?;
     while tls_conn.is_handshaking() {
         let end = step_end();
@@ -288,8 +526,10 @@ fn query_single_server(
     timed.deadline = Some(step_end());
     let mut stream = rustls::StreamOwned::new(tls_conn, timed);
 
+    let host_hdr = endpoint.host_header();
     let req = format!(
-        "GET /dns-query?dns={dns_param} HTTP/1.1\r\nHost: {server_ip}\r\nAccept: application/dns-message\r\nConnection: close\r\n\r\n"
+        "GET {}?dns={dns_param} HTTP/1.1\r\nHost: {host_hdr}\r\nAccept: application/dns-message\r\nConnection: close\r\n\r\n",
+        endpoint.path
     );
     stream.write_all(req.as_bytes())?;
     stream.flush()?;
@@ -328,39 +568,10 @@ fn query_single_server(
     let mut prefix = Cursor::new(raw);
     prefix.set_position(header_end as u64);
     let chained = prefix.chain(super::Transport::Tls(Box::new(stream)));
-    let mut body = Vec::with_capacity(512);
-    match framing {
-        DohFraming::Chunked => {
-            let reader = ChunkedReader {
-                inner: BufReader::new(chained),
-                remaining: 0,
-                need_crlf: false,
-                eof: false,
-            };
-            reader
-                .take(MAX_DOH_BODY_BYTES as u64 + 1)
-                .read_to_end(&mut body)?;
-        }
-        DohFraming::Fixed(len) => {
-            chained.take(len as u64).read_to_end(&mut body)?;
-            if body.len() != len {
-                bail!("truncated DoH body");
-            }
-        }
-        DohFraming::CloseDelimited => {
-            chained
-                .take(MAX_DOH_BODY_BYTES as u64 + 1)
-                .read_to_end(&mut body)?;
-        }
-    }
-    if body.len() > MAX_DOH_BODY_BYTES {
-        bail!("DoH body exceeds limit");
-    }
-
-    parse_dns_a_response(&body)
+    read_doh_body_and_parse(framing, chained)
 }
 
-fn encode_dns_a_query(host: &str) -> Result<Vec<u8>> {
+pub(crate) fn encode_dns_a_query(host: &str) -> Result<Vec<u8>> {
     let mut msg = Vec::with_capacity(64);
     // Header: ID=0 (RFC 8484 §4.1), Flags=0x0100 (RD=1), QDCOUNT=1, AN/NS/AR=0
     msg.extend_from_slice(&[0, 0, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0]);
@@ -411,7 +622,7 @@ fn skip_dns_name(msg: &[u8], mut pos: usize) -> Result<usize> {
     }
 }
 
-fn parse_dns_a_response(msg: &[u8]) -> Result<(Vec<IpAddr>, u64)> {
+pub(crate) fn parse_dns_a_response(msg: &[u8]) -> Result<(Vec<IpAddr>, u64)> {
     if msg.len() < 12 {
         bail!("DNS response too short");
     }
@@ -463,15 +674,49 @@ fn parse_dns_a_response(msg: &[u8]) -> Result<(Vec<IpAddr>, u64)> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CachedDns, DOH_CACHE, DohFraming, HttpCancel, cache_insert, encode_dns_a_query,
-        fallback_enabled, parse_dns_a_response, parse_doh_framing, query_servers,
-        resolve_a_records, set_fallback_enabled, should_bypass_fake_ip, use_fallback,
+        CachedDns, DEFAULT_DOH_RESOLVERS, DOH_CACHE, DOH_ENDPOINTS, DohFraming, FALLBACK_ENABLED,
+        FALLBACK_NOTICE, HttpCancel, active_resolvers, cache_insert, default_endpoints,
+        encode_dns_a_query, fallback_enabled, normalize_doh_resolver, parse_dns_a_response,
+        parse_doh_framing, parse_doh_response_bytes, query_servers, resolve_a_records,
+        resolve_a_records_with, set_fallback_enabled, set_resolvers, should_bypass_fake_ip,
+        use_fallback,
     };
     use anyhow::anyhow;
     use std::collections::BTreeMap;
     use std::net::{IpAddr, Ipv4Addr};
-    use std::sync::Mutex;
+    use std::sync::atomic::Ordering;
+    use std::sync::{Mutex, MutexGuard, PoisonError};
     use std::time::{Duration, Instant};
+
+    static TEST_STATE_LOCK: Mutex<()> = Mutex::new(());
+
+    struct DohStateGuard(#[allow(dead_code)] MutexGuard<'static, ()>);
+
+    impl DohStateGuard {
+        fn lock() -> Self {
+            let guard = TEST_STATE_LOCK
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            Self::reset();
+            Self(guard)
+        }
+
+        fn reset() {
+            FALLBACK_ENABLED.store(false, Ordering::Release);
+            FALLBACK_NOTICE.store(false, Ordering::Release);
+            *DOH_ENDPOINTS.lock().unwrap_or_else(PoisonError::into_inner) = None;
+            DOH_CACHE
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clear();
+        }
+    }
+
+    impl Drop for DohStateGuard {
+        fn drop(&mut self) {
+            Self::reset();
+        }
+    }
 
     #[test]
     fn detects_fake_ip_without_affecting_local_or_public_records() {
@@ -501,32 +746,98 @@ mod tests {
     }
 
     #[test]
-    fn opt_out_keeps_fake_ip_answers_off_public_resolvers() {
+    fn defaults_off_and_mid_flight_disable_aborts_without_caching() {
+        let _guard = DohStateGuard::lock();
         let fake: [IpAddr; 1] = ["198.18.1.82".parse().unwrap()];
         let real: [IpAddr; 1] = ["14.17.92.73".parse().unwrap()];
-        assert!(fallback_enabled(), "the fallback defaults to on");
+        assert!(!fallback_enabled(), "DoH fallback defaults to off");
+        assert!(!use_fallback("passport.bilibili.com", &fake));
+
+        set_fallback_enabled(true);
         assert!(use_fallback("passport.bilibili.com", &fake));
         assert!(!use_fallback("passport.bilibili.com", &real));
-        DOH_CACHE.lock().unwrap_or_else(|e| e.into_inner()).insert(
-            "cached.example".into(),
-            CachedDns {
-                ips: real.to_vec(),
-                expires: Instant::now() + Duration::from_secs(60),
-            },
-        );
+        DOH_CACHE
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(
+                "cached.example".into(),
+                CachedDns {
+                    ips: real.to_vec(),
+                    expires: Instant::now() + Duration::from_secs(60),
+                },
+            );
 
         set_fallback_enabled(false);
         assert!(!use_fallback("passport.bilibili.com", &fake));
         assert!(
             !DOH_CACHE
                 .lock()
-                .unwrap_or_else(|e| e.into_inner())
+                .unwrap_or_else(PoisonError::into_inner)
                 .contains_key("cached.example"),
-            "opting out must not keep serving earlier public answers"
+            "opting out must drop cached public answers"
         );
 
+        // Mid-flight TOCTOU: disabling fallback while query_fn is in flight must neither cache nor return IPs.
         set_fallback_enabled(true);
-        assert!(use_fallback("passport.bilibili.com", &fake));
+        let err = resolve_a_records_with(
+            "midflight.example",
+            &HttpCancel::default(),
+            || Instant::now() + Duration::from_secs(5),
+            |_ep, _param, _cancel, _dl| {
+                set_fallback_enabled(false);
+                Ok((real.to_vec(), 60))
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("disabled"), "{err}");
+        assert!(
+            !DOH_CACHE
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .contains_key("midflight.example")
+        );
+    }
+
+    #[test]
+    fn configurable_resolvers_accept_public_numeric_endpoints_and_reject_non_public() {
+        let _guard = DohStateGuard::lock();
+        assert_eq!(active_resolvers(), DEFAULT_DOH_RESOLVERS);
+
+        assert_eq!(
+            normalize_doh_resolver(" https://1.1.1.1/dns-query "),
+            Some("1.1.1.1".into())
+        );
+        assert_eq!(
+            normalize_doh_resolver("https://[2606:4700:4700::1111]:8443/custom"),
+            Some("https://[2606:4700:4700::1111]:8443/custom".into())
+        );
+        for bad in [
+            "",
+            "dns.alidns.com",
+            "https://dns.google/dns-query",
+            "http://1.1.1.1/dns-query",
+            "127.0.0.1",
+            "192.168.1.1",
+            "10.0.0.1",
+            "198.18.0.2",
+            "2001:2::1",
+            "https://1.1.1.1/dns-query?extra=1",
+        ] {
+            assert_eq!(normalize_doh_resolver(bad), None, "must reject {bad}");
+        }
+
+        set_resolvers(&[
+            "8.8.8.8".into(),
+            "https://9.9.9.9:8443/dns-query".into(),
+            "8.8.8.8".into(),
+        ])
+        .unwrap();
+        assert_eq!(
+            active_resolvers(),
+            vec!["8.8.8.8", "https://9.9.9.9:8443/dns-query"]
+        );
+        assert!(set_resolvers(&[]).is_err());
+        assert!(set_resolvers(&["198.18.0.1".into()]).is_err());
     }
 
     #[test]
@@ -535,27 +846,36 @@ mod tests {
         assert_eq!(&q[..12], &[0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0]);
 
         let mut resp = Vec::new();
-        // Header: QR=1, RD=1, RA=1, NOERROR, QD=1, AN=2
         resp.extend_from_slice(&[0, 0, 0x81, 0x80, 0, 1, 0, 2, 0, 0, 0, 0]);
         resp.extend_from_slice(&q[12..]);
-        // Answer 1: CNAME pointer 0xC00C -> "cdn.example"
         resp.extend_from_slice(&[
             0xC0, 0x0C, 0, 5, 0, 1, 0, 0, 1, 44, 0, 5, 3, b'c', b'd', b'n', 0,
         ]);
-        // Answer 2: A pointer 0xC00C -> 14.17.92.73, TTL=45
         resp.extend_from_slice(&[0xC0, 0x0C, 0, 1, 0, 1, 0, 0, 0, 45, 0, 4, 14, 17, 92, 73]);
 
         let (ips, ttl) = parse_dns_a_response(&resp).unwrap();
         assert_eq!(ips, vec![IpAddr::V4(Ipv4Addr::new(14, 17, 92, 73))]);
         assert_eq!(ttl, 45);
+
+        let mut http_doh = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/dns-message\r\nContent-Length: {}\r\n\r\n",
+            resp.len()
+        )
+        .into_bytes();
+        http_doh.extend_from_slice(&resp);
+        assert_eq!(
+            parse_doh_response_bytes(&http_doh).unwrap(),
+            (vec![IpAddr::V4(Ipv4Addr::new(14, 17, 92, 73))], 45)
+        );
     }
 
     #[test]
     fn doh_cache_evicts_earliest_expiry_and_headers_reject_duplicates() {
+        let _guard = DohStateGuard::lock();
+        set_fallback_enabled(true);
         let now = Instant::now();
         let ip = vec![IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4))];
         let mut cache: BTreeMap<String, CachedDns> = BTreeMap::new();
-        // "a.example" expires later than "z.example"; inserting a 3rd entry at cap=2 must evict "z.example".
         cache_insert(
             &mut cache,
             "a.example".into(),
@@ -594,7 +914,6 @@ mod tests {
             DohFraming::Chunked
         );
         assert_eq!(parse_doh_framing(&[]).unwrap(), DohFraming::CloseDelimited);
-        // Reject duplicate Content-Length (even identical), conflicting TE+CL, non-decimal, or gzip.
         assert!(
             parse_doh_framing(&[h("Content-Length", b"42"), h("Content-Length", b"42")]).is_err()
         );
@@ -612,7 +931,6 @@ mod tests {
         assert!(parse_doh_framing(&[h("Content-Length", b"+42")]).is_err());
         assert!(parse_doh_framing(&[h("Content-Encoding", b"gzip")]).is_err());
 
-        // Pre-cancelled caller aborts immediately without probing network servers.
         let cancel = HttpCancel::default();
         cancel.cancel();
         assert!(
@@ -620,17 +938,17 @@ mod tests {
                 .is_err()
         );
 
-        // Dynamic deadline extension from a joining waiter rescues an expiring DoH round.
         let shared_deadline = Mutex::new(Instant::now() + Duration::from_millis(50));
         let mut attempts = 0usize;
         let active_cancel = HttpCancel::default();
+        let servers = default_endpoints();
         let rescued = query_servers(
+            &servers,
             &active_cancel,
             || *shared_deadline.lock().unwrap(),
-            |_ip, deadline_fn| {
+            |_ep, deadline_fn| {
                 attempts += 1;
                 if attempts == 1 {
-                    // Simulate a second waiter extending the shared deadline while attempt #1 fails.
                     *shared_deadline.lock().unwrap() = Instant::now() + Duration::from_secs(5);
                     Err(anyhow!("initial short deadline expired"))
                 } else {

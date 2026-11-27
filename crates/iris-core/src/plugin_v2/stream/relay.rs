@@ -5,6 +5,7 @@ use super::{
     session::{Access, StreamSession},
 };
 use crate::{
+    concurrency::{ThreadRole, budget, spawn_thread},
     logging,
     loopback_http::{
         ClientHub, ClientWatch, HttpMethod, HttpRequestError, parse_http_request, read_request,
@@ -72,15 +73,13 @@ impl BoundRelay {
             wake,
         });
         let server = service.clone();
-        std::thread::Builder::new()
-            .name("iris-v2-relay".into())
-            .spawn(move || {
-                let _registration = registration;
-                serve_listener(&mut self, &server);
-                server.session.cancel();
-                server.done.store(true, Ordering::Release);
-            })
-            .map_err(io)?;
+        spawn_thread(ThreadRole::PluginRelayListener, move || {
+            let _registration = registration;
+            serve_listener(&mut self, &server);
+            server.session.cancel();
+            server.done.store(true, Ordering::Release);
+        })
+        .map_err(io)?;
         Ok(Relay { service })
     }
 }
@@ -143,14 +142,22 @@ fn serve_listener(bound: &mut BoundRelay, service: &Arc<Service>) {
                             // start; it is dropped right after `spawn` so the worker's close
                             // still ends the connection.
                             let fallback = socket.try_clone();
-                            let spawned = std::thread::Builder::new().name("iris-v2-range".into()).spawn(move || {
+                            let spawned = spawn_thread(ThreadRole::PluginRelayWorker, move || {
                                 let service = worker.service.clone();
-                                let Ok(cancel) = service.session.cancellation().child() else { return; };
-                                let Ok(_socket) = cancel.register(&socket) else { return; };
+                                let Ok(cancel) = service.session.cancellation().child() else {
+                                    return;
+                                };
+                                let Ok(_socket) = cancel.register(&socket) else {
+                                    return;
+                                };
                                 let mut committed = false;
-                                if let Err(error) = serve(&service, &mut socket, &cancel, &mut committed) {
-                                    if matches!(error, ErrorCode::Cancelled | ErrorCode::RangeInvalid)
-                                        || (committed && error == ErrorCode::IoError)
+                                if let Err(error) =
+                                    serve(&service, &mut socket, &cancel, &mut committed)
+                                {
+                                    if matches!(
+                                        error,
+                                        ErrorCode::Cancelled | ErrorCode::RangeInvalid
+                                    ) || (committed && error == ErrorCode::IoError)
                                     {
                                         log::debug!(
                                             "plugin stream relay closed (committed={committed}): {error:?}"
@@ -247,7 +254,7 @@ fn reserve_worker(service: &Arc<Service>) -> Result<Worker, ErrorCode> {
     service
         .active
         .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
-            (n < 8).then_some(n + 1)
+            (n < budget::PLUGIN_RELAY_WORKERS_PER_RELAY).then_some(n + 1)
         })
         .map_err(|_| ErrorCode::Backpressure)?;
     Ok(Worker {

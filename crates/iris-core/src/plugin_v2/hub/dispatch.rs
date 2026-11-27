@@ -8,7 +8,6 @@ use iris_api::v2::{Capability, ErrorCode, Generation, HostCommand, HostEvent, Id
 use std::{
     collections::BTreeSet,
     sync::{Arc, atomic::Ordering},
-    time::Instant,
 };
 
 impl Worker {
@@ -237,7 +236,7 @@ impl Worker {
                     if review.review.is_some() {
                         self.review_slots.remove(&id);
                     }
-                    review.cancel.store(true, Ordering::Release);
+                    review.cancel.cancel();
                 }
             }
             Command::ConfirmOrigin {
@@ -304,7 +303,7 @@ impl Worker {
         if pending.window != window {
             return Err(ErrorCode::Denied);
         }
-        if pending.expires <= Instant::now() || !self.windows.contains_key(&window) {
+        if pending.expires.is_expired() || !self.windows.contains_key(&window) {
             return Err(ErrorCode::StaleHandle);
         }
         if pending.review.is_none() {

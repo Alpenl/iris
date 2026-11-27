@@ -1,4 +1,5 @@
 use super::*;
+use std::time::Instant;
 
 #[test]
 fn completed_reads_release_delivery_state_without_a_seek() {

@@ -5,11 +5,8 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-};
 
+use crate::concurrency::CancelToken;
 use crate::fs_util;
 use crate::media_uri::MediaUri;
 mod annotations;
@@ -47,16 +44,16 @@ struct RecordEdit {
 pub struct ProgressFlush {
     dir: PathBuf,
     edits: BTreeMap<String, RecordEdit>,
-    aborted: Arc<AtomicBool>,
+    cancel: CancelToken,
 }
 
 impl ProgressFlush {
     pub fn run(self) -> Option<BTreeMap<String, (f64, f64)>> {
-        if self.aborted.load(Ordering::Acquire) {
+        if self.cancel.is_cancelled() {
             return None;
         }
         let _lock = fs_util::lock_file(&self.dir.join("records.lock")).ok()?;
-        if self.aborted.load(Ordering::Acquire) {
+        if self.cancel.is_cancelled() {
             return None;
         }
         let path = self.dir.join("records.tsv");
@@ -122,7 +119,7 @@ pub struct Store {
     recent_titles: BTreeMap<String, String>,
     edits: BTreeMap<String, RecordEdit>,
     in_flight: BTreeMap<String, (f64, f64)>,
-    in_flight_abort: Option<Arc<AtomicBool>>,
+    in_flight_abort: Option<CancelToken>,
     recent_pushes: Vec<(MediaUri, Option<String>)>,
     recent_title_updates: BTreeMap<String, (String, bool)>,
     clear_all_progress: bool,
@@ -257,7 +254,7 @@ impl Store {
 
     fn abort_in_flight_flush(&mut self) {
         if let Some(abort) = self.in_flight_abort.take() {
-            abort.store(true, Ordering::Release);
+            abort.cancel();
         }
     }
 
@@ -297,12 +294,12 @@ impl Store {
                 self.in_flight.insert(k.clone(), prog);
             }
         }
-        let aborted = Arc::new(AtomicBool::new(false));
-        self.in_flight_abort = Some(aborted.clone());
+        let cancel = CancelToken::new();
+        self.in_flight_abort = Some(cancel.clone());
         Some(ProgressFlush {
             dir,
             edits: self.edits.clone(),
-            aborted,
+            cancel,
         })
     }
 

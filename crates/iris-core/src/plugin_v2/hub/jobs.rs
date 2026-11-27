@@ -2,20 +2,20 @@ use super::{
     Binding, Notice, PluginStatus, ReviewSummary,
     worker::{PendingReview, Plugin, Worker},
 };
-use crate::plugin_v2::{
-    installation::{Installed, Review},
-    ledger::{Reservation, Resource},
-    runtime::{Control, PreparedWindow, Setup},
+use crate::{
+    concurrency::{CancelToken, Deadline},
+    plugin_v2::{
+        installation::{Installed, Review},
+        ledger::{Reservation, Resource},
+        runtime::{Control, PreparedWindow, Setup},
+    },
 };
 use iris_api::v2::{ErrorCode, Generation, Id};
 use std::{
     collections::BTreeSet,
     path::PathBuf,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
-    time::{Duration, Instant},
+    sync::{Arc, atomic::AtomicBool},
+    time::Duration,
 };
 
 pub(super) struct Completed {
@@ -114,7 +114,7 @@ impl Worker {
         let Ok(ticket) = super::super::instance::next_id().map(Id) else {
             return;
         };
-        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel = CancelToken::new();
         let job_cancel = cancel.clone();
         let installer = self.config.installer.clone();
         let setup = self.config.runtime.clone();
@@ -481,8 +481,8 @@ impl Worker {
                     id,
                     PendingReview {
                         window,
-                        cancel: Arc::new(AtomicBool::new(false)),
-                        expires: Instant::now() + Duration::from_secs(300),
+                        cancel: CancelToken::new(),
+                        expires: Deadline::after(Duration::from_secs(300)),
                         review: Some(review),
                     },
                 );
@@ -503,7 +503,7 @@ impl Worker {
         let (_, cancel) = state.loading.take().unwrap();
         match result {
             Ok(mut control) => {
-                if cancel.load(Ordering::Acquire)
+                if cancel.is_cancelled()
                     || !state.enabled
                     || self.windows.is_empty()
                     || state.record.as_ref().ok() != Some(control.installed())
@@ -537,7 +537,7 @@ impl Worker {
                 }
             }
             Err(error) => {
-                if cancel.load(Ordering::Acquire) {
+                if cancel.is_cancelled() {
                     state.restart = state.enabled;
                 } else {
                     state.status = PluginStatus::Failed(error);
@@ -554,7 +554,7 @@ impl Worker {
         if !self.windows.contains_key(&window) {
             return Err(ErrorCode::Cancelled);
         }
-        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel = CancelToken::new();
         let worker_cancel = cancel.clone();
         let installer = self.config.installer.clone();
         let resources = self.config.runtime.resources.clone();
@@ -568,7 +568,7 @@ impl Worker {
             PendingReview {
                 window,
                 cancel,
-                expires: Instant::now() + Duration::from_secs(300),
+                expires: Deadline::after(Duration::from_secs(300)),
                 review: None,
             },
         );

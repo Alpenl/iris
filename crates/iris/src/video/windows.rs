@@ -94,9 +94,9 @@ impl VideoSurface {
         let (reset_tx, reset_rx) = unbounded();
         let shared = layout.clone();
         let callback_wake = wake.clone();
-        let worker = std::thread::Builder::new()
-            .name("iris-video".into())
-            .spawn(move || {
+        let worker = iris_core::concurrency::spawn_thread(
+            iris_core::concurrency::ThreadRole::VideoSurface,
+            move || {
                 // COM and every D3D/render resource remain on this thread.
                 let initialized = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }.is_ok();
                 let raw_hwnd = HWND(hwnd as *mut _);
@@ -257,7 +257,8 @@ impl VideoSurface {
                 if initialized {
                     unsafe { CoUninitialize() };
                 }
-            })?;
+            },
+        )?;
         match ready_rx
             .recv()
             .context("video initialization thread ended")?

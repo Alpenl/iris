@@ -5,6 +5,7 @@ use super::{
     ledger::{Ledger, Reservation, Resource},
 };
 use crate::bounded_json::{decode, decode_exact};
+use crate::concurrency::{CancelToken, Deadline, WaitError};
 use crate::vfs::HttpCancel;
 use iris_api::v2::{
     CHUNK_LIMIT, COMMAND_LIMIT, Capability, ErrorCode, HostCommand, Id, MESSAGE_LIMIT, Reply, Role,
@@ -14,7 +15,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -76,9 +77,9 @@ pub(crate) struct State {
     pub blobs: BTreeMap<u64, Arc<Blob>>,
     pub blob_handles: BTreeMap<u64, Reservation>,
     pub services: Option<Bridge>,
-    pub cancel: Arc<AtomicBool>,
+    pub cancel: CancelToken,
     pub started: Instant,
-    pub deadline: Instant,
+    pub deadline: Deadline,
     pub ready: bool,
     limits: StoreLimits,
     _memory: Reservation,
@@ -86,12 +87,10 @@ pub(crate) struct State {
 
 impl State {
     pub fn check_live(&self) -> Result<(), ErrorCode> {
-        if self.cancel.load(Ordering::Acquire) {
-            Err(ErrorCode::Cancelled)
-        } else if Instant::now() >= self.deadline {
-            Err(ErrorCode::Timeout)
-        } else {
-            Ok(())
+        match self.cancel.check(Some(self.deadline)) {
+            Ok(_) => Ok(()),
+            Err(WaitError::Cancelled) => Err(ErrorCode::Cancelled),
+            Err(WaitError::TimedOut) => Err(ErrorCode::Timeout),
         }
     }
 }
@@ -103,7 +102,7 @@ pub struct InstanceConfig {
     pub owner: String,
     pub grants: BTreeSet<Capability>,
     pub ledger: Ledger,
-    pub cancel: Arc<AtomicBool>,
+    pub cancel: CancelToken,
 }
 
 pub struct Instance {
@@ -208,7 +207,7 @@ impl Instance {
             services,
             cancel,
             started: now,
-            deadline: now + Duration::from_secs(5),
+            deadline: Deadline::at(now + Duration::from_secs(5)),
             ready: false,
             limits: StoreLimitsBuilder::new()
                 .memory_size(memory_limit as usize)
@@ -345,7 +344,7 @@ impl Instance {
             &self.store.data().owner,
             &[(Resource::HostBytes, (MESSAGE_LIMIT * 2) as u64)],
         )?;
-        self.store.data_mut().deadline = Instant::now() + budget;
+        self.store.data_mut().deadline = Deadline::after(budget);
         self.store.data().check_live()?;
         self.store.set_epoch_deadline(1);
         let _execution = self.engine.execution()?;

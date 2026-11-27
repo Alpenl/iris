@@ -17,15 +17,17 @@ crates/
 1. `iris-core` 不依赖 GPUI、`iris-plugin-sdk` 或原生窗口/图像库；
 2. `iris-api` 常规依赖仅限 `serde`（不依赖 GPUI 或 `iris-mpv`）；
 3. `crates/iris/src/` 除 `video/` 外递归禁止出现 `iris_mpv` 或原始 mpv 调用，且 `crates/iris/src/` 与 `crates/iris-core/src/` 全量非测试代码禁止 `use super::*;`；
-4. `crates/iris-core/src/` 中 17 个核心域模块（含其单元测试）禁止反向依赖 `plugin_v2` 或 `iris_api`；
-5. `devtools` 控制管道门禁未被默认特性或普通发布版绕过；
-6. 全仓 `.rs` 模块行数预算（超过 650 行生产代码提示，生产代码上限 850 行、总行数上限 1,000 行），以及图标、官方嵌入插件摘要与示例插件清单一致性。
+4. `crates/iris-core/src/` 中 18 个核心域模块（含其单元测试）禁止反向依赖 `plugin_v2` 或 `iris_api`；
+5. 全仓生产代码禁止直接调用 `std::thread::spawn` 或未登记的 `std::thread::Builder`，所有 OS 线程必须通过 `iris_core::concurrency::{spawn_thread, spawn_thread_named}` 按 `ThreadRole` 登记，且每个角色的线程名必须记录在本文第 6 节；
+6. `devtools` 控制管道门禁未被默认特性或普通发布版绕过；
+7. 全仓 `.rs` 模块行数预算（超过 650 行生产代码提示，生产代码上限 850 行、总行数上限 1,000 行），以及图标、官方嵌入插件摘要与示例插件清单一致性。
 
 ### 核心模块职责
 
 - `crates/iris-mpv/src/{lib,render,sys}.rs`：手写 C 声明（`sys` 与 `Mpv::raw` 均为 `pub(crate)`）与安全薄封装。短属性名通过栈缓冲避免热路径堆分配。`Mpv::loadfile_with_options` 使用结构化节点传递单文件选项，包括同源字幕，不拼接 mpv 命令字符串。渲染层仅暴露 OpenGL 与 D3D11 共用的 `RenderHandle`。
 - `crates/iris-mpv/build.rs`：优先使用 `MPV_LIB_DIR`。Windows x64 MSVC 开发构建回退到工作区 `target/deps/mpv/mpv.lib`；macOS 按目标架构查找对应 Homebrew 目录。始终动态链接。
 - `crates/iris-api/src/v2/`：protocol/ABI 2 的 manifest、source（含通用 `badge`）、stream（`DirectHttp` / `RandomAccess` / `VirtualHls`）、task、wire（含 `HostCommand::Log`）、enhance 与密码学契约；公共 `Widget`（含 `PixelGrid`）、`ViewTimer`、`OverlayNode`、`UiThemeSpec` 位于 crate 根，常规依赖仅 serde，零中文 UI 文案。
+- `crates/iris-core/src/concurrency.rs`：全仓统一的取消令牌 `CancelToken`（无锁原子轮询快路径 + 嵌套子令牌与跨对象 `link` + TCP `shutdown(Both)` / `mio::Waker` / `Condvar` 唤醒回调）、单调截止时间 `Deadline` 与受管 OS 线程注册表（`ThreadRole`、`budget`、`spawn_thread` / `spawn_thread_named`，见第 6 节）。
 - `crates/iris-core/src/loopback_http.rs`：共用本地回环 HTTP 监听、Range 响应与自适应清单探测原语，由原生播放转发器与插件流中继统一复用。
 - `crates/iris-core/src/player/`：`Session` 持有播放状态、结构化 `MediaSourceState` / `PluginEnhancements` / `VisualTransform` 状态块、规范化 `MediaUri` 及语义化 `PlayerActionError`。`relay.rs` 为所有 HTTP(S) 播放提供会话级转发和取消，按源发送凭据。`player::scoped` 通过 trait `ScopedStream` 与 `MonitorLutFilter` 与 `plugin_v2` 彻底解耦。
 - `crates/iris-core/src/{media_uri,catalog,store,vault,preset}.rs`：
@@ -34,7 +36,7 @@ crates/
   - `store.rs`：以稳定媒体身份保存收藏、续播和最近记录。写入时取得文件锁，重读磁盘、合并修改字段并原子替换。写入失败保留待保存变更，旧记录在迁移成功后退役。
   - `vault.rs`：系统安全凭据库 `CredentialVault`（macOS Keychain / Windows Credential Manager，单条上限 2048B，失败显式报错）。v2 插件按安装身份 `plugin-v2.<installation_id>` 隔离（兼容读取迁移期 `builtin.<id>` 与 `ext.<id>`），Windows 下采用 `app.iris.vault.v2:` 小写十六进制编码目标名以消除大小写不敏感碰撞并保护作用域/键名边界。`credential_index.json` 只保存作用域与键名，测试可用 `in_memory()`。
   - `preset.rs` + `preset/runtime.rs`：`1B+` 稀疏工作区预设（`Option<T>` 补丁 + 显式插件启停差量与退出指令），`settings.conf` 始终只存纯净个人基线，运行期通过内存 `PresetRevert` 自动回正（全局字号 `ui_font_scale` 属个人偏好不进预设）。
-- `crates/iris-core/src/plugin_v2/`：有界 Wasmtime 运行时、安装/能力授权、网络、三模流（`DirectHttp` / `RandomAccess` / `VirtualHls`）、轻量文件产物与哈希（`FileExecutor`）、媒体增强与共享 Hub；`iris-plugin-sdk` 和两个官方插件 crate 是同一套公开 Guest 入口。
+- `crates/iris-core/src/plugin_v2/`：有界 Wasmtime 运行时（Pulley64 字节码解释器）、安装/能力授权、网络、三模流（`DirectHttp` / `RandomAccess` / `VirtualHls`）、轻量文件产物与哈希（`FileExecutor`）、媒体增强与共享 Hub；`iris-plugin-sdk` 和两个官方插件 crate 是同一套公开 Guest 入口。
 - `crates/iris-core/src/photo/{mod,containers,heif,exif,icc}.rs`：魔数优先单遍照片头解析（JPEG/PNG/WebP/HEIF/TIFF 尺寸、方向、EXIF 摘要与内嵌 ICC 原色匹配）。
 - `crates/iris-core/src/{keymap/,vfs/,logging/,input,geometry,library,settings,fs_util}.rs`：三方案键位目录与结构化 `ConflictTarget`、常驻位置书签与有界 HTTP 客户端、单一集中脱敏日志与结构化事件流（`iris.log` + `events.jsonl`）、指针手势策略、几何变换与慢速共享盘优化扫描。
 - `crates/iris/src/theme.rs` + `ui/`：GPUI `Global` `ThemeTokens` 引擎（方向 C 默认 + 扁平 `text_xs/sm/md/lg` / `control_h_sm/md` / `danger` / `ui_font_scale` `0.85..=1.35` 字号缩放与防裁切下限 + 插件圆角/栏高安全 clamp 与最低对比度兜底）；`#root` 采用统一 5 层 Z-Order 渲染栈与唯一 `Esc` 逐层退出管线：
@@ -42,9 +44,9 @@ crates/
   - `ui/strings/{mod,actions,presets,errors,chrome}.rs`：按领域归集的共享枚举、菜单、错误、预设与通用操作中文文案表，彻底剥离 `iris-core` 与 `iris-api` 中的硬编码中文 UI 文本（其余视图局部文案保留在各 UI 模块内）。
   - `ui/{mod,events,vfs_ctrl,plugin_ctrl,preset_ctrl,chrome,actions*,viewport*,titlebar,info,palette,context_menu,dialogs,debug_cmd}.rs`：核心窗口装配、`hide_titlebar` 三重安全护栏、3 秒两步内联危险操作确认、异步远程源拉取与命令面板。
   - `ui/{sidebar,controls,popover,plugin_ui,settings}/`：四模式统一侧栏（零硬编码插件特判，统一读取 `SourceDescriptor.badge` / `icon`）、响应式底栏与 60fps 时间轴、锚定浮层、插件声明式控件（含正交 `Widget::PixelGrid` + `ViewTimer`）/非破坏性校验弹窗/视口叠层，以及 7 标签设置中心。
-- `crates/iris/src/instance.rs`：Windows 单实例，见第 8 节。macOS 由系统把打开请求发给已运行进程，经 GPUI `on_open_urls` 进来，只接受 `file://`。
+- `crates/iris/src/instance.rs`：Windows 单实例，见第 9 节。macOS 由系统把打开请求发给已运行进程，经 GPUI `on_open_urls` 进来，只接受 `file://`。
 - `crates/iris/src/platform/{mod.rs,macos/{mod,imageio}.rs,windows.rs}`：按 OS 拆分的原生系统桥接——自实现窗口拖动（GPUI 0.2.2 `start_window_move()` 在 macOS/Windows 上为空函数）、窗口置顶（macOS `NSFloatingWindowLevel` / Win32 `SetWindowPos`）、播放期防休眠 `SleepPreventer`（macOS `IOKit` / Win32 `SetThreadExecutionState`）、macOS 触控板双指捏合 `PinchMonitor`（持有 `NSView` 强引用避免 UAF）、macOS 媒体键与控制中心桥接 `MediaKeyBridge`（`MediaPlayer.framework`，同步真实倍速与清空状态）、默认截图目录，以及照片内存缩略图解码 `decode_thumbnail`（macOS `ImageIO` 原生 sRGB 缩放并反预乘为直通 BGRA、Windows 原生 WIC 缩放 + EXIF 方向校正，跨平台 `image` crate 带内存/尺寸上限回退）。
-- `crates/iris/src/debug.rs`：调试控制管道（`IRIS_CONTROL`），见第 7 节。
+- `crates/iris/src/debug.rs`：调试控制管道（`IRIS_CONTROL`），见第 8 节。
 
 ## 2. macOS 视频合成（已验证）
 
@@ -134,7 +136,37 @@ DirectHttp、RandomAccess、VirtualManifest 共用受控播放准入。远端及
 
 主题、侧栏、弹窗（含正交 `Widget::PixelGrid` 与 `ViewTimer`）、时间轴、叠层使用受限声明式数据，插件可通过 `HostCommand::Log` 写入经宿主 20 条/秒限流与脱敏的结构化事件流；标记写应用数据库。零调用方的外部原生工具（BYOB）与文件导出模块已在 `0.0.2` 裁剪，当前仅保留受控私有产物读写与 `HashCurrentMedia`。详细权限/ABI/生命周期/配额见 [插件规范](PLUGIN_V2_ARCHITECTURE.md)，开发入口见 [插件指南](PLUGINS.md)，验证范围见 [实施证据](PLUGIN_V2_IMPLEMENTATION.md)。
 
-## 6. 依赖
+## 6. 并发模型、线程清单与预算
+
+所有生产环境的 OS 线程均在 `crates/iris-core/src/concurrency.rs` 中由 `ThreadRole` 集中登记，并通过 `spawn_thread` / `spawn_thread_named` 创建。`scripts/check-project.py` 在静态检查阶段禁止 `concurrency.rs` 以外的生产代码直接调用 `std::thread::spawn` 或 `std::thread::Builder`，并校验下表完整覆盖全部 18 类受管线程：
+
+| `ThreadRole` | 线程名 / 前缀 | 局部上限 | 全局上限 | 超限与背压策略 | 生命周期与回收所有权 |
+|---|---|---|---|---|---|
+| `ControlPipe` | `iris-control` | 1 | 1 | `WouldBlock` 拒绝重复监听 | 仅 debug / `devtools` 启动；进程退出结束 |
+| `SingleInstanceIpc` | `iris-open-files` | 1 | 1 | `WouldBlock` 拒绝重复监听 | Windows 主实例持有管道服务端，进程退出结束 |
+| `VideoSurface` | `iris-video` | 1 / 视口 | 视口数 | 每视口单实例构造 | 视口关闭时先释放 render context 并同步 `join` |
+| `MpvEventPump` | `iris-mpv-events` | 1 / `Session` | `Session` 数 | 每会话单实例构造 | `EventPump::stop` 发送 `quit` / `CancelToken` 并同步 `join` |
+| `MediaRelayListener` | `iris-media-relay` | 1 / `Service` | 8 | `WouldBlock` 快速失败 | `Service::drop` 触发 `CancelToken` + `mio::Waker`，`iris-relay-reap` 回收 |
+| `MediaRelayReaper` | `iris-relay-reap` | 1 / `Service::drop` | 8 | 超限时回退同步 `join` | 短生命周期回收线程，负责非阻塞释放监听与在途请求线程 |
+| `MediaRelayWorker` | `iris-media-request` | 8 / 中继 | 32 | 超限或起线程失败立即回 `503 Busy` | `CancelToken` 触发 `TcpStream::shutdown(Both)`，由 `MediaRelayReaper` `join` |
+| `SystemDnsWorker` | `iris-http-dns` | 16 并发查询 | 64 | `ACTIVE_DNS_LOOKUPS` 超限拒绝新建 | 受 `Deadline` 约束，解析完成后自动退出并归还信号量 |
+| `WasmEpochTimer` | `iris-wasm-epoch` | 1 / `RuntimeEngine` | `Engine` 数 | 起线程失败回滚活跃计数并返回 `Internal` | 无活跃 Guest 调用时 `Condvar` 挂起，`Engine` 析构时唤醒退出 |
+| `ArtifactCleanup` | `iris-artifact-cleanup` | 1 | 1 | `WouldBlock` 跳过重复后台清理 | 启动期一次性扫描清理残留临时目录后立即退出 |
+| `PluginCoordinator` | `iris-plugin-coordinator` | 1 / `Hub` | `Hub` 数 | 起线程失败 `Hub::new` 返回 `Internal` | 最后一个 `Hub` 连接释放后置 `shutdown`，待在途作业与退役实例归零后退出 |
+| `PluginStoreActor` | `iris-v2-` (`Control` / `Stream`) | Control 1/插件、Stream 2/插件 | Control 64、Stream 8 | `Ledger` 预留失败返回 `QuotaExceeded` | `Actor::stop` 触发 `CancelToken` 与唤醒，`is_quiescent` 确认 `done && outstanding == 0` |
+| `PluginPoolWorker` | `iris-v2-` (`{control,stream,package,setup}-io-{id}`) | 按宿主分片公平轮转 | 4 + 8 + 2 + 2 = 16 | 队列满返回 `Backpressure`；空闲 30s 自动缩容 | 按需懒启动，`Dispatcher::drop` 唤醒全部工作线程退出 |
+| `PluginAuthCallback` | `iris-v2-auth` | 1 / 插件 | 4 | `Ledger` `Resource::Auth` 超限拒绝 | 单次 OAuth 回调或 `Deadline` 到期/`CancelToken` 取消后退出，`Activity` 追踪归零 |
+| `PluginOriginDns` | `iris-origin-dns` | 6 / 插件 | 16 | `Ledger` `Resource::Dns` 超限拒绝 | 10s `Deadline` 与 `CancelToken` 双重约束，持槽至底层解析返回后释放 |
+| `PluginSocketPump` | `iris-v2-socket` | 每类 4 / 插件 | 每类 16（WS + TCP 共 32） | `Ledger` 超限拒绝；读写槽单路互斥 | `Socket::close` / `NetworkGrant` 吊销触发 `CancelToken` + `mio::Waker`，`Activity` 归零 |
+| `PluginRelayListener` | `iris-v2-relay` | 4 / 插件 | 12 | `Ledger` `Resource::Relay` 超限拒绝 | `Relay::stop` 取消会话并唤醒 `mio::Poll`，`Relay::is_quiescent` 确认强引用归零 |
+| `PluginRelayWorker` | `iris-v2-range` | 8 / 中继 | 32 | 超限或起线程失败立即回 `503 Busy` | 子 `CancelToken` 绑定回环 `TcpStream`，Range 结束或取消后递减活跃计数退出 |
+
+### 统一取消与截止时间原语
+
+- **`CancelToken`**：内部采用 `AtomicBool`（`Acquire` 无锁轮询快路径，供 Wasm 宿主导入门禁、事件泵与紧循环零锁检查）配合受互斥锁保护的唤醒表（已注册 `TcpStream` 的 `shutdown(Shutdown::Both)`、`mio::Waker`、`Condvar` 唤醒回调及弱引用子令牌树 `child()` / `link()`）。取消动作在锁外触发回调与级联子令牌，消除锁反转风险；`vfs::HttpCancel` 即 `CancelToken` 的类型别名。
+- **`Deadline`**：基于单调时钟 `Instant` 的统一截止时间封装，提供 `remaining()` / `remaining_capped(limit)` 与 `CancelToken::check(deadline)` / `remaining_timeout(deadline, limit)`，统一驱动 HTTP 连接/读写、DoH 回退、OAuth 回环监听、Origin DNS 审查、WebSocket/TCP 泵、串行存储票据与 Wasm Guest 执行超时判定。
+
+## 7. 依赖
 
 | 依赖 | 用途 | 规则 |
 |---|---|---|
@@ -149,14 +181,14 @@ DirectHttp、RandomAccess、VirtualManifest 共用受控播放准入。远端及
 
 `deny.toml` 约束 RustSec 公告、许可证、依赖选型和来源。C 媒体库配方另外检查锁定源码的 HTTPS 来源、摘要和 SPDX 许可。
 
-## 7. 调试控制管道
+## 8. 调试控制管道
 
 `crates/iris/src/debug.rs`：debug 或显式 `--features devtools` 构建中，`IRIS_CONTROL` 指向本地流端点（macOS Unix socket、Windows `\\.\pipe\iris-...`）。逐行读取 `key`、`move`、`click`、`snap`、`resize`、`open`、`filter`、`state`、`ui`、`get`、`mpv`、`sim_device_reset`、`quit`。客户端为 `scripts/control-client.py`；回复保留在 stderr，运行日志另外走 `log`。
 
 - 合成鼠标事件必须在 GPUI update 之外发出：macOS 发送 NSEvent，Windows 发送原生窗口消息，均经 GPUI 正常命中测试。
 - `snap`：macOS 用 `CGWindowListCreateImage`；Windows 捕获窗口占据的可见桌面区域，不能用于被遮挡窗口的自动像素对比。
 
-## 8. 安全边界
+## 9. 安全边界
 
 - 外部文件路径和网络地址以数据参数传给 mpv。插件只能发送预定义的 `HostCommand`，由宿主校验权限。`RenderHandle` 限制 UI 能调用的渲染接口。
 - **插件边界**：包、Guest 输出和网络输入均校验；凭据按安装身份分桶，网络和文件能力逐请求检查，取消中资源持续计账，插件日志经宿主限流与统一脱敏。
@@ -165,7 +197,7 @@ DirectHttp、RandomAccess、VirtualManifest 共用受控播放准入。远端及
 - Windows 用 `Local\Iris.Player.Batch.<用户 SID>` 互斥量识别当前登录会话的播放器。后启动的进程通过同用户双向管道 `\\.\pipe\iris-open-batch-v2-<会话号>-<用户 SID>` 发送绝对路径并授予前台窗口权限。消息使用有界 UTF-16LE 路径批次，两端核对会话号，主窗口接收后确认。连接、读写或确认超时后，后启动的进程以失败状态退出。`IRIS_SETTINGS` 实例独立运行。
 - 命令行参数、Finder 的本地文件 URL、文件选择器和视口拖放都把一次选择交给 `open_paths`。单个媒体沿用同目录浏览。多个媒体按选择顺序排队，所选目录在队列中展开一层，同一文件保留首次出现的位置。混选的外挂字幕等待本次媒体加载后依次挂载，单独选中的字幕挂载到正在播放或正在打开的音视频。切换媒体会使上一批待挂载字幕失效。
 
-## 9. 规划目录树与实际代码
+## 10. 规划目录树与实际代码
 
 2026-11-20 规划讨论稿提出分层结构并展望插件扩展；经过 MVP 验证、核心体验完善与控制面插件系统落地后，实际结构与规划对照如下：
 
