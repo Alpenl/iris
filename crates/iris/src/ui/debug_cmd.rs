@@ -5,7 +5,8 @@ use std::path::Path;
 use gpui::{Context, Window, px, size};
 use iris_core::catalog::MediaFilter;
 
-use super::IrisWindow;
+use super::AppModel;
+use super::views::DirtyRegions;
 use crate::platform;
 
 pub(super) fn parse_mouse_command(line: &str) -> Option<(&str, f32, f32)> {
@@ -17,7 +18,7 @@ pub(super) fn parse_mouse_command(line: &str) -> Option<(&str, f32, f32)> {
     Some((cmd, it.next()?, it.next()?))
 }
 
-impl IrisWindow {
+impl AppModel {
     pub(super) fn debug_command(
         &mut self,
         line: &str,
@@ -51,8 +52,17 @@ impl IrisWindow {
                     _ => MediaFilter::All,
                 };
                 self.rebuild_directory_rows();
+                self.scan_visible_favorites(cx);
                 eprintln!("[iris/control] filter {:?}", self.catalog.filter);
-                cx.notify();
+                self.notify_regions(
+                    DirtyRegions {
+                        sidebar: true,
+                        viewport: true,
+                        dock: true,
+                        ..DirtyRegions::NONE
+                    },
+                    cx,
+                );
             }
             "state" => {
                 let session = &self.active().session;
@@ -92,7 +102,7 @@ impl IrisWindow {
                     )),
                     self.catalog.filter,
                     fav,
-                    self.chrome.render_count,
+                    self.chrome.render_count.get(),
                     f32::from(vp_size.width),
                     f32::from(vp_size.height),
                 );

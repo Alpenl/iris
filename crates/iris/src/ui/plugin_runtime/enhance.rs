@@ -1,4 +1,4 @@
-use super::super::IrisWindow;
+use super::super::{AppModel, views::DirtyRegions};
 use gpui::Context;
 use iris_api::v2::{ErrorCode, Generation, HostCommand, HostEvent, Id};
 use iris_plugin_host::{
@@ -32,6 +32,7 @@ pub(super) struct EnhancementView {
     pub ledger: Option<iris_plugin_host::ledger::Ledger>,
     pub annotations: super::annotations::AnnotationView,
 }
+
 impl EnhancementView {
     fn cancel_lut(&mut self, owner: &str) -> bool {
         // A clear also supersedes preparation of a first LUT, or a replacement
@@ -48,6 +49,7 @@ impl EnhancementView {
         true
     }
 }
+
 pub(super) enum Effect {
     Track(Arc<Attachment>),
     Lut(Arc<MonitorLut>),
@@ -58,7 +60,8 @@ pub(super) enum Effect {
         Box<iris_plugin_host::ui::Event>,
     ),
 }
-impl IrisWindow {
+
+impl AppModel {
     pub(in crate::ui) fn apply_plugin_enhancement(
         &mut self,
         action: &Action,
@@ -83,6 +86,7 @@ impl IrisWindow {
             }
         }
     }
+
     fn apply_enhancement(
         &mut self,
         action: &Action,
@@ -119,6 +123,7 @@ impl IrisWindow {
                     .map_err(|_| ErrorCode::BadState)?;
                 self.plugin_view.enhance.timeline =
                     Some((owner, action.update.clone(), action.index));
+                self.notify_dock(cx);
             }
             HostCommand::SetMonitorLut {
                 media,
@@ -150,6 +155,7 @@ impl IrisWindow {
                         .set_monitor_lut(None)
                         .map_err(|_| ErrorCode::IoError)?;
                     self.plugin_view.enhance.lut_owner = None;
+                    self.notify_viewport(cx);
                 }
             }
             HostCommand::AttachSubtitle {
@@ -372,9 +378,9 @@ impl IrisWindow {
             // Source/Origin and declarative commands are consumed before this layer.
             _ => return Err(ErrorCode::BadState),
         }
-        cx.notify();
         Ok(())
     }
+
     fn check_overlay_media(&self, media: Id, generation: Generation) -> Result<(), ErrorCode> {
         if media != self.plugin_media_id()
             || generation != self.plugin_view.enhance.overlay_generation
@@ -383,6 +389,7 @@ impl IrisWindow {
         }
         Ok(())
     }
+
     fn check_enhancement_media(&self, media: Id, generation: Generation) -> Result<(), ErrorCode> {
         if media != self.plugin_media_id() || generation != self.plugins.generation() {
             return Err(ErrorCode::StaleHandle);
@@ -392,6 +399,7 @@ impl IrisWindow {
         }
         Ok(())
     }
+
     pub(super) fn ensure_overlay_bank(&mut self, access: &WindowAccess) -> Arc<Mutex<OverlayBank>> {
         let position = (self.active().session.state().time_pos.max(0.) * 1000.) as u64;
         self.plugin_view.enhance.ledger = Some(access.resources.ledger.clone());
@@ -408,6 +416,7 @@ impl IrisWindow {
             })
             .clone()
     }
+
     pub(super) fn enhancement_job(
         &mut self,
         action: &Action,
@@ -453,25 +462,35 @@ impl IrisWindow {
                         if let Err(error) = this.active_mut().session.attach_plugin_track(track) {
                             this.show_toast(format!("媒体轨道添加失败 · {error}"), cx);
                         }
+                        this.notify_dock(cx);
                     }
                     Ok(Effect::Lut(lut)) => {
                         match this.active_mut().session.set_monitor_lut(Some(lut)) {
                             Ok(()) => this.plugin_view.enhance.lut_owner = Some(key.0),
                             Err(error) => this.show_toast(format!("LUT 未应用 · {error}"), cx),
                         }
+                        this.notify_viewport(cx);
                     }
                     Ok(Effect::Stream) => {
-                        this.notify_stream_status(&binding.installed.plugin_id, None, cx)
+                        this.notify_stream_status(&binding.installed.plugin_id, None, cx);
                     }
                     Ok(Effect::Annotations(snapshot, event)) => {
                         if let Some(snapshot) = snapshot {
                             let _ = this.store.apply_annotation_snapshot(snapshot);
                         }
                         let report = this.plugins.send_to(&binding.installed.plugin_id, *event);
-                        this.apply_poll_report(report, None, cx);
+                        let regions =
+                            this.apply_poll_report(report, None, cx)
+                                .union(DirtyRegions {
+                                    viewport: true,
+                                    dock: true,
+                                    ..DirtyRegions::NONE
+                                });
+                        this.notify_regions(regions, cx);
                     }
                     Ok(Effect::Done) => {
                         this.plugin_view.enhance.wake = None;
+                        this.step_timed_overlay_frame(cx);
                     }
                     Err(error)
                         if matches!(
@@ -492,12 +511,12 @@ impl IrisWindow {
                         );
                     }
                 }
-                cx.notify();
             });
         })
         .detach();
         Ok(())
     }
+
     pub(in crate::ui) fn notify_stream_status(
         &mut self,
         plugin: &str,
@@ -516,7 +535,10 @@ impl IrisWindow {
                 context_version: generation.context,
             };
             let report = self.plugins.send_to(plugin, event);
-            self.apply_poll_report(report, None, cx);
+            let regions = self.apply_poll_report(report, None, cx);
+            if regions.any() {
+                self.notify_regions(regions, cx);
+            }
         }
     }
 }

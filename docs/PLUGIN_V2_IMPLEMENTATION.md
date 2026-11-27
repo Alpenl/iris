@@ -1,6 +1,6 @@
 # 插件 v2 实施证据
 
-当前源码已原子切换到 `PROTOCOL_VERSION = 2`，工作区与内嵌官方包版本已演进至 `0.0.2`（并于 `0.0.2` 完成极简收敛），未推送正式发行版。以下按依赖顺序保留历史检查点；其中“尚待”“协议仍为 1”描述各检查点当时状态，不代表最新状态。最新汇总位于文末。源码完成不代表 [架构验收矩阵](PLUGIN_V2_ARCHITECTURE.md#12-验收矩阵与证据) 的跨平台、真实服务和性能项目全部通过。
+当前源码已原子切换到 `PROTOCOL_VERSION = 2`，工作区与内嵌官方包版本已演进至 `0.0.2` 并合入默认分支 `main`，通过 GitHub Actions 多平台矩阵（Linux 官方包可复现构建、macOS ARM64、macOS Intel、Windows x64 与供应链策略门禁）；按仓库版本策略保持 `0.0.2`，未推送 `0.1.0` 正式发行版。以下按依赖顺序保留历史检查点；其中“尚待”“协议仍为 1”“未推送”描述各检查点当时状态，最新汇总位于文末。源码与 CI 矩阵完成不代表任意第三方公网服务或全设备物理显示帧率均已覆盖，文末保留明确的非声明边界。
 
 ## 2026-11-24：运行时与调度基础
 
@@ -219,3 +219,14 @@ URL 路由只选择解析器，不扩大网络权限。模式支持 `http/https/
 在原工作区重新运行完整 workspace 测试（269 通过、18 显式忽略、0 失败）、Clippy 全 targets/release/devtools（全部 `-D warnings`）、格式、工程门禁、future-incompat 白名单和 diff 检查，全部通过。依赖审查四类检查通过，打包脚本 12 通过/1 平台条件跳过。常规测试中的实际 mpv 夹具还覆盖独立音轨/字幕、0.2–0.6 秒 A-B 三次回环、NaN 边界拒绝、清除与资源回收；不据此承诺所有媒体逐帧回环精度。
 
 默认忽略的真实 Rust/C、官方包、发行示例、原生工具、HLS/DASH 和十分钟传输已按上文分别执行。公网 yt-dlp 正向测试及跨平台/长直播/GPU/高刷新率完整验收仍保留待验证，不能把默认测试绿色或源码切换解释为所有 A01–A15 已完成。
+
+## 2026-11-27：0.0.2 架构解耦、Pulley64 沙箱、跨平台确定性构建与远端矩阵验收
+
+在 `0.0.2` 架构评审与收敛系列提交（`2b2c061`、`ee6d4c1`、`970766b`、`ae05c25`、`ce88233` 及 UI 区域实体解耦）合入 `main` 后，插件 v2 运行时、宿主边界与跨平台构建矩阵完成如下闭环：
+
+- **零可执行内存 `pulley64` 沙箱与 macOS 零 JIT 签名**：Wasmtime 切换至 `pulley64` 纯字节码解释器（禁用 Cranelift 原生宿主代码生成、Mach/信号陷阱与 4 GiB 虚拟地址预留），彻底消除 RWX/RX 可执行页及 macOS `com.apple.security.cs.allow-jit` 豁免需求。Windows x64 Release 实测（见 [PLUGIN_V2_DECISIONS.md](PLUGIN_V2_DECISIONS.md) §3.1.1）显示编译产物体积缩减 4.6×–6.5×、峰值 RSS 下降 31%（37.45 MiB → 25.92 MiB），冷编译 p50 为 6.26 ms（`iris.guides`）/ 22.97 ms（`iris.webdav`），事件往返约 18.2 µs。
+- **跨平台官方插件逐字节可复现构建**：`scripts/build-official-plugins.py` 固定规范化构建路径、时间戳与容器工具链，GitHub Actions `official-plugins` 作业在 `ubuntu-24.04`（`linux/amd64` 容器）独立重编 `iris.guides` 与 `iris.webdav` 并校验与仓库 `Resources/Plugins/` 内嵌归档及 SHA-256 摘要逐字节一致。
+- **协议类型澄清与范围收敛**：`iris-api` 严格区分非零句柄 `Id`（`1..=i64::MAX`）与全范围无符号十进制量纲 `WireU64`（`0..=u64::MAX`）；按 `0.0.2` 极简原则移除零调用方的 BYOB 外部工具（`external_tool` / `export_files` / `process_tree`）及静态 DASH / 原始 HLS 文本通道，保留 `FileExecutor` 私有临时产物、`HashCurrentMedia`、结构化 `VirtualHls` 与远端 HLS 受控重写。
+- **工作区物理隔离与单窗口宿主**：网络策略、DNS/IP 钉扎、有界并发预算、协作取消原语（`CancelToken` / `Deadline`）与具名线程注册表（`ThreadRole`）下沉至无领域依赖的 `iris-net`；插件运行时独立为 `iris-plugin-host`（每窗口显式 `PluginHost` 单活跃窗口会话，`iris-core` 零 `wasmtime` / `iris-api` 依赖）；播放器收敛为无 I/O 的 `PlayerMachine` 纯状态机与统一 `VideoSurfaceBackend`；UI 拆分为 `AppModel` 与五个区域级 GPUI `Render` 实体（`Sidebar`、`PluginPanel`、`SettingsPanel`、`ViewportView`、`DockView`），`ui/kit` 完全解耦且 `render()` 零状态变更/零后台副作用。
+- **远端多平台 CI 矩阵通过证据**：GitHub Actions `Checks`（如 `main` 运行 `45933539681`、`45939119675` 及各 PR 全矩阵）与 `Release recipe policy`（`45933539674`、`45939119782`、`45946270328`）已在 `ubuntu-24.04`、`macos-15`（Apple Silicon ARM64）、`macos-15-intel`（x86_64）与 `windows-2025`（x86_64 MSVC）全绿通过，每次运行均执行 `scripts/run-plugin-v2-ci.py`（真实 Rust/C Guest 契约、官方 `iris.guides` / `iris.webdav` 包、4 个示例插件、内嵌包 `--check-plugin-runtime` 自检及有种子解析器变异回归）与 `cargo-deny` 审计。
+- **明确保留的边界与非声明项**：（1）当前网络与流媒体自动化验收基于受控本地服务、固定夹具及 10 分钟 4K 授权中继基准（[PLUGIN_V2_WINDOWS.md](benchmarks/PLUGIN_V2_WINDOWS.md)），不替代任意第三方公网 CDN、直播源或私有 NAS 固件差异；（2）libmpv HLS 解码回归与 `TimedOverlay` 静止零重绘已验证，但物理显示器端音画同步延迟与 60/120Hz 实机帧时间仍取决于具体硬件负载；（3）仓库版本按门禁策略保持 `0.0.2`，`0.1.0` 正式发行需另行授权。

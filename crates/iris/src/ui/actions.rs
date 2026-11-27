@@ -2,12 +2,13 @@
 //! dynamic `key_hint` lookup, and `#root` action listener registration.
 
 use gpui::{
-    Action, App, Context, Div, InteractiveElement, KeyBinding, SharedString, Stateful, Window,
-    actions,
+    Action, App, Context, Div, Entity, InteractiveElement, KeyBinding, SharedString, Stateful,
+    Window, actions,
 };
 use iris_core::keymap::{self, Keymap};
 
-use super::IrisWindow;
+use super::AppModel;
+use super::views::model_listener;
 use crate::platform;
 
 actions!(
@@ -219,9 +220,9 @@ pub(super) fn runtime_bindings(keymap: &Keymap) -> Vec<KeyBinding> {
     bindings
 }
 
-impl IrisWindow {
+impl AppModel {
     /// Returns the live formatted shortcut label for `action_id` under the active `Keymap`.
-    pub(super) fn key_hint(&self, action_id: &str) -> Option<SharedString> {
+    pub(in crate::ui) fn key_hint(&self, action_id: &str) -> Option<SharedString> {
         let canonical = match action_id {
             "open_stream_url" => "open_url",
             other => other,
@@ -242,66 +243,65 @@ impl IrisWindow {
     ) {
         self.reset_appearance(window, cx);
     }
+}
 
-    pub(super) fn bind_window_actions(
-        &self,
-        root: Stateful<Div>,
-        cx: &mut Context<Self>,
-    ) -> Stateful<Div> {
-        root.on_action(cx.listener(Self::toggle_pause))
-            .on_action(cx.listener(Self::seek_back))
-            .on_action(cx.listener(Self::seek_forward))
-            .on_action(cx.listener(Self::seek_back_large))
-            .on_action(cx.listener(Self::seek_forward_large))
-            .on_action(cx.listener(Self::frame_back))
-            .on_action(cx.listener(Self::frame_forward))
-            .on_action(cx.listener(Self::volume_up))
-            .on_action(cx.listener(Self::volume_down))
-            .on_action(cx.listener(Self::toggle_mute))
-            .on_action(cx.listener(Self::speed_down))
-            .on_action(cx.listener(Self::speed_up))
-            .on_action(cx.listener(Self::reset_speed))
-            .on_action(cx.listener(Self::toggle_loop))
-            .on_action(cx.listener(Self::cycle_ab_loop))
-            .on_action(cx.listener(Self::clear_ab_loop))
-            .on_action(cx.listener(Self::toggle_directory))
-            .on_action(cx.listener(Self::toggle_search))
-            .on_action(cx.listener(Self::refresh_directory))
-            .on_action(cx.listener(Self::open_settings))
-            .on_action(cx.listener(Self::open_command_palette))
-            .on_action(cx.listener(Self::toggle_always_on_top))
-            .on_action(cx.listener(Self::toggle_info))
-            .on_action(cx.listener(Self::take_screenshot))
-            .on_action(cx.listener(Self::cycle_aspect))
-            .on_action(cx.listener(Self::toggle_fullscreen))
-            .on_action(cx.listener(Self::exit_fullscreen))
-            .on_action(cx.listener(Self::toggle_subs))
-            .on_action(cx.listener(Self::cycle_sub))
-            .on_action(cx.listener(Self::sub_seek_prev))
-            .on_action(cx.listener(Self::sub_seek_next))
-            .on_action(cx.listener(Self::sub_delay_back))
-            .on_action(cx.listener(Self::sub_delay_forward))
-            .on_action(cx.listener(Self::sub_delay_reset))
-            .on_action(cx.listener(Self::cycle_audio))
-            .on_action(cx.listener(Self::prev_chapter))
-            .on_action(cx.listener(Self::next_chapter))
-            .on_action(cx.listener(Self::toggle_image_size))
-            .on_action(cx.listener(Self::fit_image))
-            .on_action(cx.listener(Self::zoom_in))
-            .on_action(cx.listener(Self::zoom_out))
-            .on_action(cx.listener(Self::rotate_cw))
-            .on_action(cx.listener(Self::rotate_ccw))
-            .on_action(cx.listener(Self::toggle_hflip))
-            .on_action(cx.listener(Self::toggle_vflip))
-            .on_action(cx.listener(Self::toggle_filmstrip))
-            .on_action(cx.listener(Self::next_item))
-            .on_action(cx.listener(Self::prev_item))
-            .on_action(cx.listener(Self::open_file))
-            .on_action(cx.listener(Self::open_stream_url_action))
-            .on_action(cx.listener(Self::cycle_preset_action))
-            .on_action(cx.listener(Self::activate_preset_action))
-            .on_action(cx.listener(Self::trigger_plugin_command_action))
-            .on_action(cx.listener(Self::reset_appearance_action))
-            .on_action(cx.listener(Self::toggle_favorite))
-    }
+pub(super) fn bind_window_actions(root: Stateful<Div>, model: &Entity<AppModel>) -> Stateful<Div> {
+    root.on_action(model_listener(model, AppModel::toggle_pause))
+        .on_action(model_listener(model, AppModel::seek_back))
+        .on_action(model_listener(model, AppModel::seek_forward))
+        .on_action(model_listener(model, AppModel::seek_back_large))
+        .on_action(model_listener(model, AppModel::seek_forward_large))
+        .on_action(model_listener(model, AppModel::frame_back))
+        .on_action(model_listener(model, AppModel::frame_forward))
+        .on_action(model_listener(model, AppModel::volume_up))
+        .on_action(model_listener(model, AppModel::volume_down))
+        .on_action(model_listener(model, AppModel::toggle_mute))
+        .on_action(model_listener(model, AppModel::speed_down))
+        .on_action(model_listener(model, AppModel::speed_up))
+        .on_action(model_listener(model, AppModel::reset_speed))
+        .on_action(model_listener(model, AppModel::toggle_loop))
+        .on_action(model_listener(model, AppModel::cycle_ab_loop))
+        .on_action(model_listener(model, AppModel::clear_ab_loop))
+        .on_action(model_listener(model, AppModel::toggle_directory))
+        .on_action(model_listener(model, AppModel::toggle_search))
+        .on_action(model_listener(model, AppModel::refresh_directory))
+        .on_action(model_listener(model, AppModel::open_settings))
+        .on_action(model_listener(model, AppModel::open_command_palette))
+        .on_action(model_listener(model, AppModel::toggle_always_on_top))
+        .on_action(model_listener(model, AppModel::toggle_info))
+        .on_action(model_listener(model, AppModel::take_screenshot))
+        .on_action(model_listener(model, AppModel::cycle_aspect))
+        .on_action(model_listener(model, AppModel::toggle_fullscreen))
+        .on_action(model_listener(model, AppModel::exit_fullscreen))
+        .on_action(model_listener(model, AppModel::toggle_subs))
+        .on_action(model_listener(model, AppModel::cycle_sub))
+        .on_action(model_listener(model, AppModel::sub_seek_prev))
+        .on_action(model_listener(model, AppModel::sub_seek_next))
+        .on_action(model_listener(model, AppModel::sub_delay_back))
+        .on_action(model_listener(model, AppModel::sub_delay_forward))
+        .on_action(model_listener(model, AppModel::sub_delay_reset))
+        .on_action(model_listener(model, AppModel::cycle_audio))
+        .on_action(model_listener(model, AppModel::prev_chapter))
+        .on_action(model_listener(model, AppModel::next_chapter))
+        .on_action(model_listener(model, AppModel::toggle_image_size))
+        .on_action(model_listener(model, AppModel::fit_image))
+        .on_action(model_listener(model, AppModel::zoom_in))
+        .on_action(model_listener(model, AppModel::zoom_out))
+        .on_action(model_listener(model, AppModel::rotate_cw))
+        .on_action(model_listener(model, AppModel::rotate_ccw))
+        .on_action(model_listener(model, AppModel::toggle_hflip))
+        .on_action(model_listener(model, AppModel::toggle_vflip))
+        .on_action(model_listener(model, AppModel::toggle_filmstrip))
+        .on_action(model_listener(model, AppModel::next_item))
+        .on_action(model_listener(model, AppModel::prev_item))
+        .on_action(model_listener(model, AppModel::open_file))
+        .on_action(model_listener(model, AppModel::open_stream_url_action))
+        .on_action(model_listener(model, AppModel::cycle_preset_action))
+        .on_action(model_listener(model, AppModel::activate_preset_action))
+        .on_action(model_listener(
+            model,
+            AppModel::trigger_plugin_command_action,
+        ))
+        .on_action(model_listener(model, AppModel::reset_appearance_action))
+        .on_action(model_listener(model, AppModel::toggle_favorite))
 }

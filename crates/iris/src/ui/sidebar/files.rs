@@ -1,6 +1,5 @@
 //! Unified `Files` sidebar view: 3-variant `DirRow` (`Up`, `Item(CatalogItem)`, `LoadMore`)
-//! driving local directories, `MediaSource` plugins,
-//! and favorites with a single virtualized renderer.
+//! driving local directories, `MediaSource` plugins, and favorites without render mutations.
 
 use std::ops::Range;
 use std::path::PathBuf;
@@ -12,16 +11,18 @@ use gpui::{
 };
 use iris_core::catalog::{CatalogItem, CatalogItemKind, MediaFilter};
 use iris_core::library::Kind;
+use iris_core::media_uri::MediaUri;
 use iris_core::player::format_time;
 
-use super::super::IrisWindow;
 use super::super::context_menu::{ContextMenu, ContextTarget};
 use super::super::kit::list_row::{
     MediaRowSpec, folder_row, media_row, row_action_icon, thin_scrollbar,
 };
-use super::super::kit::text_field::{TextFieldKind, TextFieldSpec};
+use super::super::kit::text_field::{TextFieldKind, TextFieldSpec, render_text_field};
 use super::super::kit::{bordered_button, icon, tab_strip, tab_strip_item};
+use super::super::plugin_runtime::sources::render_source_filters;
 use super::super::state::ActiveSource;
+use super::super::views::{DirtyRegions, Sidebar, model_listener};
 use crate::assets::Icon;
 use crate::theme::ThemeTokens;
 
@@ -50,19 +51,27 @@ fn item_meta(item: &CatalogItem) -> Option<SharedString> {
     None
 }
 
-impl IrisWindow {
+impl Sidebar {
     pub(super) fn render_sidebar_files(
-        &self,
+        &mut self,
         window: &Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        let model = self.model.clone();
+        let m = model.read(cx);
         let t = ThemeTokens::of(cx);
-        let filter = self.catalog.filter;
-        let row_count = self.catalog.rows.len();
-        let all_count =
-            self.catalog.video_count + self.catalog.audio_count + self.catalog.photo_count;
+        let filter = m.catalog.filter;
+        let row_count = m.catalog.rows.len();
+        let all_count = m.catalog.video_count + m.catalog.audio_count + m.catalog.photo_count;
+        let video_count = m.catalog.video_count;
+        let photo_count = m.catalog.photo_count;
+        let favorite_count = m.catalog.favorite_count;
+        let favorite_items_empty = m.catalog.favorite_items.is_empty();
+        let dir_scroll = m.catalog.dir_scroll.clone();
+        let search_open = m.text_inputs.search_open;
+        let has_source_filters = !m.plugin_view.source_filters.is_empty();
 
-        let source_banner = match &self.catalog.active_source {
+        let source_banner = match &m.catalog.active_source {
             ActiveSource::Local => None,
             ActiveSource::Plugin(ps) => {
                 let pid = ps.plugin_id.clone();
@@ -115,13 +124,13 @@ impl IrisWindow {
                                         .text_color(t.text_dim)
                                         .hover(|s| s.bg(t.hover).text_color(t.text))
                                         .child("返回本地")
-                                        .on_click(cx.listener(|this, _, _, cx| {
+                                        .on_click(model_listener(&model, |this, _, _, cx| {
                                             this.browse_local_source(cx);
                                         })),
                                 ),
                         )
-                        .when(!self.plugin_view.source_filters.is_empty(), |d| {
-                            d.child(self.render_source_filters(cx))
+                        .when(has_source_filters, |d| {
+                            d.child(render_source_filters(&model, cx))
                         })
                         .when(loading, |d| {
                             d.child(
@@ -153,9 +162,14 @@ impl IrisWindow {
                                     .when_some(auth_cmd, |r, cmd| {
                                         r.child(
                                             bordered_button("src-auth-btn", "去认证", true, t)
-                                                .on_click(cx.listener(move |this, _, w, cx| {
-                                                    this.invoke_plugin_command(&pid, &cmd, w, cx);
-                                                })),
+                                                .on_click(model_listener(
+                                                    &model,
+                                                    move |this, _, w, cx| {
+                                                        this.invoke_plugin_command(
+                                                            &pid, &cmd, w, cx,
+                                                        );
+                                                    },
+                                                )),
                                         )
                                     }),
                             )
@@ -164,13 +178,14 @@ impl IrisWindow {
             }
         };
 
-        let search_bar = self.text_inputs.search_open.then(|| {
+        let search_bar = search_open.then(|| {
             div()
                 .flex_none()
                 .p(px(6.))
                 .border_b_1()
                 .border_color(t.line)
-                .child(self.render_text_field(
+                .child(render_text_field(
+                    &model,
                     TextFieldSpec {
                         id: "sidebar-search-input".into(),
                         kind: TextFieldKind::Search,
@@ -186,25 +201,25 @@ impl IrisWindow {
 
         let tabs = [
             ("全部", all_count, MediaFilter::All),
-            ("视频", self.catalog.video_count, MediaFilter::Video),
-            ("图片", self.catalog.photo_count, MediaFilter::Photo),
-            (
-                "收藏",
-                self.catalog.favorite_count,
-                MediaFilter::FavoritesOnly,
-            ),
+            ("视频", video_count, MediaFilter::Video),
+            ("图片", photo_count, MediaFilter::Photo),
+            ("收藏", favorite_count, MediaFilter::FavoritesOnly),
         ];
 
-        let scrollbar = thin_scrollbar(&self.catalog.dir_scroll, t);
+        let scrollbar = thin_scrollbar(&dir_scroll, t);
         let list = uniform_list(
             "sidebar-files-list",
             row_count,
-            cx.processor(|this, range: Range<usize>, _, cx| {
+            cx.processor(|sidebar, range: Range<usize>, window, cx| {
+                let model = sidebar.model.clone();
+                let m = model.read(cx);
                 let t = ThemeTokens::of(cx);
-                let cur_uri = this.active().session.current_media_uri();
-                range
+                let cur_uri = m.active().session.current_media_uri();
+                let mut missing_thumbs: Vec<MediaUri> = Vec::new();
+
+                let elements: Vec<AnyElement> = range
                     .map(|ix| -> AnyElement {
-                        let Some(row) = this.catalog.rows.get(ix).cloned() else {
+                        let Some(row) = m.catalog.rows.get(ix).cloned() else {
                             return div().into_any_element();
                         };
                         match row {
@@ -212,7 +227,7 @@ impl IrisWindow {
                                 parent_local,
                                 parent_plugin,
                             } => folder_row(("dir-up", ix), true, ".. 返回上级", None, t)
-                                .on_click(cx.listener(move |this, _, _, cx| {
+                                .on_click(model_listener(&model, move |this, _, _, cx| {
                                     if let Some(p) = &parent_local {
                                         this.open_path(p, cx);
                                     } else if let Some((pid, sid, fid)) = &parent_plugin {
@@ -233,7 +248,7 @@ impl IrisWindow {
                                 folder_id,
                                 next_page,
                             } => folder_row(("dir-more", ix), false, "加载更多…", None, t)
-                                .on_click(cx.listener(move |this, _, _, cx| {
+                                .on_click(model_listener(&model, move |this, _, _, cx| {
                                     this.browse_plugin_source(
                                         &plugin_id,
                                         &source_id,
@@ -255,31 +270,38 @@ impl IrisWindow {
                                 folder_row(("dir-folder", ix), false, title.clone(), sub, t)
                                     .on_mouse_down(
                                         MouseButton::Right,
-                                        cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
-                                            this.overlays.open_context_menu(ContextMenu {
-                                                pos: ev.position,
-                                                target: ContextTarget::Media {
-                                                    uri: uri_menu.clone(),
-                                                    title: title.clone(),
-                                                    kind: None,
-                                                    folder_id: fid_menu.clone(),
-                                                },
-                                            });
-                                            cx.stop_propagation();
-                                            cx.notify();
-                                        }),
+                                        model_listener(
+                                            &model,
+                                            move |this, ev: &MouseDownEvent, w, cx| {
+                                                this.overlays.open_context_menu(ContextMenu {
+                                                    pos: ev.position,
+                                                    target: ContextTarget::Media {
+                                                        uri: uri_menu.clone(),
+                                                        title: title.clone(),
+                                                        kind: None,
+                                                        folder_id: fid_menu.clone(),
+                                                    },
+                                                });
+                                                this.reconcile_input_focus(w, cx);
+                                                cx.stop_propagation();
+                                                this.notify_root(cx);
+                                            },
+                                        ),
                                     )
-                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                    .on_click(model_listener(&model, move |this, _, _, cx| {
                                         this.open_catalog_item(item.clone(), cx);
                                     }))
                                     .into_any_element()
                             }
                             DirRow::Item(item) => {
-                                let thumbnail = this.plugin_thumbnail(&item.uri, cx);
+                                let thumbnail = m.cached_plugin_thumbnail(&item.uri);
+                                if thumbnail.is_none() && m.needs_plugin_thumbnail(&item.uri) {
+                                    missing_thumbs.push(item.uri.clone());
+                                }
                                 let kind = item.media_kind().unwrap_or(Kind::Video);
                                 let is_cur = cur_uri.as_ref() == Some(&item.uri);
-                                let is_fav = this.store.is_favorite(&item.uri);
-                                let prog = this.store.progress_ratio(&item.uri);
+                                let is_fav = m.store.is_favorite(&item.uri);
+                                let prog = m.store.progress_ratio(&item.uri);
                                 let uri_star = item.uri.clone();
                                 let star_btn = row_action_icon(
                                     ("dir-fav", ix),
@@ -288,10 +310,18 @@ impl IrisWindow {
                                     false,
                                     t,
                                 )
-                                .on_click(cx.listener(move |this, _, _, cx| {
+                                .on_click(model_listener(&model, move |this, _, _, cx| {
                                     this.store.toggle_favorite(&uri_star);
                                     this.rebuild_directory_rows();
-                                    cx.notify();
+                                    this.scan_visible_favorites(cx);
+                                    this.notify_regions(
+                                        DirtyRegions {
+                                            sidebar: true,
+                                            dock: true,
+                                            ..DirtyRegions::NONE
+                                        },
+                                        cx,
+                                    );
                                 }))
                                 .into_any_element();
 
@@ -313,31 +343,45 @@ impl IrisWindow {
                                 )
                                 .on_mouse_down(
                                     MouseButton::Right,
-                                    cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
-                                        this.overlays.open_context_menu(ContextMenu {
-                                            pos: ev.position,
-                                            target: ContextTarget::Media {
-                                                uri: uri_menu.clone(),
-                                                title: title_menu.clone(),
-                                                kind: Some(kind),
-                                                folder_id: None,
-                                            },
-                                        });
-                                        cx.stop_propagation();
-                                        cx.notify();
-                                    }),
+                                    model_listener(
+                                        &model,
+                                        move |this, ev: &MouseDownEvent, w, cx| {
+                                            this.overlays.open_context_menu(ContextMenu {
+                                                pos: ev.position,
+                                                target: ContextTarget::Media {
+                                                    uri: uri_menu.clone(),
+                                                    title: title_menu.clone(),
+                                                    kind: Some(kind),
+                                                    folder_id: None,
+                                                },
+                                            });
+                                            this.reconcile_input_focus(w, cx);
+                                            cx.stop_propagation();
+                                            this.notify_root(cx);
+                                        },
+                                    ),
                                 )
-                                .on_click(cx.listener(move |this, _, _, cx| {
+                                .on_click(model_listener(&model, move |this, _, _, cx| {
                                     this.open_catalog_item(item.clone(), cx);
                                 }))
                                 .into_any_element()
                             }
                         }
                     })
-                    .collect()
+                    .collect();
+
+                if !missing_thumbs.is_empty() {
+                    let weak = sidebar.model.downgrade();
+                    window.on_next_frame(move |_, cx| {
+                        let _ = weak.update(cx, |this, cx| {
+                            this.request_plugin_thumbnails(missing_thumbs, cx);
+                        });
+                    });
+                }
+                elements
             }),
         )
-        .track_scroll(self.catalog.dir_scroll.clone())
+        .track_scroll(dir_scroll)
         .size_full();
 
         div()
@@ -351,10 +395,11 @@ impl IrisWindow {
                 tab_strip(t).children(tabs.into_iter().enumerate().map(|(i, (lbl, cnt, f))| {
                     let active = f == filter;
                     tab_strip_item(("dir-ftab", i), format!("{lbl} {cnt}"), None, active, t)
-                        .on_click(cx.listener(move |this, _, _, cx| {
+                        .on_click(model_listener(&model, move |this, _, _, cx| {
                             this.catalog.filter = f;
                             this.filter_directory_rows();
-                            cx.notify();
+                            this.scan_visible_favorites(cx);
+                            this.notify_sidebar(cx);
                         }))
                 })),
             )
@@ -374,8 +419,8 @@ impl IrisWindow {
                                 .text_color(t.text_faint)
                                 .child(
                                     if filter == MediaFilter::FavoritesOnly
-                                        && self.catalog.favorite_items.is_empty()
-                                        && self.catalog.favorite_count > 0
+                                        && favorite_items_empty
+                                        && favorite_count > 0
                                     {
                                         "正在加载收藏…"
                                     } else {

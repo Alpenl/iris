@@ -1,5 +1,5 @@
 //! Host-owned renderers for the plugin UI workbench:
-//! - Sidebar panel container (`render_plugin_sidebar`)
+//! - Independent `PluginPanel` entity renderer (`render_plugin_sidebar_entity`)
 //! - Control bar status badge slot (`render_plugin_status_slot`)
 //! - Declarative `PluginModal` built on `kit::modal::modal_shell` with async validation
 
@@ -9,276 +9,278 @@ mod widgets;
 use std::rc::Rc;
 
 use gpui::{
-    AnyElement, Context, InteractiveElement, IntoElement, MouseButton, ParentElement, SharedString,
-    StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder, px,
+    AnyElement, App, Entity, InteractiveElement, IntoElement, MouseButton, ParentElement,
+    SharedString, StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder, px,
 };
 use iris_api::{SidebarPanel, StatusBadge};
 
-use super::IrisWindow;
+use super::AppModel;
 use super::kit::modal::{ModalCallback, ModalShellSpec, modal_shell};
 use super::kit::{panel_header, surface_card, tip};
+use super::views::model_listener;
 use crate::theme::{FONT_MONO, ThemeTokens};
 use widgets::{WidgetSurface, render_plugin_widget};
 
-impl IrisWindow {
-    pub(super) fn render_plugin_status_slot(
-        &self,
-        cx: &mut Context<Self>,
-    ) -> Option<impl IntoElement> {
-        let badges: Vec<(String, StatusBadge)> = self
-            .plugins
-            .status_badges()
-            .into_iter()
-            .map(|(pid, b)| (pid.to_string(), b.clone()))
-            .collect();
-        if badges.is_empty() {
-            return None;
-        }
-        let t = ThemeTokens::of(cx);
-        Some(div().flex().items_center().gap(px(4.)).pr(px(4.)).children(
-            badges.into_iter().enumerate().map(|(i, (pid, badge))| {
-                let action = badge.action_id.clone();
-                let label = badge.text.clone();
-                let tip_str = badge
-                    .tooltip
-                    .clone()
-                    .unwrap_or_else(|| format!("插件状态 · {pid}"));
-                let status_id =
-                    SharedString::from(format!("plugin-status:{}:{pid}:{i}", pid.len()));
-                div()
-                    .id(status_id)
-                    .h(px((f32::from(t.control_h_sm) - 2.).max(20.)))
-                    .px(px(7.))
-                    .flex()
-                    .items_center()
-                    .gap(px(5.))
-                    .rounded(t.radius_md)
-                    .bg(t.panel)
-                    .border_1()
-                    .border_color(if badge.accent {
-                        t.accent
-                    } else {
-                        t.line_strong
-                    })
-                    .font_family(FONT_MONO)
-                    .text_size(t.text_xs)
-                    .text_color(if badge.accent { t.text } else { t.text_muted })
-                    .when(action.is_some(), |d| {
-                        d.cursor_pointer().hover(|s| s.bg(t.hover))
-                    })
-                    .tooltip(tip(tip_str, None))
-                    .when_some(action, |d, act| {
-                        d.on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                            .on_click(cx.listener(move |this, _, w, cx| {
-                                this.invoke_plugin_action(&pid, &act, w, cx);
-                            }))
-                    })
-                    .when(badge.accent, |d| d.child(div().size(px(5.)).bg(t.accent)))
-                    .child(label)
-            }),
-        ))
+pub(in crate::ui) fn render_plugin_status_slot(
+    model: &Entity<AppModel>,
+    cx: &App,
+) -> Option<impl IntoElement> {
+    let m = model.read(cx);
+    let badges: Vec<(String, StatusBadge)> = m
+        .plugins
+        .status_badges()
+        .into_iter()
+        .map(|(pid, b)| (pid.to_string(), b.clone()))
+        .collect();
+    if badges.is_empty() {
+        return None;
     }
+    let t = ThemeTokens::of(cx);
+    Some(div().flex().items_center().gap(px(4.)).pr(px(4.)).children(
+        badges.into_iter().enumerate().map(|(i, (pid, badge))| {
+            let action = badge.action_id.clone();
+            let label = badge.text.clone();
+            let tip_str = badge
+                .tooltip
+                .clone()
+                .unwrap_or_else(|| format!("插件状态 · {pid}"));
+            let status_id = SharedString::from(format!("plugin-status:{}:{pid}:{i}", pid.len()));
+            div()
+                .id(status_id)
+                .h(px((f32::from(t.control_h_sm) - 2.).max(20.)))
+                .px(px(7.))
+                .flex()
+                .items_center()
+                .gap(px(5.))
+                .rounded(t.radius_md)
+                .bg(t.panel)
+                .border_1()
+                .border_color(if badge.accent {
+                    t.accent
+                } else {
+                    t.line_strong
+                })
+                .font_family(FONT_MONO)
+                .text_size(t.text_xs)
+                .text_color(if badge.accent { t.text } else { t.text_muted })
+                .when(action.is_some(), |d| {
+                    d.cursor_pointer().hover(|s| s.bg(t.hover))
+                })
+                .tooltip(tip(tip_str, None))
+                .when_some(action, |d, act| {
+                    d.on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .on_click(model_listener(model, move |this, _, w, cx| {
+                            this.invoke_plugin_action(&pid, &act, w, cx);
+                        }))
+                })
+                .when(badge.accent, |d| d.child(div().size(px(5.)).bg(t.accent)))
+                .child(label)
+        }),
+    ))
+}
 
-    pub(super) fn render_plugin_sidebar(
-        &self,
-        window: &Window,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let panels: Vec<(String, SidebarPanel)> = self
-            .plugins
-            .sidebar_panels()
-            .into_iter()
-            .map(|(pid, p)| (pid.to_string(), p.clone()))
-            .collect();
-        let empty = panels.is_empty();
-        let t = ThemeTokens::of(cx);
+pub(in crate::ui) fn render_plugin_sidebar_entity(
+    model: &Entity<AppModel>,
+    window: &Window,
+    cx: &App,
+) -> impl IntoElement {
+    let m = model.read(cx);
+    let panels: Vec<(String, SidebarPanel)> = m
+        .plugins
+        .sidebar_panels()
+        .into_iter()
+        .map(|(pid, p)| (pid.to_string(), p.clone()))
+        .collect();
+    let empty = panels.is_empty();
+    let t = ThemeTokens::of(cx);
 
-        let mut panel_els: Vec<AnyElement> = Vec::with_capacity(panels.len());
-        for (pid, panel_data) in panels {
-            let mut section_els: Vec<AnyElement> = Vec::with_capacity(panel_data.sections.len());
-            for (si, section) in panel_data.sections.into_iter().enumerate() {
-                let mut widget_els: Vec<AnyElement> = Vec::with_capacity(section.widgets.len());
-                for (wi, widget) in section.widgets.into_iter().enumerate() {
-                    widget_els.push(render_plugin_widget(
-                        self,
-                        &pid,
-                        wi,
-                        widget,
-                        WidgetSurface::Sidebar {
-                            section_ix: si,
-                            window,
-                        },
-                        t,
-                        cx,
-                    ));
-                }
-                section_els.push(
-                    div()
-                        .id(SharedString::from(format!(
-                            "plugin-section:{}:{pid}:{si}",
-                            pid.len()
-                        )))
-                        .flex()
-                        .flex_col()
-                        .gap(px(6.))
-                        .when(!section.heading.is_empty(), |d| {
-                            d.child(
-                                div()
-                                    .text_size(t.text_xs)
-                                    .text_color(t.text_faint)
-                                    .child(section.heading),
-                            )
-                        })
-                        .children(widget_els)
-                        .into_any_element(),
-                );
+    let mut panel_els: Vec<AnyElement> = Vec::with_capacity(panels.len());
+    for (pid, panel_data) in panels {
+        let mut section_els: Vec<AnyElement> = Vec::with_capacity(panel_data.sections.len());
+        for (si, section) in panel_data.sections.into_iter().enumerate() {
+            let mut widget_els: Vec<AnyElement> = Vec::with_capacity(section.widgets.len());
+            for (wi, widget) in section.widgets.into_iter().enumerate() {
+                widget_els.push(render_plugin_widget(
+                    model,
+                    &pid,
+                    wi,
+                    widget,
+                    WidgetSurface::Sidebar {
+                        section_ix: si,
+                        window,
+                    },
+                    t,
+                    cx,
+                ));
             }
-            panel_els.push(
-                surface_card(0., t)
+            section_els.push(
+                div()
                     .id(SharedString::from(format!(
-                        "plugin-panel:{}:{pid}",
+                        "plugin-section:{}:{pid}:{si}",
                         pid.len()
                     )))
-                    .p(px(0.))
-                    .rounded(t.radius_lg)
-                    .overflow_hidden()
-                    .child(panel_header(panel_data.title, None, None, t))
-                    .child(
-                        div()
-                            .p(px(10.))
-                            .flex()
-                            .flex_col()
-                            .gap(px(8.))
-                            .children(section_els),
-                    )
+                    .flex()
+                    .flex_col()
+                    .gap(px(6.))
+                    .when(!section.heading.is_empty(), |d| {
+                        d.child(
+                            div()
+                                .text_size(t.text_xs)
+                                .text_color(t.text_faint)
+                                .child(section.heading),
+                        )
+                    })
+                    .children(widget_els)
                     .into_any_element(),
             );
         }
-
-        div()
-            .id("plugin-sidebar-scroll")
-            .flex_1()
-            .min_h(px(0.))
-            .overflow_y_scroll()
-            .p(px(10.))
-            .flex()
-            .flex_col()
-            .gap(px(14.))
-            .when(empty, |d| {
-                d.child(
+        panel_els.push(
+            surface_card(0., t)
+                .id(SharedString::from(format!(
+                    "plugin-panel:{}:{pid}",
+                    pid.len()
+                )))
+                .p(px(0.))
+                .rounded(t.radius_lg)
+                .overflow_hidden()
+                .child(panel_header(panel_data.title, None, None, t))
+                .child(
                     div()
-                        .px(px(4.))
-                        .py(px(8.))
+                        .p(px(10.))
                         .flex()
                         .flex_col()
-                        .gap(px(4.))
-                        .child(
-                            div()
-                                .text_size(t.text_md)
-                                .text_color(t.text_dim)
-                                .child("没有提供侧栏面板的启用插件"),
-                        )
-                        .child(
-                            div()
-                                .text_size(t.text_sm)
-                                .text_color(t.text_faint)
-                                .child("在 设置 → 插件 中启用或添加外部插件"),
-                        ),
+                        .gap(px(8.))
+                        .children(section_els),
                 )
-            })
-            .children(panel_els)
+                .into_any_element(),
+        );
     }
 
-    pub(super) fn render_plugin_modal(
-        &self,
-        window: &Window,
-        cx: &mut Context<Self>,
-    ) -> Option<AnyElement> {
-        if self.has_host_consent() {
-            return None;
-        }
-        let (pid, modal) = self
-            .plugins
-            .active_modal()
-            .map(|(p, m)| (p.to_string(), m.clone()))?;
+    div()
+        .id("plugin-sidebar-scroll")
+        .flex_1()
+        .min_h(px(0.))
+        .overflow_y_scroll()
+        .p(px(10.))
+        .flex()
+        .flex_col()
+        .gap(px(14.))
+        .when(empty, |d| {
+            d.child(
+                div()
+                    .px(px(4.))
+                    .py(px(8.))
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.))
+                    .child(
+                        div()
+                            .text_size(t.text_md)
+                            .text_color(t.text_dim)
+                            .child("没有提供侧栏面板的启用插件"),
+                    )
+                    .child(
+                        div()
+                            .text_size(t.text_sm)
+                            .text_color(t.text_faint)
+                            .child("在 设置 → 插件 中启用或添加外部插件"),
+                    ),
+            )
+        })
+        .children(panel_els)
+}
 
-        let t = ThemeTokens::of(cx);
-        let vp = window.viewport_size();
-        let modal_w = (f32::from(vp.width) - 24.).clamp(0., 460.);
-        let max_h = (f32::from(vp.height) - 24.).clamp(0., 540.);
+pub(in crate::ui) fn render_plugin_modal(
+    model: &Entity<AppModel>,
+    window: &Window,
+    cx: &App,
+) -> Option<AnyElement> {
+    let m = model.read(cx);
+    if m.has_host_consent() {
+        return None;
+    }
+    let (pid, modal) = m
+        .plugins
+        .active_modal()
+        .map(|(p, md)| (p.to_string(), md.clone()))?;
 
-        let is_submitting = self.plugin_view.modal.is_submitting(&pid, &modal.id);
+    let t = ThemeTokens::of(cx);
+    let vp = window.viewport_size();
+    let modal_w = (f32::from(vp.width) - 24.).clamp(0., 460.);
+    let max_h = (f32::from(vp.height) - 24.).clamp(0., 540.);
 
-        let submit_label = if is_submitting {
-            "处理中…".into()
-        } else {
-            modal
-                .submit_label
-                .clone()
-                .filter(|s| !s.trim().is_empty())
-                .unwrap_or_else(|| "确认".into())
-        };
-        let cancel_label = modal
-            .cancel_label
+    let is_submitting = m.plugin_view.modal.is_submitting(&pid, &modal.id);
+    let modal_error = m.plugin_view.modal.error.clone();
+
+    let submit_label = if is_submitting {
+        "处理中…".into()
+    } else {
+        modal
+            .submit_label
             .clone()
             .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(|| "取消".into());
+            .unwrap_or_else(|| "确认".into())
+    };
+    let cancel_label = modal
+        .cancel_label
+        .clone()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "取消".into());
 
-        let submit_cb: ModalCallback = Rc::new(|this, w, cx| {
-            this.submit_active_plugin_modal(w, cx);
-        });
-        let cancel_cb: ModalCallback = Rc::new(|this, w, cx| {
-            this.cancel_active_plugin_modal(Some(w), cx);
-        });
+    let submit_cb: ModalCallback<AppModel> = Rc::new(|this, w, cx| {
+        this.submit_active_plugin_modal(w, cx);
+    });
+    let cancel_cb: ModalCallback<AppModel> = Rc::new(|this, w, cx| {
+        this.cancel_active_plugin_modal(Some(w), cx);
+    });
 
-        let mut widget_nodes: Vec<AnyElement> = Vec::with_capacity(modal.widgets.len());
-        for (wi, widget) in modal.widgets.into_iter().enumerate() {
-            widget_nodes.push(render_plugin_widget(
-                self,
-                &pid,
-                wi,
-                widget,
-                WidgetSurface::Modal {
-                    modal_id: &modal.id,
-                    on_submit: submit_cb.clone(),
-                    window,
-                },
-                t,
-                cx,
-            ));
-        }
-
-        let body = div()
-            .id(SharedString::from(format!(
-                "plugin-modal-content:{}:{pid}:{}",
-                pid.len(),
-                modal.id
-            )))
-            .flex()
-            .flex_col()
-            .gap(px(12.))
-            .when_some(modal.subtitle.filter(|s| !s.trim().is_empty()), |d, sub| {
-                d.child(div().text_size(t.text_sm).text_color(t.text_dim).child(sub))
-            })
-            .children(widget_nodes)
-            .into_any_element();
-
-        Some(modal_shell(
-            ModalShellSpec::dialog(
-                "plugin-modal",
-                modal.title,
-                modal_w,
-                max_h,
-                cancel_label,
-                submit_label,
-                body,
-                cancel_cb,
-                submit_cb,
-            )
-            .with_error(self.plugin_view.modal.error.clone())
-            .with_submit_disabled(is_submitting),
+    let mut widget_nodes: Vec<AnyElement> = Vec::with_capacity(modal.widgets.len());
+    for (wi, widget) in modal.widgets.into_iter().enumerate() {
+        widget_nodes.push(render_plugin_widget(
+            model,
+            &pid,
+            wi,
+            widget,
+            WidgetSurface::Modal {
+                modal_id: &modal.id,
+                on_submit: submit_cb.clone(),
+                window,
+            },
             t,
             cx,
-        ))
+        ));
     }
+
+    let body = div()
+        .id(SharedString::from(format!(
+            "plugin-modal-content:{}:{pid}:{}",
+            pid.len(),
+            modal.id
+        )))
+        .flex()
+        .flex_col()
+        .gap(px(12.))
+        .when_some(modal.subtitle.filter(|s| !s.trim().is_empty()), |d, sub| {
+            d.child(div().text_size(t.text_sm).text_color(t.text_dim).child(sub))
+        })
+        .children(widget_nodes)
+        .into_any_element();
+
+    Some(modal_shell(
+        model,
+        ModalShellSpec::dialog(
+            "plugin-modal",
+            modal.title,
+            modal_w,
+            max_h,
+            cancel_label,
+            submit_label,
+            body,
+            cancel_cb,
+            submit_cb,
+        )
+        .with_error(modal_error)
+        .with_submit_disabled(is_submitting),
+        t,
+    ))
 }

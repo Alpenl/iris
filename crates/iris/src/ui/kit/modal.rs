@@ -1,30 +1,28 @@
 //! Centered modal dialog shell (`t.radius_lg`, scrim click/scroll isolation)
-//! and popup/context-menu row primitives.
+//! and popup/context-menu row primitives, generic over any target GPUI entity.
 
 use std::rc::Rc;
 
 use gpui::{
-    AnyElement, Context, Div, ElementId, InteractiveElement, IntoElement, MouseButton,
+    AnyElement, Context, Div, ElementId, Entity, InteractiveElement, IntoElement, MouseButton,
     ParentElement, SharedString, Stateful, StatefulInteractiveElement, Styled, Window, div,
     prelude::FluentBuilder, px,
 };
 
-use super::super::IrisWindow;
 use super::{bordered_button, icon, icon_button, panel_header, tip};
 use crate::assets::Icon;
 use crate::theme::{FONT_MONO, ThemeTokens};
 
-pub(in crate::ui) type ModalCallback =
-    Rc<dyn Fn(&mut IrisWindow, &mut Window, &mut Context<IrisWindow>)>;
+pub(in crate::ui) type ModalCallback<V> = Rc<dyn Fn(&mut V, &mut Window, &mut Context<V>)>;
 
-pub(in crate::ui) struct ModalFooterSpec {
+pub(in crate::ui) struct ModalFooterSpec<V> {
     pub(in crate::ui) cancel_label: SharedString,
     pub(in crate::ui) submit_label: SharedString,
     pub(in crate::ui) submit_disabled: bool,
-    pub(in crate::ui) on_submit: ModalCallback,
+    pub(in crate::ui) on_submit: ModalCallback<V>,
 }
 
-pub(in crate::ui) struct ModalShellSpec {
+pub(in crate::ui) struct ModalShellSpec<V> {
     pub(in crate::ui) id_prefix: &'static str,
     pub(in crate::ui) title: SharedString,
     pub(in crate::ui) header_hint: Option<SharedString>,
@@ -35,11 +33,11 @@ pub(in crate::ui) struct ModalShellSpec {
     pub(in crate::ui) raw_body: bool,
     pub(in crate::ui) accent_border: bool,
     pub(in crate::ui) body: AnyElement,
-    pub(in crate::ui) on_cancel: ModalCallback,
-    pub(in crate::ui) footer: Option<ModalFooterSpec>,
+    pub(in crate::ui) on_cancel: ModalCallback<V>,
+    pub(in crate::ui) footer: Option<ModalFooterSpec<V>>,
 }
 
-impl ModalShellSpec {
+impl<V> ModalShellSpec<V> {
     #[allow(clippy::too_many_arguments)]
     pub(in crate::ui) fn dialog(
         id_prefix: &'static str,
@@ -49,8 +47,8 @@ impl ModalShellSpec {
         cancel_label: impl Into<SharedString>,
         submit_label: impl Into<SharedString>,
         body: AnyElement,
-        on_cancel: ModalCallback,
-        on_submit: ModalCallback,
+        on_cancel: ModalCallback<V>,
+        on_submit: ModalCallback<V>,
     ) -> Self {
         Self {
             id_prefix,
@@ -87,20 +85,24 @@ impl ModalShellSpec {
 }
 
 /// Centered modal shell with scrim backdrop that stops click and wheel propagation.
-pub(in crate::ui) fn modal_shell(
-    spec: ModalShellSpec,
+pub(in crate::ui) fn modal_shell<V: 'static>(
+    entity: &Entity<V>,
+    spec: ModalShellSpec<V>,
     t: ThemeTokens,
-    cx: &mut Context<IrisWindow>,
 ) -> AnyElement {
+    let weak = entity.downgrade();
     let (cancel_bd, cancel_x, cancel_btn) = (
         spec.on_cancel.clone(),
         spec.on_cancel.clone(),
         spec.on_cancel,
     );
 
+    let weak_x = weak.clone();
     let close_btn = icon_button((spec.id_prefix, 2usize), Icon::Close, false, t)
         .tooltip(tip("关闭", Some("Esc".into())))
-        .on_click(cx.listener(move |this, _, w, cx| cancel_x(this, w, cx)))
+        .on_click(move |_, w, cx| {
+            let _ = weak_x.update(cx, |this, cx| cancel_x(this, w, cx));
+        })
         .into_any_element();
     let header = panel_header(spec.title, spec.header_hint, Some(close_btn), t);
 
@@ -128,13 +130,18 @@ pub(in crate::ui) fn modal_shell(
 
     let footer = spec.footer.map(|f| {
         let submit_btn = f.on_submit;
+        let weak_sub = weak.clone();
+        let weak_can = weak.clone();
         let submit_el = if f.submit_disabled {
             bordered_button((spec.id_prefix, 5usize), f.submit_label, true, t)
                 .opacity(0.45)
                 .cursor_default()
         } else {
-            bordered_button((spec.id_prefix, 5usize), f.submit_label, true, t)
-                .on_click(cx.listener(move |this, _, w, cx| submit_btn(this, w, cx)))
+            bordered_button((spec.id_prefix, 5usize), f.submit_label, true, t).on_click(
+                move |_, w, cx| {
+                    let _ = weak_sub.update(cx, |this, cx| submit_btn(this, w, cx));
+                },
+            )
         };
         div()
             .min_h(px(44.))
@@ -149,8 +156,11 @@ pub(in crate::ui) fn modal_shell(
             .border_t_1()
             .border_color(t.line)
             .child(
-                bordered_button((spec.id_prefix, 4usize), f.cancel_label, false, t)
-                    .on_click(cx.listener(move |this, _, w, cx| cancel_btn(this, w, cx))),
+                bordered_button((spec.id_prefix, 4usize), f.cancel_label, false, t).on_click(
+                    move |_, w, cx| {
+                        let _ = weak_can.update(cx, |this, cx| cancel_btn(this, w, cx));
+                    },
+                ),
             )
             .child(submit_el)
     });
@@ -182,13 +192,10 @@ pub(in crate::ui) fn modal_shell(
         .bg(t.scrim)
         .p(px(12.))
         .occlude()
-        .on_mouse_down(
-            MouseButton::Left,
-            cx.listener(move |this, _, w, cx| {
-                cancel_bd(this, w, cx);
-                cx.stop_propagation();
-            }),
-        )
+        .on_mouse_down(MouseButton::Left, move |_, w, cx| {
+            let _ = weak.update(cx, |this, cx| cancel_bd(this, w, cx));
+            cx.stop_propagation();
+        })
         .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
         .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
         .child(

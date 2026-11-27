@@ -1,15 +1,15 @@
 # Iris 插件系统 v2 架构规范与演进路线图（protocol: 2）
 
-> **状态：源码已完成协议 2 切换并于 `0.0.2` 完成极简收敛；跨平台发布和性能验收仍有待验证项；修订日期：2026-11-26。**
-> **0.0.2 收敛说明**：遵循「极简、高效、自由」原则，已移除零调用方的 BYOB 外部工具（`external_tool` / `export_files` / `process_tree`）、DASH 与受限 HLS 文本通道（保留结构化 `VirtualHls` 与远端 HLS 转换，及轻量 `FileExecutor` 私有产物/当前媒体哈希）；用正交的 `Widget::PixelGrid` + `ViewTimer` 取代特化的 `Widget::QrCode` 轮询器；新增 `SourceDescriptor.badge` 与无特权 `HostCommand::Log`（20 条/秒限流 + 自动脱敏）。
+> **状态：源码已完成协议 2 切换并于 `0.0.2` 合入 `main`、通过远端多平台 CI 矩阵；设备端高刷显示与第三方公网服务仍按边界保留非声明项；修订日期：2026-11-27。**
+> **0.0.2 收敛与架构硬化说明**：遵循「极简、高效、自由」原则，已移除零调用方的 BYOB 外部工具（`external_tool` / `export_files` / `process_tree`）、DASH 与受限 HLS 文本通道（保留结构化 `VirtualHls` 与远端 HLS 转换，及轻量 `FileExecutor` 私有产物/当前媒体哈希）；用正交的 `Widget::PixelGrid` + `ViewTimer` 取代特化的 `Widget::QrCode` 轮询器；新增 `SourceDescriptor.badge` 与无特权 `HostCommand::Log`（20 条/秒限流 + 自动脱敏）；Wasmtime 切换至纯解释字节码 `pulley64`（零可执行内存页、零 macOS JIT entitlement）；工作区拆分为无领域网络底座 `iris-net`、无插件内核 `iris-core` 与独立宿主 `iris-plugin-host`（每窗口显式 `PluginHost` 单窗口模型）；控制面严格区分句柄标识 `Id`（`1..=i64::MAX`）与字节量纲 `WireU64`（`0..=u64::MAX` 十进制字符串）。
 > 决策依据见 [PLUGIN_V2_DECISIONS.md](PLUGIN_V2_DECISIONS.md)；当前产品行为以 [PLUGINS.md](PLUGINS.md) 与 [ARCHITECTURE.md](ARCHITECTURE.md) 为准，[PLUGIN_V2_IMPLEMENTATION.md](PLUGIN_V2_IMPLEMENTATION.md) 保留分阶段实现与验收证据。
-> 下文“必须”“禁止”是实现要求；配额是首版策略基线，性能项目是待测目标，均不表示已通过验收。
+> 下文“必须”“禁止”是实现要求；配额是首版策略基线，性能项目按实测报告与非声明边界解读。
 
 ## 1. 目标、分层与信任模型
 
-- `iris-core` 保持无头：负责插件、会话、网络、流源、数据与任务；原生窗口、交换链和 UI 集成留在 `iris`，FFI 留在 `iris-mpv`。
+- 无头底座分层隔离：`iris-net` 负责统一网络策略（DNS/SSRF/IP 钉扎）、HTTP/TCP/WS 传输与协作取消/并发预算；`iris-core` 保持无插件依赖，负责会话、纯状态机播放器、媒体库与持久存储；`iris-plugin-host` 负责 Wasmtime 沙箱、`PluginHost` 协调、流中继、受控清单与私有产物；原生窗口、统一视频表面和区域化 GPUI 视图留在 `iris`，零依赖 FFI 留在 `iris-mpv`。
 - `iris-api` 常规依赖仅 `serde`；新 `iris-plugin-sdk` 封装 Guest ABI 与异步状态机，可编译到 `wasm32-unknown-unknown`。SDK 不向 Guest 暴露宿主任意文件、进程或网络权限。
-- Wasmtime 使用同步调用接口，按实际锁定版本显式选择编译/runtime 特性；宿主 I/O 协议异步化，不直接引入 `tokio`。同步 Wasmtime 不等于同步等待网络。
+- Wasmtime 使用同步调用接口与 `pulley64` 纯字节码目标（禁用宿主原生 JIT、信号陷阱与 4 GiB 虚拟地址预留，零可执行内存页），宿主 I/O 协议异步化，不直接引入 `tokio`。同步 Wasmtime 不等于同步等待网络。
 - 新依赖按实际特性和传递依赖通过 `deny.toml`；生产模块维持 650 行软限 / 850 行硬限等现有门禁。没有基于选库名称的自动许可合规结论。
 
 | 对象 | 信任与责任 |
@@ -48,11 +48,11 @@
 - 状态文件按安装身份绑定、锁内读取最新版本并原子写入，128 个键、单值 32 KiB、整个序列化记录 256 KiB；读出值还必须能装入控制消息。秘密只进入系统凭据库，Plugin 桶与宿主确认的规范 Origin 桶分离，合计最多 64 个键、单值 2 KiB。不通过 Guest 提交的任意字符串选择旧安装或其他插件作用域。
 - 同一安装身份同时仅接收一个状态/凭据作业，其他请求返回 BACKPRESSURE。锁冲突、损坏文件和系统 vault 错误不能解释为空数据并覆盖。写入提交与取消竞争时可能已落盘；取消不撤销已完成写入，重试前读取当前值/状态 revision。停止后的在途作业继续持有配额至退出。
 
-### 2.3 不使用磁盘机器码缓存
+### 2.3 不使用磁盘机器码缓存与可执行内存
 
-在后台使用安全编译 API 校验并编译 Wasm；`Module` 仅在有界内存缓存中复用，身份键包括内容摘要与当前 Engine 配置。禁止接受包中预编译机器码，禁止 `Module::deserialize*`、可信预编译文件入口及磁盘 AOT 缓存。
+在后台使用安全编译 API 将 Wasm 校验并编译为只读 `pulley64` 字节码；`Module` 仅在有界内存缓存中复用，身份键包括内容摘要与当前 Engine 配置。禁止接受包中预编译机器码，禁止 `Module::deserialize*`、可信预编译文件入口及磁盘 AOT 缓存。
 
-限制编译并发、排队和输入规模；Epoch 不负责中断编译器。运行中的 Module 通过引用保持有效，闲置项可淘汰。编译/实例化耗时、产物及瞬时编译内存需测量，不承诺固定毫秒或微秒值。macOS JIT 权限、签名公证和平台支持以构建测试为准。
+限制编译并发、排队和输入规模；Epoch 不负责中断编译器。运行中的 Module 通过引用保持有效，闲置项可淘汰。`pulley64` 完全运行于宿主常规只读/读写数据页，无需 RWX/RX 可执行页或 macOS `com.apple.security.cs.allow-jit` 签名豁免（评估与实测对比见 [PLUGIN_V2_DECISIONS.md](PLUGIN_V2_DECISIONS.md) §3.1.1）。
 
 ## 3. 实例、调度与生命周期
 
@@ -72,9 +72,9 @@ flowchart LR
     CS -->|"WakeSignal"| UI
 ```
 
-- 每插件一个 `ControlStore`；RandomAccess/VirtualManifest 每播放会话一个 `StreamStore`，同一 Module 独立实例化，不共享 Guest 内存。DirectHttp 不为每块数据创建 Guest 调用。
-- 一个安装身份的 ControlStore 同时服务多个窗口：宿主用 `Window { window, generation, body }` 包裹窗口事件和异步完成，回复继承当前窗口。每插件最多四个活跃窗口上下文，宿主分配 ID 且不复用；Init/安装状态为全局，StreamStore 事件保持会话专属。窗口之间仍共享同一 Guest 内存，不是不同插件的安全边界。
-- 每个窗口有独立取消域和宿主服务句柄。控制事件的外层 `Window.generation` 绑定媒体/context 生命周期；普通拖动或 mpv 原生 A-B 循环只推进 StreamSession 的读取代次和 TimedOverlay 的内层 seek 代次，不撤销同窗口的目录、配置保存或登录任务。切集、关闭、停用才撤销对应控制窗口上下文。切换回调时隔离 Blob 句柄表，禁止在另一个窗口回调中读取或关闭原窗口的句柄。后台结果须经过各自作用域的代次检查才能应用。关闭后的服务仍保留其资源账本直到 I/O 退出；每插件最多八个活跃或等待回收的窗口执行器，超过返回背压。
+- 每窗口显式持有一个 `PluginHost`，其内每插件一个 `ControlStore`；RandomAccess/VirtualManifest 每播放会话一个 `StreamStore`，同一 Module 独立实例化，不共享 Guest 内存。DirectHttp 不为每块数据创建 Guest 调用。
+- `0.0.2` 收敛为单宿主单活跃窗口会话（`WindowId(1)`），取代早期跨窗口全局 Hub/Client 复用层；协议层保留 `Window { window, generation, body }` 包络以维持 ABI v2 兼容并隔离重开/换代边界，Init/安装状态为宿主级，StreamStore 事件保持会话专属。
+- 窗口会话拥有独立取消域和宿主服务句柄。控制事件的外层 `Window.generation` 绑定媒体/context 生命周期；普通拖动或 mpv 原生 A-B 循环只推进 StreamSession 的读取代次和 TimedOverlay 的内层 seek 代次，不撤销同窗口的目录、配置保存或登录任务。切集、关闭、停用才撤销对应控制窗口上下文。回调边界隔离 Blob 句柄表，后台结果须经过各自作用域的代次检查才能应用。关闭后的服务仍保留其资源账本直到 I/O 退出，超过活跃/回收上限时返回背压。
 - 单 Store 任一时刻仅执行一个 Guest 调用。网络与全量文件哈希在对应实例中都必须返回后再等待完成事件；中继的等待不能占着 Store 或 UI 线程。
 - 播放/控制分离队列与执行容量，限制单插件连续占用；同时等待视频、音频、清单、Range 的请求以 ID 区分。排队、执行、I/O、结果缓冲均有独立账本。
 - 设置内存/表/实例限制、Epoch 和调用预算后才允许实例化及执行 start/init。未启用实例不执行 Guest 代码。
@@ -111,7 +111,7 @@ flowchart LR
 
 - Core Wasm32，导出一个非共享 `memory`；首版不接受 memory64、多内存、共享内存、Guest 线程或 WASI。导入命名空间固定为 `iris_v2`，按实例角色建立能力白名单。
 - 控制面为 UTF-8 JSON，使用 `iris-api` 的带标签枚举、snake_case 标签；只使用有明确 schema 的字段。重复键、非有限浮点、超深结构、未知必需变体拒绝。JSON 深度上限 32，单消息 64 KiB，单返回批次最多 64 个命令。
-- JSON 中所有 u64/i64 数值使用规范十进制字符串（无加号、无多余前导零），避免其他语言精度损失；FFI 数值仍是 Wasm 整数。SDK 提供相同测试向量。
+- JSON 中所有 64 位整数使用规范十进制字符串（无加号、无多余前导零），避免跨语言精度损失：`Id`（句柄、`op_id`、请求与代次标识）严格约束在 `1..=i64::MAX` 以对齐有符号 64 位 Wasm 导入参数；`WireU64`（字节长度、偏移、文件大小、计数与毫秒时间戳）覆盖完整 `0..=u64::MAX`。FFI 数值仍是 Wasm 整数，SDK 提供相同测试向量。
 - ABI/协议首版均为 2；成功、错误消息的固定 JSON 包络分别为 `{"ok":[...]}`、`{"error":{"code":-1,"message":"..."}}`。错误文本限 1 KiB、脱敏；副作用前先验证该批消息。
 - 媒体字节不塞入 JSON/Base64；使用缓冲句柄或当前调用内的指针长度。分块边界是内存边界，不是假定的容器/加密块边界。
 
@@ -409,7 +409,7 @@ A15 的播放基准须记录素材哈希、编解码/码率、CPU/GPU/系统、�
 
 | 工作包 | 范围 | 依赖 |
 |---|---|---|
-| [V2-01 · #3](https://github.com/Alpenl/iris/issues/3) | 包加载、内存 JIT、ABI 与跨语言 SDK | 无；先建立 A01/A02 夹具 |
+| [V2-01 · #3](https://github.com/Alpenl/iris/issues/3) | 包加载、内存 Pulley64 编译、ABI 与跨语言 SDK | 无；先建立 A01/A02 夹具 |
 | [V2-02 · #4](https://github.com/Alpenl/iris/issues/4) | 双实例异步调度、取消、资源总账本 | V2-01 |
 | [V2-03 · #5](https://github.com/Alpenl/iris/issues/5) | 全链路网络/凭据授权与登录 | V2-01、V2-02 |
 | [V2-04 · #6](https://github.com/Alpenl/iris/issues/6) | 三模流、受控 `VirtualHls`/远端 HLS 重写与上下文刷新（DASH 已于 `0.0.2` 移除） | V2-01、V2-02、V2-03 |
