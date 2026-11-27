@@ -1,4 +1,4 @@
-use iris_core::vfs::validate_stream_url;
+use iris_net::http_client::validate_stream_url;
 
 #[test]
 fn validate_stream_url_enforces_schemes_loopback_ports_and_link_local_blocks() {

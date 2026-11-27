@@ -173,8 +173,8 @@ mod imp {
                 return Claim::Rejected;
             }
         };
-        if let Err(e) = iris_core::concurrency::spawn_thread(
-            iris_core::concurrency::ThreadRole::SingleInstanceIpc,
+        if let Err(e) = iris_net::concurrency::spawn_thread(
+            iris_net::concurrency::ThreadRole::SingleInstanceIpc,
             move || serve(pipe, session, opened),
         ) {
             log::error!("starting file-open listener: {e}");

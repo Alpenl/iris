@@ -25,8 +25,8 @@ use iris_core::{
     player::{Command, Session, SessionEvent, SessionUpdate, TrackKind, prepare},
     settings::{Hwdec, Settings},
     vault::CredentialVault,
-    vfs::HttpCancel,
 };
+use iris_net::http_client::HttpCancel;
 use iris_plugin_host::{
     actor::{Executor, Operation, TaskContext},
     enhancement::{AttachmentRegistry, AttachmentSpec},

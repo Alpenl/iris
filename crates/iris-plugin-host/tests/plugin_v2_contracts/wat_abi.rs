@@ -728,7 +728,7 @@ fn wat_ws_request_origin_returns_notice_without_quarantining_plugin() {
 #[test]
 fn wat_stream_role_abi_replies_and_fails_cleanly() {
     use iris_api::v2::stream::StreamContext;
-    use iris_core::vfs::HttpCancel;
+    use iris_net::http_client::HttpCancel;
     use iris_plugin_host::stream::{guest::StreamStore, session::new_session_id};
 
     let empty = r#"{"ok":[]}"#;

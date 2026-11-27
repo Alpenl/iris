@@ -230,7 +230,7 @@ fn exercise(input: &[u8]) {
         let _ = iris_core::player::fuzz_hls::parse_and_extract_uris(text, HLS_DIFF_BASE_URL);
     }
     let _ = prepare::subtitle_format(input);
-    iris_core::vfs::fuzz_net::exercise(input);
+    iris_net::fuzz_net::exercise(input);
     if let Ok(command) = decode_exact::<HostCommand>(input, MESSAGE_LIMIT) {
         let _ = validation::command(&command);
     }

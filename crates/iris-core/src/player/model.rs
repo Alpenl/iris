@@ -144,10 +144,10 @@ pub(super) fn fetch_subtitle(
     url: &url::Url,
     headers: &BTreeMap<String, String>,
     credentials: &url::Url,
-    scope: &crate::vfs::http_client::NetworkScope,
-    cancel: &crate::vfs::HttpCancel,
+    scope: &iris_net::http_client::NetworkScope,
+    cancel: &iris_net::http_client::HttpCancel,
 ) -> Result<String> {
-    let body = crate::vfs::http_client::fetch_subtitle_bytes(
+    let body = iris_net::http_client::fetch_subtitle_bytes(
         url.clone(),
         headers,
         credentials,

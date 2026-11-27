@@ -42,8 +42,8 @@ mod enabled {
             }
         };
         let (tx, rx) = unbounded();
-        match iris_core::concurrency::spawn_thread(
-            iris_core::concurrency::ThreadRole::ControlPipe,
+        match iris_net::concurrency::spawn_thread(
+            iris_net::concurrency::ThreadRole::ControlPipe,
             move || listener.run(tx),
         ) {
             Ok(_) => {

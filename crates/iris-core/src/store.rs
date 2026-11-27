@@ -6,9 +6,9 @@ use std::fmt::Write as _;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use crate::concurrency::CancelToken;
 use crate::fs_util;
 use crate::media_uri::MediaUri;
+use iris_net::concurrency::CancelToken;
 mod annotations;
 mod recent;
 mod tsv;

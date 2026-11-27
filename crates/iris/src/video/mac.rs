@@ -488,8 +488,8 @@ impl VideoSurfaceBackend for MacVideoSurface {
             let layer_ref = SendId(layer);
             let worker_state = Arc::clone(&state);
             let (tx, rx) = mpsc::sync_channel::<()>(1);
-            let worker = iris_core::concurrency::spawn_thread(
-                iris_core::concurrency::ThreadRole::VideoSurface,
+            let worker = iris_net::concurrency::spawn_thread(
+                iris_net::concurrency::ThreadRole::VideoSurface,
                 move || {
                     let layer = layer_ref;
                     while rx.recv().is_ok() {

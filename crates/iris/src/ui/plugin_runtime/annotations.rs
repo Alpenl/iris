@@ -18,7 +18,7 @@ use iris_core::store::{
     AnnotationEdit as StoreAnnotationEdit, AnnotationError, AnnotationSnapshot, AnnotationTarget,
     ColorLabel, TimeMarker,
 };
-use iris_core::vfs::HttpCancel;
+use iris_net::http_client::HttpCancel;
 use iris_plugin_host::{
     ledger::{Ledger, Resource},
     runtime::WindowAccess,

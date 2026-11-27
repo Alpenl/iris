@@ -96,8 +96,8 @@ impl VideoSurfaceBackend for WinVideoSurface {
         let (reset_tx, reset_rx) = unbounded();
         let shared = layout.clone();
         let callback_wake = wake.clone();
-        let worker = iris_core::concurrency::spawn_thread(
-            iris_core::concurrency::ThreadRole::VideoSurface,
+        let worker = iris_net::concurrency::spawn_thread(
+            iris_net::concurrency::ThreadRole::VideoSurface,
             move || {
                 // COM and every D3D/render resource remain on this thread.
                 let initialized = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }.is_ok();

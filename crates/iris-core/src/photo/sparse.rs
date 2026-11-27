@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::io::{self, Read, Seek, SeekFrom};
 
-use crate::vfs::{self, HttpCancel};
+use iris_net::http_client::{self, HttpCancel};
 
 use super::{Photo, detect_photo_format, finish_header, run_probe};
 
@@ -125,7 +125,7 @@ pub fn probe_remote(
     cancel: &HttpCancel,
 ) -> Photo {
     let Some(mut input) = Sparse::open(
-        |start, len| vfs::fetch_range(url, headers, start, len, cancel),
+        |start, len| http_client::fetch_range(url, headers, start, len, cancel),
         cancel,
     ) else {
         return Photo::default();

@@ -136,7 +136,7 @@ fn single_window_enforces_exclusivity_cancellation_and_clean_reopen() {
     }
 }
 
-type PendingRequests = Arc<Mutex<Vec<(iris_core::vfs::HttpCancel, Completion)>>>;
+type PendingRequests = Arc<Mutex<Vec<(iris_net::http_client::HttpCancel, Completion)>>>;
 struct RequestIo(PendingRequests);
 impl Executor for RequestIo {
     fn prepare(
@@ -160,7 +160,7 @@ impl Executor for RequestIo {
 #[test]
 #[ignore = "requires compiled Rust guest; run scripts/test-plugin-v2.py"]
 fn individual_source_request_cancel_survives_async_callbacks_without_cancelling_its_neighbor() {
-    use iris_core::vfs::HttpCancel;
+    use iris_net::http_client::HttpCancel;
     let engine = RuntimeEngine::new().unwrap();
     let module = engine
         .compile(&guest("IRIS_V2_RUST_GUEST"), &CancelToken::new())

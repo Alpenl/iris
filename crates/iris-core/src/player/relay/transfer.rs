@@ -6,10 +6,10 @@ use std::time::Duration;
 
 use anyhow::{Result, ensure};
 
-use crate::loopback_http::{
+use iris_net::http_client::{HttpCancel, HttpStream};
+use iris_net::loopback_http::{
     ClientWatch, HttpRequestError, read_request, write_all_cancellable, write_chunk_cancellable,
 };
-use crate::vfs::HttpCancel;
 
 pub(super) enum RelayError {
     Request(HttpRequestError),
@@ -50,7 +50,7 @@ pub(super) fn reject_busy(mut socket: TcpStream, max_request: usize) {
     );
 }
 
-pub(super) fn ensure_identity(response: &crate::vfs::http_client::HttpStream) -> Result<()> {
+pub(super) fn ensure_identity(response: &HttpStream) -> Result<()> {
     ensure!(
         response
             .headers
