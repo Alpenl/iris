@@ -8,7 +8,8 @@ use anyhow::{Result, ensure};
 
 use iris_base::net::http_client::{HttpCancel, HttpStream};
 use iris_base::net::loopback_http::{
-    ClientWatch, HttpRequestError, read_request, write_all_cancellable, write_chunk_cancellable,
+    ClientWatch, HttpRequestError, is_adaptive_manifest, is_adaptive_prefix_undecided,
+    read_request, write_all_cancellable, write_chunk_cancellable,
 };
 
 pub(super) enum RelayError {
@@ -61,6 +62,29 @@ pub(super) fn ensure_identity(response: &HttpStream) -> Result<()> {
     Ok(())
 }
 
+pub(super) fn sniff_media_prefix(body: &mut impl Read, max_sniff: usize) -> Result<Vec<u8>> {
+    let mut buf = vec![0u8; max_sniff];
+    let mut used = 0;
+    let mut eof = false;
+    while used < buf.len() && is_adaptive_prefix_undecided(&buf[..used]) {
+        match body.read(&mut buf[used..]) {
+            Ok(0) => {
+                eof = true;
+                break;
+            }
+            Ok(n) => used += n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    ensure!(
+        !is_adaptive_manifest(&buf[..used]) && (eof || !is_adaptive_prefix_undecided(&buf[..used])),
+        "unexpected adaptive manifest on media route"
+    );
+    buf.truncate(used);
+    Ok(buf)
+}
+
 pub(super) fn copy_stream(
     mut body: impl Read,
     socket: &mut TcpStream,
@@ -68,6 +92,7 @@ pub(super) fn copy_stream(
     watch: &mut ClientWatch,
     cancel: &HttpCancel,
 ) -> io::Result<()> {
+    debug_assert_eq!(socket.write_timeout().ok().flatten(), None);
     let mut buffer = [0; 64 * 1024];
     loop {
         let n = match body.read(&mut buffer) {

@@ -1,4 +1,5 @@
 mod bench;
+mod contracts;
 
 use std::collections::BTreeMap;
 use std::io::{self, Read, Write};

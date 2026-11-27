@@ -11,8 +11,9 @@ use crate::{
 use iris_api::v2::{CHUNK_LIMIT, ErrorCode};
 use iris_base::net::http_client::HttpCancel;
 use iris_base::net::loopback_http::{
-    ClientHub, ClientWatch, HttpMethod, HttpRequestError, parse_http_request, read_request,
-    write_all_cancellable, write_chunk_cancellable,
+    ClientHub, ClientWatch, HttpMethod, HttpRequestError, enter_nonblocking_body,
+    parse_http_request, read_request, write_all_bounded, write_all_cancellable,
+    write_chunk_cancellable,
 };
 use iris_base::rt::{ThreadRole, budget, spawn_thread};
 use iris_core::logging;
@@ -30,6 +31,7 @@ use std::{
 const LISTENER: Token = Token(0);
 const WAKE: Token = Token(1);
 const HEADER_LIMIT: usize = 24 << 10;
+const PRE_BODY_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct BoundRelay {
     listener: mio::net::TcpListener,
@@ -47,7 +49,14 @@ impl BoundRelay {
     pub fn authority(&self) -> Result<SocketAddr, ErrorCode> {
         self.listener.local_addr().map_err(io)
     }
-    pub fn start(mut self, session: Arc<StreamSession>) -> Result<Relay, ErrorCode> {
+    pub fn start(self, session: Arc<StreamSession>) -> Result<Relay, ErrorCode> {
+        self.start_with_timeout(session, PRE_BODY_TIMEOUT)
+    }
+    pub(super) fn start_with_timeout(
+        mut self,
+        session: Arc<StreamSession>,
+        pre_body_timeout: Duration,
+    ) -> Result<Relay, ErrorCode> {
         if session.authority() != self.authority()? {
             return Err(ErrorCode::Denied);
         }
@@ -69,6 +78,7 @@ impl BoundRelay {
             active: AtomicUsize::new(0),
             done: AtomicBool::new(false),
             wake,
+            pre_body_timeout,
         });
         let server = service.clone();
         spawn_thread(ThreadRole::PluginRelayListener, move || {
@@ -112,6 +122,7 @@ struct Service {
     active: AtomicUsize,
     done: AtomicBool,
     wake: Arc<Waker>,
+    pre_body_timeout: Duration,
 }
 struct Worker {
     service: Arc<Service>,
@@ -276,9 +287,9 @@ fn serve(
     committed: &mut bool,
 ) -> Result<(), ErrorCode> {
     socket
-        .set_write_timeout(Some(Duration::from_secs(30)))
+        .set_write_timeout(Some(service.pre_body_timeout))
         .map_err(io)?;
-    let bytes = read_request(socket, Duration::from_secs(5), HEADER_LIMIT)
+    let bytes = read_request(socket, service.pre_body_timeout, HEADER_LIMIT)
         .map_err(|e| map_watch_io(e, cancel))?;
     let authority = service.session.authority().to_string();
     let parsed = match parse_http_request(&bytes, &authority) {
@@ -306,9 +317,7 @@ fn serve(
     // Switch to nonblocking mode with NO SO_SNDTIMEO before registering with mio
     // or writing any response bytes: on Windows Winsock, SO_SNDTIMEO can leave
     // bytes queued on WSAETIMEDOUT and cause duplicate-chunk stream corruption.
-    socket.set_write_timeout(None).map_err(io)?;
-    socket.set_read_timeout(None).map_err(io)?;
-    socket.set_nonblocking(true).map_err(io)?;
+    enter_nonblocking_body(socket).map_err(io)?;
     let mut watch = service.hub.watch(socket, cancel.clone()).map_err(io)?;
     let access = service.session.open(parsed.path, cancel)?;
     let size = access.reader.size(&access.cancel)?;
@@ -324,8 +333,14 @@ fn serve(
             } else {
                 reply.push_str("Content-Range: bytes */*\r\n\r\n");
             }
-            write_all_cancellable(socket, reply.as_bytes(), &mut watch, cancel)
-                .map_err(|e| map_watch_io(e, cancel))?;
+            write_all_bounded(
+                socket,
+                reply.as_bytes(),
+                &mut watch,
+                cancel,
+                service.pre_body_timeout,
+            )
+            .map_err(|e| map_watch_io(e, cancel))?;
             return Err(error);
         }
     };
@@ -382,6 +397,7 @@ fn serve(
             access.profile,
             &mut watch,
             &access.cancel,
+            service.pre_body_timeout,
         )?;
         return write_stream_body(socket, &access, range, &mut stream, &mut watch);
     }
@@ -428,12 +444,14 @@ fn serve(
         access.profile,
         &mut watch,
         &access.cancel,
+        service.pre_body_timeout,
     )?;
     if head {
         return Ok(());
     }
     write_body(socket, access, range, first, &mut watch)
 }
+#[allow(clippy::too_many_arguments)]
 fn write_response_headers(
     socket: &mut TcpStream,
     range: &Range,
@@ -442,6 +460,7 @@ fn write_response_headers(
     profile: Option<super::manifest::Profile>,
     watch: &mut ClientWatch,
     cancel: &HttpCancel,
+    timeout: Duration,
 ) -> Result<(), ErrorCode> {
     let mut header = format!(
         "HTTP/1.1 {}\r\nConnection: close\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\n",
@@ -467,7 +486,7 @@ fn write_response_headers(
         None => "application/octet-stream",
     };
     header.push_str(&format!("Content-Type: {mime}\r\n\r\n"));
-    write_all_cancellable(socket, header.as_bytes(), watch, cancel)
+    write_all_bounded(socket, header.as_bytes(), watch, cancel, timeout)
         .map_err(|e| map_watch_io(e, cancel))
 }
 fn write_chunk(
@@ -487,6 +506,7 @@ fn write_stream_body(
     stream: &mut super::reader::OpenedStream,
     watch: &mut ClientWatch,
 ) -> Result<(), ErrorCode> {
+    debug_assert_eq!(socket.write_timeout().ok().flatten(), None);
     let chunked = range.len.is_none();
     let mut left = range.len;
     if !stream.first.is_empty() {
@@ -547,6 +567,7 @@ fn write_body(
     mut next: Option<ReadResult>,
     watch: &mut ClientWatch,
 ) -> Result<(), ErrorCode> {
+    debug_assert_eq!(socket.write_timeout().ok().flatten(), None);
     let chunked = range.len.is_none();
     let mut offset = range.offset;
     let mut left = range.len;

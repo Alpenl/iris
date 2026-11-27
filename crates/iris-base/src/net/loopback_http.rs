@@ -346,7 +346,21 @@ pub fn read_request(
             .checked_duration_since(Instant::now())
             .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "relay request timeout"))?;
         socket.set_read_timeout(Some(left))?;
-        let n = socket.read(&mut buf)?;
+        let n = match socket.read(&mut buf) {
+            Ok(n) => n,
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                ) =>
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "relay request timeout",
+                ));
+            }
+            Err(err) => return Err(err),
+        };
         if n == 0 || raw.len() + n > max_bytes {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -360,6 +374,22 @@ pub fn read_request(
         }
     }
 }
+
+/// Clears blocking read/write socket timeouts (`SO_SNDTIMEO` / `SO_RCVTIMEO`)
+/// and switches a loopback client socket into nonblocking mode before body writes.
+///
+/// On Windows Winsock, leaving `SO_SNDTIMEO` armed during streaming writes can
+/// leave partial bytes queued after `WSAETIMEDOUT` and corrupt subsequent chunks.
+pub fn enter_nonblocking_body(socket: &mut TcpStream) -> io::Result<()> {
+    socket.set_write_timeout(None)?;
+    socket.set_read_timeout(None)?;
+    socket.set_nonblocking(true)?;
+    debug_assert_eq!(socket.write_timeout().ok().flatten(), None);
+    debug_assert_eq!(socket.read_timeout().ok().flatten(), None);
+    Ok(())
+}
+
+const MAX_NONBLOCKING_WRITE: usize = 64 * 1024;
 
 /// Writes `bytes` to a nonblocking loopback socket, waiting for `mio` writability
 /// and aborting promptly if `cancel` fires.
@@ -378,7 +408,8 @@ pub fn write_all_cancellable(
             ));
         }
         let epoch = watch.writable_gen();
-        match socket.write(bytes) {
+        let step = &bytes[..bytes.len().min(MAX_NONBLOCKING_WRITE)];
+        match socket.write(step) {
             Ok(0) => {
                 watch.disarm_writable();
                 return Err(io::Error::new(io::ErrorKind::WriteZero, "relay write zero"));
@@ -386,6 +417,63 @@ pub fn write_all_cancellable(
             Ok(n) => bytes = &bytes[n..],
             Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
             Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                if let Err(wait_err) = watch.wait_writable(epoch, cancel) {
+                    watch.disarm_writable();
+                    return Err(wait_err);
+                }
+            }
+            Err(err) => {
+                watch.disarm_writable();
+                return Err(err);
+            }
+        }
+    }
+    watch.disarm_writable();
+    Ok(())
+}
+
+/// Writes pre-body bytes (`headers` / status responses) to a nonblocking loopback
+/// socket within `timeout`, failing closed with `TimedOut` if the client stalls.
+pub fn write_all_bounded(
+    socket: &mut TcpStream,
+    mut bytes: &[u8],
+    watch: &mut ClientWatch,
+    cancel: &HttpCancel,
+    timeout: Duration,
+) -> io::Result<()> {
+    let deadline = Instant::now() + timeout;
+    while !bytes.is_empty() {
+        if cancel.is_cancelled() {
+            watch.disarm_writable();
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "relay cancelled",
+            ));
+        }
+        if Instant::now() >= deadline {
+            watch.disarm_writable();
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "relay pre-body write timeout",
+            ));
+        }
+        let epoch = watch.writable_gen();
+        let step = &bytes[..bytes.len().min(MAX_NONBLOCKING_WRITE)];
+        match socket.write(step) {
+            Ok(0) => {
+                watch.disarm_writable();
+                return Err(io::Error::new(io::ErrorKind::WriteZero, "relay write zero"));
+            }
+            Ok(n) => bytes = &bytes[n..],
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                if Instant::now() >= deadline {
+                    watch.disarm_writable();
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "relay pre-body write timeout",
+                    ));
+                }
                 if let Err(wait_err) = watch.wait_writable(epoch, cancel) {
                     watch.disarm_writable();
                     return Err(wait_err);
@@ -577,5 +665,67 @@ mod tests {
         let mp4 = b"\x00\x00\x00\x18ftypisom";
         assert!(!is_adaptive_prefix_undecided(&mp4[..1]));
         assert!(!is_adaptive_manifest(mp4));
+    }
+
+    #[test]
+    fn enter_nonblocking_body_clears_socket_timeouts_and_write_all_bounded_times_out_stalled_peer()
+    {
+        use super::{ClientHub, enter_nonblocking_body, write_all_bounded};
+        use crate::net::http_client::HttpCancel;
+        use std::io::{ErrorKind, Read};
+        use std::net::{Ipv4Addr, TcpListener, TcpStream};
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut client = TcpStream::connect(addr).unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+
+        server
+            .set_write_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        server
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        assert!(server.write_timeout().unwrap().is_some());
+        assert!(server.read_timeout().unwrap().is_some());
+
+        enter_nonblocking_body(&mut server).unwrap();
+        assert_eq!(server.write_timeout().unwrap(), None);
+        assert_eq!(server.read_timeout().unwrap(), None);
+        let mut probe = [0u8; 1];
+        assert_eq!(
+            server.read(&mut probe).unwrap_err().kind(),
+            ErrorKind::WouldBlock
+        );
+
+        let poll = mio::Poll::new().unwrap();
+        let hub = Arc::new(ClientHub::new(poll.registry().try_clone().unwrap(), 2));
+        let cancel = HttpCancel::default();
+        let mut watch = hub.watch(&server, cancel.clone()).unwrap();
+
+        // Repeatedly write 1 MiB chunks without reading on `client` until both the
+        // peer receive window and local send buffer saturate (Windows Winsock loopback
+        // auto-tuning can buffer >= 8-16 MiB before returning `WouldBlock`).
+        let chunk = vec![0x5au8; 1 << 20];
+        let start = Instant::now();
+        let mut timed_out = None;
+        for _ in 0..256 {
+            if let Err(err) = write_all_bounded(
+                &mut server,
+                &chunk,
+                &mut watch,
+                &cancel,
+                Duration::from_millis(120),
+            ) {
+                timed_out = Some(err);
+                break;
+            }
+        }
+        let err = timed_out.expect("stalled loopback peer never saturated kernel buffers");
+        assert_eq!(err.kind(), ErrorKind::TimedOut);
+        assert!(start.elapsed() < Duration::from_secs(3));
+        let _ = client.read(&mut probe);
     }
 }
