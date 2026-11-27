@@ -115,6 +115,15 @@ ABI 明确 wasm32 内存模型、UTF-8 JSON 控制编码、`u64 (ptr, len)` 布�
    - 新增双向流式类型化资源接口，导致控制面 JSON 编解码在实测播放/控制路径 CPU 占比超过 5% 或手工胶水变体超过 30 个；
    - Wasmtime Component Model 在 `pulley64` 零可执行页目标下的体积、冷编译耗时与无 `tokio` 同步宿主调用开销均满足同机回归预算。
 
+### 4.6 官方插件跨平台逐字节可复现构建基准（#19）
+
+实测表明，在钉死 `Rust 1.100.0` 并通过 `--remap-path-prefix` 完整消除宿主工作区、Cargo 注册表及 `rust-src` 路径与分隔符差异（Section 11 `.rodata` 字符串完全一致）后，不同宿主目标二进制（`x86_64-pc-windows-msvc`、`aarch64-apple-darwin`、`x86_64-apple-darwin`、`x86_64-unknown-linux-gnu`）的编译器与链接器在 Wasm Section 3/9 的内部单态化函数表顺序上仍存在宿主相关排序差异。
+
+因此采用“**唯一规范构建目标（`x86_64-unknown-linux-gnu` 固定容器）+ 全平台逐字节校验**”方案：
+
+1. `scripts/build-official-plugins.py` 将 SHA-256 锁定的 `linux/amd64` 镜像（`rust:1.100.0-slim-bookworm@sha256:5d3170f8660a07782d5ff42abc55601d2df51d49e5397a8f22247341a658e128`）定为唯一规范构建环境：Linux `x86_64` 直接原生构建，macOS（Intel / Apple Silicon）与 Windows 自动调度 Docker/Podman `linux/amd64` 容器（Windows 无容器时自动回退 WSL2 `x86_64`），任何开发主机均可重建出与仓库逐字节一致的 `.irisplugin` 产物。
+2. 移除 `--verify-embedded` 的平台跳过分支：`check.yml` 与 `release-build.yml` 先在锁定 `linux/amd64` 容器内从源码重编并逐字节比对 `Resources/Plugins`，再将重编产物分发至 macOS（ARM64 / Intel）与 Windows 节点执行逐字节归档比对、本机无宿主路径泄漏编译检查及 `pulley64` 运行时自检。
+
 ## 五、存量内置插件：二拆一升与原子切换
 
 - `iris.webdav` 与 `iris.guides` 迁为随包外部插件，使用相同宿主 API 和权限规则；官方身份仅用于来源验证、命名空间和受限凭据迁移，不提供运行时绕权。

@@ -20,11 +20,14 @@ compilation. `--verify-embedded` rebuilds into `target/` and enforces byte-for-b
 equality with this directory on all platforms (Windows, macOS, and Linux). Run native
 host tests with the required mpv SDK. Do not edit the generated archives or hashes by hand.
 
-`scripts/build-official-plugins.py` generates an exact per-`.rs`-file POSIX
-`--remap-path-prefix` response file (`official-plugin-remap.args`) covering workspace
-sources, locked Cargo dependencies, and any installed `rust-src` stdlib sources
-(normalized to `/rustc/<commit-hash>/library/...`), eliminating OS path separator
-differences and `rust-src` sensitivity.
+`scripts/build-official-plugins.py` uses `x86_64-unknown-linux-gnu` (`Rust 1.100.0`) as
+the single canonical build host: on Linux `x86_64` it builds natively, on macOS and
+Windows it automatically delegates to the SHA-256-pinned `linux/amd64` container
+(`rust:1.100.0-slim-bookworm@sha256:5d3170f8660a07782d5ff42abc55601d2df51d49e5397a8f22247341a658e128`)
+via Docker/Podman (or WSL2 `x86_64` on Windows), and normalizes workspace, Cargo
+registry, and `rust-src` paths to POSIX prefixes (`/cargo/deps/...`, `/rustc/<commit>/...`).
+CI rebuilds inside the pinned `linux/amd64` container and enforces byte-for-byte
+`--verify-embedded` archive equality across Linux, macOS, and Windows.
 
 `iris --check-plugin-runtime` compiles both embedded guests to `pulley64` bytecode,
 verifies an in-memory cache hit, instantiates them and executes a callback in the

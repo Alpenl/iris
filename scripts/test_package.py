@@ -164,6 +164,7 @@ dependencies = ["dep 2.0.0 (registry+https://github.com/rust-lang/crates.io-inde
         with patch.object(official_plugins, "_rustc_sysroot", return_value=fake_sysroot), \
              patch.object(official_plugins.subprocess, "run") as run_mock:
             self.invoke(
+                "--native-host",
                 "--output",
                 self.embedded,
                 build=True,
@@ -182,11 +183,49 @@ dependencies = ["dep 2.0.0 (registry+https://github.com/rust-lang/crates.io-inde
             remaps = build_env["CARGO_ENCODED_RUSTFLAGS"].split("\x1f")
             self.assertTrue(any(r.endswith("=/iris") for r in remaps))
             self.assertTrue(any(r.endswith("=/cargo") for r in remaps))
+            self.assertTrue(any(r.endswith("=/cargo/deps") for r in remaps))
             self.assertTrue(any(r.endswith("=/rustup") for r in remaps))
             self.assertTrue(any(r.endswith("=/rustup-sysroot") for r in remaps))
-            self.assertTrue(remaps[-1].startswith("@") and "official-plugin-remap-" in remaps[-1])
+            if official_plugins._is_windows_host():
+                self.assertTrue(remaps[-1].startswith("@") and "official-plugin-remap-" in remaps[-1])
         with zipfile.ZipFile(self.embedded / "iris.guides.irisplugin") as archive:
             self.assertEqual(archive.read("plugin.wasm"), b"\x00asm\x01\x00\x00\x00ext")
+
+    def test_container_backend_pins_linux_amd64_image_and_verified_dir_checks_raw_bytes(self):
+        self.invoke("--output", self.embedded)
+        fresh = self.root / "fresh-verified"
+        shutil.copytree(self.embedded, fresh)
+        out = self.root / "native-verify-out"
+        with patch.object(official_plugins, "_is_linux_x86_64", return_value=False), \
+             patch.object(official_plugins.subprocess, "run") as run_mock:
+            self.invoke(
+                "--verify-embedded",
+                "--output",
+                out,
+                build=True,
+                env_override={"IRIS_VERIFIED_OFFICIAL_PLUGINS": str(fresh)},
+            )
+            run_mock.assert_called_once()
+
+        # Tampering archive metadata bytes in verified-dir must fail even if index.json was not changed on embedded.
+        tampered = fresh / "iris.guides.irisplugin"
+        tampered.write_bytes(tampered.read_bytes() + b"\x00")
+        with patch.object(official_plugins, "_is_linux_x86_64", return_value=False):
+            with self.assertRaisesRegex(AssertionError, "mismatch|differ"):
+                self.invoke(
+                    "--verify-embedded",
+                    "--output",
+                    out,
+                    env_override={"IRIS_VERIFIED_OFFICIAL_PLUGINS": str(fresh)},
+                )
+
+        # Container backend invokes docker/podman with --platform linux/amd64 and pinned SHA-256 image.
+        with patch.object(official_plugins, "_find_container_runtime", return_value="/usr/bin/docker"), \
+             patch.object(official_plugins.subprocess, "run") as docker_mock:
+            self.invoke("--container", "--output", out, build=True)
+            cmd = docker_mock.call_args.args[0]
+            self.assertEqual(cmd[:5], ["/usr/bin/docker", "run", "--rm", "--platform", "linux/amd64"])
+            self.assertIn(official_plugins.PINNED_LINUX_IMAGE, cmd)
 
     def test_rejects_host_path_leaks_in_built_or_embedded_wasm(self):
         wasm = self.root / "target/wasm32-unknown-unknown/release/iris_plugin_guides.wasm"
