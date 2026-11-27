@@ -6,29 +6,34 @@
 
 ```
 crates/
-  iris-mpv/          libmpv 的手写 FFI（不用 bindgen）：client API + mpv_node 结构化传参 + RenderHandle 窄能力封装
-  iris-api/          无头插件协议（protocol: 2 / ABI: 2）：虚拟数据源（含动态多实例）、参数化 UI 工作台、视口叠层与线协议（仅依赖 serde）
-  iris-net/          通用网络与并发底座：HTTP/HTTPS 客户端、DNS/DoH（RFC 8484）、本地回环 HTTP 服务、WebSocket/原始 TCP 双工帧与 CancelToken/Deadline/ThreadRole
-  iris-core/         无头领域核心：纯状态机播放器会话、统一目录与独立队列、稀疏工作区预设、键位引擎、照片探测、凭据库与日志脱敏；不依赖 GPUI、iris-api 或插件运行时
-  iris-plugin-host/  Wasm 插件宿主运行时（pulley64）：显式 PluginHost、单窗口会话生命周期、能力授权、有界网络/私有产物与三模流中继；不依赖 GPUI 或 iris-mpv
-  iris/              GPUI 应用：窗口、ThemeTokens 动态令牌、ui/kit 共用原语、统一 VideoSurfaceBackend 平台视频层与系统桥接、单实例、调试管道
+  iris-mpv/            libmpv 的手写 FFI（不用 bindgen）：client API + mpv_node 结构化传参 + RenderHandle 窄能力封装
+  iris-api/            无头插件协议（protocol: 2 / ABI: 2）：根模块公共值类型与 v2/ 版本化线协议契约（仅依赖 serde）
+  iris-net/            通用网络与并发底座：HTTP/HTTPS 客户端、DNS/DoH（RFC 8484）、本地回环 HTTP 服务、WebSocket/原始 TCP 双工帧与 CancelToken/Deadline/ThreadRole
+  iris-plugin-sdk/     Wasm 插件 Guest 侧 SDK：导出宏、类型化事件分发、异步任务/Blob 辅助与有界 JSON 校验（宿主零反向依赖）
+  iris-plugin-guides/  官方构图辅助线插件（iris.guides）：使用公开 SDK 编译的可复现 Wasm 包
+  iris-plugin-webdav/  官方 WebDAV 数据源插件（iris.webdav）：使用公开 SDK 编译的多实例远程存储 Wasm 包
+  iris-core/           无头领域核心：纯状态机播放器会话、统一目录与独立队列、稀疏工作区预设、键位引擎、照片探测、凭据库与日志脱敏；不依赖 GPUI、iris-api 或插件运行时
+  iris-plugin-host/    Wasm 插件宿主运行时（pulley64）：显式 PluginHost、单窗口会话生命周期、能力授权、有界网络/私有产物与三模流中继；不依赖 GPUI 或 iris-mpv
+  iris/                GPUI 应用：窗口、ThemeTokens 动态令牌、ui/kit 共用原语、统一 VideoSurfaceBackend 平台视频层与系统桥接、单实例、调试管道
 ```
 
-依赖方向严格单向：`iris` → `iris-plugin-host` → `iris-core` → `iris-net`，`iris-core` → `iris-mpv`，且 `iris` / `iris-plugin-host` → `iris-api`；`iris-plugin-sdk` 仅由 Wasm Guest 插件引用，宿主零反向依赖（`iris` 仅在 `src/video/` 中通过 `clippy.toml` 豁免使用窄能力 `iris_mpv::RenderHandle` 与 `Session::video_recovery`，业务与 UI 代码由编译器强制禁止触碰 `iris_mpv` 或构造 `RenderHandle`）。`scripts/check-project.py` 与 `clippy` 自动检查：
+依赖方向严格单向：`iris` → `iris-plugin-host` → `iris-core` → `iris-net`，`iris-core` → `iris-mpv`，且 `iris` / `iris-plugin-host` → `iris-api`；`iris-plugin-sdk` 仅由 Wasm Guest 插件（含 `iris-plugin-guides`、`iris-plugin-webdav` 及 `examples/plugins/*`）引用，宿主零反向依赖（`iris` 仅在 `src/video/` 中通过 `clippy.toml` 豁免使用窄能力 `iris_mpv::RenderHandle` 与 `Session::video_recovery`，业务与 UI 代码由编译器强制禁止触碰 `iris_mpv` 或构造 `RenderHandle`）。`scripts/check-project.py` 与 `clippy` 自动检查：
 
 1. Cargo 依赖图强制隔离：`iris-net` 零领域依赖，`iris-core` 不依赖 GPUI、`iris-plugin-host`、`iris-api` 或 `wasmtime`，`iris-plugin-host` 不依赖 GPUI 或 `iris-mpv`；
 2. `iris-api` 常规依赖仅限 `serde`（不依赖 GPUI 或 `iris-mpv`）；
-3. `crates/iris/clippy.toml` 与 `crates/iris-core/clippy.toml` 通过 `disallowed-types` / `disallowed-methods` 强制约束 `iris_mpv::*` 与 `RenderHandle::new` / `Session::{render_handle, video_recovery}` 仅限视频层使用，全仓非测试生产代码禁止 `use super::*;`；
+3. `crates/iris/clippy.toml`、`crates/iris-core/clippy.toml` 与 `crates/iris-plugin-host/clippy.toml` 通过 `disallowed-types` / `disallowed-methods` 强制约束 `iris_mpv::*` 与 `RenderHandle::new` / `Session::{render_handle, video_recovery}` 的调用边界，扫描全仓 `crates/*` 的 `src/` 与 `tests/` 禁止越权 `allow/expect(clippy::disallowed_*)`（仅显式豁免 `crates/iris/src/video/` 与 `crates/iris-core/src/player/mod.rs` 的 `render_handle` / `video_recovery` 两处），且全仓非测试生产代码禁止 `use super::*;`；
 4. `crates/iris/src/ui/` 禁止散落 `target_os` 条件编译，且通用组件库 `crates/iris/src/ui/kit/` 禁止引用根窗口 `IrisWindow` 或业务宿主 `AppModel`；
 5. 全仓生产代码禁止直接调用 `std::thread::spawn` 或未登记的 `std::thread::Builder`，所有 OS 线程必须通过 `iris_net::concurrency::{spawn_thread, spawn_thread_named}` 按 `ThreadRole` 登记，且每个角色的线程名必须记录在本文第 6 节；
 6. `devtools` 控制管道门禁未被默认特性或普通发布版绕过；
-7. 全仓 `.rs` 模块行数预算（超过 650 行生产代码提示，生产代码上限 850 行、总行数上限 1,000 行），以及图标、官方嵌入插件摘要与示例插件清单一致性。
+7. 全仓 `.rs` 有效代码行（SLOC，剥离注释与空白行）预算（生产代码超过 650 SLOC 提示、硬上限 850 SLOC，尾部内联 `#[cfg(test)] mod tests` 硬上限 400 SLOC，独立测试文件硬上限 1,500 SLOC）、`crates/*/src` 顶层模块环单向棘轮、本文与双语 `README` 的成员同步门禁，以及图标、官方嵌入插件源码摘要隔离与示例插件清单一致性。
 
 ### 核心模块职责
 
 - `crates/iris-mpv/src/{lib,event,render,sys}.rs`：纯手写 C 声明（`sys` 与 `Mpv::raw` 均为 `pub(crate)`，零常规依赖）与薄安全封装，不包含任何平台恢复或业务状态机。短属性名通过栈缓冲避免热路径堆分配。`Mpv::loadfile_with_options` 使用结构化节点传递单文件选项，不拼接 mpv 命令字符串；渲染层仅暴露 OpenGL 与 D3D11 共用的 `RenderHandle`。
 - `crates/iris-mpv/build.rs`：优先使用 `MPV_LIB_DIR`。Windows x64 MSVC 开发构建回退到工作区 `target/deps/mpv/mpv.lib`；macOS 按目标架构查找对应 Homebrew 目录。始终动态链接。
-- `crates/iris-api/src/v2/`：protocol/ABI 2 的 manifest、source（含通用 `badge`）、stream（`DirectHttp` / `RandomAccess` / `VirtualHls`）、task、wire（`WireU64` 十进制/数值双兼容、`HostCommand::Log`）、enhance 与密码学契约；公共 `Widget`（含 `PixelGrid`）、`ViewTimer`、`OverlayNode`、`UiThemeSpec` 位于 crate 根，常规依赖仅 `serde`，零中文 UI 文案。
+- `crates/iris-api/src/`（根模块公共类型 vs `v2/` 协议子模块边界）：常规依赖仅 `serde`，零宿主 I/O 与零中文 UI 文案。
+  - **根模块（`lib.rs` 及 `{manifest, overlay, source, workbench}.rs`）**：承载不绑定单版线协议帧外壳的共享声明式值类型与纯校验函数，供宿主侧（`iris`、`iris-plugin-host`）与 Guest SDK 直接经 `iris_api::*` 复用，包括 `PROTOCOL_VERSION = 2`、命令与数据源声明规格（`CommandSpec`、`SourceProviderSpec`、`is_valid_id`）、媒体与流变体值类型（`MediaKind`、`SourceEntryKind`、`SourceManageAction`、`StreamVariant`）、视口矢量叠层节点（`OverlayNode`、`TextAlign`）以及参数化工作台组件树与主题/栏位规格（`Widget` 含 `PixelGrid`、`PluginModal`、`SidebarPanel`、`SidebarSection`、`UiThemeSpec`、`ChromeLayoutSpec`、`ViewTimer`、`Color`、`is_valid_hex_color`）。
+  - **`v2/` 协议子模块（`src/v2/{mod, manifest, wire, integer, source, stream, task, task_result, enhance, crypto}.rs`）**：收敛 `ABI_VERSION = 2` 的宿主↔Guest 版本化线协议契约与配额常量（`MESSAGE_LIMIT`、`CHUNK_LIMIT`、`JSON_DEPTH_LIMIT`、`COMMAND_LIMIT`、`ErrorCode`），包括包清单与权限/网络规则（`Manifest`、`Capability`、`NetworkDeclaration`、`HostRule`）、双向控制消息与句柄/整数编码（`HostEvent`、`HostCommand` 含 `Log`、`Id`、`Generation`、`WireU64` 十进制/数值双兼容）、目录分页与播放快照（`SourcePage`、`PlaybackSnapshot`）、三模流契约（`DirectHttp` / `RandomAccess` / `VirtualHls`）、异步任务请求与结果载荷（`Task`、`StoreRead`/`StoreWrite` 等）、媒体增强（轨道、LUT、章节、标注）及密码学原语规格。
 - `crates/iris-net/src/{concurrency,http_client,dns,loopback_http,net_Socket}.rs`：统一的取消令牌 `CancelToken`（无锁原子轮询快路径 + 嵌套子令牌与跨对象 `link` + TCP `shutdown(Both)` / `mio::Waker` / `Condvar` 唤醒回调）、单调截止时间 `Deadline`、受管 OS 线程注册表（`ThreadRole`、`budget`、`spawn_thread` / `spawn_thread_named`）、有界 HTTP/DoH 客户端、共用本地回环 HTTP 监听/Range 响应以及 WebSocket/原始 TCP 泵。
 - `crates/iris-core/src/player/`：
   - `machine.rs` + `machine/reduce.rs`：不依赖 `libmpv` 即可独立单测的纯状态机 `PlayerMachine`、穷尽生命周期变体 `MediaSourceState::{Idle, Opening, Loaded, Failed}`（收拢 `entry_id`、`OpeningTransport` / `LoadedTransport` / `FailedTransport`、`in_flight_adds`、`deferred_local_subs`、`dirty`、`reattach_on_load`、`FailedEnhancements` 与 `eof_paused`，令非法标志位组合不可表达）、声明式副作用 `MpvOp` 与批次属性合并纯函数 `coalesce_updates`。

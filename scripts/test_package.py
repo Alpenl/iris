@@ -138,6 +138,133 @@ dependencies = ["dep 2.0.0 (registry+https://github.com/rust-lang/crates.io-inde
         with self.assertRaisesRegex(AssertionError, "exactly one package"):
             official_plugins.lock_closure(lock(), ["dep"])
 
+    def test_source_hash_isolates_host_root_cargo_sections_and_tracks_plugin_affecting_inputs(self):
+        # Build a realistic miniature workspace tree matching OFFICIAL_SOURCE_CRATES.
+        (self.root / "rust-toolchain.toml").write_text('[toolchain]\nchannel = "1.100.0"\n', encoding="utf-8", newline="\n")
+        (self.root / "scripts").mkdir(parents=True, exist_ok=True)
+        shutil.copy2(Path(__file__).resolve().parent / "build-official-plugins.py", self.root / "scripts/build-official-plugins.py")
+
+        def write_root_cargo(
+            *,
+            resolver="2",
+            rust_version="1.100",
+            extra_members='"crates/iris", "crates/iris-plugin-host"',
+            default_members='"crates/iris"',
+            host_deps='gpui = { version = "=0.2.2", default-features = false }\n',
+            anyhow_spec='"1"',
+            lints='[workspace.lints.clippy]\ndbg_macro = "deny"\n',
+            dev_profile='[profile.dev]\ndebug = 0\n',
+            release_profile='[profile.release]\ndebug = "line-tables-only"\nlto = "thin"\n',
+            extra_sections="",
+            comment="",
+        ):
+            content = (
+                f"{comment}[workspace]\n"
+                f'resolver = "{resolver}"\n'
+                f'members = ["crates/iris-api", "crates/iris-plugin-sdk", "crates/iris-plugin-guides", "crates/iris-plugin-webdav", {extra_members}]\n'
+                f"default-members = [{default_members}]\n\n"
+                "[workspace.package]\n"
+                'version = "0.0.2"\n'
+                'edition = "2024"\n'
+                f'rust-version = "{rust_version}"\n'
+                "publish = false\n"
+                'license = "MIT OR Apache-2.0"\n\n'
+                "[workspace.dependencies]\n"
+                f"{host_deps}"
+                f"anyhow = {anyhow_spec}\n\n"
+                f"{lints}\n"
+                f"{dev_profile}\n"
+                f"{release_profile}"
+                f"{extra_sections}"
+            )
+            (self.root / "Cargo.toml").write_text(content, encoding="utf-8", newline="\n")
+
+        write_root_cargo()
+        manifests = {
+            "iris-api": '[package]\nname = "iris-api"\nversion.workspace = true\n[dependencies]\nserde = "1"\n',
+            "iris-plugin-sdk": '[package]\nname = "iris-plugin-sdk"\nversion.workspace = true\n[dependencies]\niris-api = { path = "../iris-api" }\n',
+            "iris-plugin-guides": '[package]\nname = "iris-plugin-guides"\nversion.workspace = true\n[dependencies]\niris-plugin-sdk = { path = "../iris-plugin-sdk" }\n',
+            "iris-plugin-webdav": '[package]\nname = "iris-plugin-webdav"\nversion.workspace = true\n[dependencies]\niris-plugin-sdk = { path = "../iris-plugin-sdk" }\nanyhow.workspace = true\n',
+        }
+        for crate_name, cargo_toml in manifests.items():
+            cdir = self.root / "crates" / crate_name
+            (cdir / "src").mkdir(parents=True, exist_ok=True)
+            (cdir / "Cargo.toml").write_text(cargo_toml, encoding="utf-8", newline="\n")
+            (cdir / "src/lib.rs").write_text("pub fn entry() {}\n", encoding="utf-8", newline="\n")
+
+        (self.root / "Cargo.lock").write_text(
+            'version = 4\n\n'
+            '[[package]]\nname = "anyhow"\nversion = "1.0.95"\nsource = "registry+https://github.com/rust-lang/crates.io-index"\nchecksum = "11"\n\n'
+            '[[package]]\nname = "serde"\nversion = "1.0.210"\nsource = "registry+https://github.com/rust-lang/crates.io-index"\nchecksum = "22"\n\n'
+            '[[package]]\nname = "iris-api"\nversion = "0.0.2"\ndependencies = ["serde"]\n\n'
+            '[[package]]\nname = "iris-plugin-sdk"\nversion = "0.0.2"\ndependencies = ["iris-api"]\n\n'
+            '[[package]]\nname = "iris-plugin-guides"\nversion = "0.0.2"\ndependencies = ["iris-plugin-sdk"]\n\n'
+            '[[package]]\nname = "iris-plugin-webdav"\nversion = "0.0.2"\ndependencies = ["anyhow", "iris-plugin-sdk"]\n',
+            encoding="utf-8",
+            newline="\n",
+        )
+
+        with patch.object(official_plugins, "ROOT", self.root):
+            baseline_hash = official_plugins.source_hash()
+            # Package with real source_hash and verify --check passes.
+            with patch.dict(os.environ, {}, clear=False), \
+                 patch.object(sys, "argv", ["build-official-plugins.py", "--no-build", "--output", str(self.embedded)]), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                official_plugins.main()
+            official_plugins.check(self.embedded)
+
+            # 1. Host-only changes in root Cargo.toml must NOT invalidate source_hash or --check.
+            write_root_cargo(
+                extra_members='"crates/iris-base", "crates/iris-app", "crates/iris"',
+                default_members='"crates/iris", "crates/iris-app"',
+                host_deps='gpui = "=0.2.2"\nwasmtime = "=51.0.0"\nlog = "0.4"\n',
+                lints='[workspace.lints.clippy]\ntodo = "deny"\nallow_attributes = "warn"\n',
+                dev_profile='[profile.dev]\ndebug = 2\n',
+                comment="# Host-side workspace refactor comment\n",
+            )
+            self.assertEqual(official_plugins.source_hash(), baseline_hash)
+            official_plugins.check(self.embedded)
+            # CRLF line endings in root Cargo.toml must also preserve source_hash.
+            raw_cargo = (self.root / "Cargo.toml").read_bytes()
+            (self.root / "Cargo.toml").write_bytes(raw_cargo.replace(b"\n", b"\r\n"))
+            self.assertEqual(official_plugins.source_hash(), baseline_hash)
+
+            # 2. Plugin-affecting changes MUST change source_hash and fail --check as stale.
+            mutations = [
+                ("resolver", lambda: write_root_cargo(resolver="3")),
+                ("workspace.package", lambda: write_root_cargo(rust_version="1.101")),
+                ("inherited anyhow features", lambda: write_root_cargo(anyhow_spec='{ version = "1", features = ["backtrace"] }')),
+                ("profile.release", lambda: write_root_cargo(release_profile='[profile.release]\ndebug = "line-tables-only"\nlto = "fat"\n')),
+                (
+                    "profile.release subtable",
+                    lambda: write_root_cargo(
+                        release_profile='[profile.release]\ndebug = "line-tables-only"\nlto = "thin"\n[profile.release.package."*"]\nopt-level = "z"\n'
+                    ),
+                ),
+                ("patch section", lambda: write_root_cargo(extra_sections='\n[patch.crates-io]\nanyhow = { path = "vendor/anyhow" }\n')),
+                ("replace section", lambda: write_root_cargo(extra_sections='\n[replace]\n"anyhow:1.0.95" = { path = "vendor/anyhow" }\n')),
+            ]
+            for label, mutate in mutations:
+                with self.subTest(mutation=label):
+                    mutate()
+                    self.assertNotEqual(official_plugins.source_hash(), baseline_hash)
+                    with self.assertRaisesRegex(AssertionError, "stale"):
+                        official_plugins.check(self.embedded)
+            write_root_cargo()
+            self.assertEqual(official_plugins.source_hash(), baseline_hash)
+
+            # 3. Adding `.cargo/config.toml` or editing `iris-api` must also invalidate source_hash.
+            cargo_cfg = self.root / ".cargo/config.toml"
+            cargo_cfg.parent.mkdir(parents=True, exist_ok=True)
+            cargo_cfg.write_text('[build]\nrustflags = ["-C", "opt-level=3"]\n', encoding="utf-8", newline="\n")
+            self.assertNotEqual(official_plugins.source_hash(), baseline_hash)
+            cargo_cfg.unlink()
+            self.assertEqual(official_plugins.source_hash(), baseline_hash)
+
+            api_lib = self.root / "crates/iris-api/src/lib.rs"
+            api_lib.write_text("pub fn entry() { let _ = 42; }\n", encoding="utf-8", newline="\n")
+            self.assertNotEqual(official_plugins.source_hash(), baseline_hash)
+
     def test_index_json_uses_lf_and_check_rejects_crlf(self):
         self.invoke("--output", self.embedded)
         index_path = self.embedded / "index.json"
@@ -1024,21 +1151,214 @@ class CheckProjectHelperTests(unittest.TestCase):
         self.assertNotIn("use super::*;", stripped)
         self.assertNotIn("iris_mpv", stripped)
 
-    def test_check_file_line_budget_rejects_trailing_prod_code_and_ignores_commented_cfg_test(self):
+    def test_check_file_line_budget_enforces_sloc_decouples_inline_tests_and_rejects_trailing_prod(self):
+        self.assertFalse(hasattr(check_project, "SRC_TOTAL_HARD_MAX_LINES"))
+        self.assertEqual(check_project.PROD_WARN_LINES, 650)
+        self.assertEqual(check_project.PROD_HARD_MAX_LINES, 850)
+        self.assertEqual(check_project.INLINE_TEST_HARD_MAX_LINES, 400)
+        self.assertEqual(check_project.TEST_FILE_HARD_MAX_LINES, 1500)
         rel = Path("crates/iris/src/demo.rs")
         clean_src = (
             "/// Tested in `#[cfg(test)] mod tests` below.\n"
-            "pub fn ok() -> usize { 1 }\n"
+            "\n"
+            "/* Outer /* nested block comment\n"
+            "   spanning multiple lines */ */\n"
+            "pub fn ok() -> usize { 1 } // inline comment\n"
+            "\n"
             "#[cfg(test)]\n"
             "mod tests {\n"
+            "    // Comment and blank lines inside tests do not consume inline SLOC budget either.\n"
+            "\n"
             '    #[test] fn unbalanced_braces_in_literals() { let _ = "{"; let _ = \'}\'; let _ = r#"{"#; }\n'
             "}\n"
         )
-        self.assertEqual(check_project.check_file_line_budget(rel, clean_src), 2)
+        self.assertEqual(check_project.check_file_line_budget(rel, clean_src), 1)
 
+        # Heavy doc comments + blank lines + 850 prod SLOC + 400 inline test SLOC (>1000 physical/SLOC total) passes.
+        decoupled_max = (
+            "/// Doc line\n\n" * 300
+            + ("let _x = 1;\n" * 850)
+            + "#[cfg(test)]\nmod tests {\n"
+            + ("    #[test] fn t() {}\n" * 397)
+            + "}\n"
+        )
+        self.assertEqual(check_project.check_file_line_budget(rel, decoupled_max), 850)
+
+        # 851 prod SLOC fails PROD_HARD_MAX_LINES (850).
+        over_prod = ("let _x = 1;\n" * 851)
+        with self.assertRaisesRegex(AssertionError, "851 production SLOC"):
+            check_project.check_file_line_budget(rel, over_prod)
+
+        # 401 inline test SLOC fails INLINE_TEST_HARD_MAX_LINES (400).
+        over_inline = (
+            "pub fn ok() {}\n#[cfg(test)]\nmod tests {\n"
+            + ("    #[test] fn t() {}\n" * 398)
+            + "}\n"
+        )
+        with self.assertRaisesRegex(AssertionError, "401 inline test SLOC"):
+            check_project.check_file_line_budget(rel, over_inline)
+
+        # Standalone test files allow up to 1500 SLOC (no warn return) and reject 1501 SLOC.
+        test_rel = Path("crates/iris-core/src/player/relay/tests.rs")
+        self.assertIsNone(
+            check_project.check_file_line_budget(test_rel, "// header\n\n" * 200 + ("#[test] fn t() {}\n" * 1500))
+        )
+        with self.assertRaisesRegex(AssertionError, "1501 test SLOC"):
+            check_project.check_file_line_budget(test_rel, "#[test] fn t() {}\n" * 1501)
+
+        # Structural rules: single trailing #[cfg(test)] module, no trailing production code.
         sneaky_trailing = clean_src + "pub fn sneaky_after_tests() {}\n"
         with self.assertRaisesRegex(AssertionError, "after inline `mod tests`"):
             check_project.check_file_line_budget(rel, sneaky_trailing)
+        with self.assertRaisesRegex(AssertionError, re.escape("outside trailing `mod tests`")):
+            check_project.check_file_line_budget(rel, "#[cfg(test)]\nfn helper() {}\npub fn ok() {}\n")
+        with self.assertRaisesRegex(AssertionError, re.escape("multiple `#[cfg(test)]`")):
+            check_project.check_file_line_budget(
+                rel,
+                "pub fn ok() {}\n#[cfg(test)]\nmod tests {}\n#[cfg(test)]\nmod more_tests {}\n",
+            )
+
+    def test_module_cycle_analyzer_expands_nested_use_trees_aliases_and_excludes_tests(self):
+        expanded = check_project.expand_use_tree(
+            "super::{alpha, beta::{self, gamma as g, delta::{self as d, eps::*}}, zeta as _}"
+        )
+        self.assertEqual(
+            expanded,
+            [
+                "super::alpha",
+                "super::beta",
+                "super::beta::gamma",
+                "super::beta::delta",
+                "super::beta::delta::eps::*",
+                "super::zeta",
+            ],
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            crates_dir = Path(directory) / "crates"
+            src = crates_dir / "demo/src"
+            (src / "b/sub").mkdir(parents=True)
+            (src / "lib.rs").write_text(
+                "pub mod a;\npub mod b;\npub mod c;\npub mod d;\n#[cfg(test)]\nmod test_util;\n",
+                encoding="utf-8",
+            )
+            # `a` imports `b` and `c` via nested braces + aliases + pub use; fake string & #[cfg(test)] must be ignored.
+            (src / "a.rs").write_text(
+                'pub use crate::{b::{self as b_mod, Sub as _}, c::Item as CItem};\n'
+                'const FAKE: &str = "use crate::d::Fake; crate::d::call()";\n'
+                "#[cfg(test)]\nuse crate::d::OnlyInTest;\n"
+                "#[cfg(test)]\nmod tests {\n    use super::super::d;\n    fn t() { crate::d::noop(); }\n}\n",
+                encoding="utf-8",
+            )
+            # `b/sub/leaf.rs` (depth 3: mod_chain = [b, sub, leaf]) reaches `c` via `super::super::super::c`.
+            (src / "b/mod.rs").write_text("pub mod sub;\n", encoding="utf-8")
+            (src / "b/sub/mod.rs").write_text("pub mod leaf;\n", encoding="utf-8")
+            (src / "b/sub/leaf.rs").write_text(
+                "use super::super::super::{c::{helper as h}};\npub fn run() { h(); }\n",
+                encoding="utf-8",
+            )
+            # Standalone test files (`tests.rs`, `test_util.rs`) referencing `a` must not create cycles.
+            (src / "c.rs").write_text("pub fn helper() {}\n#[cfg(test)]\nmod tests;\n", encoding="utf-8")
+            (src / "c/tests.rs").parent.mkdir(parents=True, exist_ok=True)
+            (src / "tests.rs").write_text("use crate::a;\n", encoding="utf-8")
+            (src / "test_util.rs").write_text("use crate::a;\n", encoding="utf-8")
+            (src / "d.rs").write_text("pub fn noop() {}\n", encoding="utf-8")
+
+            nodes, edges = check_project.extract_crate_module_edges(src)
+            self.assertEqual(nodes, {"a", "b", "c", "d"})
+            self.assertEqual(edges, {("a", "b"), ("a", "c"), ("b", "c")})
+            self.assertEqual(check_project.tarjan_sccs(nodes, edges), [])
+            check_project.check_module_cycle_ratchet(crates_dir, baseline={})
+
+            # Introduce `c -> a` cycle edge via qualified path; ratchet must fail and print SCCs & cycle edges.
+            (src / "c.rs").write_text("pub fn helper() { crate::a::touch(); }\n", encoding="utf-8")
+            with self.assertRaises(AssertionError) as ctx_new:
+                check_project.check_module_cycle_ratchet(crates_dir, baseline={})
+            msg_new = str(ctx_new.exception)
+            self.assertIn("[a, b, c]", msg_new)
+            self.assertIn("c -> a", msg_new)
+            self.assertIn("New cycle edges", msg_new)
+
+            exact_baseline = {"demo": frozenset({("a", "b"), ("a", "c"), ("b", "c"), ("c", "a")})}
+            check_project.check_module_cycle_ratchet(crates_dir, baseline=exact_baseline)
+
+            # Resolve `c -> a` without tightening baseline; one-way ratchet must fail!
+            (src / "c.rs").write_text("pub fn helper() {}\n", encoding="utf-8")
+            with self.assertRaises(AssertionError) as ctx_resolved:
+                check_project.check_module_cycle_ratchet(crates_dir, baseline=exact_baseline)
+            self.assertIn("Resolved cycle edges", str(ctx_resolved.exception))
+
+        # Repository baseline counts match reviewed audit numbers.
+        self.assertEqual(len(check_project.KNOWN_MODULE_CYCLE_EDGES["iris-plugin-host"]), 56)
+        self.assertEqual(len(check_project.KNOWN_MODULE_CYCLE_EDGES["iris-core"]), 2)
+
+    def test_clippy_and_docs_sync_gates_enforce_exact_exemptions_and_crate_lists(self):
+        # 1. Disallowed lint suppression scan.
+        check_project.check_disallowed_lint_suppressions(
+            Path("crates/iris/src/video/mod.rs"),
+            "#![allow(clippy::disallowed_types, clippy::disallowed_methods)]\n",
+        )
+        valid_player_mod = (
+            "impl Session {\n"
+            "    #[allow(clippy::disallowed_methods)]\n"
+            "    pub fn render_handle(&self) {}\n"
+            "    #[allow(clippy::disallowed_methods)]\n"
+            "    pub fn video_recovery(&self) {}\n"
+            "}\n"
+        )
+        check_project.check_disallowed_lint_suppressions(Path("crates/iris-core/src/player/mod.rs"), valid_player_mod)
+        for bad_rel, bad_src in (
+            (
+                Path("crates/iris-core/src/player/mod.rs"),
+                valid_player_mod + "#[allow(clippy::disallowed_methods)]\npub fn extra() {}\n",
+            ),
+            (
+                Path("crates/iris-core/src/player/mod.rs"),
+                "#[allow(clippy::disallowed_types)]\npub fn render_handle(&self) {}\n",
+            ),
+            (
+                Path("crates/iris-plugin-host/tests/plugin_v2_contracts.rs"),
+                "#[expect(clippy::disallowed_methods)]\nfn t() {}\n",
+            ),
+            (
+                Path("crates/iris-net/src/http_client.rs"),
+                "#[allow(clippy::disallowed_types)]\nstruct S;\n",
+            ),
+        ):
+            with self.subTest(rel=bad_rel), self.assertRaisesRegex(AssertionError, "disallowed_"):
+                check_project.check_disallowed_lint_suppressions(bad_rel, bad_src)
+
+        # 2. `crates/iris-plugin-host/clippy.toml` verification.
+        with tempfile.TemporaryDirectory() as directory:
+            fake_root = Path(directory)
+            for rel_dir in ("crates/iris", "crates/iris-core", "crates/iris-plugin-host"):
+                (fake_root / rel_dir).mkdir(parents=True)
+            (fake_root / "Cargo.toml").write_text(
+                '[workspace.lints.clippy]\ndisallowed_methods = "deny"\ndisallowed_types = "deny"\n',
+                encoding="utf-8",
+            )
+            shutil.copy2(check_project.ROOT / "crates/iris/clippy.toml", fake_root / "crates/iris/clippy.toml")
+            shutil.copy2(check_project.ROOT / "crates/iris-core/clippy.toml", fake_root / "crates/iris-core/clippy.toml")
+            (fake_root / "crates/iris-plugin-host/clippy.toml").write_text("disallowed-methods = []\n", encoding="utf-8")
+            with self.assertRaisesRegex(AssertionError, "iris-plugin-host/clippy.toml"):
+                check_project.check_clippy_disallowed_configs(fake_root)
+
+        # 3. Docs sync gate: strict two-way on ARCHITECTURE.md, token-bounded substring on bilingual READMEs.
+        expected = {"iris", "iris-api", "iris-core"}
+        arch_ok = "```text\ncrates/\n  iris/\n  iris-api/\n  iris-core/\n```\n"
+        en_ok = "## Project layout\nWe ship `iris`, `iris-api`, and `iris-core`.\n## Next\n"
+        zh_ok = "## 代码结构\n包含 iris、iris-api 与 iris-core。\n## 许可\n"
+        check_project.check_crate_docs_sync(expected, arch_ok, en_ok, zh_ok)
+
+        # Stale extra crate in ARCHITECTURE.md fails two-way check.
+        arch_extra = "```text\ncrates/\n  iris/\n  iris-api/\n  iris-core/\n  iris-net/\n```\n"
+        with self.assertRaisesRegex(AssertionError, "extra=\\['iris-net'\\]"):
+            check_project.check_crate_docs_sync(expected, arch_extra, en_ok, zh_ok)
+
+        # `iris-api` alone must NOT satisfy missing `iris` in README layout section.
+        en_missing_iris = "## Project layout\nOnly `iris-api` and `iris-core` listed.\n"
+        with self.assertRaisesRegex(AssertionError, "README.md.*iris"):
+            check_project.check_crate_docs_sync(expected, arch_ok, en_missing_iris, zh_ok)
 
     def test_lock_poisoning_gate_checks_production_code_only(self):
         rel = Path("crates/iris-core/src/demo.rs")
