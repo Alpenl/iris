@@ -1,4 +1,6 @@
 mod bench;
+mod contracts;
+mod live_a09;
 mod relay;
 mod remote;
 mod session;

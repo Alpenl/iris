@@ -6,7 +6,8 @@ mod playlist;
 mod transfer;
 
 use transfer::{
-    RelayError, copy_stream, ensure_identity, reject_busy, valid_range, write_error_response,
+    RelayError, copy_stream, ensure_identity, reject_busy, sniff_media_prefix, valid_range,
+    write_error_response,
 };
 
 use std::collections::BTreeMap;
@@ -31,8 +32,8 @@ use iris_base::net::http_client::{
     HttpCancel, HttpStream, NetworkScope, Request, open_stream, validate_stream_url,
 };
 use iris_base::net::loopback_http::{
-    ClientHub, HttpMethod, HttpRequestError, is_adaptive_manifest, is_adaptive_prefix_undecided,
-    parse_http_request, read_request,
+    ClientHub, HttpMethod, HttpRequestError, enter_nonblocking_body, parse_http_request,
+    read_request,
 };
 use iris_base::rt::{ThreadRole, budget, spawn_thread};
 
@@ -225,6 +226,7 @@ pub(super) struct Service {
     budget: RelayWorkerBudget,
     hub: Arc<ClientHub>,
     wake: Waker,
+    client_timeout: Duration,
 }
 
 pub(super) struct PlaybackRelay {
@@ -237,6 +239,16 @@ impl PlaybackRelay {
         url: Url,
         headers: BTreeMap<String, String>,
         budget: &RelayWorkerBudget,
+    ) -> Result<Self> {
+        Self::start_with_timeouts(url, headers, budget, CLIENT_TIMEOUT, SLOT_WAIT)
+    }
+
+    pub(super) fn start_with_timeouts(
+        url: Url,
+        headers: BTreeMap<String, String>,
+        budget: &RelayWorkerBudget,
+        client_timeout: Duration,
+        slot_wait: Duration,
     ) -> Result<Self> {
         const LISTENER: Token = Token(0);
         const WAKE: Token = Token(1);
@@ -257,6 +269,7 @@ impl PlaybackRelay {
             budget: budget.clone(),
             hub: Arc::new(ClientHub::new(registry, 2)),
             wake,
+            client_timeout,
         });
         let server = Arc::clone(&service);
         let listener = spawn_thread(ThreadRole::MediaRelayListener, move || {
@@ -289,7 +302,7 @@ impl PlaybackRelay {
                                         workers.push(handle);
                                     }
                                 } else {
-                                    waiting = Some((socket, Instant::now() + SLOT_WAIT));
+                                    waiting = Some((socket, Instant::now() + slot_wait));
                                     break;
                                 }
                             }
@@ -460,13 +473,15 @@ impl Service {
         committed: &mut bool,
     ) -> std::result::Result<(), RelayError> {
         socket
-            .set_write_timeout(Some(CLIENT_TIMEOUT))
+            .set_write_timeout(Some(self.client_timeout))
             .map_err(|_| RelayError::BadGateway)?;
         let raw =
-            read_request(socket, CLIENT_TIMEOUT, MAX_REQUEST).map_err(|err| match err.kind() {
-                io::ErrorKind::TimedOut => RelayError::Timeout,
-                io::ErrorKind::InvalidData => RelayError::Request(HttpRequestError::BadRequest),
-                _ => RelayError::BadGateway,
+            read_request(socket, self.client_timeout, MAX_REQUEST).map_err(|err| {
+                match err.kind() {
+                    io::ErrorKind::TimedOut => RelayError::Timeout,
+                    io::ErrorKind::InvalidData => RelayError::Request(HttpRequestError::BadRequest),
+                    _ => RelayError::BadGateway,
+                }
             })?;
         let host = self.routes.authority.to_string();
         let parsed = parse_http_request(&raw, &host).map_err(RelayError::Request)?;
@@ -570,32 +585,14 @@ impl Service {
             return Ok(());
         }
 
-        let mut sniffed = Vec::new();
-        if kind == RouteKind::Media
+        let sniffed = if kind == RouteKind::Media
             && method == "GET"
             && range.is_none_or(|r| r.starts_with("bytes=0-"))
         {
-            let mut buf = [0u8; MAX_ADAPTIVE_SNIFF];
-            let mut used = 0;
-            let mut eof = false;
-            while used < buf.len() && is_adaptive_prefix_undecided(&buf[..used]) {
-                match response.body().read(&mut buf[used..]) {
-                    Ok(0) => {
-                        eof = true;
-                        break;
-                    }
-                    Ok(n) => used += n,
-                    Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                    Err(e) => return Err(e.into()),
-                }
-            }
-            ensure!(
-                !is_adaptive_manifest(&buf[..used])
-                    && (eof || !is_adaptive_prefix_undecided(&buf[..used])),
-                "unexpected adaptive manifest on media route"
-            );
-            sniffed.extend_from_slice(&buf[..used]);
-        }
+            sniff_media_prefix(response.body(), MAX_ADAPTIVE_SNIFF)?
+        } else {
+            Vec::new()
+        };
         let chunked = method == "GET" && !response.headers.contains_key("content-length");
         *committed = true;
         write!(
@@ -619,8 +616,7 @@ impl Service {
             // Switch to nonblocking writes with NO SO_SNDTIMEO before streaming
             // body bytes so long pauses or full demuxer caches never time out or
             // trigger Winsock SO_SNDTIMEO partial-write hazards.
-            socket.set_write_timeout(None)?;
-            socket.set_nonblocking(true)?;
+            enter_nonblocking_body(socket)?;
             let mut combined = io::Cursor::new(sniffed).chain(response.body());
             copy_stream(
                 &mut combined,
