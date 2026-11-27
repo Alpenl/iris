@@ -8,7 +8,7 @@ use iris_api::v2::{
     Capability, HostEvent,
     enhance::{CueContent, CueLayout, OverlayWindow},
 };
-use iris_core::plugin_v2::{
+use iris_plugin_host::{
     ledger::{Ledger, Reservation, Resource},
     overlay::OverlayFrame,
 };

@@ -52,7 +52,7 @@ def main():
                "files": {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in sorted(directory.iterdir()) if p.is_file()},
                "scope": "160x90 H.264/AAC, six seconds, local HTTP, native null output; excludes GPU/display and 4K performance"}
     env = configure_mpv_env(dict(os.environ, IRIS_V2_ADAPTIVE_FIXTURE=str(directory)))
-    result = subprocess.run(["cargo", "test", "--locked", "-p", "iris-core", "--test", "player_scoped_plugin",
+    result = subprocess.run(["cargo", "test", "--locked", "-p", "iris-plugin-host", "--test", "player_scoped_plugin",
                              "real_hls_decode_through_scoped_rewritten_manifest", "--", "--ignored", "--nocapture"],
                             cwd=ROOT, env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=300)
     print(result.stdout)

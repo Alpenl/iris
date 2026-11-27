@@ -10,7 +10,7 @@ use crate::library::Kind;
 use crate::settings::{Hwdec, OnEof, Settings, SubLang};
 
 use super::model::{AspectMode, Command, MAX_SPEED, MIN_SPEED, PlayerActionError};
-use super::{MediaSourceState, MonitorLutFilter, Session, next_command_receipt};
+use super::{MediaSourceState, MonitorLutFilter, Session};
 mod commands;
 mod pump;
 mod references;
@@ -208,7 +208,7 @@ impl Session {
                     .command_async(&["set", "hwdec", self.effective_hwdec_str()]),
             );
         }
-        match next_command_receipt().and_then(|receipt| {
+        match self.receipts.next().and_then(|receipt| {
             self.mpv
                 .command_with_reply(receipt, &["set", "vf", ""])
                 .map(|()| receipt)
@@ -393,7 +393,7 @@ impl Session {
             }
             vf.push_str(&lut.filter_spec()?);
         }
-        if track_reply && let Ok(receipt) = next_command_receipt() {
+        if track_reply && let Ok(receipt) = self.receipts.next() {
             self.mpv.command_with_reply(receipt, &["set", "vf", &vf])?;
             return Ok(Some(receipt));
         }

@@ -10,12 +10,23 @@ use url::Url;
 
 use super::playlist::{is_hls, rewrite_playlist};
 use super::transfer::valid_range;
-use super::{CLIENT_TIMEOUT, MAX_REQUEST, PlaybackRelay, RELAY_WORKERS, RouteKind, Routes};
+use super::{
+    CLIENT_TIMEOUT, MAX_REQUEST, PlaybackRelay, RELAY_WORKERS, RelayWorkerBudget, RouteKind, Routes,
+};
 use crate::library::Kind;
 use crate::loopback_http::read_request;
 use crate::media_uri::MediaUri;
 use crate::player::{RemoteMediaRequest, RemoteSubtitle, Session};
 use crate::settings::Settings;
+
+impl PlaybackRelay {
+    pub(in crate::player) fn start(
+        url: Url,
+        headers: BTreeMap<String, String>,
+    ) -> anyhow::Result<Self> {
+        Self::start_with_budget(url, headers, &RelayWorkerBudget::default())
+    }
+}
 
 #[test]
 fn playlist_routes_bind_urls_extensions_and_playback_keys() {
@@ -580,7 +591,24 @@ fn playlist_probe_falls_back_when_range_rejected_and_subtitle_keeps_explicit_aut
     client.read_to_string(&mut sub_reply).unwrap();
     sub_upstream.join().unwrap();
     assert!(sub_reply.ends_with("\r\n\r\nhi"));
-    drop(origin);
+    drop((relay, auth_relay, origin));
+
+    // Session-scoped RelayWorkerBudget enforces the 8-listener cap without cross-session contention.
+    let shared_budget = RelayWorkerBudget::default();
+    let probe_url = Url::parse("https://example.invalid/clip.mp4").unwrap();
+    let mut held = Vec::new();
+    for _ in 0..8 {
+        held.push(
+            PlaybackRelay::start_with_budget(probe_url.clone(), BTreeMap::new(), &shared_budget)
+                .unwrap(),
+        );
+    }
+    assert!(
+        PlaybackRelay::start_with_budget(probe_url.clone(), BTreeMap::new(), &shared_budget)
+            .is_err()
+    );
+    let independent = PlaybackRelay::start(probe_url, BTreeMap::new()).unwrap();
+    drop((independent, held));
 }
 
 #[test]

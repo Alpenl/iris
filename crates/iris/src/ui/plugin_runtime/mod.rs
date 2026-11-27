@@ -15,11 +15,11 @@ use crate::assets::Icon;
 use gpui::{Context, SharedString, Window};
 use iris_api::v2::{Capability, ErrorCode, Generation, Id, source::PlaylistEntry};
 use iris_api::{PluginModal, SidebarPanel};
-use iris_core::plugin_v2::{
+use iris_core::preset::SidebarMode;
+use iris_plugin_host::{
     hub::{Binding, OriginSummary, PluginStatus, ReviewSummary},
     requests::AcceptedPage,
 };
-use iris_core::preset::SidebarMode;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
@@ -355,7 +355,7 @@ impl IrisWindow {
             .pending
             .retain(|(_, key), _| !key.starts_with("overlay:"));
         if let Some(session) =
-            iris_core::plugin_v2::stream::prepare::stream_session(&self.active().session)
+            iris_plugin_host::stream::prepare::stream_session(&self.active().session)
         {
             let plugin = self
                 .plugins
@@ -457,8 +457,7 @@ impl IrisWindow {
                 .iter()
                 .find(|p| p.id == plugin)
                 .is_none_or(|p| {
-                    p.enabled
-                        && !matches!(p.status, iris_core::plugin_v2::hub::PluginStatus::Failed(_))
+                    p.enabled && !matches!(p.status, iris_plugin_host::hub::PluginStatus::Failed(_))
                 })
             {
                 self.plugin_view.deferred.push((plugin, command));

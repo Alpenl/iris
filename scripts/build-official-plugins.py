@@ -41,7 +41,7 @@ DEFAULT_NETWORK = {
 
 # Reviewed capability/network baseline for bundled official plugins (R1-M07).
 # Expanding permissions or static network rules requires updating this baseline
-# and verifying the host upgrade review path in crates/iris-core/src/plugin_v2/official.rs.
+# and verifying the host upgrade review path in crates/iris-plugin-host/src/official.rs.
 FROZEN_OFFICIAL_CAPABILITIES = {
     "iris.guides": (
         frozenset({"ui_overlay", "ui_status", "ui_sidebar", "notifications"}),
@@ -288,7 +288,7 @@ def _find_container_runtime() -> str | None:
                 stderr=subprocess.DEVNULL,
                 text=True,
             )
-            out, _ = proc.communicate(timeout=8)
+            out, _ = proc.communicate(timeout=20)
             if proc.returncode == 0 and "linux" in out.strip().lower():
                 return binary
         except (OSError, subprocess.SubprocessError):

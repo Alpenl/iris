@@ -8,11 +8,11 @@ use gpui::{
 };
 use iris_api::SourceManageAction;
 use iris_api::v2::{Capability, source::SourceDescriptor};
-use iris_core::plugin_v2::{
+use iris_core::preset::{PresetCaptureScope, WorkspacePreset};
+use iris_plugin_host::{
     hub::{PluginInfo, PluginStatus},
     product::plugins_dir,
 };
-use iris_core::preset::{PresetCaptureScope, WorkspacePreset};
 
 use super::super::IrisWindow;
 use super::super::kit::form::{chip_button, toggle};

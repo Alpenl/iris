@@ -1,0 +1,3 @@
+disallowed-methods = [
+    { path = "iris_core::player::Session::render_handle", reason = "Plugin host must never access video render handles" },
+]

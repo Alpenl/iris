@@ -37,7 +37,7 @@ def main():
     env = configure_mpv_env(os.environ.copy())
     env["IRIS_V2_GUIDES_PACKAGE"] = str(guides)
     env["IRIS_V2_WEBDAV_PACKAGE"] = str(webdav)
-    subprocess.run(["cargo", "test", "--locked", "-p", "iris-core", "--test", "plugin_v2_official",
+    subprocess.run(["cargo", "test", "--locked", "-p", "iris-plugin-host", "--test", "plugin_v2_official",
                     "--", "--ignored", "--test-threads=1", "--nocapture"], cwd=ROOT, env=env, check=True)
 
 

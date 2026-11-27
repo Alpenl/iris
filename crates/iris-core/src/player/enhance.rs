@@ -7,7 +7,7 @@ use std::sync::Arc;
 use anyhow::{Result, ensure};
 use iris_mpv::Mpv;
 
-use super::{Chapter, Command, Session, next_command_receipt};
+use super::{Chapter, Command, CommandReceipts, Session};
 
 /// Externally managed subtitle/audio attachment bound to a host playback session.
 pub trait ExternalTrack: Send + Sync {
@@ -34,11 +34,22 @@ enum Pending {
     Stop,
 }
 
-#[derive(Default)]
 pub(super) struct TrackState {
+    receipts: CommandReceipts,
     active: BTreeMap<(String, String), Arc<dyn ExternalTrack>>,
     pending: BTreeMap<u64, Pending>,
     retired: Vec<Arc<dyn ExternalTrack>>,
+}
+
+impl TrackState {
+    pub(super) fn new(receipts: CommandReceipts) -> Self {
+        Self {
+            receipts,
+            active: BTreeMap::new(),
+            pending: BTreeMap::new(),
+            retired: Vec::new(),
+        }
+    }
 }
 
 fn native_track(mpv: &Mpv, track: &dyn ExternalTrack) -> Option<i64> {
@@ -117,7 +128,7 @@ impl TrackState {
     }
     fn remove(&mut self, mpv: &Mpv, track: Arc<dyn ExternalTrack>) -> Result<()> {
         if let Some(native) = native_track(mpv, track.as_ref()) {
-            let receipt = next_command_receipt()?;
+            let receipt = self.receipts.next()?;
             mpv.command_with_reply(
                 receipt,
                 &[
@@ -355,7 +366,7 @@ impl Session {
         // Applies also to enhancements of ordinary local media; decoder policy
         // for the already-open primary stream has already been captured by mpv.
         super::scoped::restore_attachment_policy(&self.mpv)?;
-        let receipt = next_command_receipt()?;
+        let receipt = self.receipts.next()?;
         self.mpv.command_with_reply(
             receipt,
             &[

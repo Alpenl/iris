@@ -1,7 +1,7 @@
 //! Remote stream safety helpers (`validate_stream_url`)
 //! and persistent pinned location bookmarks (`LocationStore`).
 
-pub(crate) mod http_client;
+pub use iris_net::http_client;
 
 use std::path::{Path, PathBuf};
 

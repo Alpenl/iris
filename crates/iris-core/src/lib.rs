@@ -5,18 +5,16 @@
 
 pub mod bounded_json;
 pub mod catalog;
-pub mod concurrency;
-pub(crate) mod fs_util;
+pub use iris_net::{concurrency, loopback_http};
+pub mod fs_util;
 pub mod geometry;
 pub mod input;
 pub mod keymap;
 pub mod library;
 pub mod logging;
-pub(crate) mod loopback_http;
 pub mod media_uri;
 pub mod photo;
 pub mod player;
-pub mod plugin_v2;
 pub mod preset;
 pub mod settings;
 pub mod store;

@@ -5,8 +5,8 @@ use gpui::{Context, Window};
 use iris_api::v2::{HostCommand, HostEvent, source::PlaybackSnapshot};
 use iris_core::media_uri::MediaUri;
 use iris_core::player::Command;
-use iris_core::plugin_v2::ui::{self as plugin, PollReport};
 use iris_core::preset::SidebarMode;
+use iris_plugin_host::ui::{self as plugin, PollReport};
 
 use super::IrisWindow;
 use super::state::{ActiveSource, PopoverKind, SourceErrorKind};
@@ -168,7 +168,7 @@ impl IrisWindow {
 
     fn execute_one_host_command(
         &mut self,
-        action: &iris_core::plugin_v2::ui::Action,
+        action: &iris_plugin_host::ui::Action,
         cx: &mut Context<Self>,
     ) {
         let pid = &action.binding.installed.plugin_id;
@@ -353,7 +353,7 @@ impl IrisWindow {
             .as_ref()
             .is_some_and(|m| m.matches_source(pid, sid));
         let owner_matches = sid.is_none()
-            && iris_core::plugin_v2::stream::prepare::stream_session(&self.active().session)
+            && iris_plugin_host::stream::prepare::stream_session(&self.active().session)
                 .is_some_and(|session| match pid {
                     None => true,
                     Some(target) => {

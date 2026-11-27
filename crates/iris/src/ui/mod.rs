@@ -42,11 +42,11 @@ use iris_core::input::{self, PointerCommand, PointerInput};
 use iris_core::keymap::Keymap;
 use iris_core::library::Kind;
 use iris_core::player::{Command, MAX_SPEED, MIN_SPEED, Session};
-use iris_core::plugin_v2::ui::PluginManager;
 use iris_core::preset::{PresetManager, PresetRuntime, SidebarMode};
 use iris_core::settings::{Settings, Side};
 use iris_core::store::Store;
 use iris_core::vfs::LocationStore;
+use iris_plugin_host::ui::PluginManager;
 
 pub(crate) use actions::{
     CycleAspect, CyclePreset, NextChapter, OpenCommandPalette, OpenFile, OpenNextMedia,
@@ -62,7 +62,6 @@ use viewport::Viewport;
 
 use crate::platform::{self, MediaKey, MediaKeyBridge, PinchMonitor, SleepPreventer};
 use crate::theme::{FONT_UI, ThemeTokens};
-use crate::video::VideoSurface;
 
 pub(super) fn should_recover_after_gpu_reset(
     reset_gen: u64,
@@ -93,6 +92,7 @@ pub(crate) struct IrisWindow {
     presets: PresetManager,
     preset_rt: PresetRuntime,
     keymap: Keymap,
+    plugin_host: iris_plugin_host::PluginHost,
     plugins: PluginManager,
     plugin_view: plugin_runtime::PluginView,
     locations: LocationStore,
@@ -114,6 +114,7 @@ impl IrisWindow {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         session: Session,
+        plugin_host: iris_plugin_host::PluginHost,
         settings: Settings,
         presets: PresetManager,
         preset_rt: PresetRuntime,
@@ -123,7 +124,7 @@ impl IrisWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let (video, video_reset_rx) = match VideoSurface::attach(window, session.render_handle()) {
+        let (video, video_reset_rx) = match crate::video::attach(window, &session) {
             Ok((v, rx)) => (Some(v), Some(rx)),
             Err(e) => {
                 log::error!("video surface failed: {e:#}");
@@ -200,7 +201,7 @@ impl IrisWindow {
         });
 
         let (plugins, mut plugin_wake_rx) =
-            PluginManager::load_with_wake(&settings.disabled_plugins, &settings.theme_id);
+            plugin_host.open_manager(&settings.disabled_plugins, &settings.theme_id);
         let plugin_events = cx.spawn_in(window, async move |this, cx| {
             while plugin_wake_rx.next().await.is_some() {
                 if this
@@ -326,6 +327,7 @@ impl IrisWindow {
             presets,
             preset_rt,
             keymap,
+            plugin_host,
             plugins,
             plugin_view: plugin_runtime::PluginView::new(init_plugin_cmds),
             locations: LocationStore::load(),
@@ -428,6 +430,7 @@ impl IrisWindow {
         self.sleep_preventer.set_active(false);
         self.media_keys.take();
         self.plugins.shutdown();
+        self.plugin_host.shutdown();
         self.store_flush.take();
         self.save_progress_sync();
         let (vol, spd) = {

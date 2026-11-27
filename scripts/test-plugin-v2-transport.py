@@ -69,7 +69,7 @@ def main():
         if mpv_dir.name.lower() == 'lib' and sibling_bin.is_dir():
             path_entries.insert(0, str(sibling_bin))
         env['PATH'] = os.pathsep.join([*path_entries, env.get('PATH', '')])
-    build = subprocess.run(['cargo', 'test', '--locked', '-p', 'iris-core', '--test', 'player_scoped_plugin', '--no-run',
+    build = subprocess.run(['cargo', 'test', '--locked', '-p', 'iris-plugin-host', '--test', 'player_scoped_plugin', '--no-run',
         '--message-format=json', *(['--release'] if args.release else [])], cwd=ROOT, env=env,
         stdout=subprocess.PIPE, text=True)
     artifacts = [json.loads(line) for line in build.stdout.splitlines() if line.startswith('{')]

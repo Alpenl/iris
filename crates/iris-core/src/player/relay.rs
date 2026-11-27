@@ -42,17 +42,63 @@ const MAX_REQUEST: usize = 24 * 1024;
 const MAX_PLAYLIST: usize = 4 * 1024 * 1024;
 const MAX_ADAPTIVE_SNIFF: usize = 4096;
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(10);
+const RELAY_LISTENERS: usize = budget::MEDIA_RELAY_LISTENERS_GLOBAL;
+const RELAY_REAPERS: usize = budget::MEDIA_RELAY_REAPERS_GLOBAL;
 const RELAY_WORKERS: usize = budget::MEDIA_RELAY_WORKERS_PER_RELAY;
 const GLOBAL_WORKERS: usize = budget::MEDIA_RELAY_WORKERS_GLOBAL;
 const SLOT_WAIT: Duration = Duration::from_secs(1);
-static ACTIVE_WORKERS: Mutex<usize> = Mutex::new(0);
 
-/// The worker count is a plain integer, so a poisoned lock still holds a usable value.
-/// Recovering keeps `Worker::drop` from panicking while a panicking worker unwinds.
-fn active_workers() -> std::sync::MutexGuard<'static, usize> {
-    ACTIVE_WORKERS
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
+#[derive(Default)]
+struct RelayCounts {
+    listeners: usize,
+    reapers: usize,
+    workers: usize,
+}
+
+/// Session-scoped media relay thread budget (replaces process-wide mutable statics).
+/// Recovering from poison keeps drop guards from panicking while a worker unwinds.
+#[derive(Clone, Default)]
+pub(super) struct RelayWorkerBudget(Arc<Mutex<RelayCounts>>);
+
+impl RelayWorkerBudget {
+    fn lock(&self) -> std::sync::MutexGuard<'_, RelayCounts> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn acquire_listener(&self) -> Result<ListenerSlot> {
+        let mut counts = self.lock();
+        if counts.listeners >= RELAY_LISTENERS {
+            bail!(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "thread budget exceeded for iris-media-relay",
+            ));
+        }
+        counts.listeners += 1;
+        Ok(ListenerSlot(self.clone()))
+    }
+
+    fn try_acquire_reaper(&self) -> Option<ReaperSlot> {
+        let mut counts = self.lock();
+        if counts.reapers >= RELAY_REAPERS {
+            return None;
+        }
+        counts.reapers += 1;
+        Some(ReaperSlot(self.clone()))
+    }
+}
+
+struct ListenerSlot(RelayWorkerBudget);
+impl Drop for ListenerSlot {
+    fn drop(&mut self) {
+        self.0.lock().listeners -= 1;
+    }
+}
+
+struct ReaperSlot(RelayWorkerBudget);
+impl Drop for ReaperSlot {
+    fn drop(&mut self) {
+        self.0.lock().reapers -= 1;
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -174,6 +220,7 @@ pub(super) struct Service {
     headers: BTreeMap<String, String>,
     cancel: HttpCancel,
     workers: AtomicUsize,
+    budget: RelayWorkerBudget,
     hub: Arc<ClientHub>,
     wake: Waker,
 }
@@ -184,9 +231,14 @@ pub(super) struct PlaybackRelay {
 }
 
 impl PlaybackRelay {
-    pub(super) fn start(url: Url, headers: BTreeMap<String, String>) -> Result<Self> {
+    pub(super) fn start_with_budget(
+        url: Url,
+        headers: BTreeMap<String, String>,
+        budget: &RelayWorkerBudget,
+    ) -> Result<Self> {
         const LISTENER: Token = Token(0);
         const WAKE: Token = Token(1);
+        let listener_slot = budget.acquire_listener()?;
         let mut listener =
             mio::net::TcpListener::bind(SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 0)))?;
         let mut poll = Poll::new()?;
@@ -200,11 +252,13 @@ impl PlaybackRelay {
             headers,
             cancel: HttpCancel::default(),
             workers: AtomicUsize::new(0),
+            budget: budget.clone(),
             hub: Arc::new(ClientHub::new(registry, 2)),
             wake,
         });
         let server = Arc::clone(&service);
         let listener = spawn_thread(ThreadRole::MediaRelayListener, move || {
+            let _listener_slot = listener_slot;
             let mut events = Events::with_capacity(16);
             let mut workers: Vec<thread::JoinHandle<()>> = Vec::new();
             let mut waiting: Option<(TcpStream, Instant)> = None;
@@ -311,7 +365,7 @@ impl PlaybackRelay {
     pub(super) fn cancel(&self) {
         self.service.cancel.cancel();
         // Synchronize with the admission check before waking the listener.
-        let _workers = active_workers();
+        let _workers = self.service.budget.lock();
         let _ = self.service.wake.wake();
     }
 }
@@ -322,10 +376,11 @@ impl Drop for PlaybackRelay {
         if let Some(listener) = self.listener.take() {
             if listener.is_finished() {
                 let _ = listener.join();
-            } else {
+            } else if let Some(reaper_slot) = self.service.budget.try_acquire_reaper() {
                 let handle = Arc::new(Mutex::new(Some(listener)));
                 let bg = Arc::clone(&handle);
                 if spawn_thread(ThreadRole::MediaRelayReaper, move || {
+                    let _reaper_slot = reaper_slot;
                     if let Some(h) = bg.lock().unwrap_or_else(PoisonError::into_inner).take() {
                         let _ = h.join();
                     }
@@ -335,6 +390,8 @@ impl Drop for PlaybackRelay {
                 {
                     let _ = h.join();
                 }
+            } else {
+                let _ = listener.join();
             }
         }
     }
@@ -344,9 +401,9 @@ struct Worker(Arc<Service>);
 
 impl Drop for Worker {
     fn drop(&mut self) {
-        let mut active = active_workers();
+        let mut active = self.0.budget.lock();
         self.0.workers.fetch_sub(1, Ordering::Relaxed);
-        *active -= 1;
+        active.workers -= 1;
         drop(active);
         let _ = self.0.wake.wake();
     }
@@ -354,14 +411,14 @@ impl Drop for Worker {
 
 impl Service {
     fn try_reserve_worker(self: &Arc<Self>) -> Option<Worker> {
-        let mut active = active_workers();
+        let mut active = self.budget.lock();
         if self.cancel.is_cancelled()
-            || *active >= GLOBAL_WORKERS
+            || active.workers >= GLOBAL_WORKERS
             || self.workers.load(Ordering::Relaxed) >= RELAY_WORKERS
         {
             return None;
         }
-        *active += 1;
+        active.workers += 1;
         self.workers.fetch_add(1, Ordering::Relaxed);
         Some(Worker(Arc::clone(self)))
     }

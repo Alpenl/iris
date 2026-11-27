@@ -111,7 +111,7 @@ impl IrisWindow {
             ActiveSource::Plugin(view) => self
                 .plugin_source_entries(&view.source_id)
                 .map(|entry| {
-                    iris_core::plugin_v2::catalog_item_from_source_entry(
+                    iris_plugin_host::catalog_item_from_source_entry(
                         &view.plugin_id,
                         &view.source_id,
                         entry,

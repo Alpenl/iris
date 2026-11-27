@@ -10,22 +10,20 @@ use gpui::{
 use iris_api::v2::{
     Capability, ErrorCode, GuestError, HostEvent, Id, Reply, enhance::AnnotationEdit,
 };
-use iris_core::{
-    media_uri::MediaUri,
-    plugin_v2::{
-        ledger::{Ledger, Resource},
-        runtime::{Resources, WindowAccess},
-        selection::{
-            SelectionGrants, annotation_error_code, edit_to_store, error_code_to_annotation,
-            page_to_api,
-        },
-        ui::Action,
+use iris_core::media_uri::MediaUri;
+use iris_core::store::{
+    AnnotationEdit as StoreAnnotationEdit, AnnotationError, AnnotationSnapshot, AnnotationTarget,
+    ColorLabel, TimeMarker,
+};
+use iris_core::vfs::HttpCancel;
+use iris_plugin_host::{
+    ledger::{Ledger, Resource},
+    runtime::WindowAccess,
+    selection::{
+        SelectionGrants, annotation_error_code, edit_to_store, error_code_to_annotation,
+        page_to_api,
     },
-    store::{
-        AnnotationEdit as StoreAnnotationEdit, AnnotationError, AnnotationSnapshot,
-        AnnotationTarget, ColorLabel, TimeMarker,
-    },
-    vfs::HttpCancel,
+    ui::Action,
 };
 use std::any::Any;
 use std::collections::BTreeMap;
@@ -269,7 +267,7 @@ impl IrisWindow {
                 .store
                 .annotation_target()
                 .map_err(annotation_error_code)?;
-            let resources = Resources::global()?;
+            let resources = self.plugin_host.resources()?;
             let lease = resources
                 .ledger
                 .reserve("host.annotation-job", &[(Resource::Task, 1)])?;

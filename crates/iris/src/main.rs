@@ -117,7 +117,7 @@ fn main() -> ExitCode {
             return print_cli_line(format_args!("Iris {}", env!("CARGO_PKG_VERSION")));
         }
         Ok(Invocation::CheckPluginRuntime) => {
-            return match iris_core::plugin_v2::official::smoke::check() {
+            return match iris_plugin_host::official::smoke::check() {
                 Ok(receipt) => print_cli_line(format_args!("{receipt}")),
                 Err(error) => {
                     attach_parent_console(true);
@@ -242,6 +242,8 @@ fn run(initial: Vec<PathBuf>) -> ExitCode {
         if let Err(e) = iris_core::vfs::set_doh_resolvers(&active_settings.doh_resolvers) {
             log::warn!("applying configured DoH resolvers: {e:#}");
         }
+        let plugin_host =
+            iris_plugin_host::PluginHost::open_default(&active_settings.disabled_plugins);
         cx.set_global(theme::ThemeTokens::resolve(&active_settings.theme_id, None));
 
         let use_saved_size =
@@ -281,6 +283,7 @@ fn run(initial: Vec<PathBuf>) -> ExitCode {
             cx.new(|cx| {
                 ui::IrisWindow::new(
                     session,
+                    plugin_host,
                     active_settings,
                     presets,
                     preset_rt,

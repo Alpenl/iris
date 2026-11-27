@@ -12,7 +12,7 @@ static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 /// - macOS: `~/Library/Application Support/Iris`;
 /// - Windows: `%APPDATA%\Iris`;
 /// - Other Unix: `$XDG_CONFIG_HOME/iris` or `~/.config/iris`.
-pub(crate) fn data_dir() -> Option<PathBuf> {
+pub fn data_dir() -> Option<PathBuf> {
     if let Some(p) = std::env::var_os("IRIS_SETTINGS") {
         let dir = Path::new(&p).parent()?;
         return if dir.as_os_str().is_empty() {
@@ -42,20 +42,17 @@ pub(crate) fn data_dir() -> Option<PathBuf> {
 
 /// Keep the lock on a stable sibling: the data files themselves are replaced by rename.
 /// Closing the returned file releases the OS lock, including on process exit.
-pub(crate) fn lock_file(path: &Path) -> io::Result<std::fs::File> {
+pub fn lock_file(path: &Path) -> io::Result<std::fs::File> {
     lock_file_with_timeout(path, Duration::from_millis(20))
 }
 
-pub(crate) fn lock_file_with_timeout(path: &Path, timeout: Duration) -> io::Result<std::fs::File> {
+pub fn lock_file_with_timeout(path: &Path, timeout: Duration) -> io::Result<std::fs::File> {
     lock_file_impl(path, timeout, false)
 }
 
 /// Acquires a shared (reader) lock on `path`, allowing concurrent readers while
 /// blocking exclusive writers until all shared locks are released.
-pub(crate) fn lock_file_shared_with_timeout(
-    path: &Path,
-    timeout: Duration,
-) -> io::Result<std::fs::File> {
+pub fn lock_file_shared_with_timeout(path: &Path, timeout: Duration) -> io::Result<std::fs::File> {
     lock_file_impl(path, timeout, true)
 }
 
@@ -90,7 +87,7 @@ fn lock_file_impl(path: &Path, timeout: Duration, shared: bool) -> io::Result<st
     }
 }
 
-pub(crate) fn create_parent(path: &Path) -> io::Result<()> {
+pub fn create_parent(path: &Path) -> io::Result<()> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
     {
@@ -99,7 +96,7 @@ pub(crate) fn create_parent(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-pub(crate) fn retry_sharing_violation<T>(mut op: impl FnMut() -> io::Result<T>) -> io::Result<T> {
+pub fn retry_sharing_violation<T>(mut op: impl FnMut() -> io::Result<T>) -> io::Result<T> {
     for attempt in 1.. {
         match op() {
             Err(e) if cfg!(windows) && attempt < 5 && windows_sharing_violation(&e) => {
@@ -118,7 +115,7 @@ fn windows_sharing_violation(e: &io::Error) -> bool {
 /// Atomically writes `bytes` to `path` via a unique sibling `.tmp` file,
 /// cleaning up the temp file on failure and retrying briefly on Windows
 /// transient sharing locks.
-pub(crate) fn atomic_write(path: &Path, bytes: impl AsRef<[u8]>) -> std::io::Result<()> {
+pub fn atomic_write(path: &Path, bytes: impl AsRef<[u8]>) -> std::io::Result<()> {
     write_impl(path, bytes.as_ref(), false)
 }
 
@@ -128,7 +125,7 @@ pub(crate) fn atomic_write(path: &Path, bytes: impl AsRef<[u8]>) -> std::io::Res
 /// Platform note (Windows): Windows does not apply Unix mode bits; the created file
 /// inherits the parent directory's DACL (user-private under `%APPDATA%\Iris`, or the
 /// overridden directory's ACL when `IRIS_SETTINGS` / `IRIS_TEST_VAULT` is configured).
-pub(crate) fn atomic_write_private(path: &Path, bytes: impl AsRef<[u8]>) -> std::io::Result<()> {
+pub fn atomic_write_private(path: &Path, bytes: impl AsRef<[u8]>) -> std::io::Result<()> {
     write_impl(path, bytes.as_ref(), true)
 }
 

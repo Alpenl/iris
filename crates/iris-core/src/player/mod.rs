@@ -44,19 +44,27 @@ pub trait MonitorLutFilter: Send + Sync {
     fn filter_spec(&self) -> Result<String>;
 }
 
-static NEXT_COMMAND_RECEIPT: AtomicU64 = AtomicU64::new(1);
+/// Session-scoped monotonic command receipt generator (no process-wide static).
+#[derive(Clone)]
+pub(super) struct CommandReceipts(Arc<AtomicU64>);
+
+impl CommandReceipts {
+    fn new() -> Self {
+        Self(Arc::new(AtomicU64::new(1)))
+    }
+
+    pub(super) fn next(&self) -> Result<u64> {
+        self.0
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
+            .map_err(|_| anyhow!("exhausted mpv command receipt identifiers"))
+    }
+}
 
 /// mpv only takes UTF-8 paths. A lossy conversion would name a different file, and
 /// for `screenshot-to-file` it could overwrite one.
 fn mpv_path(path: &Path) -> Result<&str> {
     path.to_str()
         .ok_or_else(|| PlayerActionError::NonUnicodePath.into())
-}
-
-pub(super) fn next_command_receipt() -> Result<u64> {
-    NEXT_COMMAND_RECEIPT
-        .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
-        .map_err(|_| anyhow!("exhausted mpv command receipt identifiers"))
 }
 
 /// Active media transport state; mutually exclusive across local, direct remote, and plugin-scoped loads.
@@ -78,7 +86,6 @@ enum MediaSourceState {
 }
 
 /// Active plugin-attached enhancements owned for the current media lifecycle.
-#[derive(Default)]
 struct PluginEnhancements {
     tracks: enhance::TrackState,
     timeline_owner: Option<String>,
@@ -89,6 +96,22 @@ struct PluginEnhancements {
     loading_luts: Vec<Arc<dyn MonitorLutFilter>>,
     reattach_on_load: Vec<Arc<dyn ExternalTrack>>,
     error_tracks: Vec<std::sync::Weak<dyn ExternalTrack>>,
+}
+
+impl PluginEnhancements {
+    fn new(receipts: CommandReceipts) -> Self {
+        Self {
+            tracks: enhance::TrackState::new(receipts),
+            timeline_owner: None,
+            error_timeline: None,
+            monitor_lut: None,
+            error_lut: None,
+            retired_luts: Vec::new(),
+            loading_luts: Vec::new(),
+            reattach_on_load: Vec::new(),
+            error_tracks: Vec::new(),
+        }
+    }
 }
 
 /// Visual orientation and subtitle safe-area state for the active viewport.
@@ -103,6 +126,8 @@ pub struct Session {
     pub(super) mpv: Arc<Mpv>,
     event_pump: backend::EventPump,
     event_rx: RefCell<Option<UnboundedReceiver<SessionUpdate>>>,
+    pub(super) receipts: CommandReceipts,
+    relay_budget: relay::RelayWorkerBudget,
     pub(super) state: PlaybackState,
     pub(super) current: Option<PathBuf>,
     pub(super) current_uri: Option<String>,
@@ -137,10 +162,14 @@ impl Session {
 
     fn from_mpv(mpv: Arc<Mpv>) -> Result<Self> {
         let (event_pump, event_rx) = backend::spawn_event_pump(mpv.clone())?;
+        let receipts = CommandReceipts::new();
         Ok(Self {
             mpv,
             event_pump,
             event_rx: RefCell::new(Some(event_rx)),
+            enhancements: PluginEnhancements::new(receipts.clone()),
+            receipts,
+            relay_budget: relay::RelayWorkerBudget::default(),
             state: PlaybackState::default(),
             current: None,
             current_uri: None,
@@ -150,7 +179,6 @@ impl Session {
             photo_meta: None,
             playlist_entry_id: None,
             source: MediaSourceState::Idle,
-            enhancements: PluginEnhancements::default(),
             visual: VisualTransform::default(),
             user_hwdec: Cell::new(Hwdec::AutoSafe),
             on_eof: Cell::new(OnEof::Pause),
@@ -162,6 +190,7 @@ impl Session {
         })
     }
 
+    #[allow(clippy::disallowed_methods)]
     pub fn render_handle(&self) -> RenderHandle {
         RenderHandle::new(self.mpv.clone())
     }
@@ -243,7 +272,7 @@ impl Session {
         let need_stop_receipt = stopped_lut.is_some()
             || !loading_luts.is_empty()
             || self.enhancements.tracks.has_retired_or_pending();
-        if need_stop_receipt && let Ok(receipt) = next_command_receipt() {
+        if need_stop_receipt && let Ok(receipt) = self.receipts.next() {
             self.mpv.command_with_reply(receipt, &["stop"])?;
             if let Some(lut) = stopped_lut {
                 self.enhancements.retired_luts.push((receipt, lut));
@@ -469,7 +498,8 @@ impl Session {
         let saved_remote = req.clone();
         let main_url = vfs::validate_stream_url(&req.playback_url)?;
         let clean_headers = origin_headers(&main_url, &req.headers)?;
-        let relay = PlaybackRelay::start(main_url.clone(), clean_headers)?;
+        let relay =
+            PlaybackRelay::start_with_budget(main_url.clone(), clean_headers, &self.relay_budget)?;
         let playback_url = relay.url(&main_url)?;
         let mut owned_opts: Vec<(&'static str, String)> = Vec::new();
         owned_opts.push(("autoload-files", "no".into()));

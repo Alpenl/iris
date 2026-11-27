@@ -40,7 +40,7 @@ def main():
     cmd = ["cargo", "test", "--locked"]
     if not args.debug:
         cmd.append("--release")
-    cmd += ["-p", "iris-core", "--test", "plugin_v2_examples", "--", "--ignored", "--nocapture"]
+    cmd += ["-p", "iris-plugin-host", "--test", "plugin_v2_examples", "--", "--ignored", "--nocapture"]
     subprocess.run(cmd, cwd=ROOT, env=env, check=True)
 
 

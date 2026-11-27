@@ -268,7 +268,7 @@ impl Session {
             } else {
                 "auto"
             };
-            match super::next_command_receipt().and_then(|receipt| {
+            match self.receipts.next().and_then(|receipt| {
                 self.mpv
                     .command_with_reply(
                         receipt,

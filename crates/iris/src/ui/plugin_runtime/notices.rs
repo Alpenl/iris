@@ -3,10 +3,8 @@ use super::super::{
     state::{ActiveSource, ActiveStreamMeta, StreamReply},
 };
 use gpui::Context;
-use iris_core::{
-    media_uri::MediaUri,
-    plugin_v2::{hub::Notice, requests::RequestTarget},
-};
+use iris_core::media_uri::MediaUri;
+use iris_plugin_host::{hub::Notice, requests::RequestTarget};
 use std::sync::Arc;
 
 impl IrisWindow {

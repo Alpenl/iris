@@ -2798,6 +2798,8 @@ dependencies = [
  "iris-api",
  "iris-core",
  "iris-mpv",
+ "iris-net",
+ "iris-plugin-host",
  "libc",
  "log",
  "objc",
@@ -2820,38 +2822,23 @@ dependencies = [
 name = "iris-core"
 version = "0.0.2"
 dependencies = [
- "aes",
  "anyhow",
  "base64",
- "blake3",
- "cap-std",
- "cbc",
  "env_logger",
  "futures",
- "httparse",
- "httpdate",
- "iris-api",
  "iris-mpv",
+ "iris-net",
  "libc",
  "log",
- "md-5",
  "miniz_oxide 0.8.9",
  "mio",
  "percent-encoding",
  "ring",
- "rustls",
- "rustls-native-certs",
- "rustls-pki-types",
  "security-framework",
  "serde",
  "serde_json",
- "sha1 0.10.7",
- "tungstenite",
  "url",
- "wasmtime",
- "wat",
  "windows-sys 0.61.2",
- "zip",
 ]
 
 [[package]]
@@ -2898,10 +2885,62 @@ name = "iris-mpv"
 version = "0.0.2"
 
 [[package]]
+name = "iris-net"
+version = "0.0.2"
+dependencies = [
+ "anyhow",
+ "base64",
+ "httparse",
+ "log",
+ "mio",
+ "percent-encoding",
+ "rustls",
+ "rustls-native-certs",
+ "rustls-pki-types",
+ "tungstenite",
+ "url",
+]
+
+[[package]]
 name = "iris-plugin-guides"
 version = "0.0.2"
 dependencies = [
  "iris-plugin-sdk",
+]
+
+[[package]]
+name = "iris-plugin-host"
+version = "0.0.2"
+dependencies = [
+ "aes",
+ "anyhow",
+ "base64",
+ "blake3",
+ "cap-std",
+ "cbc",
+ "futures",
+ "httparse",
+ "httpdate",
+ "iris-api",
+ "iris-core",
+ "iris-net",
+ "libc",
+ "log",
+ "md-5",
+ "miniz_oxide 0.8.9",
+ "mio",
+ "percent-encoding",
+ "ring",
+ "rustls",
+ "serde",
+ "serde_json",
+ "sha1 0.10.7",
+ "tungstenite",
+ "url",
+ "wasmtime",
+ "wat",
+ "windows-sys 0.61.2",
+ "zip",
 ]
 
 [[package]]
