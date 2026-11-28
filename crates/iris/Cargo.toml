@@ -7,7 +7,7 @@ publish.workspace = true
 license.workspace = true
 
 [features]
-devtools = ["iris-core/devtools"]
+devtools = ["iris-core/devtools", "iris-app/devtools"]
 
 [dependencies]
 gpui = { workspace = true, features = ["font-kit", "runtime_shaders"] }

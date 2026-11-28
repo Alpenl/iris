@@ -10,7 +10,7 @@ use iris_core::bookmarks::PinnedBookmark;
 use iris_core::keymap;
 use iris_core::preset::PresetCaptureScope;
 
-use super::AppModel;
+use super::WindowShell;
 use super::actions::{ClearAbLoop, CycleAbLoop};
 use super::actions::{
     CycleAspect, CyclePreset, OpenFile, RefreshDirectory, RotateCw, TakeScreenshot,
@@ -57,7 +57,7 @@ fn palette_selected_index(palette_index: usize, entry_count: usize) -> Option<us
     (entry_count > 0).then(|| palette_index.min(entry_count - 1))
 }
 
-impl AppModel {
+impl WindowShell {
     fn palette_entries(&self) -> Vec<PaletteEntry> {
         use super::strings::{actions::action_title, chrome};
         let live_key = |id: &str| self.key_hint(id).map(|s| s.to_string());
@@ -154,7 +154,7 @@ impl AppModel {
                 title: "切换侧栏视图（目录 / 数据源 / 队列 / 插件）".into(),
                 subtitle: Some(format!(
                     "当前侧栏视图：{}",
-                    super::strings::presets::sidebar_mode_label(self.catalog.sidebar_mode())
+                    super::strings::presets::sidebar_mode_label(self.catalog().sidebar_mode())
                 )),
                 badge: "工作区".into(),
                 shortcut: None,
@@ -225,7 +225,7 @@ impl AppModel {
             },
         ];
 
-        for (pid, spec) in self.plugins.source_providers() {
+        for (pid, spec) in self.plugins().source_providers() {
             entries.push(PaletteEntry {
                 title: format!("数据源：添加{}…", spec.label),
                 subtitle: None,
@@ -238,8 +238,8 @@ impl AppModel {
             });
         }
 
-        for preset in self.presets.list() {
-            let cur = if self.settings.active_preset == preset.id {
+        for preset in self.presets().list() {
+            let cur = if self.settings().active_preset == preset.id {
                 " [当前]"
             } else {
                 ""
@@ -258,7 +258,7 @@ impl AppModel {
         }
 
         for th in BUILTIN_THEMES {
-            let cur = if self.settings.theme_id.eq_ignore_ascii_case(th.id) {
+            let cur = if self.settings().theme_id.eq_ignore_ascii_case(th.id) {
                 " [当前]"
             } else {
                 ""
@@ -272,7 +272,7 @@ impl AppModel {
             });
         }
 
-        for (pid, pname, src) in self.plugins.media_sources() {
+        for (pid, pname, src) in self.plugins().media_sources() {
             entries.push(PaletteEntry {
                 title: format!("数据源：浏览 {} · {}", pname, src.name),
                 subtitle: src.subtitle.clone(),
@@ -285,7 +285,7 @@ impl AppModel {
             });
         }
 
-        for bm in self.catalog.bookmarks() {
+        for bm in self.catalog().bookmarks() {
             entries.push(PaletteEntry {
                 title: format!("书签：打开 {}", bm.name),
                 subtitle: Some(bm.uri.to_uri_string()),
@@ -295,7 +295,7 @@ impl AppModel {
             });
         }
 
-        for (pid, pname, cmd) in self.plugins.commands() {
+        for (pid, pname, cmd) in self.plugins().commands() {
             entries.push(PaletteEntry {
                 title: cmd.title.clone(),
                 subtitle: cmd.subtitle.clone(),
@@ -381,7 +381,7 @@ impl AppModel {
                 "screenshot" => self.take_screenshot(&TakeScreenshot, window, cx),
                 "info" => self.toggle_info(&ToggleInfo, window, cx),
                 "toggle_sidebar_mode" => {
-                    let next = self.catalog.cycle_sidebar_mode();
+                    let next = self.app.cycle_sidebar_mode();
                     self.set_sidebar_mode(next, cx);
                 }
                 "toggle_directory" => self.toggle_directory(&ToggleDirectory, window, cx),
@@ -436,10 +436,9 @@ impl AppModel {
                 cx,
             ),
             PaletteTarget::Theme(id) => {
-                self.settings.theme_id = id.to_string();
-                self.persist_user_settings();
-                self.sync_theme_tokens(cx);
-                self.notify_all(cx);
+                let wb = self.app.set_theme_id(id);
+                let regions = self.apply_workbench_changes(wb, Some(window), cx);
+                self.notify_regions(regions, cx);
             }
             PaletteTarget::OpenUrl => {
                 self.open_builtin_dialog(BuiltinDialog::OpenUrl, window, cx);
@@ -463,7 +462,7 @@ impl AppModel {
 }
 
 pub(super) fn render_command_palette(
-    model: &Entity<AppModel>,
+    model: &Entity<WindowShell>,
     window: &Window,
     cx: &App,
 ) -> impl IntoElement {

@@ -1,12 +1,12 @@
 //! Playback, seek, volume, speed, track, chapter, and queue-step GPUI action
-//! adapters delegating all orchestration to [`iris_app::PlaybackController`].
+//! adapters delegating all orchestration to [`iris_app::AppModel`].
 
 use std::time::Instant;
 
 use gpui::{Context, Window};
 use iris_app::PlaybackActionOutcome;
 
-use super::AppModel;
+use super::WindowShell;
 use super::actions::{
     ClearAbLoop, CycleAbLoop, CycleAudio, CycleSub, FrameBack, FrameForward, NextChapter,
     OpenNextMedia, OpenPreviousMedia, PrevChapter, ResetSpeed, SeekBackwardExact,
@@ -15,7 +15,7 @@ use super::actions::{
     ToggleSubs, VolumeDown, VolumeUp,
 };
 
-impl AppModel {
+impl WindowShell {
     pub(in crate::ui) fn apply_playback_action(
         &mut self,
         outcome: PlaybackActionOutcome,
@@ -44,7 +44,7 @@ impl AppModel {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let out = self.playback.cycle_ab_loop();
+        let out = self.app.cycle_ab_loop();
         self.apply_playback_action(out, cx);
     }
 
@@ -54,12 +54,12 @@ impl AppModel {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let out = self.playback.clear_ab_loop();
+        let out = self.app.clear_ab_loop();
         self.apply_playback_action(out, cx);
     }
 
     pub(super) fn toggle_pause(&mut self, _: &TogglePause, _: &mut Window, cx: &mut Context<Self>) {
-        let out = self.playback.toggle_pause();
+        let out = self.app.toggle_pause();
         self.apply_playback_action(out, cx);
     }
 
@@ -69,9 +69,7 @@ impl AppModel {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let out = self
-            .playback
-            .seek_relative_step(self.settings.seek_step, false);
+        let out = self.app.seek_relative_step(false);
         self.apply_playback_action(out, cx);
     }
 
@@ -81,9 +79,7 @@ impl AppModel {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let out = self
-            .playback
-            .seek_relative_step(self.settings.seek_step, true);
+        let out = self.app.seek_relative_step(true);
         self.apply_playback_action(out, cx);
     }
 
@@ -93,9 +89,7 @@ impl AppModel {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let out = self
-            .playback
-            .seek_relative_large(self.settings.seek_step, false);
+        let out = self.app.seek_relative_large(false);
         self.apply_playback_action(out, cx);
     }
 
@@ -105,14 +99,12 @@ impl AppModel {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let out = self
-            .playback
-            .seek_relative_large(self.settings.seek_step, true);
+        let out = self.app.seek_relative_large(true);
         self.apply_playback_action(out, cx);
     }
 
     pub(super) fn frame_back(&mut self, _: &FrameBack, _: &mut Window, cx: &mut Context<Self>) {
-        let out = self.playback.frame_step(false);
+        let out = self.app.frame_step(false);
         self.apply_playback_action(out, cx);
     }
 
@@ -122,7 +114,7 @@ impl AppModel {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let out = self.playback.frame_step(true);
+        let out = self.app.frame_step(true);
         self.apply_playback_action(out, cx);
     }
 
@@ -135,43 +127,43 @@ impl AppModel {
     }
 
     pub(super) fn adjust_volume_by(&mut self, delta: f64, cx: &mut Context<Self>) {
-        if let Err(error) = self.playback.adjust_volume_by(delta, Instant::now()) {
+        if let Err(error) = self.app.adjust_volume_by(delta, Instant::now()) {
             self.show_toast(format!("操作失败 · {error}"), cx);
         }
     }
 
     pub(super) fn toggle_mute(&mut self, _: &ToggleMute, _: &mut Window, cx: &mut Context<Self>) {
-        let out = self.playback.toggle_mute();
+        let out = self.app.toggle_mute();
         self.apply_playback_action(out, cx);
     }
 
     pub(super) fn speed_down(&mut self, _: &SpeedDown, _: &mut Window, cx: &mut Context<Self>) {
-        let out = self.playback.step_speed(-1);
+        let out = self.app.step_speed(-1);
         self.apply_playback_action(out, cx);
     }
 
     pub(super) fn speed_up(&mut self, _: &SpeedUp, _: &mut Window, cx: &mut Context<Self>) {
-        let out = self.playback.step_speed(1);
+        let out = self.app.step_speed(1);
         self.apply_playback_action(out, cx);
     }
 
     pub(super) fn reset_speed(&mut self, _: &ResetSpeed, _: &mut Window, cx: &mut Context<Self>) {
-        let out = self.playback.reset_speed();
+        let out = self.app.reset_speed();
         self.apply_playback_action(out, cx);
     }
 
     pub(super) fn toggle_loop(&mut self, _: &ToggleLoop, _: &mut Window, cx: &mut Context<Self>) {
-        let out = self.playback.toggle_loop();
+        let out = self.app.toggle_loop();
         self.apply_playback_action(out, cx);
     }
 
     pub(super) fn toggle_subs(&mut self, _: &ToggleSubs, _: &mut Window, cx: &mut Context<Self>) {
-        let out = self.playback.toggle_subtitles();
+        let out = self.app.toggle_subtitles();
         self.apply_playback_action(out, cx);
     }
 
     pub(super) fn cycle_sub(&mut self, _: &CycleSub, _: &mut Window, cx: &mut Context<Self>) {
-        let out = self.playback.cycle_subtitle_track();
+        let out = self.app.cycle_subtitle_track();
         self.apply_playback_action(out, cx);
     }
 
@@ -181,7 +173,7 @@ impl AppModel {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let out = self.playback.seek_subtitle_cue(false);
+        let out = self.app.seek_subtitle_cue(false);
         self.apply_playback_action(out, cx);
     }
 
@@ -191,7 +183,7 @@ impl AppModel {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let out = self.playback.seek_subtitle_cue(true);
+        let out = self.app.seek_subtitle_cue(true);
         self.apply_playback_action(out, cx);
     }
 
@@ -201,7 +193,7 @@ impl AppModel {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let out = self.playback.adjust_sub_delay(-0.1);
+        let out = self.app.adjust_sub_delay(-0.1);
         self.apply_playback_action(out, cx);
     }
 
@@ -211,7 +203,7 @@ impl AppModel {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let out = self.playback.adjust_sub_delay(0.1);
+        let out = self.app.adjust_sub_delay(0.1);
         self.apply_playback_action(out, cx);
     }
 
@@ -221,22 +213,22 @@ impl AppModel {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let out = self.playback.reset_sub_delay();
+        let out = self.app.reset_sub_delay();
         self.apply_playback_action(out, cx);
     }
 
     pub(super) fn cycle_audio(&mut self, _: &CycleAudio, _: &mut Window, cx: &mut Context<Self>) {
-        let out = self.playback.cycle_audio_track();
+        let out = self.app.cycle_audio_track();
         self.apply_playback_action(out, cx);
     }
 
     pub(super) fn prev_chapter(&mut self, _: &PrevChapter, _: &mut Window, cx: &mut Context<Self>) {
-        let out = self.playback.step_chapter(false);
+        let out = self.app.step_chapter(false);
         self.apply_playback_action(out, cx);
     }
 
     pub(super) fn next_chapter(&mut self, _: &NextChapter, _: &mut Window, cx: &mut Context<Self>) {
-        let out = self.playback.step_chapter(true);
+        let out = self.app.step_chapter(true);
         self.apply_playback_action(out, cx);
     }
 

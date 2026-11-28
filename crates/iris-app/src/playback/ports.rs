@@ -10,10 +10,10 @@ use anyhow::Result;
 use iris_core::library::Kind;
 use iris_core::media_uri::MediaUri;
 use iris_core::player::{
-    AspectMode, Command, MediaStats, PlaybackState, Session, SessionEvent, SessionUpdate, Track,
-    TrackKind, coalesce_updates,
+    AspectMode, AudioDevice, Command, MediaStats, PlaybackState, Session, SessionEvent,
+    SessionUpdate, Track, TrackKind, coalesce_updates,
 };
-use iris_core::settings::Settings;
+use iris_core::settings::{Hwdec, OnEof, Settings, SubLang};
 
 /// Narrow headless port over [`Session`] enabling fast zero-libmpv unit tests of
 /// [`super::PlaybackOrchestrator`] alongside full [`Session`] integration tests.
@@ -33,11 +33,26 @@ pub trait PlaybackSessionPort {
     fn display_flips(&self) -> (bool, bool);
     fn tracks_of(&self, kind: TrackKind) -> Vec<&Track>;
     fn selected_track(&self, kind: TrackKind) -> Option<&Track>;
+    fn audio_devices(&self) -> Vec<AudioDevice> {
+        vec![AudioDevice {
+            name: "auto".into(),
+            description: String::new(),
+        }]
+    }
     fn media_stats(&self) -> MediaStats;
     fn refresh_dynamic_stats(&self, stats: &mut MediaStats);
     fn apply_update<'a>(&mut self, update: &'a Self::Update) -> Option<&'a SessionEvent>;
     fn flush_deferred(&mut self);
     fn execute(&mut self, command: Command) -> Result<()>;
+    fn set_hwdec(&mut self, _hwdec: Hwdec) {}
+    fn set_sub_lang(&mut self, _sub_lang: SubLang) {}
+    fn set_sub_scale(&mut self, _scale: f64) {}
+    fn set_on_eof_loop(&mut self, _on_eof: OnEof) {}
+    fn apply_settings(&mut self, _settings: &Settings) {}
+    fn transform(&mut self, _zoom: f64, _pan: [f64; 2]) -> Result<()> {
+        Ok(())
+    }
+    fn subtitle_inset(&mut self, _logical_inset: f64, _viewport_height: f64) {}
     fn recover_unloaded_after_gpu_reset(&mut self, settings: &Settings, zoom: f64, pan: [f64; 2]);
     fn shutdown(&self);
 }
@@ -97,6 +112,10 @@ impl PlaybackSessionPort for Session {
         Session::selected_track(self, kind)
     }
 
+    fn audio_devices(&self) -> Vec<AudioDevice> {
+        Session::audio_devices(self)
+    }
+
     fn media_stats(&self) -> MediaStats {
         Session::media_stats(self)
     }
@@ -115,6 +134,34 @@ impl PlaybackSessionPort for Session {
 
     fn execute(&mut self, command: Command) -> Result<()> {
         Session::execute(self, command)
+    }
+
+    fn set_hwdec(&mut self, hwdec: Hwdec) {
+        Session::set_hwdec(self, hwdec);
+    }
+
+    fn set_sub_lang(&mut self, sub_lang: SubLang) {
+        Session::set_sub_lang(self, sub_lang);
+    }
+
+    fn set_sub_scale(&mut self, scale: f64) {
+        Session::set_sub_scale(self, scale);
+    }
+
+    fn set_on_eof_loop(&mut self, on_eof: OnEof) {
+        Session::set_on_eof_loop(self, on_eof);
+    }
+
+    fn apply_settings(&mut self, settings: &Settings) {
+        Session::apply_settings(self, settings);
+    }
+
+    fn transform(&mut self, zoom: f64, pan: [f64; 2]) -> Result<()> {
+        Session::transform(self, zoom, pan)
+    }
+
+    fn subtitle_inset(&mut self, logical_inset: f64, viewport_height: f64) {
+        Session::subtitle_inset(self, logical_inset, viewport_height);
     }
 
     fn recover_unloaded_after_gpu_reset(&mut self, settings: &Settings, zoom: f64, pan: [f64; 2]) {

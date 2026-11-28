@@ -8,21 +8,21 @@ use gpui::{
 use iris_core::library::{Kind, format_size};
 use iris_core::settings::Side;
 
-use super::AppModel;
+use super::WindowShell;
 use super::kit::{icon_button, panel_header, tip};
 use super::views::model_listener;
 use crate::assets::Icon;
 use crate::theme::{FLOAT_GAP, FONT_MONO, ThemeTokens};
 
 pub(super) fn render_info_overlay(
-    model: &Entity<AppModel>,
+    model: &Entity<WindowShell>,
     fullscreen: bool,
     window: &Window,
     cx: &App,
 ) -> impl IntoElement {
     let m = model.read(cx);
     let t = ThemeTokens::of(cx);
-    let stats = m.playback.cached_stats().cloned().unwrap_or_default();
+    let stats = m.playback().cached_stats().cloned().unwrap_or_default();
     let kind = m.session().kind();
     let mut rows: Vec<(&'static str, String)> = Vec::new();
 
@@ -141,9 +141,9 @@ pub(super) fn render_info_overlay(
         }))
         .into_any_element();
     let place_left = if fullscreen {
-        m.settings.directory_side == Side::Right
+        m.settings().directory_side == Side::Right
     } else {
-        m.settings.directory_side == Side::Left
+        m.settings().directory_side == Side::Left
     };
     let panel_box = div()
         .id("media-info")

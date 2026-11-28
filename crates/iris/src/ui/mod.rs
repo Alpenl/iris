@@ -1,5 +1,23 @@
-//! Main `IrisWindow` shell and `AppModel` domain coordinator: regional GPUI
-//! entity wiring, window/focus lifecycle observers, and side-effect-free `Render`.
+//! Main `IrisWindow` shell and `WindowShell` GPUI adapter around [`iris_app::AppModel`]:
+//! regional GPUI entity wiring, window/focus lifecycle observers, two-phase native shutdown,
+//! and side-effect-free `Render`.
+//!
+//! ## Five-Layer Input Priority Stack
+//! 1. **`ShortcutRecorder`** (`KeyContext: ShortcutRecorder + TextInput` when Settings Shortcuts
+//!    recorder is open & focused): captures raw chords before workspace bindings (`Esc` cancels
+//!    recording; reserved `⌘⌥⇧R` / `Ctrl+Alt+Shift+R` `ResetAppearance` still passes through).
+//! 2. **Active `TextInput`** (`KeyContext: Workspace + TextInput` on search, palette, modal, or
+//!    sidebar form field): `!TextInput` firewall blocks single-key and text-editing workspace
+//!    shortcuts while IME/typing owns the keystroke (`Esc` peels input/modal via `TextFieldHost`).
+//! 3. **Modal / Context-Menu / Palette / Overlay `Esc` & `!Modal` Stack** (`KeyContext: Workspace + Modal`
+//!    when consent, plugin modal, built-in dialog, settings, palette, context menu, or popover is open):
+//!    blocks background workspace chords while `handle_escape` peels exactly one top-most layer in
+//!    strict reverse Z-order (`HostConsent > ShortcutRecorder > PluginModal > BuiltinDialog > Palette
+//!    > Settings > ContextMenu > Popover > MediaInfo > FullscreenDirPopup > SidebarForm > Search`).
+//! 4. **`Workspace` / `Viewport` Keymap** (`KeyContext: Workspace` + `Viewport[media=...]`):
+//!    dispatches active scheme (`Modern` / `MpvClassic` / `PotPlayer`) + user overrides + preset/plugin
+//!    bindings when unobstructed by layers 1–3.
+//! 5. **Fullscreen `Esc` Exit**: reached only after layers 1–3 have zero active overlays or inputs.
 
 mod action_playback;
 mod action_view;
@@ -40,15 +58,15 @@ use gpui::{
     Subscription, Task, Window, div, prelude::FluentBuilder, px,
 };
 use iris_app::{
-    CatalogController, MediaKeyInput, MediaKeyOutcome, PlaybackController, PluginController,
-    WindowShutdownCoordinator,
+    AppModel, CatalogController, MediaKeyInput, MediaKeyOutcome, PlaybackController,
+    PluginController, StartupWorkbench, WindowShutdownCoordinator,
 };
 use iris_core::input::{self, PointerCommand, PointerInput};
 use iris_core::keymap::Keymap;
 use iris_core::library::Kind;
 use iris_core::player::{Command, Session};
-use iris_core::preset::{PresetManager, PresetRuntime, SidebarMode};
-use iris_core::settings::{MAX_SPEED, MIN_SPEED, Settings, Side};
+use iris_core::preset::{PresetManager, SidebarMode};
+use iris_core::settings::{Settings, Side};
 
 pub(crate) use actions::{
     CycleAspect, CyclePreset, NextChapter, OpenCommandPalette, OpenFile, OpenNextMedia,
@@ -69,20 +87,16 @@ use views::{
 use crate::platform::{self, MediaKey, MediaKeyBridge, PinchMonitor, SleepPreventer};
 use crate::theme::{FONT_UI, ThemeTokens};
 
-pub(in crate::ui) struct AppModel {
+/// Window-owned GPUI shell pairing headless [`iris_app::AppModel`] (whose internal fields are all
+/// non-`pub`) with window-local focus handles, `VideoSurface`, overlays, and async executor tasks.
+pub(in crate::ui) struct WindowShell {
+    pub(in crate::ui) app: AppModel,
     focus: FocusHandle,
-    playback: PlaybackController,
     viewport: Viewport,
-    catalog: CatalogController,
     catalog_ui: CatalogUiState,
     overlays: OverlayState,
     text_inputs: TextInputHub,
     chrome: WindowChromeState,
-    settings: Settings,
-    presets: PresetManager,
-    preset_rt: PresetRuntime,
-    keymap: Keymap,
-    plugins: PluginController,
     plugin_ui: plugin_runtime::PluginUiState,
     shutdown: WindowShutdownCoordinator,
     sleep_preventer: SleepPreventer,
@@ -94,23 +108,19 @@ pub(in crate::ui) struct AppModel {
     _plugin_events: Task<()>,
 }
 
-impl AppModel {
-    #[allow(clippy::too_many_arguments)]
+impl WindowShell {
     fn new(
         session: Session,
         plugin_host: iris_plugin_host::PluginHost,
-        settings: Settings,
-        presets: PresetManager,
-        preset_rt: PresetRuntime,
-        init_plugin_cmds: Vec<(String, String)>,
-        keymap: Keymap,
+        startup: StartupWorkbench,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let now = Instant::now();
-        let (mut playback, mut rx) =
-            PlaybackController::open_window(session, now).expect("new session event receiver");
-        let attach_slot = playback
+        let (mut app, mut rx, mut plugin_wake_rx) =
+            AppModel::open_window(session, plugin_host, startup, now)
+                .expect("open window app model");
+        let attach_slot = app
             .take_video_attach_slot()
             .expect("initial window video attach slot");
         let (video, video_reset_rx) = match crate::video::attach(window, attach_slot) {
@@ -127,7 +137,7 @@ impl AppModel {
                     let Ok((is_photo, load_gen)) = this.update(cx, |this, _| {
                         (
                             this.session().kind() == Some(Kind::Photo),
-                            this.playback.load_generation(),
+                            this.playback().load_generation(),
                         )
                     }) else {
                         break;
@@ -140,11 +150,9 @@ impl AppModel {
                     if this
                         .update(cx, |this, cx| {
                             let (zoom, pan) = (this.active().image.zoom, this.active().image.pan);
-                            let settings = this.settings.clone();
-                            if this.playback.recover_after_gpu_reset(
+                            if this.app.recover_after_gpu_reset(
                                 load_gen,
                                 reset.restored_vid,
-                                &settings,
                                 zoom,
                                 pan,
                             ) {
@@ -160,7 +168,7 @@ impl AppModel {
             .detach();
         }
         platform::hide_traffic_lights(window);
-        if settings.always_on_top {
+        if app.settings().always_on_top {
             platform::set_always_on_top(window, true);
         }
         let focus = cx.focus_handle();
@@ -220,13 +228,6 @@ impl AppModel {
             }
         });
 
-        let (plugins, mut plugin_wake_rx) = PluginController::open_window(
-            plugin_host,
-            &settings.disabled_plugins,
-            &settings.theme_id,
-            init_plugin_cmds,
-            now,
-        );
         let plugin_events = cx.spawn_in(window, async move |this, cx| {
             while plugin_wake_rx.next().await.is_some() {
                 if this
@@ -271,7 +272,7 @@ impl AppModel {
                             MediaKey::Prev => MediaKeyInput::Prev,
                             MediaKey::Seek(seconds) => MediaKeyInput::Seek(seconds),
                         };
-                        match this.playback.handle_media_key(input) {
+                        match this.app.handle_media_key(input) {
                             MediaKeyOutcome::Ignored | MediaKeyOutcome::Executed => {}
                             MediaKeyOutcome::StepQueue { delta } => this.step(delta, true, cx),
                             MediaKeyOutcome::Failed(e) => {
@@ -326,32 +327,15 @@ impl AppModel {
         }
 
         let initial_scale = window.scale_factor() as f64;
-        let initial_sidebar_mode = presets
-            .get(&settings.active_preset)
-            .and_then(|p| p.layout.as_ref())
-            .and_then(|l| l.sidebar_mode)
-            .unwrap_or(SidebarMode::Files);
-        let catalog = CatalogController::load(
-            initial_sidebar_mode,
-            settings.sort_by,
-            settings.sort_order,
-            now,
-        );
 
         Self {
+            app,
             focus,
-            playback,
             viewport: Viewport::new(video),
-            catalog,
             catalog_ui: CatalogUiState::default(),
             overlays: OverlayState::default(),
             text_inputs,
             chrome: WindowChromeState::new(now, initial_scale),
-            settings,
-            presets,
-            preset_rt,
-            keymap,
-            plugins,
             plugin_ui: plugin_runtime::PluginUiState::default(),
             shutdown: WindowShutdownCoordinator::default(),
             sleep_preventer: SleepPreventer::new(),
@@ -370,27 +354,12 @@ impl AppModel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.plugins.active_modal().is_some() {
-            self.plugins.modal_mut().mark_focus_pending();
+        if self.plugins().active_modal().is_some() {
+            self.app.mark_plugin_modal_focus_pending();
         }
         self.sync_plugin_modal_focus(window);
         self.sync_theme_tokens(cx);
         self.rebuild_directory_rows();
-        self.playback.session_mut().apply_settings(&self.settings);
-        if self.settings.audio_device != "auto" && !self.settings.audio_device.is_empty() {
-            self.command(
-                Command::SetAudioDevice(self.settings.audio_device.clone()),
-                cx,
-            );
-        }
-        if let Some(v) = self.settings.volume {
-            self.command(Command::SetVolume(v), cx);
-        }
-        if (self.settings.remember_speed || self.settings.active_preset != "default")
-            && let Some(v) = self.settings.speed
-        {
-            self.command(Command::SetSpeed(v), cx);
-        }
         self.open_paths(initial, cx);
         self.sync_view_timer(cx);
         self.sync_window_and_viewport(window, cx);
@@ -398,12 +367,42 @@ impl AppModel {
 
     #[inline]
     pub(in crate::ui) fn session(&self) -> &Session {
-        self.playback.session()
+        self.app.session()
     }
 
     #[inline]
-    pub(in crate::ui) fn session_mut(&mut self) -> &mut Session {
-        self.playback.session_mut()
+    pub(in crate::ui) fn playback(&self) -> &PlaybackController {
+        self.app.playback()
+    }
+
+    #[inline]
+    pub(in crate::ui) fn catalog(&self) -> &CatalogController {
+        self.app.catalog()
+    }
+
+    #[inline]
+    pub(in crate::ui) fn plugins(&self) -> &PluginController {
+        self.app.plugins()
+    }
+
+    #[inline]
+    pub(in crate::ui) fn settings(&self) -> &Settings {
+        self.app.settings()
+    }
+
+    #[inline]
+    pub(in crate::ui) fn presets(&self) -> &PresetManager {
+        self.app.presets()
+    }
+
+    #[inline]
+    pub(in crate::ui) fn keymap(&self) -> &Keymap {
+        self.app.keymap()
+    }
+
+    #[inline]
+    pub(in crate::ui) fn is_preset_modified(&self) -> bool {
+        self.app.is_preset_modified()
     }
 
     #[inline]
@@ -420,7 +419,7 @@ impl AppModel {
         UiVisibility {
             dock_visible: self.chrome_shown(),
             sidebar_plugins_visible: self.sidebar_is_visible()
-                && self.catalog.sidebar_mode() == SidebarMode::Plugins,
+                && self.catalog().sidebar_mode() == SidebarMode::Plugins,
             settings_open: self.overlays.settings_open,
             palette_open: self.overlays.palette_open,
             popover_open: self.overlays.popover.is_some(),
@@ -482,7 +481,7 @@ impl AppModel {
     pub(in crate::ui) fn sync_viewport_effects(&mut self, cx: &mut Context<Self>) {
         if self.session().kind() == Some(Kind::Photo)
             && self.image_geometry_ready()
-            && self.playback.take_pending_photo_actual()
+            && self.app.take_pending_photo_actual()
         {
             let (viewport, media) = self.image_geometry();
             let scale = self.chrome.last_scale;
@@ -490,7 +489,7 @@ impl AppModel {
                 .image
                 .toggle_actual_size(viewport, media, scale);
             let (zoom, pan) = (self.active().image.zoom, self.active().image.pan);
-            let _ = self.session_mut().transform(zoom, pan);
+            let _ = self.app.transform_view(zoom, pan);
             self.notify_viewport_and_dock(cx);
         }
         let t = ThemeTokens::of(cx);
@@ -506,7 +505,7 @@ impl AppModel {
         } else {
             rect_h
         };
-        self.session_mut().subtitle_inset(inset, height);
+        self.app.set_subtitle_inset(inset, height);
     }
 
     pub(in crate::ui) fn sync_window_and_viewport(
@@ -515,7 +514,7 @@ impl AppModel {
         cx: &mut Context<Self>,
     ) {
         self.sync_fullscreen(window, cx);
-        if self.plugins.modal().focus_pending() {
+        if self.plugins().modal().focus_pending() {
             self.sync_plugin_modal_focus(window);
         }
         let sz = window.viewport_size();
@@ -534,70 +533,49 @@ impl AppModel {
     }
 
     pub(super) fn command(&mut self, command: Command, cx: &mut Context<Self>) {
-        if let Err(e) = self.session_mut().execute(command) {
+        if let Some(e) = self.app.execute_player_command(command).error {
             log::warn!("player command failed: {e:#}");
             self.show_error_toast(strings::errors::player_action_error(&e), cx);
         }
     }
 
-    /// Single explicit window shutdown coordinator used by window close, `on_app_quit`,
-    /// and `Drop` fallback. Destroys `VideoSurface` strictly before `Session::shutdown()`.
+    /// Single explicit window shutdown coordinator used by window close, frameless close buttons,
+    /// `on_app_quit`, and `Drop` fallback. Destroys `VideoSurface` strictly BEFORE `Session::shutdown()`.
     pub(super) fn shutdown(&mut self) {
+        if self.shutdown.is_done() {
+            return;
+        }
+        self.catalog_ui.store_flush.take();
+        let window_size_to_save = self
+            .chrome
+            .pending_window_size
+            .is_none()
+            .then_some(self.chrome.last_window_size)
+            .flatten();
         let sleep_preventer = &mut self.sleep_preventer;
         let media_keys = &mut self.media_keys;
-        let plugins = &self.plugins;
-        let catalog_ui = &mut self.catalog_ui;
-        let catalog = &mut self.catalog;
-        let settings = &mut self.settings;
-        let preset_rt = &mut self.preset_rt;
-        let chrome = &self.chrome;
         let viewport = &self.viewport;
-        let playback = &self.playback;
-        let scoped_released = plugins.scoped_released();
-
-        let _ = self.shutdown.run_once(
+        let _ = self.app.shutdown_with_coordinator(
+            &mut self.shutdown,
+            window_size_to_save,
+            Instant::now(),
             || sleep_preventer.set_active(false),
             || {
                 media_keys.take();
             },
-            || plugins.shutdown(),
-            || {
-                catalog_ui.store_flush.take();
-                let progress = iris_app::PluginPlayer::progress(playback.session());
-                catalog.flush_on_shutdown(
-                    progress,
-                    settings.resume_playback,
-                    scoped_released,
-                    Instant::now(),
-                );
-                let st = playback.session().state();
-                settings.volume = Some(st.volume.clamp(0., 100.));
-                if settings.remember_speed {
-                    settings.speed = Some(st.speed.clamp(MIN_SPEED, MAX_SPEED));
-                }
-                if settings.remember_window_size
-                    && chrome.pending_window_size.is_none()
-                    && let Some((w, h)) = chrome.last_window_size
-                {
-                    settings.window_width = Some(w);
-                    settings.window_height = Some(h);
-                }
-                preset_rt.record_user_edit(settings);
-            },
             || drop(viewport.take_video_surface()),
-            || playback.shutdown(),
         );
     }
 }
 
-impl Drop for AppModel {
+impl Drop for WindowShell {
     fn drop(&mut self) {
         self.shutdown();
     }
 }
 
 pub(crate) struct IrisWindow {
-    model: Entity<AppModel>,
+    model: Entity<WindowShell>,
     viewport_view: Entity<ViewportView>,
     dock_view: Entity<DockView>,
     sidebar_view: Entity<Sidebar>,
@@ -605,32 +583,15 @@ pub(crate) struct IrisWindow {
 }
 
 impl IrisWindow {
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         session: Session,
         plugin_host: iris_plugin_host::PluginHost,
-        settings: Settings,
-        presets: PresetManager,
-        preset_rt: PresetRuntime,
-        init_plugin_cmds: Vec<(String, String)>,
-        keymap: Keymap,
+        startup: StartupWorkbench,
         initial: Vec<PathBuf>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let model = cx.new(|cx| {
-            AppModel::new(
-                session,
-                plugin_host,
-                settings,
-                presets,
-                preset_rt,
-                init_plugin_cmds,
-                keymap,
-                window,
-                cx,
-            )
-        });
+        let model = cx.new(|cx| WindowShell::new(session, plugin_host, startup, window, cx));
         let plugin_panel = cx.new(|_| PluginPanel {
             model: model.clone(),
         });
@@ -688,6 +649,27 @@ impl IrisWindow {
     }
 }
 
+pub(in crate::ui) fn build_root_key_context(
+    recording: bool,
+    has_blocking_overlay: bool,
+    text_input_focused: bool,
+) -> KeyContext {
+    let mut root_ctx = KeyContext::default();
+    if recording {
+        root_ctx.add("ShortcutRecorder");
+        root_ctx.add("TextInput");
+    } else {
+        root_ctx.add("Workspace");
+        if has_blocking_overlay {
+            root_ctx.add("Modal");
+        }
+        if text_input_focused {
+            root_ctx.add("TextInput");
+        }
+    }
+    root_ctx
+}
+
 impl Render for IrisWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let m = self.model.read(cx);
@@ -702,19 +684,11 @@ impl Render for IrisWindow {
         let recorder_focused = m.text_inputs.recorder_focus.is_focused(window);
         let recording = m.overlays.is_recording(recorder_focused);
 
-        let mut root_ctx = KeyContext::default();
-        if recording {
-            root_ctx.add("ShortcutRecorder");
-            root_ctx.add("TextInput");
-        } else {
-            root_ctx.add("Workspace");
-            if m.has_blocking_overlay() {
-                root_ctx.add("Modal");
-            }
-            if m.text_inputs.is_any_focused(window) {
-                root_ctx.add("TextInput");
-            }
-        }
+        let root_ctx = build_root_key_context(
+            recording,
+            m.has_blocking_overlay(),
+            m.text_inputs.is_any_focused(window),
+        );
 
         let show_overlay_tb = !fullscreen
             && hide_tb
@@ -748,7 +722,7 @@ impl Render for IrisWindow {
                         if this.has_host_consent() {
                             this.approve_host_consent(cx);
                             cx.stop_propagation();
-                        } else if this.plugins.active_modal().is_some() {
+                        } else if this.plugins().active_modal().is_some() {
                             this.submit_active_plugin_modal(window, cx);
                             cx.stop_propagation();
                         } else if this.overlays.dialog.is_some() {
@@ -785,8 +759,8 @@ impl Render for IrisWindow {
 
         let resizing = m.chrome.resizing_dir.is_some();
         let hide_cursor = !m.chrome_shown() && !m.has_host_consent();
-        let dir_open = m.settings.directory_open;
-        let dir_side = m.settings.directory_side;
+        let dir_open = m.settings().directory_open;
+        let dir_side = m.settings().directory_side;
         let popover = m.overlays.popover;
         let context_menu = m.overlays.context_menu.clone();
         let settings_open = m.overlays.settings_open;

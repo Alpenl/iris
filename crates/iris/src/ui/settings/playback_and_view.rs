@@ -4,23 +4,23 @@ use gpui::{
     App, Entity, InteractiveElement, IntoElement, ParentElement, StatefulInteractiveElement,
     Styled, div, prelude::FluentBuilder, px,
 };
-use iris_core::player::{AudioDevice, Command};
+use iris_core::player::AudioDevice;
 use iris_core::settings::{Hwdec, OnEof, PhotoDefault, SubLang, VideoWheel};
 
-use super::super::AppModel;
+use super::super::WindowShell;
 use super::super::actions::ToggleFilmstrip;
 use super::super::kit::form::{segmented, setting_row, stepper, toggle};
 use super::super::kit::icon;
-use super::super::views::{DirtyRegions, model_listener};
+use super::super::views::model_listener;
 use crate::assets::Icon;
 use crate::theme::{FONT_MONO, ThemeTokens};
 
 pub(super) fn settings_playback(
-    model: &Entity<AppModel>,
+    model: &Entity<WindowShell>,
     t: ThemeTokens,
     cx: &App,
 ) -> impl IntoElement {
-    let s = &model.read(cx).settings;
+    let s = model.read(cx).settings();
     div()
         .flex()
         .flex_col()
@@ -39,17 +39,9 @@ pub(super) fn settings_playback(
                 t,
                 model,
                 |this, val, _, cx| {
-                    this.settings.on_eof = val;
-                    this.preset_rt.record_user_edit(&this.settings);
-                    this.session_mut().set_on_eof_loop(val);
-                    this.notify_regions(
-                        DirtyRegions {
-                            settings: true,
-                            dock: true,
-                            ..DirtyRegions::NONE
-                        },
-                        cx,
-                    );
+                    let wb = this.app.set_on_eof(val);
+                    let regions = this.apply_workbench_changes(wb, None, cx);
+                    this.notify_regions(regions, cx);
                 },
             ),
             t,
@@ -64,9 +56,9 @@ pub(super) fn settings_playback(
                 t,
                 model,
                 |this, val, _, cx| {
-                    this.settings.seek_step = val as f64;
-                    this.preset_rt.record_user_edit(&this.settings);
-                    this.notify_settings(cx);
+                    let wb = this.app.set_seek_step(val as f64);
+                    let regions = this.apply_workbench_changes(wb, None, cx);
+                    this.notify_regions(regions, cx);
                 },
             ),
             t,
@@ -79,9 +71,9 @@ pub(super) fn settings_playback(
                 s.single_click_pause,
                 t,
                 model_listener(model, |this, _, _, cx| {
-                    this.settings.single_click_pause = !this.settings.single_click_pause;
-                    this.preset_rt.record_user_edit(&this.settings);
-                    this.notify_settings(cx);
+                    let wb = this.app.toggle_single_click_pause();
+                    let regions = this.apply_workbench_changes(wb, None, cx);
+                    this.notify_regions(regions, cx);
                 }),
             ),
             t,
@@ -96,10 +88,9 @@ pub(super) fn settings_playback(
                 t,
                 model,
                 |this, val, _, cx| {
-                    this.settings.hwdec = val;
-                    this.preset_rt.record_user_edit(&this.settings);
-                    this.session_mut().set_hwdec(val);
-                    this.notify_settings(cx);
+                    let wb = this.app.set_hwdec(val);
+                    let regions = this.apply_workbench_changes(wb, None, cx);
+                    this.notify_regions(regions, cx);
                 },
             ),
             t,
@@ -112,9 +103,9 @@ pub(super) fn settings_playback(
                 s.resume_playback,
                 t,
                 model_listener(model, |this, _, _, cx| {
-                    this.settings.resume_playback = !this.settings.resume_playback;
-                    this.preset_rt.record_user_edit(&this.settings);
-                    this.notify_settings(cx);
+                    let wb = this.app.toggle_resume_playback();
+                    let regions = this.apply_workbench_changes(wb, None, cx);
+                    this.notify_regions(regions, cx);
                 }),
             ),
             t,
@@ -127,9 +118,9 @@ pub(super) fn settings_playback(
                 s.remember_speed,
                 t,
                 model_listener(model, |this, _, _, cx| {
-                    this.settings.remember_speed = !this.settings.remember_speed;
-                    this.preset_rt.record_user_edit(&this.settings);
-                    this.notify_settings(cx);
+                    let wb = this.app.toggle_remember_speed();
+                    let regions = this.apply_workbench_changes(wb, None, cx);
+                    this.notify_regions(regions, cx);
                 }),
             ),
             t,
@@ -142,9 +133,9 @@ pub(super) fn settings_playback(
                 s.screenshot_subs,
                 t,
                 model_listener(model, |this, _, _, cx| {
-                    this.settings.screenshot_subs = !this.settings.screenshot_subs;
-                    this.preset_rt.record_user_edit(&this.settings);
-                    this.notify_settings(cx);
+                    let wb = this.app.toggle_screenshot_subs();
+                    let regions = this.apply_workbench_changes(wb, None, cx);
+                    this.notify_regions(regions, cx);
                 }),
             ),
             t,
@@ -152,12 +143,12 @@ pub(super) fn settings_playback(
 }
 
 pub(super) fn settings_tracks(
-    model: &Entity<AppModel>,
+    model: &Entity<WindowShell>,
     t: ThemeTokens,
     cx: &App,
 ) -> impl IntoElement {
     let m = model.read(cx);
-    let s = &m.settings;
+    let s = m.settings();
     let mut devices = m.session().audio_devices();
     if !devices.iter().any(|d| d.name == "auto") {
         devices.insert(
@@ -193,10 +184,9 @@ pub(super) fn settings_tracks(
                 t,
                 model,
                 |this, val, _, cx| {
-                    this.settings.sub_lang = val;
-                    this.preset_rt.record_user_edit(&this.settings);
-                    this.session_mut().set_sub_lang(val);
-                    this.notify_settings(cx);
+                    let wb = this.app.set_sub_lang(val);
+                    let regions = this.apply_workbench_changes(wb, None, cx);
+                    this.notify_regions(regions, cx);
                 },
             ),
             t,
@@ -210,26 +200,19 @@ pub(super) fn settings_tracks(
                 (s.sub_scale - 1.0).abs() > 0.01,
                 t,
                 model_listener(model, |this, _, _, cx| {
-                    let scale =
-                        (((this.settings.sub_scale - 0.1) * 100.).round() / 100.).clamp(0.5, 2.5);
-                    this.settings.sub_scale = scale;
-                    this.preset_rt.record_user_edit(&this.settings);
-                    this.session_mut().set_sub_scale(scale);
-                    this.notify_settings(cx);
+                    let wb = this.app.step_sub_scale(-0.1);
+                    let regions = this.apply_workbench_changes(wb, None, cx);
+                    this.notify_regions(regions, cx);
                 }),
                 model_listener(model, |this, _, _, cx| {
-                    let scale =
-                        (((this.settings.sub_scale + 0.1) * 100.).round() / 100.).clamp(0.5, 2.5);
-                    this.settings.sub_scale = scale;
-                    this.preset_rt.record_user_edit(&this.settings);
-                    this.session_mut().set_sub_scale(scale);
-                    this.notify_settings(cx);
+                    let wb = this.app.step_sub_scale(0.1);
+                    let regions = this.apply_workbench_changes(wb, None, cx);
+                    this.notify_regions(regions, cx);
                 }),
                 model_listener(model, |this, _, _, cx| {
-                    this.settings.sub_scale = 1.0;
-                    this.preset_rt.record_user_edit(&this.settings);
-                    this.session_mut().set_sub_scale(1.0);
-                    this.notify_settings(cx);
+                    let wb = this.app.reset_sub_scale();
+                    let regions = this.apply_workbench_changes(wb, None, cx);
+                    this.notify_regions(regions, cx);
                 }),
             ),
             t,
@@ -247,9 +230,9 @@ pub(super) fn settings_tracks(
                 t,
                 model,
                 |this, val, _, cx| {
-                    this.settings.video_wheel = val;
-                    this.preset_rt.record_user_edit(&this.settings);
-                    this.notify_settings(cx);
+                    let wb = this.app.set_video_wheel(val);
+                    let regions = this.apply_workbench_changes(wb, None, cx);
+                    this.notify_regions(regions, cx);
                 },
             ),
             t,
@@ -300,10 +283,11 @@ pub(super) fn settings_tracks(
                             .border_color(if active { t.accent } else { t.line })
                             .hover(|st| st.bg(t.hover))
                             .on_click(model_listener(model, move |this, _, _, cx| {
-                                this.settings.audio_device = dev_name.clone();
-                                this.preset_rt.record_user_edit(&this.settings);
-                                this.command(Command::SetAudioDevice(dev_name.clone()), cx);
-                                this.notify_settings(cx);
+                                let (playback_out, wb) =
+                                    this.app.set_audio_device(dev_name.clone());
+                                this.apply_playback_action(playback_out, cx);
+                                let regions = this.apply_workbench_changes(wb, None, cx);
+                                this.notify_regions(regions, cx);
                                 this.show_toast(format!("音频输出 · {desc_toast}"), cx);
                             }))
                             .child(
@@ -338,11 +322,11 @@ pub(super) fn settings_tracks(
 }
 
 pub(super) fn settings_view(
-    model: &Entity<AppModel>,
+    model: &Entity<WindowShell>,
     t: ThemeTokens,
     cx: &App,
 ) -> impl IntoElement {
-    let s = &model.read(cx).settings;
+    let s = model.read(cx).settings();
     div()
         .flex()
         .flex_col()
@@ -357,9 +341,9 @@ pub(super) fn settings_view(
                 t,
                 model,
                 |this, val, _, cx| {
-                    this.settings.fullscreen_hide_ms = val;
-                    this.preset_rt.record_user_edit(&this.settings);
-                    this.notify_settings(cx);
+                    let wb = this.app.set_fullscreen_hide_ms(val);
+                    let regions = this.apply_workbench_changes(wb, None, cx);
+                    this.notify_regions(regions, cx);
                 },
             ),
             t,
@@ -377,9 +361,9 @@ pub(super) fn settings_view(
                 t,
                 model,
                 |this, val, _, cx| {
-                    this.settings.photo_default = val;
-                    this.preset_rt.record_user_edit(&this.settings);
-                    this.notify_settings(cx);
+                    let wb = this.app.set_photo_default(val);
+                    let regions = this.apply_workbench_changes(wb, None, cx);
+                    this.notify_regions(regions, cx);
                 },
             ),
             t,
@@ -394,9 +378,9 @@ pub(super) fn settings_view(
                 t,
                 model,
                 |this, val, _, cx| {
-                    this.settings.photo_double_click_actual = val;
-                    this.preset_rt.record_user_edit(&this.settings);
-                    this.notify_settings(cx);
+                    let wb = this.app.set_photo_double_click_actual(val);
+                    let regions = this.apply_workbench_changes(wb, None, cx);
+                    this.notify_regions(regions, cx);
                 },
             ),
             t,

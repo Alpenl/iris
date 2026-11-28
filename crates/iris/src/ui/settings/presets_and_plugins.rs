@@ -11,7 +11,7 @@ use iris_api::v2::{Capability, source::SourceDescriptor};
 use iris_core::preset::{PresetCaptureScope, WorkspacePreset};
 use iris_plugin_host::{PluginInfo, PluginStatus, plugins_dir};
 
-use super::super::AppModel;
+use super::super::WindowShell;
 use super::super::kit::form::{chip_button, toggle};
 use super::super::kit::{
     ButtonSize, ButtonVariant, badge_pill, bordered_button, button, hbetween, hstack, surface_card,
@@ -28,7 +28,7 @@ fn render_preset_card(
     confirm_delete: bool,
     key_badge: Option<SharedString>,
     t: ThemeTokens,
-    model: &Entity<AppModel>,
+    model: &Entity<WindowShell>,
 ) -> AnyElement {
     let is_builtin = preset.builtin;
     let display_name = super::super::strings::presets::preset_name(&preset).to_string();
@@ -64,7 +64,6 @@ fn render_preset_card(
                     model,
                     move |this, _, w, cx| {
                         this.update_preset_from_current(&pid_update, update_scope, w, cx);
-                        this.notify_settings(cx);
                     },
                 )),
             )
@@ -85,23 +84,8 @@ fn render_preset_card(
                     t,
                 )
                 .on_click(model_listener(model, move |this, _, w, cx| {
-                    if this.confirm_destructive(del_key.clone(), cx)
-                        && this.presets.delete_custom(&pid_delete)
-                    {
-                        this.keymap.reset_binding(&format!("preset:{pid_delete}"));
-                        crate::ui::rebind_keys(cx, &this.keymap);
-                        if this.settings.active_preset == pid_delete {
-                            this.activate_preset("default", w, cx);
-                        }
-                        this.notify_regions(
-                            DirtyRegions {
-                                root: true,
-                                settings: true,
-                                ..DirtyRegions::NONE
-                            },
-                            cx,
-                        );
-                        this.show_toast("已删除自定义工作区预设", cx);
+                    if this.confirm_destructive(del_key.clone(), cx) {
+                        this.delete_custom_preset(&pid_delete, w, cx);
                     }
                 })),
             )
@@ -154,13 +138,13 @@ fn render_preset_card(
 }
 
 pub(super) fn settings_presets(
-    model: &Entity<AppModel>,
+    model: &Entity<WindowShell>,
     t: ThemeTokens,
     cx: &App,
 ) -> impl IntoElement {
     let m = model.read(cx);
-    let presets = m.presets.list().to_vec();
-    let active_id = m.settings.active_preset.clone();
+    let presets = m.presets().list().to_vec();
+    let active_id = m.settings().active_preset.clone();
     let cards: Vec<AnyElement> = presets
         .into_iter()
         .enumerate()
@@ -213,14 +197,14 @@ pub(super) fn settings_presets(
 }
 
 pub(super) fn settings_plugins(
-    model: &Entity<AppModel>,
+    model: &Entity<WindowShell>,
     t: ThemeTokens,
     cx: &App,
 ) -> impl IntoElement {
     let m = model.read(cx);
-    let list = m.plugins.list();
+    let list = m.plugins().list();
     let active_sources: Vec<(String, SourceDescriptor)> = m
-        .plugins
+        .plugins()
         .media_sources()
         .into_iter()
         .map(|(pid, _, desc)| (pid.to_string(), desc.clone()))
@@ -300,8 +284,8 @@ pub(super) fn settings_plugins(
 }
 
 fn render_plugin_card(
-    model: &Entity<AppModel>,
-    m: &AppModel,
+    model: &Entity<WindowShell>,
+    m: &WindowShell,
     i: usize,
     info: PluginInfo,
     plugin_sources: Vec<SourceDescriptor>,
@@ -413,11 +397,9 @@ fn render_plugin_card(
                             d.child(
                                 chip_button(("plugin-theme", i), "应用主题", false, t).on_click(
                                     model_listener(model, move |this, _, _, cx| {
-                                        this.settings.theme_id = format!("plugin:{theme}");
-                                        this.sync_theme_tokens(cx);
-                                        this.persist_user_settings();
-                                        this.sync_viewport_effects(cx);
-                                        this.notify_all(cx);
+                                        let wb = this.app.set_theme_id(&format!("plugin:{theme}"));
+                                        let regions = this.apply_workbench_changes(wb, None, cx);
+                                        this.notify_regions(regions, cx);
                                     }),
                                 ),
                             )
@@ -467,7 +449,7 @@ fn render_plugin_card(
 }
 
 fn render_plugin_source_row(
-    model: &Entity<AppModel>,
+    model: &Entity<WindowShell>,
     pid: String,
     row_ix: usize,
     enabled: bool,

@@ -1,6 +1,6 @@
 use std::time::Instant;
 
-use super::super::{AppModel, views::model_listener};
+use super::super::{WindowShell, views::model_listener};
 use crate::theme::ThemeTokens;
 use crate::ui::kit::form::chip_button;
 use gpui::{
@@ -9,10 +9,13 @@ use gpui::{
 };
 use iris_app::OpenUrlOutcome;
 
-pub(in crate::ui) fn render_source_filters(model: &Entity<AppModel>, cx: &App) -> impl IntoElement {
+pub(in crate::ui) fn render_source_filters(
+    model: &Entity<WindowShell>,
+    cx: &App,
+) -> impl IntoElement {
     let m = model.read(cx);
     let t = ThemeTokens::of(cx);
-    let filters = m.plugins.source_filters().to_vec();
+    let filters = m.plugins().source_filters().to_vec();
     div()
         .id("source-filter-options")
         .max_h(px(144.))
@@ -53,10 +56,8 @@ pub(in crate::ui) fn render_source_filters(model: &Entity<AppModel>, cx: &App) -
                                 } else {
                                     String::new()
                                 };
-                                let cur = this.session().current_media_uri();
-                                this.catalog.set_search_query(query, cur.as_ref());
-                                if let Some((_, out)) = this.catalog.select_plugin_source_filter(
-                                    &mut this.plugins,
+                                if let Some((_, out)) = this.app.select_plugin_source_filter(
+                                    query,
                                     &filter_id,
                                     val.clone(),
                                     this.text_inputs.search_open,
@@ -75,7 +76,7 @@ pub(in crate::ui) fn render_source_filters(model: &Entity<AppModel>, cx: &App) -
 }
 
 pub(in crate::ui) fn render_url_resolver_choice(
-    model: &Entity<AppModel>,
+    model: &Entity<WindowShell>,
     cx: &App,
 ) -> impl IntoElement {
     let m = model.read(cx);
@@ -84,7 +85,7 @@ pub(in crate::ui) fn render_url_resolver_choice(
         ("auto".to_owned(), "自动匹配解析插件".to_owned()),
         ("direct".into(), "直接播放媒体地址".into()),
     ];
-    choices.extend(m.plugins.url_resolvers(None));
+    choices.extend(m.plugins().url_resolvers(None));
     let selected = m.form_value("url-resolver");
     let active_id = choices
         .iter()
@@ -120,15 +121,14 @@ pub(in crate::ui) fn render_url_resolver_choice(
         )
 }
 
-impl AppModel {
+impl WindowShell {
     pub(in crate::ui) fn open_user_url(
         &mut self,
         url: &str,
         selected: &str,
         cx: &mut Context<Self>,
     ) -> bool {
-        let (outcome, batch) = self
-            .with_plugin_ctx(|ctrl, ctx| ctrl.open_user_url(ctx, url, selected, Instant::now()));
+        let (outcome, batch) = self.app.open_user_url(url, selected, Instant::now());
         let regions = self.apply_plugin_outcome(batch, None, cx);
         match outcome {
             OpenUrlOutcome::ValidationError(msg) => {

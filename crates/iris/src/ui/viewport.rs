@@ -14,7 +14,7 @@ use iris_core::input::{self, InputContext, PointerCommand, PointerInput};
 use iris_core::library::Kind;
 use iris_core::settings::{Side, VideoWheel};
 
-use super::AppModel;
+use super::WindowShell;
 use super::context_menu::{ContextMenu, ContextTarget};
 use super::views::{ViewportView, model_listener};
 use crate::platform;
@@ -24,11 +24,39 @@ use crate::video::VideoSurface;
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub(super) struct VideoRect(pub(super) [f64; 4]);
 
+pub(in crate::ui) fn build_viewport_key_context(
+    has_blocking_overlay: bool,
+    dir_popup_open: bool,
+    text_input_focused: bool,
+    kind: Option<Kind>,
+    zoomed: bool,
+) -> KeyContext {
+    let mut kc = KeyContext::default();
+    if has_blocking_overlay || dir_popup_open || text_input_focused {
+        kc.add("Overlay");
+    } else {
+        kc.add("Viewport");
+        kc.set(
+            "media",
+            match kind {
+                Some(Kind::Photo) => "image",
+                Some(Kind::Video) => "video",
+                Some(Kind::Audio) => "audio",
+                None => "none",
+            },
+        );
+        if zoomed {
+            kc.add("zoomed");
+        }
+    }
+    kc
+}
+
 /// Window-owned native surface, pixel bounds probe, and pointer gesture origins.
 ///
 /// Playback session state and `load_generation` belong exclusively to [`iris_app::PlaybackController`],
 /// and native teardown order (`VideoSurface` dropped BEFORE `Session::shutdown()`) is enforced by
-/// [`AppModel::shutdown`].
+/// [`WindowShell::shutdown`].
 pub(in crate::ui) struct Viewport {
     pub(super) video: Rc<RefCell<Option<VideoSurface>>>,
     pub(super) rect: Rc<Cell<Option<VideoRect>>>,
@@ -55,7 +83,7 @@ impl Viewport {
     }
 }
 
-impl AppModel {
+impl WindowShell {
     pub(super) fn image_geometry(&self) -> ([f64; 2], [f64; 2]) {
         let rect = self.active().rect.get().map(|r| r.0).unwrap_or([0.; 4]);
         let (w, h) = self.session().display_size();
@@ -78,7 +106,7 @@ impl AppModel {
 
     pub(super) fn apply_image_view(&mut self, cx: &mut Context<Self>) {
         let (zoom, pan) = (self.active().image.zoom, self.active().image.pan);
-        if let Err(e) = self.session_mut().transform(zoom, pan) {
+        if let Err(e) = self.app.transform_view(zoom, pan) {
             log::warn!("image transform failed: {e:#}");
             self.show_error_toast("画面缩放或平移失败", cx);
         }
@@ -113,9 +141,9 @@ impl AppModel {
             media: self.session().kind(),
             zoomed: self.image_can_pan(),
             overlay: self.has_blocking_overlay() || self.overlays.dir_popup.is_open(),
-            video_wheel_volume: self.settings.video_wheel == VideoWheel::Volume,
-            single_click_pause: self.settings.single_click_pause,
-            photo_double_click_actual: self.settings.photo_double_click_actual,
+            video_wheel_volume: self.settings().video_wheel == VideoWheel::Volume,
+            single_click_pause: self.settings().single_click_pause,
+            photo_double_click_actual: self.settings().photo_double_click_actual,
         }
     }
 }
@@ -132,8 +160,8 @@ impl ViewportView {
         let last_rect = vp.rect.clone();
         let video = vp.video.clone();
         let model_weak = self.model.downgrade();
-        let on_move = model_listener(&self.model, AppModel::on_root_mouse_move);
-        let on_up = model_listener(&self.model, AppModel::on_root_mouse_up);
+        let on_move = model_listener(&self.model, WindowShell::on_root_mouse_move);
+        let on_up = model_listener(&self.model, WindowShell::on_root_mouse_up);
         let on_exit = model_listener(&self.model, |this, _: &gpui::MouseExitEvent, window, cx| {
             this.on_window_pointer_exit(window, cx);
         });
@@ -194,36 +222,25 @@ impl ViewportView {
         let is_photo_zoomed = kind == Some(Kind::Photo) && m.image_can_pan();
         let panning = vp.drag_origin.is_some();
         let show_empty =
-            !has_media && m.playback.pending_path().is_none() && !m.playback.loading_visible();
+            !has_media && m.playback().pending_path().is_none() && !m.playback().loading_visible();
         let show_filmstrip = kind == Some(Kind::Photo)
-            && m.settings.photo_filmstrip
+            && m.settings().photo_filmstrip
             && (!fullscreen || chrome_visible)
             && session
                 .current()
-                .is_some_and(|cur| m.catalog.photo_paths().iter().any(|p| p == cur));
-        let dir_side = m.settings.directory_side;
+                .is_some_and(|cur| m.catalog().photo_paths().iter().any(|p| p == cur));
+        let dir_side = m.settings().directory_side;
         let info_open = m.overlays.info_open;
         let dir_popup_open = m.overlays.dir_popup.is_open();
         let focus = m.focus.clone();
 
-        let mut kc = KeyContext::default();
-        if m.has_blocking_overlay() || dir_popup_open || m.text_inputs.is_any_focused(window) {
-            kc.add("Overlay");
-        } else {
-            kc.add("Viewport");
-            kc.set(
-                "media",
-                match kind {
-                    Some(Kind::Photo) => "image",
-                    Some(Kind::Video) => "video",
-                    Some(Kind::Audio) => "audio",
-                    None => "none",
-                },
-            );
-            if vp.image.zoomed() {
-                kc.add("zoomed");
-            }
-        }
+        let kc = build_viewport_key_context(
+            m.has_blocking_overlay(),
+            dir_popup_open,
+            m.text_inputs.is_any_focused(window),
+            kind,
+            vp.image.zoomed(),
+        );
 
         let fs_chip_data = (fullscreen && chrome_visible)
             .then(|| {
@@ -232,7 +249,7 @@ impl ViewportView {
                     .and_then(|p| p.file_name())
                     .map(|n| n.to_string_lossy().into_owned())
                     .or_else(|| session.current_title().map(str::to_string))?;
-                Some((name, m.playback.media_info()))
+                Some((name, m.playback().media_info()))
             })
             .flatten();
         let dock_bounds_slot = m.chrome.probes.dock_bounds.clone();

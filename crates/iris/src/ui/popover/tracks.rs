@@ -7,7 +7,7 @@ use gpui::{
 };
 use iris_core::player::{Command, TrackKind};
 
-use super::super::AppModel;
+use super::super::WindowShell;
 use super::super::kit::form::stepper;
 use super::super::kit::list_row::select_row;
 use super::super::views::{DirtyRegions, model_listener};
@@ -15,7 +15,7 @@ use super::popover_header;
 use crate::theme::ThemeTokens;
 
 pub(super) fn render_sub_popover(
-    model: &Entity<AppModel>,
+    model: &Entity<WindowShell>,
     t: ThemeTokens,
     cx: &App,
 ) -> impl IntoElement {
@@ -145,7 +145,7 @@ pub(super) fn render_sub_popover(
 }
 
 pub(super) fn render_audio_popover(
-    model: &Entity<AppModel>,
+    model: &Entity<WindowShell>,
     t: ThemeTokens,
     cx: &App,
 ) -> impl IntoElement {
@@ -176,10 +176,10 @@ pub(super) fn render_audio_popover(
         }))
     });
 
-    let cur_dev = if m.settings.audio_device.trim().is_empty() {
+    let cur_dev = if m.settings().audio_device.trim().is_empty() {
         "auto"
     } else {
-        m.settings.audio_device.trim()
+        m.settings().audio_device.trim()
     };
     let device_rows = session
         .audio_devices()
@@ -193,20 +193,14 @@ pub(super) fn render_audio_popover(
             select_row(("audio-dev", i), dev_label, None, active, false, false, t)
                 .text_size(t.text_sm)
                 .on_click(model_listener(model, move |this, _, _, cx| {
-                    this.settings.audio_device = dev_name.clone();
-                    this.persist_user_settings();
-                    this.command(Command::SetAudioDevice(dev_name.clone()), cx);
+                    let (playback_out, wb) = this.app.set_audio_device(dev_name.clone());
+                    this.apply_playback_action(playback_out, cx);
                     this.overlays.popover = None;
                     this.show_osd(format!("音频输出 · {osd_label}"), cx);
-                    this.notify_regions(
-                        DirtyRegions {
-                            root: true,
-                            settings: true,
-                            dock: true,
-                            ..DirtyRegions::NONE
-                        },
-                        cx,
-                    );
+                    let regions = this
+                        .apply_workbench_changes(wb, None, cx)
+                        .union(DirtyRegions::root_only());
+                    this.notify_regions(regions, cx);
                 }))
         });
 

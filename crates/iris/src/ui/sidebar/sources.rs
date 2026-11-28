@@ -11,7 +11,7 @@ use iris_api::v2::source::SourceDescriptor;
 use iris_core::bookmarks::PinnedBookmark;
 use iris_core::media_uri::MediaUri;
 
-use super::super::AppModel;
+use super::super::WindowShell;
 use super::super::actions::OpenFile;
 use super::super::kit::{
     ButtonSize, ButtonVariant, badge_pill, bordered_button, button, icon, icon_button,
@@ -22,17 +22,17 @@ use super::super::views::model_listener;
 use crate::assets::Icon;
 use crate::theme::{FONT_MONO, ThemeTokens};
 
-pub(super) fn render_sidebar_sources(model: &Entity<AppModel>, cx: &App) -> impl IntoElement {
+pub(super) fn render_sidebar_sources(model: &Entity<WindowShell>, cx: &App) -> impl IntoElement {
     let m = model.read(cx);
     let t = ThemeTokens::of(cx);
-    let providers = m.plugins.source_providers();
+    let providers = m.plugins().source_providers();
     let sources: Vec<(String, String, SourceDescriptor)> = m
-        .plugins
+        .plugins()
         .media_sources()
         .into_iter()
         .map(|(pid, pname, desc)| (pid.to_string(), pname.to_string(), desc.clone()))
         .collect();
-    let bookmarks: Vec<PinnedBookmark> = m.catalog.bookmarks().to_vec();
+    let bookmarks: Vec<PinnedBookmark> = m.catalog().bookmarks().to_vec();
 
     div()
         .id("sidebar-sources-scroll")
@@ -134,7 +134,7 @@ pub(super) fn render_sidebar_sources(model: &Entity<AppModel>, cx: &App) -> impl
                             model,
                             move |this, _, _, cx| {
                                 if this.confirm_destructive(confirm_key.clone(), cx) {
-                                    this.catalog.remove_bookmark(&bm_id);
+                                    this.app.remove_bookmark(&bm_id);
                                     this.notify_sidebar(cx);
                                     this.show_toast("已移除书签", cx);
                                 }
@@ -146,7 +146,7 @@ pub(super) fn render_sidebar_sources(model: &Entity<AppModel>, cx: &App) -> impl
                             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                             .on_click(model_listener(model, move |this, _, _, cx| {
                                 if this.confirm_destructive(confirm_key.clone(), cx) {
-                                    this.catalog.remove_bookmark(&bm_id);
+                                    this.app.remove_bookmark(&bm_id);
                                     this.notify_sidebar(cx);
                                     this.show_toast("已移除书签", cx);
                                 }

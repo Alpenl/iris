@@ -7,7 +7,7 @@ use gpui::{
 };
 use iris_core::keymap::{self, Keymap};
 
-use super::AppModel;
+use super::WindowShell;
 use super::views::model_listener;
 use crate::platform;
 
@@ -220,19 +220,12 @@ pub(super) fn runtime_bindings(keymap: &Keymap) -> Vec<KeyBinding> {
     bindings
 }
 
-impl AppModel {
+impl WindowShell {
     /// Returns the live formatted shortcut label for `action_id` under the active `Keymap`.
     pub(in crate::ui) fn key_hint(&self, action_id: &str) -> Option<SharedString> {
-        let canonical = match action_id {
-            "open_stream_url" => "open_url",
-            other => other,
-        };
-        let raw = self.keymap.effective_key(canonical);
-        if raw.is_empty() {
-            return None;
-        }
-        let disp = keymap::format_keystroke_display(&raw, platform::IS_MACOS);
-        (!disp.is_empty()).then(|| SharedString::from(disp))
+        self.app
+            .key_hint_string(action_id, platform::IS_MACOS)
+            .map(SharedString::from)
     }
 
     pub(super) fn reset_appearance_action(
@@ -245,63 +238,66 @@ impl AppModel {
     }
 }
 
-pub(super) fn bind_window_actions(root: Stateful<Div>, model: &Entity<AppModel>) -> Stateful<Div> {
-    root.on_action(model_listener(model, AppModel::toggle_pause))
-        .on_action(model_listener(model, AppModel::seek_back))
-        .on_action(model_listener(model, AppModel::seek_forward))
-        .on_action(model_listener(model, AppModel::seek_back_large))
-        .on_action(model_listener(model, AppModel::seek_forward_large))
-        .on_action(model_listener(model, AppModel::frame_back))
-        .on_action(model_listener(model, AppModel::frame_forward))
-        .on_action(model_listener(model, AppModel::volume_up))
-        .on_action(model_listener(model, AppModel::volume_down))
-        .on_action(model_listener(model, AppModel::toggle_mute))
-        .on_action(model_listener(model, AppModel::speed_down))
-        .on_action(model_listener(model, AppModel::speed_up))
-        .on_action(model_listener(model, AppModel::reset_speed))
-        .on_action(model_listener(model, AppModel::toggle_loop))
-        .on_action(model_listener(model, AppModel::cycle_ab_loop))
-        .on_action(model_listener(model, AppModel::clear_ab_loop))
-        .on_action(model_listener(model, AppModel::toggle_directory))
-        .on_action(model_listener(model, AppModel::toggle_search))
-        .on_action(model_listener(model, AppModel::refresh_directory))
-        .on_action(model_listener(model, AppModel::open_settings))
-        .on_action(model_listener(model, AppModel::open_command_palette))
-        .on_action(model_listener(model, AppModel::toggle_always_on_top))
-        .on_action(model_listener(model, AppModel::toggle_info))
-        .on_action(model_listener(model, AppModel::take_screenshot))
-        .on_action(model_listener(model, AppModel::cycle_aspect))
-        .on_action(model_listener(model, AppModel::toggle_fullscreen))
-        .on_action(model_listener(model, AppModel::exit_fullscreen))
-        .on_action(model_listener(model, AppModel::toggle_subs))
-        .on_action(model_listener(model, AppModel::cycle_sub))
-        .on_action(model_listener(model, AppModel::sub_seek_prev))
-        .on_action(model_listener(model, AppModel::sub_seek_next))
-        .on_action(model_listener(model, AppModel::sub_delay_back))
-        .on_action(model_listener(model, AppModel::sub_delay_forward))
-        .on_action(model_listener(model, AppModel::sub_delay_reset))
-        .on_action(model_listener(model, AppModel::cycle_audio))
-        .on_action(model_listener(model, AppModel::prev_chapter))
-        .on_action(model_listener(model, AppModel::next_chapter))
-        .on_action(model_listener(model, AppModel::toggle_image_size))
-        .on_action(model_listener(model, AppModel::fit_image))
-        .on_action(model_listener(model, AppModel::zoom_in))
-        .on_action(model_listener(model, AppModel::zoom_out))
-        .on_action(model_listener(model, AppModel::rotate_cw))
-        .on_action(model_listener(model, AppModel::rotate_ccw))
-        .on_action(model_listener(model, AppModel::toggle_hflip))
-        .on_action(model_listener(model, AppModel::toggle_vflip))
-        .on_action(model_listener(model, AppModel::toggle_filmstrip))
-        .on_action(model_listener(model, AppModel::next_item))
-        .on_action(model_listener(model, AppModel::prev_item))
-        .on_action(model_listener(model, AppModel::open_file))
-        .on_action(model_listener(model, AppModel::open_stream_url_action))
-        .on_action(model_listener(model, AppModel::cycle_preset_action))
-        .on_action(model_listener(model, AppModel::activate_preset_action))
+pub(super) fn bind_window_actions(
+    root: Stateful<Div>,
+    model: &Entity<WindowShell>,
+) -> Stateful<Div> {
+    root.on_action(model_listener(model, WindowShell::toggle_pause))
+        .on_action(model_listener(model, WindowShell::seek_back))
+        .on_action(model_listener(model, WindowShell::seek_forward))
+        .on_action(model_listener(model, WindowShell::seek_back_large))
+        .on_action(model_listener(model, WindowShell::seek_forward_large))
+        .on_action(model_listener(model, WindowShell::frame_back))
+        .on_action(model_listener(model, WindowShell::frame_forward))
+        .on_action(model_listener(model, WindowShell::volume_up))
+        .on_action(model_listener(model, WindowShell::volume_down))
+        .on_action(model_listener(model, WindowShell::toggle_mute))
+        .on_action(model_listener(model, WindowShell::speed_down))
+        .on_action(model_listener(model, WindowShell::speed_up))
+        .on_action(model_listener(model, WindowShell::reset_speed))
+        .on_action(model_listener(model, WindowShell::toggle_loop))
+        .on_action(model_listener(model, WindowShell::cycle_ab_loop))
+        .on_action(model_listener(model, WindowShell::clear_ab_loop))
+        .on_action(model_listener(model, WindowShell::toggle_directory))
+        .on_action(model_listener(model, WindowShell::toggle_search))
+        .on_action(model_listener(model, WindowShell::refresh_directory))
+        .on_action(model_listener(model, WindowShell::open_settings))
+        .on_action(model_listener(model, WindowShell::open_command_palette))
+        .on_action(model_listener(model, WindowShell::toggle_always_on_top))
+        .on_action(model_listener(model, WindowShell::toggle_info))
+        .on_action(model_listener(model, WindowShell::take_screenshot))
+        .on_action(model_listener(model, WindowShell::cycle_aspect))
+        .on_action(model_listener(model, WindowShell::toggle_fullscreen))
+        .on_action(model_listener(model, WindowShell::exit_fullscreen))
+        .on_action(model_listener(model, WindowShell::toggle_subs))
+        .on_action(model_listener(model, WindowShell::cycle_sub))
+        .on_action(model_listener(model, WindowShell::sub_seek_prev))
+        .on_action(model_listener(model, WindowShell::sub_seek_next))
+        .on_action(model_listener(model, WindowShell::sub_delay_back))
+        .on_action(model_listener(model, WindowShell::sub_delay_forward))
+        .on_action(model_listener(model, WindowShell::sub_delay_reset))
+        .on_action(model_listener(model, WindowShell::cycle_audio))
+        .on_action(model_listener(model, WindowShell::prev_chapter))
+        .on_action(model_listener(model, WindowShell::next_chapter))
+        .on_action(model_listener(model, WindowShell::toggle_image_size))
+        .on_action(model_listener(model, WindowShell::fit_image))
+        .on_action(model_listener(model, WindowShell::zoom_in))
+        .on_action(model_listener(model, WindowShell::zoom_out))
+        .on_action(model_listener(model, WindowShell::rotate_cw))
+        .on_action(model_listener(model, WindowShell::rotate_ccw))
+        .on_action(model_listener(model, WindowShell::toggle_hflip))
+        .on_action(model_listener(model, WindowShell::toggle_vflip))
+        .on_action(model_listener(model, WindowShell::toggle_filmstrip))
+        .on_action(model_listener(model, WindowShell::next_item))
+        .on_action(model_listener(model, WindowShell::prev_item))
+        .on_action(model_listener(model, WindowShell::open_file))
+        .on_action(model_listener(model, WindowShell::open_stream_url_action))
+        .on_action(model_listener(model, WindowShell::cycle_preset_action))
+        .on_action(model_listener(model, WindowShell::activate_preset_action))
         .on_action(model_listener(
             model,
-            AppModel::trigger_plugin_command_action,
+            WindowShell::trigger_plugin_command_action,
         ))
-        .on_action(model_listener(model, AppModel::reset_appearance_action))
-        .on_action(model_listener(model, AppModel::toggle_favorite))
+        .on_action(model_listener(model, WindowShell::reset_appearance_action))
+        .on_action(model_listener(model, WindowShell::toggle_favorite))
 }

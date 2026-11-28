@@ -5,10 +5,9 @@ use gpui::{
     App, Entity, InteractiveElement, IntoElement, MouseButton, ParentElement, ScrollWheelEvent,
     StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder, px,
 };
-use iris_core::media_uri::MediaUri;
 use iris_core::player::{AspectMode, Command, TrackKind, format_time};
 
-use super::super::AppModel;
+use super::super::WindowShell;
 use super::super::actions::{
     CycleAspect, FitImage, RotateCw, TakeScreenshot, ToggleFilmstrip, ToggleHFlip, ToggleImageSize,
     ToggleLoop, TogglePause, ZoomIn, ZoomOut,
@@ -24,14 +23,14 @@ use crate::assets::Icon;
 use crate::theme::{FONT_MONO, ThemeTokens};
 
 pub(super) fn render_plugin_toolbar_slot(
-    model: &Entity<AppModel>,
+    model: &Entity<WindowShell>,
     compact: bool,
     t: ThemeTokens,
     cx: &App,
 ) -> Option<impl IntoElement> {
     let m = model.read(cx);
     let buttons: Vec<(String, iris_api::ToolbarButton)> = m
-        .plugins
+        .plugins()
         .toolbar_buttons()
         .into_iter()
         .map(|(pid, b)| (pid.to_string(), b.clone()))
@@ -95,16 +94,16 @@ pub(super) fn render_plugin_toolbar_slot(
 }
 
 fn render_variant_selector(
-    model: &Entity<AppModel>,
+    model: &Entity<WindowShell>,
     t: ThemeTokens,
     cx: &App,
 ) -> Option<impl IntoElement> {
     let m = model.read(cx);
-    let meta = m.plugins.active_stream_meta()?;
+    let meta = m.plugins().active_stream_meta()?;
     if meta
         .plugin_id
         .as_deref()
-        .is_some_and(|pid| !m.plugins.is_ready(pid))
+        .is_some_and(|pid| !m.plugins().is_ready(pid))
         || m.session().current_media_uri().is_none()
     {
         return None;
@@ -130,19 +129,8 @@ fn render_variant_selector(
     Some(anchor_wrap(slot, btn))
 }
 
-fn can_step_media(m: &AppModel, delta: isize) -> bool {
-    let current = m
-        .playback
-        .pending_path()
-        .map(std::path::Path::to_path_buf)
-        .map(MediaUri::Local)
-        .or_else(|| m.session().current_media_uri());
-    m.catalog
-        .can_step_media(&m.plugins, current.as_ref(), delta)
-}
-
 fn step_button(
-    model: &Entity<AppModel>,
+    model: &Entity<WindowShell>,
     id: &'static str,
     delta: isize,
     t: ThemeTokens,
@@ -154,7 +142,7 @@ fn step_button(
     } else {
         (Icon::Next, "下一个", "open_next")
     };
-    if !can_step_media(m, delta) {
+    if !m.app.can_step_media(delta) {
         return icon_button_disabled(id, glyph, false, t).tooltip(tip("当前列表仅有一项", None));
     }
     icon_button(id, glyph, false, t)
@@ -165,7 +153,7 @@ fn step_button(
 }
 
 fn loop_button(
-    model: &Entity<AppModel>,
+    model: &Entity<WindowShell>,
     looping: bool,
     t: ThemeTokens,
     cx: &App,
@@ -184,7 +172,7 @@ fn loop_button(
 }
 
 fn speed_button(
-    model: &Entity<AppModel>,
+    model: &Entity<WindowShell>,
     speed: f64,
     with_wheel_and_reset: bool,
     t: ThemeTokens,
@@ -229,7 +217,7 @@ fn speed_button(
                 |this, ev: &ScrollWheelEvent, _, cx| {
                     let step = this.damped_wheel_steps(ev, 36.);
                     if step != 0 {
-                        let out = this.playback.step_speed(step.signum());
+                        let out = this.app.step_speed(step.signum());
                         this.apply_playback_action(out, cx);
                         this.notify_dock(cx);
                     }
@@ -241,7 +229,7 @@ fn speed_button(
 }
 
 pub(super) fn video_transport(
-    model: &Entity<AppModel>,
+    model: &Entity<WindowShell>,
     tiny: bool,
     compact: bool,
     t: ThemeTokens,
@@ -337,7 +325,7 @@ pub(super) fn video_transport(
 }
 
 pub(super) fn video_fields(
-    model: &Entity<AppModel>,
+    model: &Entity<WindowShell>,
     narrow: bool,
     tiny: bool,
     compact: bool,
@@ -441,7 +429,7 @@ pub(super) fn video_fields(
 }
 
 pub(super) fn audio_fields(
-    model: &Entity<AppModel>,
+    model: &Entity<WindowShell>,
     narrow: bool,
     compact: bool,
     t: ThemeTokens,
@@ -475,7 +463,7 @@ pub(super) fn audio_fields(
 }
 
 pub(super) fn photo_transport(
-    model: &Entity<AppModel>,
+    model: &Entity<WindowShell>,
     compact: bool,
     t: ThemeTokens,
     cx: &App,
@@ -483,7 +471,7 @@ pub(super) fn photo_transport(
     let m = model.read(cx);
     let session = m.session();
     let cur_uri = session.current_media_uri();
-    let (pos_str, total_str) = m.catalog.photo_counter_strings(
+    let (pos_str, total_str) = m.catalog().photo_counter_strings(
         cur_uri.as_ref(),
         session.current().is_some(),
         session.current_uri().is_some(),
@@ -502,7 +490,7 @@ pub(super) fn photo_transport(
 }
 
 pub(super) fn photo_fields(
-    model: &Entity<AppModel>,
+    model: &Entity<WindowShell>,
     narrow: bool,
     compact: bool,
     t: ThemeTokens,
@@ -512,7 +500,7 @@ pub(super) fn photo_fields(
     let m = model.read(cx);
     let view = &m.active().image;
     let state = m.session().state();
-    let strip_on = m.settings.photo_filmstrip;
+    let strip_on = m.settings().photo_filmstrip;
     let more_pop = m.overlays.popover == Some(PopoverKind::More);
     let (viewport, media) = m.image_geometry();
     let pct_str = (viewport[0] > 0. && state.video_size.0 > 0)

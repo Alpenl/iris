@@ -943,6 +943,31 @@ def check_no_transitive_gpui(tree_output: str):
     )
 
 
+def check_ui_kit_decoupling(rel: Path, code: str):
+    """Reject coupling from `crates/iris/src/ui/kit` to root window/shell/model types."""
+    _require(
+        not re.search(r"\b(?:IrisWindow|WindowShell|AppModel)\b", code),
+        f"{rel} couples `ui/kit` to root window/model types",
+    )
+
+
+def check_devtools_gates(pkgs: dict, root: Path):
+    """Reject `devtools` default features and missing `feature = \"devtools\"` source gates."""
+    for crate_name in ("iris", "iris-core", "iris-app"):
+        default_feats = pkgs[crate_name]["features"].get("default", [])
+        _require("devtools" not in default_feats, f"{crate_name} enables devtools by default: {default_feats}")
+    for gated_rel in (
+        "crates/iris/src/debug.rs",
+        "crates/iris-core/src/player/mod.rs",
+        "crates/iris-app/src/model/debug.rs",
+    ):
+        gated_file = root / gated_rel
+        _require(
+            gated_file.is_file() and 'feature = "devtools"' in gated_file.read_text(encoding="utf-8"),
+            f"{Path(gated_rel)} missing devtools cfg gate",
+        )
+
+
 def check_file_line_budget(rel: Path, text: str) -> int | None:
     """Validate file SLOC budgets and trailing `#[cfg(test)] mod` placement; return prod SLOC."""
     stripped = strip_comments(text)
@@ -1044,10 +1069,7 @@ def main():
         if is_under(path, ui_dir):
             _require(not re.search(r"\btarget_os\b", code), f"{rel} scatters `target_os` cfg in UI layer")
         if is_under(path, kit_dir):
-            _require(
-                not re.search(r"\b(?:IrisWindow|AppModel)\b", code),
-                f"{rel} couples `ui/kit` to root window/model types",
-            )
+            check_ui_kit_decoupling(rel, code)
 
     # 3. Cargo metadata: devtools security gates, layer dependency boundaries & workspace lints
     metadata = json.loads(
@@ -1064,9 +1086,7 @@ def main():
     _require(bool(re.fullmatch(r"0\.0\.(0|[1-9][0-9]*)", version)), "Only 0.0.x Iris builds are authorized")
     _require(all(p["version"] == version for p in pkgs.values()), "Workspace package versions differ")
 
-    for crate_name in ("iris", "iris-core"):
-        default_feats = pkgs[crate_name]["features"].get("default", [])
-        _require("devtools" not in default_feats, f"{crate_name} enables devtools by default: {default_feats}")
+    check_devtools_gates(pkgs, ROOT)
 
     host_default_feats = pkgs["iris-plugin-host"]["features"].get("default", [])
     _require(
@@ -1085,15 +1105,6 @@ def main():
         _require(
             "required-features" not in test_target,
             "crates/iris-plugin-host/Cargo.toml must not use `required-features` on test targets",
-        )
-
-    for gated_file in (
-        ROOT / "crates/iris/src/debug.rs",
-        ROOT / "crates/iris-core/src/player/mod.rs",
-    ):
-        _require(
-            'feature = "devtools"' in gated_file.read_text(encoding="utf-8"),
-            f"{gated_file.relative_to(ROOT)} missing devtools cfg gate",
         )
 
     vault = ROOT / "crates/iris-core/src/vault.rs"

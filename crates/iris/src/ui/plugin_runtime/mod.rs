@@ -1,6 +1,6 @@
 //! Window-owned GPUI presentation adapters (`PluginUiState`, `GlyphCache`, view
 //! timers, remote thumbnail executor tasks, and consent/annotation/overlay views)
-//! delegating all plugin state and orchestration to [`iris_app::PluginController`].
+//! delegating all plugin state and orchestration to [`iris_app::AppModel`].
 
 pub(in crate::ui) mod annotations;
 mod consent;
@@ -18,7 +18,7 @@ use gpui::{Context, RenderImage, SharedString};
 use iris_app::{ThumbnailCache, ViewTimerSlot, run_view_timer};
 use iris_core::preset::SidebarMode;
 
-use super::AppModel;
+use super::WindowShell;
 use crate::assets::Icon;
 
 /// Maps a plugin-declared `SourceDescriptor::icon` name onto a controlled host [`Icon`].
@@ -66,10 +66,10 @@ pub(super) fn desired_view_timers_for_ui(
     out
 }
 
-impl AppModel {
+impl WindowShell {
     pub(in crate::ui) fn plugin_source_icon(&self, plugin_id: &str, source_id: &str) -> Icon {
         source_icon_for_name(
-            self.plugins
+            self.plugins()
                 .source_icon_name(plugin_id, source_id)
                 .as_deref(),
         )
@@ -80,11 +80,11 @@ impl AppModel {
         plugin_id: &str,
         source_id: &str,
     ) -> SharedString {
-        self.plugins.source_badge(plugin_id, source_id).into()
+        self.plugins().source_badge(plugin_id, source_id).into()
     }
 
     pub(super) fn close_plugin_browse(&mut self) {
-        let out = self.catalog.close_plugin_browse(&mut self.plugins);
+        let out = self.app.close_plugin_browse();
         self.plugin_ui.browse_timeout = None;
         if out
             .effects
@@ -95,7 +95,7 @@ impl AppModel {
     }
 
     pub(super) fn advance_plugin_media(&mut self, cx: &mut Context<Self>) -> bool {
-        let (ok, out) = self.plugins.advance_media(self.playback.session_mut());
+        let (ok, out) = self.app.advance_plugin_media();
         let regions = self.apply_plugin_outcome(out, None, cx);
         if regions.any() {
             self.notify_regions(regions, cx);
@@ -104,7 +104,7 @@ impl AppModel {
     }
 
     pub(super) fn advance_plugin_seek(&mut self, cx: &mut Context<Self>) {
-        let out = self.with_plugin_ctx(|ctrl, ctx| ctrl.advance_seek(ctx, Instant::now()));
+        let out = self.app.advance_plugin_seek(Instant::now());
         let regions = self.apply_plugin_outcome(out, None, cx);
         if regions.any() {
             self.notify_regions(regions, cx);
@@ -115,17 +115,16 @@ impl AppModel {
         &mut self,
         cx: &mut Context<Self>,
     ) -> super::views::DirtyRegions {
-        let out =
-            self.with_plugin_ctx(|ctrl, ctx| ctrl.announce_media_if_loaded(ctx, Instant::now()));
+        let out = self.app.announce_plugin_media_if_loaded(Instant::now());
         self.apply_plugin_outcome(out, None, cx)
     }
 
     fn desired_view_timers(&self) -> BTreeMap<ViewTimerSlot, (String, u32)> {
         let sidebar_visible =
-            self.sidebar_is_visible() && self.catalog.sidebar_mode() == SidebarMode::Plugins;
-        let modal_timer = self.plugins.active_modal_timer();
+            self.sidebar_is_visible() && self.catalog().sidebar_mode() == SidebarMode::Plugins;
+        let modal_timer = self.plugins().active_modal_timer();
         let sidebar_timers = if sidebar_visible {
-            self.plugins.sidebar_panel_timers()
+            self.plugins().sidebar_panel_timers()
         } else {
             Vec::new()
         };
@@ -159,14 +158,11 @@ impl AppModel {
                                 this.plugin_ui.view_timers.remove(&expected_slot);
                                 return false;
                             }
-                            let out = this.with_plugin_ctx(|ctrl, ctx| {
-                                ctrl.fire_view_timer_tick(
-                                    ctx,
-                                    &pid,
-                                    &expected_spec.0,
-                                    Instant::now(),
-                                )
-                            });
+                            let out = this.app.fire_view_timer_tick(
+                                &pid,
+                                &expected_spec.0,
+                                Instant::now(),
+                            );
                             let regions = this.apply_plugin_outcome(out, None, cx);
                             if regions.any() {
                                 this.notify_regions(regions, cx);

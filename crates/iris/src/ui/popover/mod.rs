@@ -10,7 +10,7 @@ use gpui::{
 };
 use iris_core::player::{Command, SPEED_STEPS};
 
-use super::AppModel;
+use super::WindowShell;
 use super::kit::list_row::select_row;
 use super::state::PopoverKind;
 use super::views::{DirtyRegions, model_listener};
@@ -49,7 +49,7 @@ pub(super) fn popover_header(
 }
 
 pub(super) fn render_popover(
-    model: &Entity<AppModel>,
+    model: &Entity<WindowShell>,
     kind: PopoverKind,
     fullscreen: bool,
     window: &Window,
@@ -188,7 +188,7 @@ pub(super) fn render_popover(
         .child(panel)
 }
 
-impl AppModel {
+impl WindowShell {
     pub(super) fn handle_popover_key(&mut self, key: &str, cx: &mut Context<Self>) -> bool {
         let Some(kind) = self.overlays.popover else {
             return false;
@@ -196,7 +196,7 @@ impl AppModel {
         let len = match kind {
             PopoverKind::Speed => SPEED_STEPS.len(),
             PopoverKind::Variants => self
-                .plugins
+                .plugins()
                 .active_stream_meta()
                 .map_or(0, |m| m.variants.len()),
             _ => return false,
@@ -234,7 +234,7 @@ impl AppModel {
                     }
                     PopoverKind::Variants => {
                         let chosen = self
-                            .plugins
+                            .plugins()
                             .active_stream_meta()
                             .and_then(|m| m.variants.get(idx))
                             .map(|v| (v.id.clone(), v.label.clone()));
@@ -254,7 +254,7 @@ impl AppModel {
     }
 }
 
-fn render_speed_popover(model: &Entity<AppModel>, t: ThemeTokens, cx: &App) -> impl IntoElement {
+fn render_speed_popover(model: &Entity<WindowShell>, t: ThemeTokens, cx: &App) -> impl IntoElement {
     let m = model.read(cx);
     let current = m.session().state().speed;
     let focused_ix = m.overlays.popover_index;
@@ -300,9 +300,13 @@ fn render_speed_popover(model: &Entity<AppModel>, t: ThemeTokens, cx: &App) -> i
         )
 }
 
-fn render_variants_popover(model: &Entity<AppModel>, t: ThemeTokens, cx: &App) -> impl IntoElement {
+fn render_variants_popover(
+    model: &Entity<WindowShell>,
+    t: ThemeTokens,
+    cx: &App,
+) -> impl IntoElement {
     let m = model.read(cx);
-    let (variants, active_var) = match m.plugins.active_stream_meta() {
+    let (variants, active_var) = match m.plugins().active_stream_meta() {
         Some(meta) => (meta.variants.clone(), meta.active_variant.clone()),
         None => (Vec::new(), None),
     };

@@ -11,9 +11,9 @@ use gpui::{
     StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder, px,
 };
 use iris_core::player::Command;
-use iris_core::settings::{MAX_DIRECTORY_WIDTH, MIN_DIRECTORY_WIDTH, Side};
+use iris_core::settings::Side;
 
-use super::AppModel;
+use super::WindowShell;
 use super::state::{PopoverKind, ScrubState};
 use super::views::{DirtyRegions, model_listener};
 use crate::platform;
@@ -174,7 +174,7 @@ impl WindowChromeState {
 }
 
 pub(super) fn render_top_pill(
-    model: &Entity<AppModel>,
+    model: &Entity<WindowShell>,
     fullscreen: bool,
     t: ThemeTokens,
     cx: &App,
@@ -186,7 +186,7 @@ pub(super) fn render_top_pill(
         (msg, false, false)
     } else if m.session().state().buffering {
         (SharedString::from("缓冲中…"), false, false)
-    } else if m.playback.loading_visible() {
+    } else if m.playback().loading_visible() {
         (SharedString::from("加载中…"), false, false)
     } else {
         return None;
@@ -245,7 +245,7 @@ pub(super) fn render_top_pill(
     )
 }
 
-impl AppModel {
+impl WindowShell {
     pub(super) fn popover_anchor(&self, kind: PopoverKind) -> Option<Bounds<Pixels>> {
         self.chrome.probes.popover_anchor(kind)
     }
@@ -350,7 +350,8 @@ impl AppModel {
             && !self.chrome.scrub.dragging_volume
             && !over_dock
         {
-            let delay = Duration::from_millis(self.settings.fullscreen_hide_ms.clamp(1000, 10000));
+            let delay =
+                Duration::from_millis(self.settings().fullscreen_hide_ms.clamp(1000, 10000));
             let idle = self.chrome.last_activity.elapsed();
             if idle < delay {
                 return Some(delay - idle);
@@ -432,12 +433,11 @@ impl AppModel {
     }
 
     pub(super) fn set_directory_side(&mut self, side: Side, cx: &mut Context<Self>) {
-        if self.settings.directory_side == side {
+        let Some(wb) = self.app.set_directory_side(side) else {
             return;
-        }
-        self.settings.directory_side = side;
-        self.persist_user_settings();
-        self.notify_all(cx);
+        };
+        let regions = self.apply_workbench_changes(wb, None, cx);
+        self.notify_regions(regions, cx);
         self.show_toast(
             if side == Side::Left {
                 "侧栏移到左侧"
@@ -446,27 +446,6 @@ impl AppModel {
             },
             cx,
         );
-    }
-
-    pub(super) fn drag_sidebar_width(
-        &mut self,
-        pointer_x: f32,
-        viewport_w: f32,
-        start_x: f32,
-        start_w: f32,
-    ) {
-        let dx = pointer_x - start_x;
-        let signed = if self.settings.directory_side == Side::Left {
-            dx
-        } else {
-            -dx
-        };
-        let max = if viewport_w > 0. {
-            (viewport_w * 0.45).clamp(MIN_DIRECTORY_WIDTH, MAX_DIRECTORY_WIDTH)
-        } else {
-            MAX_DIRECTORY_WIDTH
-        };
-        self.settings.directory_width = (start_w + signed).clamp(MIN_DIRECTORY_WIDTH, max);
     }
 
     pub(super) fn update_seek_preview(&mut self, x: Pixels) {
@@ -487,12 +466,7 @@ impl AppModel {
             return;
         }
         let pct = (((x - b.origin.x) / b.size.width).clamp(0., 1.) as f64) * 100.;
-        let cmd = if exact {
-            Command::SeekPercent(pct)
-        } else {
-            Command::SeekPercentFast(pct)
-        };
-        if let Err(e) = self.session_mut().execute(cmd) {
+        if let Err(e) = self.app.seek_percent(pct, exact) {
             log::error!("seek: {e}");
         }
     }
@@ -606,8 +580,8 @@ impl AppModel {
                     position,
                     viewport,
                     t.dock_h,
-                    self.settings.directory_side,
-                    px(self.settings.directory_width),
+                    self.settings().directory_side,
+                    px(self.settings().directory_width),
                 )
             };
             let next = self.overlays.dir_popup.on_pointer(
@@ -643,7 +617,7 @@ impl AppModel {
         }
         if let Some((start_x, start_w)) = self.chrome.resizing_dir {
             if ev.pressed_button == Some(MouseButton::Left) {
-                self.drag_sidebar_width(
+                let _ = self.app.drag_sidebar_width(
                     f32::from(ev.position.x),
                     f32::from(window.viewport_size().width),
                     start_x,
@@ -651,7 +625,7 @@ impl AppModel {
                 );
             } else {
                 self.chrome.resizing_dir = None;
-                self.persist_user_settings();
+                let _ = self.app.commit_directory_width();
             }
             self.notify_regions(
                 DirtyRegions {
@@ -747,17 +721,17 @@ impl AppModel {
         {
             self.chrome.scrub.click_seq += 1;
             let seq = self.chrome.scrub.click_seq;
-            let generation = self.playback.load_generation();
+            let generation = self.playback().load_generation();
             cx.spawn(async move |this, cx| {
                 cx.background_executor()
                     .timer(Duration::from_millis(200))
                     .await;
                 let _ = this.update(cx, |this, cx| {
                     if this.chrome.scrub.click_seq == seq
-                        && this.playback.load_generation() == generation
+                        && this.playback().load_generation() == generation
                         && !this.input_context().overlay
                     {
-                        let out = this.playback.toggle_pause();
+                        let out = this.app.toggle_pause();
                         this.apply_playback_action(out, cx);
                         this.notify_dock(cx);
                     }
@@ -766,7 +740,7 @@ impl AppModel {
             .detach();
         }
         if self.chrome.resizing_dir.take().is_some() {
-            self.persist_user_settings();
+            let _ = self.app.commit_directory_width();
             self.notify_regions(
                 DirtyRegions {
                     root: true,

@@ -12,6 +12,10 @@ use super::ports::{
 use super::state::PlaybackOrchestrator;
 
 impl<S: PlaybackSessionPort> PlaybackOrchestrator<S> {
+    pub fn execute_command(&mut self, command: Command) -> PlaybackActionOutcome {
+        self.execute_with_osd(command, None)
+    }
+
     fn execute_with_osd(&mut self, command: Command, osd: Option<String>) -> PlaybackActionOutcome {
         match self.session.execute(command) {
             Ok(()) => PlaybackActionOutcome {

@@ -7,7 +7,7 @@ use gpui::{
 };
 use iris_api::{Color, OverlayNode, TextAlign};
 
-use super::super::AppModel;
+use super::super::WindowShell;
 use super::super::kit::icon;
 use super::super::views::model_listener;
 use crate::assets::Icon;
@@ -40,15 +40,15 @@ fn finite_clamp(value: f32, min: f32, max: f32) -> f32 {
 }
 
 pub(in crate::ui) fn render_plugin_overlay(
-    model: &Entity<AppModel>,
+    model: &Entity<WindowShell>,
     cx: &App,
 ) -> Option<impl IntoElement> {
     let m = model.read(cx);
-    render_overlay_nodes(model, m.plugins.overlay_nodes(), cx)
+    render_overlay_nodes(model, m.plugins().overlay_nodes(), cx)
 }
 
 pub(in crate::ui) fn render_overlay_nodes<'a>(
-    model: &Entity<AppModel>,
+    model: &Entity<WindowShell>,
     tagged: impl Iterator<Item = (&'a str, &'a OverlayNode)>,
     cx: &App,
 ) -> Option<impl IntoElement> {

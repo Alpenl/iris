@@ -11,7 +11,7 @@ use iris_core::media_uri::MediaUri;
 use iris_core::player::format_time;
 use iris_core::preset::SidebarMode;
 
-use super::AppModel;
+use super::WindowShell;
 use super::actions::OpenFile;
 use super::kit::{badge_pill, icon};
 use super::state::BuiltinDialog;
@@ -19,7 +19,7 @@ use super::views::model_listener;
 use crate::assets::Icon;
 use crate::theme::{FONT_MONO, ThemeTokens};
 
-pub(super) fn render_audio_card(m: &AppModel, t: ThemeTokens) -> impl IntoElement {
+pub(super) fn render_audio_card(m: &WindowShell, t: ThemeTokens) -> impl IntoElement {
     let session = m.session();
     let st = session.state();
     let name = session
@@ -93,12 +93,12 @@ pub(super) fn render_audio_card(m: &AppModel, t: ThemeTokens) -> impl IntoElemen
 }
 
 pub(super) fn render_empty_state(
-    model: &Entity<AppModel>,
+    model: &Entity<WindowShell>,
     t: ThemeTokens,
     cx: &App,
 ) -> impl IntoElement {
     let m = model.read(cx);
-    let store = m.catalog.store();
+    let store = m.catalog().store();
     let recents: Vec<(MediaUri, Option<String>, String)> = store
         .recent()
         .iter()
@@ -266,7 +266,7 @@ pub(super) fn render_empty_state(
                                     })
                                     .on_click(model_listener(model, |this, _, _, cx| {
                                         if this.confirm_destructive("clear-recent", cx) {
-                                            this.catalog.clear_recent();
+                                            this.app.clear_recent();
                                             this.notify_viewport(cx);
                                             this.show_toast("已清除最近打开记录", cx);
                                         }
@@ -324,18 +324,18 @@ pub(super) fn render_empty_state(
 }
 
 pub(super) fn render_photo_filmstrip(
-    model: &Entity<AppModel>,
+    model: &Entity<WindowShell>,
     fullscreen: bool,
     t: ThemeTokens,
     cx: &App,
 ) -> Option<impl IntoElement> {
     let m = model.read(cx);
-    let photos = m.catalog.photo_paths();
+    let photos = m.catalog().photo_paths();
     if photos.len() < 2 {
         return None;
     }
     let current = m.session().current();
-    let cur_ix = m.catalog.filmstrip_index();
+    let cur_ix = m.catalog().filmstrip_index();
     const WINDOW: usize = 11;
     let start = cur_ix
         .saturating_sub(WINDOW / 2)

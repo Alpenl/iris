@@ -6,10 +6,10 @@ use gpui::{
     ParentElement, SharedString, StatefulInteractiveElement, Styled, Window, div,
     prelude::FluentBuilder, px,
 };
+use iris_app::ShortcutRecordOutcome;
 use iris_core::keymap::{self, KeymapScheme};
 
-use super::super::AppModel;
-use super::super::actions::rebind_keys;
+use super::super::WindowShell;
 use super::super::kit::form::{chip_button, segmented};
 use super::super::kit::{badge_pill, section_label};
 use super::super::views::{DirtyRegions, model_listener};
@@ -31,75 +31,76 @@ fn scope_short_label(entry: &keymap::ActionEntry) -> &'static str {
     }
 }
 
-impl AppModel {
+impl WindowShell {
     pub(super) fn handle_shortcut_recorder_key(
         &mut self,
         ev: &KeyDownEvent,
         w: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.overlays.recording_shortcut.is_none() {
+        let Some((target_id, ctx_pred)) = self.overlays.recording_shortcut.clone() else {
             return;
-        }
+        };
         let mods = ev.keystroke.modifiers;
-        let key_str = ev.keystroke.key.as_str();
-        let Some(spec) = keymap::normalize_gpui_keystroke(
-            key_str,
+        match self.app.record_shortcut_keystroke(
+            &target_id,
+            &ctx_pred,
+            ev.keystroke.key.as_str(),
             mods.platform,
             mods.control,
             mods.alt,
             mods.shift,
-        ) else {
-            cx.stop_propagation();
-            return;
-        };
-        if spec == "escape" {
-            self.overlays.recording_shortcut = None;
-            self.overlays.shortcut_conflict = None;
-            self.focus.focus(w);
-            cx.stop_propagation();
-            self.notify_regions(
-                DirtyRegions {
-                    root: true,
-                    settings: true,
-                    ..DirtyRegions::NONE
-                },
-                cx,
-            );
-            return;
-        }
-        if keymap::reserved_shortcut(&spec) == Some("reset_appearance") {
-            return;
-        }
-        let disp = keymap::format_keystroke_display(&spec, IS_MACOS);
-        if let Some((target_id, ctx_pred)) = self.overlays.recording_shortcut.as_ref()
-            && let Some(conflict) = self.keymap.find_conflict(ctx_pred, &spec, target_id)
-        {
-            let other = super::super::strings::actions::describe_conflict(&conflict, &self.presets);
-            let warn = format!("无法绑定 {disp}：与「{other}」冲突，请选择其他按键");
-            self.overlays.shortcut_conflict = Some(warn.clone());
-            self.notify_settings(cx);
-            self.show_error_toast(warn, cx);
-        } else if let Some((target_id, _)) = self.overlays.recording_shortcut.take() {
-            self.keymap.set_binding(&target_id, spec);
-            rebind_keys(cx, &self.keymap);
-            self.overlays.shortcut_conflict = None;
-            self.focus.focus(w);
-            self.notify_all(cx);
-            self.show_toast(format!("已绑定快捷键 · {disp}"), cx);
+            IS_MACOS,
+        ) {
+            ShortcutRecordOutcome::Ignored => {
+                cx.stop_propagation();
+                return;
+            }
+            ShortcutRecordOutcome::Cancelled => {
+                self.overlays.recording_shortcut = None;
+                self.overlays.shortcut_conflict = None;
+                self.focus.focus(w);
+                cx.stop_propagation();
+                self.notify_regions(
+                    DirtyRegions {
+                        root: true,
+                        settings: true,
+                        ..DirtyRegions::NONE
+                    },
+                    cx,
+                );
+                return;
+            }
+            ShortcutRecordOutcome::PassThroughReserved(_) => return,
+            ShortcutRecordOutcome::Conflict { display, target } => {
+                let other =
+                    super::super::strings::actions::describe_conflict(&target, self.presets());
+                let warn = format!("无法绑定 {display}：与「{other}」冲突，请选择其他按键");
+                self.overlays.shortcut_conflict = Some(warn.clone());
+                self.notify_settings(cx);
+                self.show_error_toast(warn, cx);
+            }
+            ShortcutRecordOutcome::Bound { display, changes } => {
+                self.overlays.recording_shortcut = None;
+                self.overlays.shortcut_conflict = None;
+                self.focus.focus(w);
+                let regions = self.apply_workbench_changes(changes, Some(w), cx);
+                self.notify_regions(regions, cx);
+                self.show_toast(format!("已绑定快捷键 · {display}"), cx);
+            }
         }
         cx.stop_propagation();
     }
 }
 
 pub(super) fn settings_shortcuts(
-    model: &Entity<AppModel>,
+    model: &Entity<WindowShell>,
     t: ThemeTokens,
     cx: &App,
 ) -> impl IntoElement {
     let m = model.read(cx);
-    let cur_scheme = m.keymap.scheme;
-    let has_any_overrides = !m.keymap.overrides.is_empty();
+    let cur_scheme = m.keymap().scheme;
+    let has_any_overrides = !m.keymap().overrides.is_empty();
     let recording_id = m
         .overlays
         .recording_shortcut
@@ -118,7 +119,7 @@ pub(super) fn settings_shortcuts(
     }
 
     let preset_rows: Vec<(String, String)> = m
-        .presets
+        .presets()
         .list()
         .iter()
         .map(|p| {
@@ -133,7 +134,7 @@ pub(super) fn settings_shortcuts(
         .collect();
 
     let plugin_rows: Vec<(String, String)> = m
-        .plugins
+        .plugins()
         .commands()
         .into_iter()
         .map(|(pid, pname, spec)| {
@@ -191,10 +192,10 @@ pub(super) fn settings_shortcuts(
                                 |this, _, w, cx| {
                                     this.overlays.recording_shortcut = None;
                                     this.overlays.shortcut_conflict = None;
-                                    this.keymap.reset_all();
-                                    rebind_keys(cx, &this.keymap);
+                                    let wb = this.app.reset_all_shortcuts();
                                     this.focus.focus(w);
-                                    this.notify_all(cx);
+                                    let regions = this.apply_workbench_changes(wb, Some(w), cx);
+                                    this.notify_regions(regions, cx);
                                     this.show_toast("已将全部快捷键恢复为当前方案默认值", cx);
                                 },
                             )),
@@ -216,10 +217,9 @@ pub(super) fn settings_shortcuts(
                                 this.focus.focus(w);
                             }
                             this.overlays.shortcut_conflict = None;
-                            this.keymap.set_scheme(scheme);
-                            this.keymap.save();
-                            rebind_keys(cx, &this.keymap);
-                            this.notify_all(cx);
+                            let wb = this.app.set_keymap_scheme(scheme);
+                            let regions = this.apply_workbench_changes(wb, Some(w), cx);
+                            this.notify_regions(regions, cx);
                             this.show_toast(
                                 format!(
                                     "已切换快捷键方案 · {}",
@@ -237,10 +237,10 @@ pub(super) fn settings_shortcuts(
             } else if let Some(pid) = rec.strip_prefix("preset:") {
                 format!(
                     "切换到预设 · {}",
-                    super::super::strings::presets::preset_name_by_id(&m.presets, pid)
+                    super::super::strings::presets::preset_name_by_id(m.presets(), pid)
                 )
             } else if let Some(rest) = rec.strip_prefix("plugin:") {
-                m.plugins
+                m.plugins()
                     .commands()
                     .into_iter()
                     .find(|(pid, _, spec)| {
@@ -394,8 +394,8 @@ pub(super) fn settings_shortcuts(
 
 #[allow(clippy::too_many_arguments)]
 fn render_shortcut_recorder_row(
-    model: &Entity<AppModel>,
-    m: &AppModel,
+    model: &Entity<WindowShell>,
+    m: &WindowShell,
     target_id: String,
     title: String,
     scope_tag: Option<&'static str>,
@@ -404,8 +404,8 @@ fn render_shortcut_recorder_row(
     t: ThemeTokens,
 ) -> impl IntoElement {
     let is_recording = active_recording == Some(target_id.as_str());
-    let is_overridden = m.keymap.is_overridden(&target_id);
-    let effective = m.keymap.effective_key(&target_id);
+    let is_overridden = m.keymap().is_overridden(&target_id);
+    let effective = m.keymap().effective_key(&target_id);
     let key_text = if is_recording {
         "按下组合键…".to_string()
     } else if effective.is_empty() {
@@ -464,9 +464,9 @@ fn render_shortcut_recorder_row(
                                     this.overlays.recording_shortcut = None;
                                     this.focus.focus(w);
                                 }
-                                this.keymap.reset_binding(&id_reset);
-                                rebind_keys(cx, &this.keymap);
-                                this.notify_all(cx);
+                                let wb = this.app.reset_shortcut_binding(&id_reset);
+                                let regions = this.apply_workbench_changes(wb, Some(w), cx);
+                                this.notify_regions(regions, cx);
                             },
                         )),
                     )

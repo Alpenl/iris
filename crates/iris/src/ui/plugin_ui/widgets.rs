@@ -11,7 +11,7 @@ use gpui::{
 };
 use iris_api::Widget;
 
-use super::super::AppModel;
+use super::super::WindowShell;
 use super::super::kit::form::{check_indicator, chip_button, stepper_box};
 use super::super::kit::text_buffer::format_slider_value;
 use super::super::kit::text_field::{FormEnterCallback, TextFieldSpec, render_text_field};
@@ -20,7 +20,7 @@ use super::super::views::model_listener;
 use crate::assets::Icon;
 use crate::theme::{FONT_MONO, FONT_UI, ThemeTokens};
 
-type ValCallback<T> = Rc<dyn Fn(&mut AppModel, T, &mut Window, &mut Context<AppModel>)>;
+type ValCallback<T> = Rc<dyn Fn(&mut WindowShell, T, &mut Window, &mut Context<WindowShell>)>;
 
 #[derive(Clone)]
 pub(super) enum WidgetSurface<'a> {
@@ -30,7 +30,7 @@ pub(super) enum WidgetSurface<'a> {
     },
     Modal {
         modal_id: &'a str,
-        on_submit: FormEnterCallback<AppModel>,
+        on_submit: FormEnterCallback<WindowShell>,
         window: &'a Window,
     },
 }
@@ -126,16 +126,16 @@ fn progress_bar(ratio: f32, t: ThemeTokens) -> Div {
 }
 
 fn dispatch_widget_value(
-    this: &mut AppModel,
+    this: &mut WindowShell,
     target: (&str, &str, Option<&str>, Option<&str>),
     next_val: String,
     w: &mut Window,
-    cx: &mut Context<AppModel>,
+    cx: &mut Context<WindowShell>,
 ) {
     let (pid, id, action_id, modal_key) = target;
     let explicit_act = action_id.filter(|a| !a.is_empty());
     if let Some(mk) = modal_key {
-        this.plugins.modal_mut().clear_feedback();
+        this.app.clear_plugin_modal_feedback();
         this.set_form_value(mk, next_val.clone());
         if let Some(act) = explicit_act {
             this.invoke_plugin_widget_action(pid, act, Some(next_val), w, cx);
@@ -256,7 +256,7 @@ fn qr_canvas_metrics(dim: usize, max_logical: f32, scale_factor: f32) -> (f32, f
 }
 
 fn render_pixel_grid_widget(
-    model: &Entity<AppModel>,
+    model: &Entity<WindowShell>,
     scope: &str,
     max_logical_side: f32,
     scale_factor: f32,
@@ -355,7 +355,7 @@ fn render_pixel_grid_widget(
 }
 
 pub(super) fn render_plugin_widget(
-    model: &Entity<AppModel>,
+    model: &Entity<WindowShell>,
     pid: &str,
     base_id: usize,
     widget: Widget,
@@ -531,15 +531,15 @@ pub(super) fn render_plugin_widget(
                     let seed_sub = value.clone();
                     let target_act = action_id.filter(|a| !a.is_empty()).unwrap_or(id);
                     let fk_sub = field_key.clone();
-                    let submit_cb: FormEnterCallback<AppModel> = Rc::new(move |this, w, cx| {
-                        let had_modal = this.plugins.active_modal().is_some();
+                    let submit_cb: FormEnterCallback<WindowShell> = Rc::new(move |this, w, cx| {
+                        let had_modal = this.plugins().active_modal().is_some();
                         let val = this
                             .text_inputs
                             .form_fields
                             .get(&fk_sub)
                             .map_or_else(|| seed_sub.clone(), |s| s.text().to_string());
                         this.invoke_plugin_widget_action(&pid_owned, &target_act, Some(val), w, cx);
-                        if had_modal || this.plugins.active_modal().is_none() {
+                        if had_modal || this.plugins().active_modal().is_none() {
                             this.text_inputs.active_form_key = None;
                             this.focus.focus(w);
                         }
@@ -714,7 +714,7 @@ pub(super) fn render_plugin_widget(
             let max_logical_side = if is_modal {
                 (f32::from(window.viewport_size().width) - 108.0).clamp(160.0, 260.0)
             } else {
-                (win.settings.directory_width - 64.0).clamp(140.0, 256.0)
+                (win.settings().directory_width - 64.0).clamp(140.0, 256.0)
             };
             render_pixel_grid_widget(
                 model,
