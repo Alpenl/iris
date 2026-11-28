@@ -50,7 +50,7 @@ impl TempDir {
             std::env::temp_dir().join(format!("iris-app-test-{label}-{}-{id}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("create temp test dir");
-        Self(dir)
+        Self(iris_core::library::safe_resolve_path(&dir))
     }
 }
 

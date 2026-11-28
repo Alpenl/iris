@@ -429,9 +429,9 @@ fn media_context_items(
     t: ThemeTokens,
 ) -> Vec<AnyElement> {
     let mut out: Vec<AnyElement> = Vec::new();
-    let is_fav = m.store.is_favorite(&uri);
-    let in_queue = m.queue.contains(&uri);
-    let has_prog = m.store.progress_ratio(&uri).is_some();
+    let is_fav = m.catalog.store().is_favorite(&uri);
+    let in_queue = m.catalog.queue().contains(&uri);
+    let has_prog = m.catalog.store().progress_ratio(&uri).is_some();
 
     // 1. Open / Browse
     {
@@ -496,11 +496,11 @@ fn media_context_items(
             .on_click(model_listener(model, move |this, _, _, cx| {
                 this.overlays.context_menu = None;
                 if in_queue {
-                    this.queue.remove(&u_q);
+                    this.catalog.remove_queue_uri(&u_q);
                     this.show_toast("已从播放队列移除", cx);
                 } else {
-                    this.queue
-                        .push(QueueItem::new(u_q.clone(), ttl_q.clone(), k));
+                    this.catalog
+                        .push_queue_item(QueueItem::new(u_q.clone(), ttl_q.clone(), k));
                     this.show_toast("已加入播放队列", cx);
                 }
                 this.notify_regions(
@@ -554,8 +554,13 @@ fn media_context_items(
             )
             .on_click(model_listener(model, move |this, _, _, cx| {
                 this.overlays.context_menu = None;
-                this.store.toggle_favorite(&u_fav);
-                this.rebuild_directory_rows();
+                let cur_uri = this.session().current_media_uri();
+                let cur_local = this.playback.session().current();
+                this.catalog
+                    .toggle_favorite(&u_fav, &this.plugins, cur_uri.as_ref(), cur_local);
+                if !this.catalog.is_favorite_scan_in_flight() {
+                    this.catalog_ui.favorite_scan = None;
+                }
                 this.scan_visible_favorites(cx);
                 this.notify_regions(
                     DirtyRegions {
@@ -584,7 +589,7 @@ fn media_context_items(
             )
             .on_click(model_listener(model, move |this, _, _, cx| {
                 this.overlays.context_menu = None;
-                this.store.reset_progress(&u_rst);
+                this.catalog.reset_progress(&u_rst);
                 this.notify_regions(
                     DirtyRegions {
                         root: true,

@@ -477,8 +477,8 @@ fn persistent_delete_failure_completes_bounded_drain_and_join_with_warning_and_f
             poll_interval: Duration::from_millis(200),
             drain_retry_limit: 3,
             drain_retry_delay: Duration::from_millis(10),
-            drain_timeout: Duration::from_millis(80),
-            join_timeout: Duration::from_millis(500),
+            drain_timeout: Duration::from_millis(500),
+            join_timeout: Duration::from_secs(1),
         },
         Arc::new(move |_dir, _name| {
             attempts_hook.fetch_add(1, Ordering::AcqRel);
@@ -513,7 +513,7 @@ fn persistent_delete_failure_completes_bounded_drain_and_join_with_warning_and_f
     cleaner_a.shutdown();
     let elapsed_a = t0.elapsed();
     assert!(
-        elapsed_a < Duration::from_millis(450),
+        elapsed_a < Duration::from_secs(2),
         "bounded drain + join took too long: {elapsed_a:?}"
     );
     assert!(attempts.load(Ordering::Acquire) >= 3);

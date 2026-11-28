@@ -8,7 +8,7 @@ use gpui::{
 };
 use iris_core::bookmarks::PinnedBookmark;
 use iris_core::keymap;
-use iris_core::preset::{PresetCaptureScope, SidebarMode};
+use iris_core::preset::PresetCaptureScope;
 
 use super::AppModel;
 use super::actions::{ClearAbLoop, CycleAbLoop};
@@ -154,7 +154,7 @@ impl AppModel {
                 title: "切换侧栏视图（目录 / 数据源 / 队列 / 插件）".into(),
                 subtitle: Some(format!(
                     "当前侧栏视图：{}",
-                    super::strings::presets::sidebar_mode_label(self.catalog.sidebar_mode)
+                    super::strings::presets::sidebar_mode_label(self.catalog.sidebar_mode())
                 )),
                 badge: "工作区".into(),
                 shortcut: None,
@@ -285,7 +285,7 @@ impl AppModel {
             });
         }
 
-        for bm in &self.locations.bookmarks {
+        for bm in self.catalog.bookmarks() {
             entries.push(PaletteEntry {
                 title: format!("书签：打开 {}", bm.name),
                 subtitle: Some(bm.uri.to_uri_string()),
@@ -381,12 +381,7 @@ impl AppModel {
                 "screenshot" => self.take_screenshot(&TakeScreenshot, window, cx),
                 "info" => self.toggle_info(&ToggleInfo, window, cx),
                 "toggle_sidebar_mode" => {
-                    let next = match self.catalog.sidebar_mode {
-                        SidebarMode::Files => SidebarMode::Sources,
-                        SidebarMode::Sources => SidebarMode::Queue,
-                        SidebarMode::Queue => SidebarMode::Plugins,
-                        SidebarMode::Plugins => SidebarMode::Files,
-                    };
+                    let next = self.catalog.cycle_sidebar_mode();
                     self.set_sidebar_mode(next, cx);
                 }
                 "toggle_directory" => self.toggle_directory(&ToggleDirectory, window, cx),

@@ -79,13 +79,18 @@ impl AppModel {
         self.overlays.close_all();
         self.text_inputs.active_form_key = None;
         self.focus.focus(window);
-        let (theme_plugin_ids, out) = self.plugins.reset_theme_plugins_and_modals(
-            self.playback.session_mut(),
-            &mut self.store,
-            &mut self.settings,
-            &mut self.catalog.active_source,
-            Instant::now(),
-        );
+        let plugins = &mut self.plugins;
+        let session = self.playback.session_mut();
+        let settings = &mut self.settings;
+        let (theme_plugin_ids, out) = self.catalog.with_plugin_parts(|store, active_source| {
+            plugins.reset_theme_plugins_and_modals(
+                session,
+                store,
+                settings,
+                active_source,
+                Instant::now(),
+            )
+        });
         for pid in &theme_plugin_ids {
             self.text_inputs.clear_plugin_sidebar_fields(pid);
         }
@@ -104,7 +109,7 @@ impl AppModel {
 
     pub(super) fn set_sidebar_mode(&mut self, mode: SidebarMode, cx: &mut Context<Self>) {
         let mut opened_sidebar = false;
-        self.catalog.sidebar_mode = mode;
+        self.catalog.set_sidebar_mode(mode);
         if !self.chrome.fullscreen {
             if !self.settings.directory_open {
                 self.settings.directory_open = true;
@@ -134,7 +139,7 @@ impl AppModel {
     fn current_preset_layout(&self, window: &Window) -> PresetLayout {
         let size = window.viewport_size();
         PresetLayout {
-            sidebar_mode: self.catalog.sidebar_mode,
+            sidebar_mode: self.catalog.sidebar_mode(),
             window_size: self.chrome.pending_window_size.or_else(|| {
                 if window.is_fullscreen() || window.is_maximized() {
                     self.chrome.last_window_size
@@ -194,7 +199,20 @@ impl AppModel {
         }
 
         if let Some(mode) = trans.sidebar_mode {
-            self.catalog.sidebar_mode = mode;
+            self.catalog.set_sidebar_mode(mode);
+        }
+        if (self.catalog.sort_by(), self.catalog.sort_order())
+            != (self.settings.sort_by, self.settings.sort_order)
+        {
+            let cur_uri = self.playback.session().current_media_uri();
+            let cur_local = self.playback.session().current();
+            self.catalog.set_sort(
+                self.settings.sort_by,
+                self.settings.sort_order,
+                &self.plugins,
+                cur_uri.as_ref(),
+                cur_local,
+            );
         }
         self.sync_view_timer(cx);
         platform::set_always_on_top(window, self.settings.always_on_top);
@@ -243,7 +261,7 @@ impl AppModel {
             scope,
             &self.settings,
             &self.preset_rt,
-            self.catalog.sidebar_mode,
+            self.catalog.sidebar_mode(),
             win_sz,
             st.speed,
             st.aspect,
@@ -268,7 +286,7 @@ impl AppModel {
             scope,
             &self.settings,
             &self.preset_rt,
-            self.catalog.sidebar_mode,
+            self.catalog.sidebar_mode(),
             win_sz,
             st.speed,
             st.aspect,
@@ -294,18 +312,17 @@ impl AppModel {
     }
 
     pub(super) fn cycle_sort(&mut self, cx: &mut Context<Self>) {
-        let (next_by, next_ord) = match (self.settings.sort_by, self.settings.sort_order) {
-            (SortBy::Name, SortOrder::Asc) => (SortBy::Name, SortOrder::Desc),
-            (SortBy::Name, SortOrder::Desc) => (SortBy::Modified, SortOrder::Desc),
-            (SortBy::Modified, SortOrder::Desc) => (SortBy::Modified, SortOrder::Asc),
-            (SortBy::Modified, SortOrder::Asc) => (SortBy::Size, SortOrder::Desc),
-            (SortBy::Size, SortOrder::Desc) => (SortBy::Size, SortOrder::Asc),
-            (SortBy::Size, SortOrder::Asc) => (SortBy::Name, SortOrder::Asc),
-        };
+        let cur_uri = self.playback.session().current_media_uri();
+        let cur_local = self.playback.session().current();
+        let (next_by, next_ord) =
+            self.catalog
+                .cycle_sort(&self.plugins, cur_uri.as_ref(), cur_local);
         self.settings.sort_by = next_by;
         self.settings.sort_order = next_ord;
         self.persist_user_settings();
-        self.rebuild_directory_rows();
+        if !self.catalog.is_favorite_scan_in_flight() {
+            self.catalog_ui.favorite_scan = None;
+        }
         self.ensure_filmstrip_thumbnails(cx);
         self.notify_regions(
             DirtyRegions {

@@ -287,7 +287,7 @@ pub(super) fn settings_appearance(
             )
             .on_click(model_listener(model, |this, _, _, cx| {
                 if this.confirm_destructive("clear-recent", cx) {
-                    this.store.clear_recent();
+                    this.catalog.clear_recent();
                     this.notify_regions(
                         DirtyRegions {
                             settings: true,
@@ -321,7 +321,7 @@ pub(super) fn settings_appearance(
             )
             .on_click(model_listener(model, |this, _, _, cx| {
                 if this.confirm_destructive("clear-progress", cx) {
-                    let n = this.store.clear_progress();
+                    let n = this.catalog.clear_progress();
                     let msg = if n > 0 {
                         format!("已清除 {n} 条播放进度")
                     } else {

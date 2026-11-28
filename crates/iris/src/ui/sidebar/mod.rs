@@ -6,8 +6,6 @@ mod files;
 mod queue;
 mod sources;
 
-pub(in crate::ui) use files::DirRow;
-
 use gpui::{
     Context, CursorStyle, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
     ParentElement, StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder, px,
@@ -16,7 +14,6 @@ use iris_core::library::{SortBy, SortOrder};
 use iris_core::preset::SidebarMode;
 use iris_core::settings::Side;
 
-use super::AppModel;
 use super::actions::OpenFile;
 use super::kit::{ButtonSize, ButtonVariant, button, icon_button, tab_strip, tab_strip_item, tip};
 use super::state::{BuiltinDialog, SettingsTab};
@@ -34,7 +31,7 @@ impl Sidebar {
         let model = self.model.clone();
         let m = model.read(cx);
         let t = ThemeTokens::of(cx);
-        let mode = m.catalog.sidebar_mode;
+        let mode = m.catalog.sidebar_mode();
         let vw = f32::from(window.viewport_size().width);
         let max_w = if floating {
             (vw - 48.).max(180.)
@@ -43,21 +40,21 @@ impl Sidebar {
         };
         let width = m.settings.directory_width.min(max_w);
         let side = m.settings.directory_side;
-        let queue_len = m.queue.len();
+        let queue_len = m.catalog.queue().len();
 
-        let sort_by_label = match m.settings.sort_by {
+        let sort_by_label = match m.catalog.sort_by() {
             SortBy::Name => "名称",
             SortBy::Modified => "修改时间",
             SortBy::Size => "文件大小",
         };
-        let sort_order_label = match m.settings.sort_order {
+        let sort_order_label = match m.catalog.sort_order() {
             SortOrder::Asc => "升序",
             SortOrder::Desc => "降序",
         };
         let sort_tip = format!("排序：按{sort_by_label} · {sort_order_label}（点击切换）");
         let confirm_clear_queue = m.is_confirming("clear-queue");
         let search_open = m.text_inputs.search_open;
-        let title = m.sidebar_header_title();
+        let title = m.catalog.sidebar_header_title();
         let hint_search = m.key_hint("toggle_search");
         let hint_refresh = m.key_hint("refresh_directory");
         let hint_open = m.key_hint("open_file");
@@ -143,7 +140,7 @@ impl Sidebar {
                                 &model,
                                 |this, _, _, cx| {
                                     if this.confirm_destructive("clear-queue", cx) {
-                                        this.queue.clear();
+                                        this.catalog.clear_queue();
                                         this.notify_regions(
                                             DirtyRegions {
                                                 sidebar: true,
@@ -163,7 +160,7 @@ impl Sidebar {
                                 .tooltip(tip("清空播放队列", None))
                                 .on_click(model_listener(&model, |this, _, _, cx| {
                                     if this.confirm_destructive("clear-queue", cx) {
-                                        this.queue.clear();
+                                        this.catalog.clear_queue();
                                         this.notify_regions(
                                             DirtyRegions {
                                                 sidebar: true,
@@ -268,7 +265,7 @@ impl Sidebar {
                         t,
                     )
                     .on_click(model_listener(&model, move |this, _, w, cx| {
-                        this.catalog.sidebar_mode = target_mode;
+                        this.catalog.set_sidebar_mode(target_mode);
                         this.sync_view_timer(cx);
                         this.reconcile_input_focus(w, cx);
                         this.notify_sidebar(cx);
@@ -298,25 +295,5 @@ impl Sidebar {
                     handle.left_0()
                 })
             })
-    }
-}
-
-impl AppModel {
-    fn sidebar_header_title(&self) -> String {
-        match self.catalog.sidebar_mode {
-            SidebarMode::Files => match &self.catalog.active_source {
-                super::state::ActiveSource::Local => self
-                    .catalog
-                    .local_dir
-                    .folder()
-                    .and_then(|f| f.file_name())
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| "本地目录".into()),
-                super::state::ActiveSource::Plugin(ps) => ps.title.clone(),
-            },
-            SidebarMode::Sources => "数据源与书签".into(),
-            SidebarMode::Queue => "独立播放队列".into(),
-            SidebarMode::Plugins => "插件工作台".into(),
-        }
     }
 }

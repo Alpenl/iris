@@ -704,7 +704,7 @@ fn plugin_playlist_resolution_and_stepping_cover_url_resolver_and_expanded_entri
 
 #[test]
 fn remote_search_query_gates_supports_search_and_trims_whitespace() {
-    use super::plugin_runtime::remote_search_query;
+    use iris_app::remote_search_query;
 
     assert_eq!(remote_search_query(false, "anime"), None);
     assert_eq!(remote_search_query(true, ""), None);

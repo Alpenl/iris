@@ -147,7 +147,7 @@ pub(super) fn render_timeline(
     let annotation_marks: Vec<AnyElement> = session
         .current_media_uri()
         .filter(|_| session.may_share_current_identity() && valid_dur)
-        .and_then(|uri| m.store.annotations(&uri))
+        .and_then(|uri| m.catalog.store().annotations(&uri))
         .into_iter()
         .flat_map(|a| a.markers.values())
         .filter(|marker| marker.position_ms as f64 / 1000. <= duration)

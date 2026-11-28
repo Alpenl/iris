@@ -4,7 +4,8 @@ use std::path::Path;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use gpui::{Context, PathPromptOptions, Pixels, Point, Window};
-use iris_core::library::{self, Kind};
+use iris_app::ActiveSource;
+use iris_core::library::Kind;
 use iris_core::player::Command;
 use iris_core::preset::SidebarMode;
 
@@ -17,7 +18,7 @@ use super::actions::{
     ZoomIn, ZoomOut,
 };
 use super::chrome::DirectoryPopup;
-use super::state::{ActiveSource, BuiltinDialog, EscapeStep};
+use super::state::{BuiltinDialog, EscapeStep};
 use super::views::DirtyRegions;
 use crate::platform;
 
@@ -61,8 +62,13 @@ impl AppModel {
             self.show_toast("此链接仅用于本次播放，无法收藏", cx);
             return;
         }
-        let added = self.store.toggle_favorite(&uri);
-        self.rebuild_directory_rows();
+        let cur_local = self.playback.session().current();
+        let added = self
+            .catalog
+            .toggle_favorite(&uri, &self.plugins, Some(&uri), cur_local);
+        if !self.catalog.is_favorite_scan_in_flight() {
+            self.catalog_ui.favorite_scan = None;
+        }
         self.scan_visible_favorites(cx);
         self.notify_regions(
             DirtyRegions {
@@ -284,7 +290,7 @@ impl AppModel {
             self.settings.directory_open = true;
             self.persist_user_settings();
         }
-        self.catalog.sidebar_mode = SidebarMode::Files;
+        self.catalog.set_sidebar_mode(SidebarMode::Files);
         self.sync_view_timer(cx);
         self.text_inputs.search_open = !self.text_inputs.search_open;
         if self.text_inputs.search_open {
@@ -315,45 +321,40 @@ impl AppModel {
         if self.has_active_modal() {
             return;
         }
-        if let ActiveSource::Plugin(ps) = &self.catalog.active_source {
-            let (pid, sid, fid, supports_search) = (
-                ps.plugin_id.clone(),
-                ps.source_id.clone(),
-                ps.folder_id.clone(),
-                ps.supports_search,
-            );
-            let q = super::plugin_runtime::remote_search_query(
-                supports_search && self.text_inputs.search_open,
-                self.text_inputs.search_input.text(),
-            );
-            self.browse_plugin_source(&pid, &sid, fid, None, q, cx);
+        if let ActiveSource::Plugin(ps) = self.catalog.active_source() {
+            let (pid, sid) = (ps.plugin_id.clone(), ps.source_id.clone());
+            self.refresh_plugin_source(&pid, &sid, cx);
             return;
         }
         if self.playback.pending_path().is_some() {
             return;
         }
-        let Some(folder) = self.catalog.local_dir.folder().map(Path::to_path_buf) else {
+        let Some(ticket) = self.catalog.begin_local_directory_refresh() else {
             return;
         };
-        let generation = self.playback.load_generation();
-        let f_scan = folder.clone();
+        let load_generation = self.playback.load_generation();
+        let ticket_scan = ticket.clone();
         let task = cx
             .background_executor()
-            .spawn(async move { library::scan_local_or_share(&f_scan) });
-        self.catalog.directory_refresh = Some(cx.spawn(async move |this, cx| {
+            .spawn(async move { ticket_scan.run_scan() });
+        self.catalog_ui.directory_refresh = Some(cx.spawn(async move |this, cx| {
             let scan = task.await;
             let _ = this.update(cx, |this, cx| {
-                if this.playback.load_generation() != generation
-                    || this.playback.pending_path().is_some()
-                    || !this.catalog.active_source.is_local()
-                    || this.catalog.local_dir.folder() != Some(folder.as_path())
-                {
+                let media_pending = this.playback.load_generation() != load_generation
+                    || this.playback.pending_path().is_some();
+                let cur_uri = this.session().current_media_uri();
+                let cur_local = this.playback.session().current();
+                if !this.catalog.finish_local_directory_refresh(
+                    &ticket,
+                    scan,
+                    media_pending,
+                    &this.plugins,
+                    cur_uri.as_ref(),
+                    cur_local,
+                ) {
                     return;
                 }
-                this.catalog.local_dir.folder = Some(folder);
-                this.catalog.local_dir.entries = scan.entries;
-                this.catalog.local_dir.subfolders = scan.subfolders;
-                this.rebuild_directory_rows();
+                this.catalog_ui.directory_refresh = None;
                 this.scroll_directory_to_current();
                 this.ensure_filmstrip_thumbnails(cx);
                 this.notify_regions(

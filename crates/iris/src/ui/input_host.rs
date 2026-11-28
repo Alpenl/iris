@@ -25,7 +25,7 @@ impl AppModel {
                 })
         } else if key.starts_with("sb:") {
             self.sidebar_is_visible()
-                && self.catalog.sidebar_mode == SidebarMode::Plugins
+                && self.catalog.sidebar_mode() == SidebarMode::Plugins
                 && !modal_visible
                 && !self.overlays.has_menu_or_modal()
         } else {
@@ -50,7 +50,7 @@ impl AppModel {
         }
         let modal_visible = self.has_host_consent() || self.plugins.active_modal().is_some();
         let files_visible = self.sidebar_is_visible()
-            && self.catalog.sidebar_mode == SidebarMode::Files
+            && self.catalog.sidebar_mode() == SidebarMode::Files
             && !modal_visible
             && !self.overlays.has_menu_or_modal();
         let form_visible = self

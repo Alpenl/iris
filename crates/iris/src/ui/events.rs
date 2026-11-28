@@ -7,17 +7,16 @@ use std::time::{Duration, Instant};
 
 use gpui::Context;
 use iris_app::{
-    EofOutcome, NowPlayingSnapshot, SubtitleFlushOutcome, should_record_progress, split_open_paths,
+    EofOutcome, NowPlayingSnapshot, OpenMediaBatchAction, SAVE_EVERY, StoreFlushIntent,
+    SubtitleFlushOutcome, plan_open_paths,
 };
-use iris_core::library::{Kind, ScanResult};
+use iris_core::library::Kind;
 use iris_core::player::{self, SessionUpdate};
 
 use super::AppModel;
-use super::state::ActiveSource;
 use super::views::{DirtyRegions, dirty_regions_for_playback};
 use crate::platform;
 
-const SAVE_EVERY: Duration = Duration::from_secs(5);
 const MIN_BAR_TICK_INTERVAL: Duration = Duration::from_millis(250);
 
 impl AppModel {
@@ -65,7 +64,7 @@ impl AppModel {
         }
 
         self.sleep_preventer.set_active(report.sleep_prevent_active);
-        if self.last_save.elapsed() >= SAVE_EVERY {
+        if self.catalog.last_save().elapsed() >= SAVE_EVERY {
             self.save_progress_periodic(cx);
         }
 
@@ -180,46 +179,39 @@ impl AppModel {
         }
     }
 
-    pub(super) fn record_progress_memory(&mut self) {
-        if !should_record_progress(
+    pub(super) fn save_progress_sync(&mut self) {
+        self.catalog_ui.store_flush = None;
+        let progress = iris_app::PluginPlayer::progress(self.playback.session());
+        self.catalog.save_progress_sync(
+            progress,
             self.settings.resume_playback,
             self.plugins.scoped_released(),
-        ) {
-            return;
-        }
-        if let Some((path, pos, dur, eof)) = self.session().progress() {
-            let path = path.to_path_buf();
-            self.store.remember_path(&path, pos, dur, eof);
-        } else if let Some((uri_str, pos, dur, eof)) = self.session().uri_progress() {
-            let uri = iris_core::media_uri::MediaUri::parse(uri_str);
-            self.store.remember(&uri, pos, dur, eof);
-        }
-    }
-
-    pub(super) fn save_progress_sync(&mut self) {
-        self.record_progress_memory();
-        if self.store.is_dirty() {
-            self.store.save();
-        }
-        self.last_save = Instant::now();
+            Instant::now(),
+        );
     }
 
     fn save_progress_periodic(&mut self, cx: &mut Context<Self>) {
-        self.record_progress_memory();
-        self.last_save = Instant::now();
-        if !self.store.is_dirty() || self.store_flush.is_some() {
-            return;
+        let progress = iris_app::PluginPlayer::progress(self.playback.session());
+        if let Some(intent) = self.catalog.maybe_periodic_flush(
+            progress,
+            self.settings.resume_playback,
+            self.plugins.scoped_released(),
+            Instant::now(),
+        ) {
+            self.spawn_store_flush(intent, cx);
         }
-        let Some(flush) = self.store.prepare_progress_flush() else {
-            self.store.save();
-            return;
-        };
-        let work = cx.background_executor().spawn(async move { flush.run() });
-        self.store_flush = Some(cx.spawn(async move |this, cx| {
-            let applied = work.await;
-            let _ = this.update(cx, |this, _| {
-                this.store_flush = None;
-                this.store.finish_progress_flush(applied);
+    }
+
+    fn spawn_store_flush(&mut self, intent: StoreFlushIntent, cx: &mut Context<Self>) {
+        let work = cx.background_executor().spawn(async move { intent.run() });
+        self.catalog_ui.store_flush = Some(cx.spawn(async move |this, cx| {
+            let receipt = work.await;
+            let _ = this.update(cx, |this, cx| {
+                if let Some(next_intent) = this.catalog.complete_store_flush(receipt) {
+                    this.spawn_store_flush(next_intent, cx);
+                } else if !this.catalog.is_store_flush_in_flight() {
+                    this.catalog_ui.store_flush = None;
+                }
             });
         }));
     }
@@ -227,28 +219,11 @@ impl AppModel {
     pub(super) fn finish_media_open(&mut self, cx: &mut Context<Self>) {
         self.plugins.sync_media_open_state(self.playback.session());
         self.refresh_annotations(cx);
-        if let Some(uri) = self.session().current_media_uri() {
-            if self.session().may_share_current_identity() {
-                let title = match &uri {
-                    iris_core::media_uri::MediaUri::Local(_) => None,
-                    iris_core::media_uri::MediaUri::Plugin { .. }
-                    | iris_core::media_uri::MediaUri::HttpUrl(_) => self
-                        .session()
-                        .current_title()
-                        .map(str::trim)
-                        .filter(|t| {
-                            !t.is_empty()
-                                && *t != super::strings::chrome::DEFAULT_PLUGIN_MEDIA_TITLE
-                        })
-                        .map(str::to_owned),
-                };
-                self.store.push_recent_with_title(&uri, title.as_deref());
-            }
-        } else if let Some(dir) = self.catalog.local_dir.folder().map(Path::to_path_buf)
-            && self.catalog.active_source.is_local()
-        {
-            self.store.push_recent_path(&dir);
-        }
+        let cur_uri = self.session().current_media_uri();
+        let may_share = self.session().may_share_current_identity();
+        let cur_title = self.session().current_title().map(str::to_owned);
+        self.catalog
+            .record_media_opened(cur_uri, may_share, cur_title.as_deref());
         self.playback
             .on_media_open_succeeded(self.settings.photo_default);
         {
@@ -276,28 +251,24 @@ impl AppModel {
     }
 
     pub(crate) fn open_paths(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
-        let (packages, paths): (Vec<_>, Vec<_>) = paths.into_iter().partition(|p| {
-            p.extension()
-                .is_some_and(|e| e.eq_ignore_ascii_case("irisplugin"))
-        });
-        for package in packages.into_iter().take(1) {
+        let plan = plan_open_paths(paths);
+        if let Some(package) = plan.package_to_review {
             self.review_plugin_path(package, cx);
         }
-        let (paths, subtitles) = split_open_paths(paths);
-        match paths.as_slice() {
-            [] => {}
-            [path] => self.open_path(path, cx),
-            _ => self.open_multi_queue(paths, cx),
+        match plan.media_action {
+            OpenMediaBatchAction::None => {}
+            OpenMediaBatchAction::SinglePath(path) => self.open_path(&path, cx),
+            OpenMediaBatchAction::MultiQueue(paths) => self.open_multi_queue(paths, cx),
         }
         let pending = self.media_load_pending();
-        if self.playback.enqueue_subtitles(subtitles, pending) {
+        if self.playback.enqueue_subtitles(plan.subtitles, pending) {
             self.flush_pending_subtitles(cx);
         }
     }
 
     pub(super) fn media_load_pending(&self) -> bool {
         self.playback.pending_path().is_some()
-            || self.catalog.remote_load.is_some()
+            || self.catalog.has_remote_load()
             || self.plugins.has_pending_resolve()
     }
 
@@ -356,23 +327,8 @@ impl AppModel {
             return;
         }
         self.overlays.close_menus();
-        self.catalog.active_source = ActiveSource::Local;
         self.plugins.clear_active_stream_meta();
-        let cached = {
-            let local_dir = &self.catalog.local_dir;
-            local_dir
-                .folder()
-                .filter(|folder| path.parent() == Some(*folder))
-                .map(|folder| {
-                    (
-                        folder.to_path_buf(),
-                        ScanResult {
-                            entries: local_dir.entries().to_vec(),
-                            subfolders: local_dir.subfolders().to_vec(),
-                        },
-                    )
-                })
-        };
+        let cached = self.catalog.cached_parent_scan(path);
         let generation = self.playback.begin_local_load(Some(path.to_path_buf()));
         let target_path = path.to_path_buf();
         let task = cx
@@ -388,13 +344,11 @@ impl AppModel {
                     return;
                 }
                 let result = prepared.and_then(|prepared| {
-                    let resume = if this.settings.resume_playback {
-                        prepared.target().map_or(0., |p| this.store.resume_path(p))
-                    } else {
-                        0.
-                    };
+                    let resume = this
+                        .catalog
+                        .resume_for_local(this.settings.resume_playback, prepared.target());
                     let dir = this.session_mut().open(prepared, resume)?;
-                    this.catalog.local_dir = dir;
+                    this.catalog.install_local_directory(dir);
                     Ok(())
                 });
                 match result {
@@ -429,7 +383,6 @@ impl AppModel {
             return;
         }
         self.overlays.close_menus();
-        self.catalog.active_source = ActiveSource::Local;
         self.plugins.clear_active_stream_meta();
         let generation = self.playback.begin_local_load(paths.first().cloned());
         let task = cx
@@ -454,15 +407,13 @@ impl AppModel {
                     return;
                 };
                 let count = prepared.entries().len();
-                this.queue.replace_from_entries(prepared.entries());
-                let resume = if this.settings.resume_playback {
-                    prepared.target().map_or(0., |p| this.store.resume_path(p))
-                } else {
-                    0.
-                };
+                this.catalog.replace_queue_from_entries(prepared.entries());
+                let resume = this
+                    .catalog
+                    .resume_for_local(this.settings.resume_playback, prepared.target());
                 match this.session_mut().open_prepared_queue(prepared, resume) {
                     Ok(dir) => {
-                        this.catalog.local_dir = dir;
+                        this.catalog.install_local_directory(dir);
                         this.finish_media_open(cx);
                         this.show_toast(format!("已加入播放队列 · {count} 个文件"), cx);
                     }
@@ -484,32 +435,19 @@ impl AppModel {
     }
 
     pub(super) fn ensure_filmstrip_thumbnails(&mut self, cx: &mut Context<Self>) {
-        if self.session().kind() != Some(Kind::Photo) || !self.settings.photo_filmstrip {
-            self.catalog.thumbs.enqueue_window(Vec::new());
-            return;
+        let is_photo = self.session().kind() == Some(Kind::Photo);
+        let prioritized = self
+            .catalog
+            .prioritized_filmstrip_window(is_photo, self.settings.photo_filmstrip);
+        let has_work = !prioritized.is_empty();
+        self.catalog_ui.thumbs.enqueue_window(prioritized);
+        if has_work {
+            self.pump_thumbnail_queue(cx);
         }
-        let photos = &self.catalog.photo_paths;
-        if photos.len() < 2 {
-            self.catalog.thumbs.enqueue_window(Vec::new());
-            return;
-        }
-        let cur_ix = self.catalog.filmstrip_index;
-        let mut prioritized = Vec::with_capacity(13);
-        prioritized.push(photos[cur_ix].clone());
-        for d in 1..=6usize {
-            if let Some(p) = photos.get(cur_ix + d) {
-                prioritized.push(p.clone());
-            }
-            if cur_ix >= d {
-                prioritized.push(photos[cur_ix - d].clone());
-            }
-        }
-        self.catalog.thumbs.enqueue_window(prioritized);
-        self.pump_thumbnail_queue(cx);
     }
 
     fn pump_thumbnail_queue(&mut self, cx: &mut Context<Self>) {
-        for (batch_gen, path) in self.catalog.thumbs.pop_next_batch() {
+        for (batch_gen, path) in self.catalog_ui.thumbs.pop_next_batch() {
             let p_decode = path.clone();
             let task = cx
                 .background_executor()
@@ -517,7 +455,7 @@ impl AppModel {
             cx.spawn(async move |this, cx| {
                 let decoded = task.await;
                 let _ = this.update(cx, |this, cx| {
-                    let changed = this.catalog.thumbs.finish(batch_gen, path, decoded);
+                    let changed = this.catalog_ui.thumbs.finish(batch_gen, path, decoded);
                     this.pump_thumbnail_queue(cx);
                     if changed && this.chrome_shown() && this.settings.photo_filmstrip {
                         this.notify_viewport(cx);

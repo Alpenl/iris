@@ -25,8 +25,8 @@ impl AppModel {
     fn native_annotation(&mut self, edit: Option<StoreAnnotationEdit>, cx: &mut Context<Self>) {
         let saving = edit.is_some();
         let started =
-            self.plugins
-                .begin_host_annotation(self.playback.session(), &self.store, edit);
+            self.catalog
+                .begin_host_annotation(&mut self.plugins, self.playback.session(), edit);
         let (target, uri, edit, cancel, host_job) = match started {
             Ok(Some(args)) => args,
             Ok(None) => return,
@@ -45,8 +45,8 @@ impl AppModel {
             let (result, _lease) = job.await;
             let _ = this.update(cx, |this, cx| {
                 let (refresh, outcome) =
-                    this.plugins
-                        .finish_host_annotation(&mut this.store, saving, result);
+                    this.catalog
+                        .finish_host_annotation(&mut this.plugins, saving, result);
                 let regions = this.apply_plugin_outcome(outcome, None, cx);
                 if refresh {
                     this.refresh_annotations(cx);
@@ -68,7 +68,7 @@ pub(in crate::ui) fn render_personal_annotations(
     let m = model.read(cx);
     let uri = m.annotation_uri()?;
     let empty = iris_core::store::Annotations::default();
-    let value = m.store.annotations(&uri).unwrap_or(&empty);
+    let value = m.catalog.store().annotations(&uri).unwrap_or(&empty);
     let current_rating = value.rating;
     let current_color = value.color;
     let marker_count = value.markers.len();

@@ -1,6 +1,6 @@
 use std::time::Instant;
 
-use super::super::{AppModel, state::ActiveSource, views::model_listener};
+use super::super::{AppModel, views::model_listener};
 use crate::theme::ThemeTokens;
 use crate::ui::kit::form::chip_button;
 use gpui::{
@@ -8,9 +8,6 @@ use gpui::{
     StatefulInteractiveElement, Styled, div, px,
 };
 use iris_app::OpenUrlOutcome;
-use iris_core::media_uri::MediaUri;
-
-pub(in crate::ui) use iris_app::remote_search_query;
 
 pub(in crate::ui) fn render_source_filters(model: &Entity<AppModel>, cx: &App) -> impl IntoElement {
     let m = model.read(cx);
@@ -51,22 +48,25 @@ pub(in crate::ui) fn render_source_filters(model: &Entity<AppModel>, cx: &App) -
                         .on_click(model_listener(
                             model,
                             move |this, _, _, cx| {
-                                let ActiveSource::Plugin(view) = &this.catalog.active_source else {
-                                    return;
+                                let query = if this.text_inputs.search_open {
+                                    this.text_inputs.search_input.text().to_owned()
+                                } else {
+                                    String::new()
                                 };
-                                let (pid, sid, folder, supports_search) = (
-                                    view.plugin_id.clone(),
-                                    view.source_id.clone(),
-                                    view.folder_id.clone(),
-                                    view.supports_search,
-                                );
-                                this.plugins
-                                    .set_source_filter_value(&filter_id, val.clone());
-                                let query = remote_search_query(
-                                    supports_search && this.text_inputs.search_open,
-                                    this.text_inputs.search_input.text(),
-                                );
-                                this.browse_plugin_source(&pid, &sid, folder, None, query, cx);
+                                let cur = this.session().current_media_uri();
+                                this.catalog.set_search_query(query, cur.as_ref());
+                                if let Some((_, out)) = this.catalog.select_plugin_source_filter(
+                                    &mut this.plugins,
+                                    &filter_id,
+                                    val.clone(),
+                                    this.text_inputs.search_open,
+                                    Instant::now(),
+                                ) {
+                                    let regions = this.apply_plugin_outcome(out, None, cx);
+                                    if regions.any() {
+                                        this.notify_regions(regions, cx);
+                                    }
+                                }
                             },
                         ))
                     }),
@@ -121,33 +121,6 @@ pub(in crate::ui) fn render_url_resolver_choice(
 }
 
 impl AppModel {
-    pub(in crate::ui) fn can_step_plugin_playlist(
-        &self,
-        current: Option<&MediaUri>,
-        delta: isize,
-    ) -> bool {
-        self.plugins.can_step_playlist(current, delta)
-    }
-
-    pub(in crate::ui) fn step_plugin_playlist(
-        &mut self,
-        current: Option<&MediaUri>,
-        delta: isize,
-        wrap: bool,
-        cx: &mut Context<Self>,
-    ) -> bool {
-        let Some(out) = self.with_plugin_ctx(|ctrl, ctx| {
-            ctrl.step_playlist(ctx, current, delta, wrap, Instant::now())
-        }) else {
-            return false;
-        };
-        let regions = self.apply_plugin_outcome(out, None, cx);
-        if regions.any() {
-            self.notify_regions(regions, cx);
-        }
-        true
-    }
-
     pub(in crate::ui) fn open_user_url(
         &mut self,
         url: &str,
