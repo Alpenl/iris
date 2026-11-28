@@ -1,5 +1,5 @@
 use super::super::{
-    AppModel,
+    WindowShell,
     plugin_ui::overlay::{render_overlay_nodes, resolve_overlay_color},
 };
 use crate::theme::ThemeTokens;
@@ -36,17 +36,14 @@ impl GlyphCache {
     }
 }
 
-impl AppModel {
+impl WindowShell {
     pub(in crate::ui) fn sync_overlay_clock(&mut self) {
-        let _ = self
-            .plugins
-            .sync_overlay_clock(self.playback.session(), Instant::now());
+        let _ = self.app.sync_overlay_clock(Instant::now());
         self.plugin_ui.overlay_wake = None;
     }
 
     pub(in crate::ui) fn reconcile_enhancements(&mut self, cx: &mut Context<Self>) {
-        let out =
-            self.with_plugin_ctx(|ctrl, ctx| ctrl.reconcile_enhancements(ctx, Instant::now()));
+        let out = self.app.reconcile_plugin_enhancements(Instant::now());
         let regions = self.apply_plugin_outcome(out, None, cx);
         if regions.any() {
             self.notify_regions(regions, cx);
@@ -54,7 +51,7 @@ impl AppModel {
     }
 
     pub(in crate::ui) fn update_overlay_window(&mut self, cx: &mut Context<Self>) {
-        let out = self.with_plugin_ctx(|ctrl, ctx| ctrl.update_overlay_window(ctx, Instant::now()));
+        let out = self.app.update_overlay_window(Instant::now());
         let regions = self.apply_plugin_outcome(out, None, cx);
         if regions.any() {
             self.notify_regions(regions, cx);
@@ -64,8 +61,7 @@ impl AppModel {
     /// Advances timed overlay cues outside `render()`, scheduling wake timers and notifying
     /// `ViewportView` only when the active cue frame changes.
     pub(in crate::ui) fn step_timed_overlay_frame(&mut self, cx: &mut Context<Self>) {
-        let out =
-            self.with_plugin_ctx(|ctrl, ctx| ctrl.step_timed_overlay_frame(ctx, Instant::now()));
+        let out = self.app.step_timed_overlay_frame(Instant::now());
         let regions = self.apply_plugin_outcome(out, None, cx);
         if regions.any() {
             self.notify_regions(regions, cx);
@@ -74,12 +70,12 @@ impl AppModel {
 }
 
 pub(in crate::ui) fn render_timed_overlay(
-    model: &Entity<AppModel>,
+    model: &Entity<WindowShell>,
     window: &Window,
     cx: &App,
 ) -> Option<AnyElement> {
     let m = model.read(cx);
-    let frame = m.plugins.overlay_frame()?.clone();
+    let frame = m.plugins().overlay_frame()?.clone();
     if frame.cues.is_empty() {
         return None;
     }

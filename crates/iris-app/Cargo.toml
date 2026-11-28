@@ -9,6 +9,9 @@ license.workspace = true
 [lints]
 workspace = true
 
+[features]
+devtools = ["iris-core/devtools"]
+
 [dependencies]
 anyhow.workspace = true
 futures.workspace = true

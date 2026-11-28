@@ -1,4 +1,4 @@
-use super::super::{AppModel, views::model_listener};
+use super::super::{WindowShell, views::model_listener};
 use crate::theme::ThemeTokens;
 use gpui::{
     AnyElement, App, Entity, InteractiveElement, IntoElement, MouseButton,
@@ -8,7 +8,7 @@ use iris_app::can_seek_skip_range;
 use iris_core::player::Command;
 
 pub(in crate::ui) fn plugin_timeline_ranges(
-    model: &Entity<AppModel>,
+    model: &Entity<WindowShell>,
     duration: f64,
     t: ThemeTokens,
     cx: &App,
@@ -17,7 +17,7 @@ pub(in crate::ui) fn plugin_timeline_ranges(
         return Vec::new();
     }
     let m = model.read(cx);
-    let Some((heat, skip)) = m.plugins.timeline_ranges() else {
+    let Some((heat, skip)) = m.plugins().timeline_ranges() else {
         return Vec::new();
     };
     let ratio = |ms: u64| ((ms as f64 / 1000.) / duration).clamp(0., 1.) as f32;
@@ -40,7 +40,7 @@ pub(in crate::ui) fn plugin_timeline_ranges(
                 .into_any_element(),
         );
     }
-    let generation = m.plugins.generation();
+    let generation = m.plugins().generation();
     for (index, range) in skip.iter().enumerate() {
         let (start, end) = (ratio(range.start_ms.0), ratio(range.end_ms.0));
         if end <= start {
@@ -64,8 +64,8 @@ pub(in crate::ui) fn plugin_timeline_ranges(
                         cx.stop_propagation();
                         if can_seek_skip_range(
                             generation,
-                            this.plugins.generation(),
-                            this.plugins.timeline_ranges().is_some(),
+                            this.plugins().generation(),
+                            this.plugins().timeline_ranges().is_some(),
                         ) {
                             this.command(Command::SeekAbsolute(target), cx);
                         }

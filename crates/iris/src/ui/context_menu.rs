@@ -9,7 +9,7 @@ use iris_core::catalog::QueueItem;
 use iris_core::library::Kind;
 use iris_core::media_uri::MediaUri;
 
-use super::AppModel;
+use super::WindowShell;
 use super::actions::{ClearAbLoop, CycleAbLoop};
 use super::actions::{
     CycleAspect, OpenFile, OpenSettings, RotateCw, TakeScreenshot, ToggleAlwaysOnTop, ToggleInfo,
@@ -40,7 +40,7 @@ pub(super) struct ContextMenu {
 }
 
 pub(super) fn render_context_menu(
-    model: &Entity<AppModel>,
+    model: &Entity<WindowShell>,
     menu: &ContextMenu,
     window: &Window,
     cx: &App,
@@ -70,7 +70,7 @@ pub(super) fn render_context_menu(
     // Only the current viewport is a supported plugin context. Browsed
     // files are never passed to a command as an implicit selection grant.
     if matches!(menu.target, ContextTarget::Viewport) {
-        let commands = m.plugins.commands();
+        let commands = m.plugins().commands();
         let mut contributions = commands
             .into_iter()
             .filter(|(_, _, c)| c.context_menu)
@@ -151,8 +151,8 @@ pub(super) fn render_context_menu(
 }
 
 fn viewport_context_items(
-    model: &Entity<AppModel>,
-    m: &AppModel,
+    model: &Entity<WindowShell>,
+    m: &WindowShell,
     t: ThemeTokens,
 ) -> Vec<AnyElement> {
     let session = m.session();
@@ -160,7 +160,7 @@ fn viewport_context_items(
     let st = session.state();
     let cur_uri = session.current_media_uri();
     let cur_local = session.current().map(std::path::Path::to_path_buf);
-    let pinned = m.settings.always_on_top;
+    let pinned = m.settings().always_on_top;
 
     let mut out: Vec<AnyElement> = Vec::new();
     if matches!(kind, Some(Kind::Video | Kind::Audio)) {
@@ -420,8 +420,8 @@ fn viewport_context_items(
 }
 
 fn media_context_items(
-    model: &Entity<AppModel>,
-    m: &AppModel,
+    model: &Entity<WindowShell>,
+    m: &WindowShell,
     uri: MediaUri,
     title: String,
     kind: Option<Kind>,
@@ -429,9 +429,9 @@ fn media_context_items(
     t: ThemeTokens,
 ) -> Vec<AnyElement> {
     let mut out: Vec<AnyElement> = Vec::new();
-    let is_fav = m.catalog.store().is_favorite(&uri);
-    let in_queue = m.catalog.queue().contains(&uri);
-    let has_prog = m.catalog.store().progress_ratio(&uri).is_some();
+    let is_fav = m.catalog().store().is_favorite(&uri);
+    let in_queue = m.catalog().queue().contains(&uri);
+    let has_prog = m.catalog().store().progress_ratio(&uri).is_some();
 
     // 1. Open / Browse
     {
@@ -496,10 +496,10 @@ fn media_context_items(
             .on_click(model_listener(model, move |this, _, _, cx| {
                 this.overlays.context_menu = None;
                 if in_queue {
-                    this.catalog.remove_queue_uri(&u_q);
+                    this.app.remove_queue_uri(&u_q);
                     this.show_toast("已从播放队列移除", cx);
                 } else {
-                    this.catalog
+                    this.app
                         .push_queue_item(QueueItem::new(u_q.clone(), ttl_q.clone(), k));
                     this.show_toast("已加入播放队列", cx);
                 }
@@ -554,11 +554,8 @@ fn media_context_items(
             )
             .on_click(model_listener(model, move |this, _, _, cx| {
                 this.overlays.context_menu = None;
-                let cur_uri = this.session().current_media_uri();
-                let cur_local = this.playback.session().current();
-                this.catalog
-                    .toggle_favorite(&u_fav, &this.plugins, cur_uri.as_ref(), cur_local);
-                if !this.catalog.is_favorite_scan_in_flight() {
+                this.app.toggle_favorite(&u_fav);
+                if !this.catalog().is_favorite_scan_in_flight() {
                     this.catalog_ui.favorite_scan = None;
                 }
                 this.scan_visible_favorites(cx);
@@ -589,7 +586,7 @@ fn media_context_items(
             )
             .on_click(model_listener(model, move |this, _, _, cx| {
                 this.overlays.context_menu = None;
-                this.catalog.reset_progress(&u_rst);
+                this.app.reset_progress(&u_rst);
                 this.notify_regions(
                     DirtyRegions {
                         root: true,

@@ -44,19 +44,19 @@ impl Sidebar {
         let model = self.model.clone();
         let m = model.read(cx);
         let t = ThemeTokens::of(cx);
-        let filter = m.catalog.filter();
-        let row_count = m.catalog.rows().len();
-        let counts = m.catalog.counts();
+        let filter = m.catalog().filter();
+        let row_count = m.catalog().rows().len();
+        let counts = m.catalog().counts();
         let all_count = counts.total_media();
         let video_count = counts.video;
         let photo_count = counts.photo;
         let favorite_count = counts.favorite;
-        let favorite_items_empty = m.catalog.favorite_items().is_empty();
+        let favorite_items_empty = m.catalog().favorite_items().is_empty();
         let dir_scroll = m.catalog_ui.dir_scroll.clone();
         let search_open = m.text_inputs.search_open;
-        let has_source_filters = !m.plugins.source_filters().is_empty();
+        let has_source_filters = !m.plugins().source_filters().is_empty();
 
-        let source_banner = match m.catalog.active_source() {
+        let source_banner = match m.catalog().active_source() {
             ActiveSource::Local => None,
             ActiveSource::Plugin(ps) => {
                 let pid = ps.plugin_id.clone();
@@ -204,7 +204,7 @@ impl Sidebar {
 
                 let elements: Vec<AnyElement> = range
                     .map(|ix| -> AnyElement {
-                        let Some(row) = m.catalog.rows().get(ix).cloned() else {
+                        let Some(row) = m.catalog().rows().get(ix).cloned() else {
                             return div().into_any_element();
                         };
                         match row {
@@ -285,8 +285,8 @@ impl Sidebar {
                                 }
                                 let kind = item.media_kind().unwrap_or(Kind::Video);
                                 let is_cur = cur_uri.as_ref() == Some(&item.uri);
-                                let is_fav = m.catalog.store().is_favorite(&item.uri);
-                                let prog = m.catalog.store().progress_ratio(&item.uri);
+                                let is_fav = m.catalog().store().is_favorite(&item.uri);
+                                let prog = m.catalog().store().progress_ratio(&item.uri);
                                 let uri_star = item.uri.clone();
                                 let star_btn = row_action_icon(
                                     ("dir-fav", ix),
@@ -296,15 +296,8 @@ impl Sidebar {
                                     t,
                                 )
                                 .on_click(model_listener(&model, move |this, _, _, cx| {
-                                    let cur_uri = this.session().current_media_uri();
-                                    let cur_local = this.playback.session().current();
-                                    this.catalog.toggle_favorite(
-                                        &uri_star,
-                                        &this.plugins,
-                                        cur_uri.as_ref(),
-                                        cur_local,
-                                    );
-                                    if !this.catalog.is_favorite_scan_in_flight() {
+                                    this.app.toggle_favorite(&uri_star);
+                                    if !this.catalog().is_favorite_scan_in_flight() {
                                         this.catalog_ui.favorite_scan = None;
                                     }
                                     this.scan_visible_favorites(cx);
@@ -390,8 +383,7 @@ impl Sidebar {
                     let active = f == filter;
                     tab_strip_item(("dir-ftab", i), format!("{lbl} {cnt}"), None, active, t)
                         .on_click(model_listener(&model, move |this, _, _, cx| {
-                            let cur_uri = this.session().current_media_uri();
-                            this.catalog.set_filter(f, cur_uri.as_ref());
+                            this.app.set_filter(f);
                             this.scan_visible_favorites(cx);
                             this.notify_sidebar(cx);
                         }))

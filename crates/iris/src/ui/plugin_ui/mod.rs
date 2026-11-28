@@ -14,7 +14,7 @@ use gpui::{
 };
 use iris_api::{SidebarPanel, StatusBadge};
 
-use super::AppModel;
+use super::WindowShell;
 use super::kit::modal::{ModalCallback, ModalShellSpec, modal_shell};
 use super::kit::{panel_header, surface_card, tip};
 use super::views::model_listener;
@@ -22,12 +22,12 @@ use crate::theme::{FONT_MONO, ThemeTokens};
 use widgets::{WidgetSurface, render_plugin_widget};
 
 pub(in crate::ui) fn render_plugin_status_slot(
-    model: &Entity<AppModel>,
+    model: &Entity<WindowShell>,
     cx: &App,
 ) -> Option<impl IntoElement> {
     let m = model.read(cx);
     let badges: Vec<(String, StatusBadge)> = m
-        .plugins
+        .plugins()
         .status_badges()
         .into_iter()
         .map(|(pid, b)| (pid.to_string(), b.clone()))
@@ -80,13 +80,13 @@ pub(in crate::ui) fn render_plugin_status_slot(
 }
 
 pub(in crate::ui) fn render_plugin_sidebar_entity(
-    model: &Entity<AppModel>,
+    model: &Entity<WindowShell>,
     window: &Window,
     cx: &App,
 ) -> impl IntoElement {
     let m = model.read(cx);
     let panels: Vec<(String, SidebarPanel)> = m
-        .plugins
+        .plugins()
         .sidebar_panels()
         .into_iter()
         .map(|(pid, p)| (pid.to_string(), p.clone()))
@@ -191,7 +191,7 @@ pub(in crate::ui) fn render_plugin_sidebar_entity(
 }
 
 pub(in crate::ui) fn render_plugin_modal(
-    model: &Entity<AppModel>,
+    model: &Entity<WindowShell>,
     window: &Window,
     cx: &App,
 ) -> Option<AnyElement> {
@@ -200,7 +200,7 @@ pub(in crate::ui) fn render_plugin_modal(
         return None;
     }
     let (pid, modal) = m
-        .plugins
+        .plugins()
         .active_modal()
         .map(|(p, md)| (p.to_string(), md.clone()))?;
 
@@ -209,9 +209,9 @@ pub(in crate::ui) fn render_plugin_modal(
     let modal_w = (f32::from(vp.width) - 24.).clamp(0., 460.);
     let max_h = (f32::from(vp.height) - 24.).clamp(0., 540.);
 
-    let is_submitting = m.plugins.modal().is_submitting(&pid, &modal.id);
+    let is_submitting = m.plugins().modal().is_submitting(&pid, &modal.id);
     let modal_error = m
-        .plugins
+        .plugins()
         .modal()
         .error()
         .map(|err| SharedString::from(err.to_owned()));
@@ -231,10 +231,10 @@ pub(in crate::ui) fn render_plugin_modal(
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| "取消".into());
 
-    let submit_cb: ModalCallback<AppModel> = Rc::new(|this, w, cx| {
+    let submit_cb: ModalCallback<WindowShell> = Rc::new(|this, w, cx| {
         this.submit_active_plugin_modal(w, cx);
     });
-    let cancel_cb: ModalCallback<AppModel> = Rc::new(|this, w, cx| {
+    let cancel_cb: ModalCallback<WindowShell> = Rc::new(|this, w, cx| {
         this.cancel_active_plugin_modal(Some(w), cx);
     });
 

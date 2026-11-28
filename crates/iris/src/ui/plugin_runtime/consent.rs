@@ -1,5 +1,5 @@
 use super::super::{
-    AppModel,
+    WindowShell,
     kit::{
         form::checkbox,
         modal::{ModalCallback, ModalShellSpec, modal_shell},
@@ -14,13 +14,13 @@ use gpui::{
 use iris_api::v2::NetworkDeclaration;
 use std::{path::PathBuf, rc::Rc};
 
-impl AppModel {
+impl WindowShell {
     pub(in crate::ui) fn has_host_consent(&self) -> bool {
-        self.plugins.has_host_consent()
+        self.plugins().has_host_consent()
     }
 
     pub(in crate::ui) fn review_plugin_path(&mut self, path: PathBuf, cx: &mut Context<Self>) {
-        let out = self.plugins.review_package_path(path);
+        let out = self.app.review_plugin_package(path);
         let regions = self.apply_plugin_outcome(out, None, cx);
         if regions.any() {
             self.notify_regions(regions, cx);
@@ -52,9 +52,9 @@ impl AppModel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let had_focus_pending = self.plugins.modal().focus_pending();
-        let out = self.plugins.cancel_host_consent();
-        let focus_handled = self.plugins.modal().focus_pending();
+        let had_focus_pending = self.plugins().modal().focus_pending();
+        let out = self.app.cancel_host_consent();
+        let focus_handled = self.plugins().modal().focus_pending();
         let _ = self.apply_plugin_outcome(out, Some(window), cx);
         if !had_focus_pending && !focus_handled {
             self.focus.focus(window);
@@ -63,7 +63,7 @@ impl AppModel {
     }
 
     pub(in crate::ui) fn approve_host_consent(&mut self, cx: &mut Context<Self>) {
-        let out = self.plugins.approve_host_consent();
+        let out = self.app.approve_host_consent();
         let regions = self
             .apply_plugin_outcome(out, None, cx)
             .union(DirtyRegions::root_only());
@@ -72,7 +72,7 @@ impl AppModel {
 }
 
 pub(in crate::ui) fn render_host_consent(
-    model: &Entity<AppModel>,
+    model: &Entity<WindowShell>,
     window: &Window,
     cx: &App,
 ) -> Option<AnyElement> {
@@ -81,11 +81,11 @@ pub(in crate::ui) fn render_host_consent(
         return None;
     }
     // Authorization uses native colors, unaffected by a plugin's selected theme.
-    let t = ThemeTokens::resolve_scaled("graphite", None, m.settings.ui_font_scale);
+    let t = ThemeTokens::resolve_scaled("graphite", None, m.settings().ui_font_scale);
     let line = |text: String| div().text_size(t.text_md).text_color(t.text).child(text);
     let mut body = div().flex().flex_col().gap(px(10.));
     let title;
-    if let Some(origin) = m.plugins.origin_summary() {
+    if let Some(origin) = m.plugins().origin_summary() {
         title = "Iris · 确认网络服务";
         body = body
             .child(line(format!(
@@ -124,18 +124,18 @@ pub(in crate::ui) fn render_host_consent(
             let origin_id = origin.id;
             body = body.child(checkbox(
                 "host-origin-http-auth",
-                m.plugins.insecure_auth(),
+                m.plugins().insecure_auth(),
                 "允许向此 HTTP 服务发送凭据（传输未加密）",
                 t,
                 model_listener(model, move |this, _, _, cx| {
-                    if this.plugins.toggle_insecure_auth(origin_id) {
+                    if this.app.toggle_insecure_auth(origin_id) {
                         this.notify_root(cx);
                     }
                 }),
             ));
         }
     } else {
-        let review = m.plugins.review_summary()?;
+        let review = m.plugins().review_summary()?;
         title = "Iris · 安装权限审核";
         body = body
             .child(line(format!(
@@ -169,11 +169,11 @@ pub(in crate::ui) fn render_host_consent(
                 )))
                 .child(checkbox(
                     "host-plugin-keep-identity",
-                    m.plugins.keep_identity(),
+                    m.plugins().keep_identity(),
                     "信任此更新继续使用原插件状态、凭据与已确认服务",
                     t,
                     model_listener(model, move |this, _, _, cx| {
-                        if this.plugins.toggle_keep_identity(review_id) {
+                        if this.app.toggle_keep_identity(review_id) {
                             this.notify_root(cx);
                         }
                     }),
@@ -193,11 +193,11 @@ pub(in crate::ui) fn render_host_consent(
                 )))
                 .child(checkbox(
                     "host-plugin-keep-identity",
-                    m.plugins.keep_identity(),
+                    m.plugins().keep_identity(),
                     "信任此插件包并恢复此前保留的登录信息与设置",
                     t,
                     model_listener(model, move |this, _, _, cx| {
-                        if this.plugins.toggle_keep_identity(review_id) {
+                        if this.app.toggle_keep_identity(review_id) {
                             this.notify_root(cx);
                         }
                     }),
@@ -205,12 +205,12 @@ pub(in crate::ui) fn render_host_consent(
         }
     }
     let busy = m
-        .plugins
+        .plugins()
         .active_consent_id()
-        .is_some_and(|id| m.plugins.is_consent_busy(id));
-    let cancel: ModalCallback<AppModel> =
+        .is_some_and(|id| m.plugins().is_consent_busy(id));
+    let cancel: ModalCallback<WindowShell> =
         Rc::new(|this, window, cx| this.cancel_host_consent(window, cx));
-    let submit: ModalCallback<AppModel> = Rc::new(|this, _, cx| this.approve_host_consent(cx));
+    let submit: ModalCallback<WindowShell> = Rc::new(|this, _, cx| this.approve_host_consent(cx));
     let viewport = window.viewport_size();
     Some(modal_shell(
         model,

@@ -1,13 +1,14 @@
 //! Unified virtual media source controller: GPUI bridge delegating local folders,
 //! `MediaSource` plugins, bookmarks, direct HTTP(S) streams, remote photo header
-//! probing, and `step` navigation to [`iris_app::CatalogController`].
+//! probing, and `step` navigation to [`iris_app::AppModel`].
 
-use std::path::Path;
 use std::time::Instant;
 
 use gpui::{Context, Window};
 use iris_api::SourceManageAction;
-use iris_app::{BookmarkAction, DirectStreamTarget, StepAction, parse_direct_stream_input};
+use iris_app::{
+    BookmarkAction, DirectStreamTarget, MediaOpenCommit, StepAction, parse_direct_stream_input,
+};
 use iris_core::bookmarks::PinnedBookmark;
 use iris_core::catalog::{CatalogItem, CatalogItemKind};
 use iris_core::library::Kind;
@@ -15,31 +16,23 @@ use iris_core::media_uri::MediaUri;
 use iris_core::photo;
 use iris_core::player::RemoteMediaRequest;
 
-use super::AppModel;
+use super::WindowShell;
 use super::views::DirtyRegions;
 
-impl AppModel {
+impl WindowShell {
     /// Cancels in-flight remote/plugin media loads without interrupting directory browsing.
     pub(super) fn cancel_media_loads(&mut self) {
-        let was_resolving = self.plugins.cancel_resolve_load();
-        if was_resolving {
+        if self.plugins().has_pending_resolve() {
             self.plugin_ui.resolve_timeout = None;
         }
-        let was_remote = self.catalog.cancel_remote_load();
-        if was_remote {
+        if self.catalog().has_remote_load() {
             self.catalog_ui.remote_load = None;
         }
-        let _ = self
-            .playback
-            .cancel_in_flight_load(was_remote || was_resolving);
+        let _ = self.app.cancel_in_flight_media_loads();
     }
 
     pub(super) fn browse_local_source(&mut self, cx: &mut Context<Self>) {
-        let cur_uri = self.session().current_media_uri();
-        let cur_local = self.playback.session().current();
-        let out = self
-            .catalog
-            .browse_local_source(&mut self.plugins, cur_uri.as_ref(), cur_local);
+        let out = self.app.browse_local_source();
         self.plugin_ui.browse_timeout = None;
         if out
             .effects
@@ -72,12 +65,10 @@ impl AppModel {
         } else {
             String::new()
         };
-        let cur_uri = self.session().current_media_uri();
-        self.catalog.set_search_query(query, cur_uri.as_ref());
-        let Some((_, out)) = self.catalog.refresh_plugin_source(
-            &mut self.plugins,
+        let Some((_, out)) = self.app.refresh_plugin_source(
             plugin_id,
             source_id,
+            query,
             self.text_inputs.search_open,
             Instant::now(),
         ) else {
@@ -90,7 +81,7 @@ impl AppModel {
     }
 
     pub(super) fn pin_current_location(&mut self, cx: &mut Context<Self>) {
-        match self.catalog.pin_current_location() {
+        match self.app.pin_current_location() {
             Ok(bm) => {
                 self.notify_sidebar(cx);
                 self.show_toast(format!("已固定书签 · {}", bm.name), cx);
@@ -106,13 +97,13 @@ impl AppModel {
         folder_id: Option<String>,
         cx: &mut Context<Self>,
     ) {
-        self.catalog.pin_bookmark(name.clone(), uri, folder_id);
+        self.app.pin_bookmark(name.clone(), uri, folder_id);
         self.notify_sidebar(cx);
         self.show_toast(format!("已固定书签 · {name}"), cx);
     }
 
     pub(super) fn open_bookmark(&mut self, bm: &PinnedBookmark, cx: &mut Context<Self>) {
-        match self.catalog.prepare_open_bookmark(bm) {
+        match self.app.prepare_open_bookmark(bm) {
             BookmarkAction::OpenLocal(path) => {
                 self.sync_view_timer(cx);
                 self.notify_sidebar(cx);
@@ -194,8 +185,7 @@ impl AppModel {
         query: Option<String>,
         cx: &mut Context<Self>,
     ) {
-        let (_, out) = self.catalog.browse_plugin_source(
-            &mut self.plugins,
+        let (_, out) = self.app.browse_plugin_source(
             plugin_id,
             source_id,
             folder_id,
@@ -217,9 +207,9 @@ impl AppModel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let out = self.with_plugin_ctx(|ctrl, ctx| {
-            ctrl.manage_source(ctx, plugin_id, source_id, action, Instant::now())
-        });
+        let out = self
+            .app
+            .manage_plugin_source(plugin_id, source_id, action, Instant::now());
         let regions = self
             .apply_plugin_outcome(out, Some(window), cx)
             .union(DirtyRegions {
@@ -242,22 +232,18 @@ impl AppModel {
         variant: Option<String>,
         cx: &mut Context<Self>,
     ) {
-        let was_remote = self.catalog.cancel_remote_load();
-        if was_remote {
+        if self.catalog().has_remote_load() {
             self.catalog_ui.remote_load = None;
         }
-        let _ = self.playback.cancel_in_flight_load(was_remote);
-        let out = self.with_plugin_ctx(|ctrl, ctx| {
-            ctrl.resolve_entry(
-                ctx,
-                plugin_id,
-                source_id,
-                entry_id,
-                title,
-                variant,
-                Instant::now(),
-            )
-        });
+        let _ = self.app.cancel_remote_media_load();
+        let out = self.app.resolve_plugin_entry(
+            plugin_id,
+            source_id,
+            entry_id,
+            title,
+            variant,
+            Instant::now(),
+        );
         let regions = self.apply_plugin_outcome(out, None, cx);
         if regions.any() {
             self.notify_regions(regions, cx);
@@ -266,9 +252,7 @@ impl AppModel {
 
     pub(super) fn switch_stream_variant(&mut self, variant_id: &str, cx: &mut Context<Self>) {
         self.overlays.popover = None;
-        let Some(out) = self.with_plugin_ctx(|ctrl, ctx| {
-            ctrl.switch_stream_variant(ctx, variant_id, Instant::now())
-        }) else {
+        let Some(out) = self.app.switch_stream_variant(variant_id, Instant::now()) else {
             return;
         };
         let regions = self.apply_plugin_outcome(out, None, cx);
@@ -290,8 +274,14 @@ impl AppModel {
                 self.show_toast("仅支持合法的 http:// 或 https:// 媒体地址", cx);
             }
             DirectStreamTarget::Remote(req) => {
-                self.close_plugin_browse();
-                self.plugins.clear_active_stream_meta();
+                let out = self.app.prepare_direct_remote_entry();
+                self.plugin_ui.browse_timeout = None;
+                if out
+                    .effects
+                    .contains(&iris_app::PluginSideEffect::ResetThumbnails)
+                {
+                    self.plugin_ui.thumbnails.reset();
+                }
                 self.overlays.close_variants_popover();
                 self.rebuild_directory_rows();
                 self.open_remote_media(*req, cx);
@@ -306,10 +296,9 @@ impl AppModel {
             return;
         }
         self.overlays.close_menus();
-        let generation = self.playback.begin_remote_load();
+        let (generation, worker_cancel, slot) = self.app.begin_remote_stream_open();
         self.notify_all(cx);
 
-        let (worker_cancel, slot) = self.catalog.begin_remote_load();
         let task = if req.kind != Kind::Photo {
             gpui::Task::ready(Some(req))
         } else {
@@ -331,56 +320,22 @@ impl AppModel {
         let completion = cx.spawn(async move |this, cx| {
             let Some(req) = task.await else { return };
             let _ = this.update(cx, |this, cx| {
-                if !this.playback.accept_prepared_load(generation) {
+                let commit = this
+                    .app
+                    .commit_prepared_remote_open(generation, req, Instant::now());
+                if matches!(commit, MediaOpenCommit::StaleGeneration) {
                     return;
                 }
-                this.catalog.cancel_remote_load();
                 this.catalog_ui.remote_load = None;
-                let resume = this.catalog.resume_for_remote(
-                    this.settings.resume_playback,
-                    req.is_live,
-                    req.kind,
-                    &req.uri,
-                );
-                let settings = this.settings.clone();
-                match this.session_mut().open_remote(req, &settings, resume) {
-                    Ok(()) => {
-                        this.finish_media_open(cx);
-                    }
-                    Err(e) => {
-                        log::warn!("open_remote failed: {e:#}");
-                        if let Some(np) = this.playback.on_media_open_failed(Instant::now()) {
-                            this.apply_now_playing_snapshot(np);
-                        }
-                        this.show_error_toast("无法打开远程流，请检查地址与网络状态", cx);
-                    }
-                }
-                this.active_mut().image.reset();
-                this.sync_viewport_effects(cx);
-                this.notify_all(cx);
+                this.finish_media_open_commit(commit, cx);
             });
         });
         self.catalog_ui.remote_load = Some(completion);
     }
 
-    /// Unified previous/next navigation delegated to [`iris_app::CatalogController::step`].
+    /// Unified previous/next navigation delegated to [`iris_app::AppModel::step_media`].
     pub(super) fn step(&mut self, delta: isize, wrap: bool, cx: &mut Context<Self>) {
-        let cur = self
-            .playback
-            .pending_path()
-            .map(Path::to_path_buf)
-            .map(MediaUri::Local)
-            .or_else(|| self.session().current_media_uri());
-        let action = self.catalog.step(
-            &mut self.plugins,
-            self.playback.session_mut(),
-            &self.settings,
-            cur.as_ref(),
-            delta,
-            wrap,
-            Instant::now(),
-        );
-        match action {
+        match self.app.step_media(delta, wrap, Instant::now()) {
             StepAction::OpenMediaUri { uri, title } => {
                 self.open_media_uri(&uri, title, cx);
             }

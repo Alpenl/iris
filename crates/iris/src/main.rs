@@ -23,14 +23,8 @@ use gpui::{
     App, AppContext as _, Application, Bounds, Menu, MenuItem, TitlebarOptions,
     WindowBackgroundAppearance, WindowBounds, WindowOptions, px, size,
 };
-use iris_core::{
-    keymap::Keymap,
-    logging,
-    media_uri::MediaUri,
-    player::Session,
-    preset::{DEFAULT_WINDOW_SIZE, PresetManager, PresetRuntime},
-    settings::Settings,
-};
+use iris_app::StartupWorkbench;
+use iris_core::{logging, media_uri::MediaUri, player::Session};
 
 const HELP: &str = "Iris 照片 / 视频播放器\n用法：iris [--] [本地文件或文件夹…]\n  --version  显示版本\n  --help     显示本说明\n  --check-plugin-runtime  校验内嵌 Wasm 运行时";
 
@@ -220,8 +214,8 @@ fn run(initial: Vec<PathBuf>) -> ExitCode {
         ]) {
             log::error!("fonts: {e:#}");
         }
-        let initial_keymap = Keymap::load();
-        ui::rebind_keys(cx, &initial_keymap);
+        let startup = StartupWorkbench::load();
+        ui::rebind_keys(cx, startup.keymap());
         cx.set_menus(app_menus());
         cx.on_action(|_: &ui::Quit, cx| cx.quit());
 
@@ -234,38 +228,15 @@ fn run(initial: Vec<PathBuf>) -> ExitCode {
             }
         };
 
-        let presets = PresetManager::load();
-        let loaded_settings = Settings::load();
-        let (active_settings, preset_rt, init_plugin_cmds) =
-            PresetRuntime::restore_on_startup(&presets, loaded_settings);
-        iris_base::net::http_client::doh::set_fallback_enabled(
-            active_settings.fake_ip_doh_fallback,
-        );
-        if let Err(e) =
-            iris_base::net::http_client::doh::set_resolvers(&active_settings.doh_resolvers)
-        {
-            log::warn!("applying configured DoH resolvers: {e:#}");
-        }
         let plugin_host =
-            iris_plugin_host::PluginHost::open_default(&active_settings.disabled_plugins);
-        cx.set_global(theme::ThemeTokens::resolve(&active_settings.theme_id, None));
+            iris_plugin_host::PluginHost::open_default(&startup.settings().disabled_plugins);
+        cx.set_global(theme::ThemeTokens::resolve_scaled(
+            &startup.settings().theme_id,
+            None,
+            startup.settings().ui_font_scale,
+        ));
 
-        let use_saved_size =
-            active_settings.remember_window_size || active_settings.active_preset != "default";
-        let (win_w, win_h) = if use_saved_size {
-            (
-                active_settings
-                    .window_width
-                    .unwrap_or(DEFAULT_WINDOW_SIZE.0)
-                    .clamp(480., 7680.),
-                active_settings
-                    .window_height
-                    .unwrap_or(DEFAULT_WINDOW_SIZE.1)
-                    .clamp(300., 4320.),
-            )
-        } else {
-            DEFAULT_WINDOW_SIZE
-        };
+        let (win_w, win_h) = startup.initial_window_size();
 
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
@@ -284,20 +255,7 @@ fn run(initial: Vec<PathBuf>) -> ExitCode {
             ..Default::default()
         };
         let window = match cx.open_window(options, move |window, cx| {
-            cx.new(|cx| {
-                ui::IrisWindow::new(
-                    session,
-                    plugin_host,
-                    active_settings,
-                    presets,
-                    preset_rt,
-                    init_plugin_cmds,
-                    initial_keymap,
-                    initial,
-                    window,
-                    cx,
-                )
-            })
+            cx.new(|cx| ui::IrisWindow::new(session, plugin_host, startup, initial, window, cx))
         }) {
             Ok(window) => window,
             Err(e) => {

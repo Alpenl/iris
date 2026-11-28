@@ -1,4 +1,4 @@
-use super::super::{AppModel, views::model_listener};
+use super::super::{WindowShell, views::model_listener};
 use crate::{
     theme::ThemeTokens,
     ui::kit::{form::chip_button, hstack, vstack},
@@ -10,7 +10,7 @@ use gpui::{
 use iris_core::media_uri::MediaUri;
 use iris_core::store::{AnnotationEdit as StoreAnnotationEdit, ColorLabel, TimeMarker};
 
-impl AppModel {
+impl WindowShell {
     pub(super) fn annotation_uri(&self) -> Option<MediaUri> {
         self.session()
             .may_share_current_identity()
@@ -24,10 +24,7 @@ impl AppModel {
 
     fn native_annotation(&mut self, edit: Option<StoreAnnotationEdit>, cx: &mut Context<Self>) {
         let saving = edit.is_some();
-        let started =
-            self.catalog
-                .begin_host_annotation(&mut self.plugins, self.playback.session(), edit);
-        let (target, uri, edit, cancel, host_job) = match started {
+        let (target, uri, edit, cancel, host_job) = match self.app.begin_host_annotation(edit) {
             Ok(Some(args)) => args,
             Ok(None) => return,
             Err(outcome) => {
@@ -44,9 +41,7 @@ impl AppModel {
         cx.spawn(async move |this, cx| {
             let (result, _lease) = job.await;
             let _ = this.update(cx, |this, cx| {
-                let (refresh, outcome) =
-                    this.catalog
-                        .finish_host_annotation(&mut this.plugins, saving, result);
+                let (refresh, outcome) = this.app.finish_host_annotation(saving, result);
                 let regions = this.apply_plugin_outcome(outcome, None, cx);
                 if refresh {
                     this.refresh_annotations(cx);
@@ -61,14 +56,14 @@ impl AppModel {
 }
 
 pub(in crate::ui) fn render_personal_annotations(
-    model: &Entity<AppModel>,
+    model: &Entity<WindowShell>,
     t: ThemeTokens,
     cx: &App,
 ) -> Option<gpui::AnyElement> {
     let m = model.read(cx);
     let uri = m.annotation_uri()?;
     let empty = iris_core::store::Annotations::default();
-    let value = m.catalog.store().annotations(&uri).unwrap_or(&empty);
+    let value = m.catalog().store().annotations(&uri).unwrap_or(&empty);
     let current_rating = value.rating;
     let current_color = value.color;
     let marker_count = value.markers.len();

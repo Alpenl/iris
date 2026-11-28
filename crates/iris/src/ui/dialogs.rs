@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use gpui::{AnyElement, App, Context, Entity, IntoElement, ParentElement, Styled, Window, div, px};
 use iris_api::Widget;
 
-use super::AppModel;
+use super::WindowShell;
 use super::kit::form::checkbox;
 use super::kit::modal::{ModalCallback, ModalShellSpec, modal_shell};
 use super::kit::text_field::{
@@ -37,7 +37,7 @@ fn confirm_regions(key: &str) -> DirtyRegions {
     }
 }
 
-impl AppModel {
+impl WindowShell {
     pub(super) fn is_confirming(&self, key: &str) -> bool {
         self.overlays.is_confirming(key, Instant::now())
     }
@@ -94,7 +94,7 @@ impl AppModel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.has_host_consent() || self.plugins.active_modal().is_some() {
+        if self.has_host_consent() || self.plugins().active_modal().is_some() {
             return;
         }
         match &dialog {
@@ -127,7 +127,7 @@ impl AppModel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let keys: Vec<String> = if let Some((pid, modal)) = self.plugins.active_modal() {
+        let keys: Vec<String> = if let Some((pid, modal)) = self.plugins().active_modal() {
             modal
                 .widgets
                 .iter()
@@ -206,7 +206,7 @@ impl AppModel {
 }
 
 pub(super) fn render_builtin_dialog(
-    model: &Entity<AppModel>,
+    model: &Entity<WindowShell>,
     window: &Window,
     cx: &App,
 ) -> Option<AnyElement> {
@@ -218,7 +218,7 @@ pub(super) fn render_builtin_dialog(
     let modal_w = (f32::from(vp.width) - 32.).clamp(0., 460.);
     let max_h = (f32::from(vp.height) - 32.).clamp(0., 520.);
 
-    let cancel_cb: ModalCallback<AppModel> = Rc::new(|this, w, cx| {
+    let cancel_cb: ModalCallback<WindowShell> = Rc::new(|this, w, cx| {
         this.overlays.dialog = None;
         this.overlays.dialog_error = None;
         this.text_inputs.active_form_key = None;
@@ -226,13 +226,13 @@ pub(super) fn render_builtin_dialog(
         this.notify_root(cx);
     });
 
-    let submit_cb: ModalCallback<AppModel> = Rc::new(|this, w, cx| {
+    let submit_cb: ModalCallback<WindowShell> = Rc::new(|this, w, cx| {
         this.submit_builtin_dialog(w, cx);
     });
 
     let (title, submit_label, body) = match dialog {
         BuiltinDialog::OpenUrl => {
-            let enter_cb: FormEnterCallback<AppModel> = submit_cb.clone();
+            let enter_cb: FormEnterCallback<WindowShell> = submit_cb.clone();
             let inp = render_text_field(
                 model,
                 TextFieldSpec {
@@ -273,7 +273,7 @@ pub(super) fn render_builtin_dialog(
             )
         }
         BuiltinDialog::SavePreset { scope } => {
-            let enter_cb: FormEnterCallback<AppModel> = submit_cb.clone();
+            let enter_cb: FormEnterCallback<WindowShell> = submit_cb.clone();
             let name_inp = render_text_field(
                 model,
                 TextFieldSpec {

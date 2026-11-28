@@ -6,37 +6,18 @@ use std::time::{Duration, Instant};
 
 use gpui::{Context, Window};
 use iris_api::v2::Id;
-use iris_app::{PluginBatchOutcome, PluginContext, PluginController, PluginSideEffect};
-use iris_core::player::Session;
+use iris_app::{PluginBatchOutcome, PluginSideEffect};
 
-use super::AppModel;
+use super::WindowShell;
 use super::views::{DirtyRegions, dirty_regions_for_plugin_outcome};
 
-impl AppModel {
-    pub(in crate::ui) fn with_plugin_ctx<R>(
-        &mut self,
-        f: impl FnOnce(&mut PluginController, PluginContext<'_, Session>) -> R,
-    ) -> R {
-        let plugins = &mut self.plugins;
-        let player = self.playback.session_mut();
-        let settings = &self.settings;
-        self.catalog.with_plugin_parts(|store, active_source| {
-            let ctx = PluginContext {
-                player,
-                store,
-                settings,
-                active_source,
-            };
-            f(plugins, ctx)
-        })
-    }
-
+impl WindowShell {
     pub(super) fn has_active_modal(&self) -> bool {
         self.has_host_consent()
             || self.overlays.settings_open
             || self.overlays.palette_open
             || self.overlays.dialog.is_some()
-            || self.plugins.active_modal().is_some()
+            || self.plugins().active_modal().is_some()
     }
 
     /// Single source of truth for any overlay that blocks background playback / workspace shortcuts.
@@ -50,7 +31,7 @@ impl AppModel {
         if self.chrome.fullscreen {
             self.overlays.dir_popup.is_open()
         } else {
-            self.settings.directory_open
+            self.settings().directory_open
         }
     }
 
@@ -65,10 +46,7 @@ impl AppModel {
         cx.spawn(async move |this, cx| {
             timer.await;
             let _ = this.update(cx, |this, cx| {
-                let plugins = &mut this.plugins;
-                let out = this.catalog.with_plugin_parts(|_, active_source| {
-                    plugins.on_source_request_timeout(active_source, &plugin_id, request_id)
-                });
+                let out = this.app.on_source_request_timeout(&plugin_id, request_id);
                 let regions = this.apply_plugin_outcome(out, None, cx);
                 if regions.any() {
                     this.notify_regions(regions, cx);
@@ -80,7 +58,7 @@ impl AppModel {
     /// Drains background plugin messages (`cx.spawn_in` wakeup), auto-focusing
     /// newly opened modals and notifying only the regional GPUI entities marked dirty.
     pub(super) fn poll_plugins(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let outcome = self.with_plugin_ctx(|ctrl, ctx| ctrl.poll(ctx, Instant::now()));
+        let (outcome, _) = self.app.poll_plugins(Instant::now());
         let regions = self.apply_plugin_outcome(outcome, Some(window), cx);
         if regions.any() {
             self.notify_regions(regions, cx);
@@ -95,29 +73,21 @@ impl AppModel {
         window: Option<&mut Window>,
         cx: &mut Context<Self>,
     ) -> DirtyRegions {
+        let mut d = outcome.domain;
+        self.app.reconcile_plugin_domain(&mut d);
+
         let mut regions = dirty_regions_for_plugin_outcome(
             outcome.dirty_slots,
             outcome.status_changed,
-            &outcome.domain,
+            &d,
             self.ui_visibility(),
         );
 
-        let d = outcome.domain;
-        if d.locations_reloaded {
-            self.catalog.reload_locations();
-        }
         if d.close_overlays {
             self.overlays.close_all();
         }
         if d.stream_meta_cleared {
             self.overlays.close_variants_popover();
-        }
-        if d.uninstalled_changed
-            && let Some(pid) = self.settings.theme_id.strip_prefix("plugin:")
-            && !self.plugins.list().iter().any(|p| p.id == pid)
-        {
-            self.settings.theme_id = "graphite".into();
-            self.persist_user_settings();
         }
         if d.theme_changed {
             self.sync_theme_tokens(cx);
@@ -131,7 +101,15 @@ impl AppModel {
             self.ensure_filmstrip_thumbnails(cx);
         }
 
+        let now = Instant::now();
         for effect in outcome.effects {
+            let (loading_gen, np_update) = self.app.apply_plugin_media_side_effect(&effect, now);
+            if let Some(generation) = loading_gen {
+                self.schedule_loading_indicator(generation, cx);
+            }
+            if let Some(np) = np_update {
+                self.apply_now_playing_snapshot(np);
+            }
             match effect {
                 PluginSideEffect::ShowToast { message, is_error } => {
                     if is_error {
@@ -172,37 +150,27 @@ impl AppModel {
                         Some(self.spawn_plugin_source_timeout(plugin_id, request_id, timeout, cx));
                 }
                 PluginSideEffect::MediaResolveStarted => {
-                    self.catalog.cancel_remote_load();
                     self.catalog_ui.remote_load = None;
-                    self.playback.begin_plugin_resolve();
                     regions.root = true;
                     regions.viewport = true;
                     regions.dock = true;
                 }
                 PluginSideEffect::MediaLoadCancelled => {
                     self.plugin_ui.resolve_timeout = None;
-                    let _ = self.playback.cancel_in_flight_load(true);
                     regions.viewport = true;
                 }
                 PluginSideEffect::MediaOpenSucceeded => {
                     self.plugin_ui.resolve_timeout = None;
-                    self.catalog.cancel_remote_load();
                     self.catalog_ui.remote_load = None;
                     self.overlays.close_menus();
-                    self.playback.commit_media_open_generation();
                     self.active_mut().image.reset();
-                    self.finish_media_open(cx);
+                    self.on_media_opened_ui(cx);
                     regions = DirtyRegions::ALL;
                 }
                 PluginSideEffect::MediaOpenFailed { .. } => {
                     self.plugin_ui.resolve_timeout = None;
-                    self.catalog.cancel_remote_load();
                     self.catalog_ui.remote_load = None;
                     self.overlays.close_menus();
-                    self.playback.commit_media_open_generation();
-                    if let Some(np) = self.playback.on_media_open_failed(Instant::now()) {
-                        self.apply_now_playing_snapshot(np);
-                    }
                     self.active_mut().image.reset();
                     self.sync_viewport_effects(cx);
                     regions = DirtyRegions::ALL;
@@ -210,7 +178,7 @@ impl AppModel {
                 PluginSideEffect::PlaybackStopped => {
                     self.active_mut().image.reset();
                     self.sleep_preventer
-                        .set_active(self.playback.should_prevent_sleep());
+                        .set_active(self.app.playback().should_prevent_sleep());
                     self.sync_now_playing(true);
                     regions.viewport = true;
                     regions.dock = true;
@@ -242,7 +210,7 @@ impl AppModel {
             }
         }
 
-        if self.plugins.modal().focus_pending()
+        if self.plugins().modal().focus_pending()
             && let Some(window) = window
         {
             self.sync_plugin_modal_focus(window);
@@ -259,10 +227,10 @@ impl AppModel {
             }
             return;
         }
-        if !self.plugins.modal_mut().take_focus_pending() {
+        if !self.app.take_plugin_modal_focus_pending() {
             return;
         }
-        let modal = self.plugins.active_modal();
+        let modal = self.app.plugins().active_modal();
         if modal.is_some() {
             self.overlays.close_all();
         }
@@ -289,22 +257,10 @@ impl AppModel {
         cx: &mut Context<Self>,
     ) {
         let text_inputs = &self.text_inputs;
-        let plugins = &mut self.plugins;
-        let player = self.playback.session_mut();
-        let settings = &self.settings;
-        let out = self.catalog.with_plugin_parts(|store, active_source| {
-            let ctx = PluginContext {
-                player,
-                store,
-                settings,
-                active_source,
-            };
-            plugins.submit_active_modal(
-                ctx,
-                |pid, modal| text_inputs.collect_modal_values(pid, modal),
-                Instant::now(),
-            )
-        });
+        let out = self.app.submit_active_plugin_modal(
+            |pid, modal| text_inputs.collect_modal_values(pid, modal),
+            Instant::now(),
+        );
         let regions = self.apply_plugin_outcome(out, Some(window), cx);
         if regions.any() {
             self.notify_regions(regions, cx);
@@ -318,9 +274,7 @@ impl AppModel {
         window: Option<&mut Window>,
         cx: &mut Context<Self>,
     ) {
-        let Some(out) =
-            self.with_plugin_ctx(|ctrl, ctx| ctrl.cancel_active_modal(ctx, Instant::now()))
-        else {
+        let Some(out) = self.app.cancel_active_plugin_modal(Instant::now()) else {
             return;
         };
         self.text_inputs.clear_modal_fields();
@@ -338,9 +292,9 @@ impl AppModel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let out = self.with_plugin_ctx(|ctrl, ctx| {
-            ctrl.invoke_command(ctx, plugin_id, command_id, Instant::now())
-        });
+        let out = self
+            .app
+            .invoke_plugin_command(plugin_id, command_id, Instant::now());
         let regions = self.apply_plugin_outcome(out, Some(window), cx);
         if regions.any() {
             self.notify_regions(regions, cx);
@@ -355,9 +309,9 @@ impl AppModel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let out = self.with_plugin_ctx(|ctrl, ctx| {
-            ctrl.invoke_widget_action(ctx, plugin_id, action_id, value, Instant::now())
-        });
+        let out = self
+            .app
+            .invoke_plugin_widget_action(plugin_id, action_id, value, Instant::now());
         let regions = self.apply_plugin_outcome(out, Some(window), cx);
         if regions.any() {
             self.notify_regions(regions, cx);
@@ -380,43 +334,35 @@ impl AppModel {
         enabled: bool,
         cx: &mut Context<Self>,
     ) {
-        self.preset_rt
-            .set_plugin_enabled(&mut self.settings, id, enabled);
         if !enabled {
             self.text_inputs.clear_plugin_sidebar_fields(id);
         }
-        let out = self.with_plugin_ctx(|ctrl, ctx| {
-            ctrl.toggle_plugin_enabled(ctx, id, enabled, Instant::now())
-        });
-        let _ = self.apply_plugin_outcome(out, None, cx);
-        self.sync_viewport_effects(cx);
-        self.notify_all(cx);
+        let (out, wb) = self.app.toggle_plugin_enabled(id, enabled, Instant::now());
+        let plugin_regions = self.apply_plugin_outcome(out, None, cx);
+        let wb_regions = self.apply_workbench_changes(wb, None, cx);
+        self.notify_regions(
+            plugin_regions.union(wb_regions).union(DirtyRegions::ALL),
+            cx,
+        );
     }
 
     pub(super) fn uninstall_plugin(&mut self, id: &str, keep_data: bool, cx: &mut Context<Self>) {
-        if id.to_ascii_lowercase().starts_with("iris.") {
-            self.show_toast("官方内置插件不可删除", cx);
+        let (rejected, out, wb) = self.app.uninstall_plugin(id, keep_data, Instant::now());
+        if rejected {
+            let _ = self.apply_plugin_outcome(out, None, cx);
             return;
         }
-        self.preset_rt
-            .set_plugin_enabled(&mut self.settings, id, true);
         self.text_inputs.clear_plugin_sidebar_fields(id);
-        if self.settings.theme_id == format!("plugin:{id}") {
-            self.settings.theme_id = "graphite".into();
-            self.persist_user_settings();
-            self.sync_theme_tokens(cx);
-        }
-        let (_, out) = self
-            .with_plugin_ctx(|ctrl, ctx| ctrl.uninstall_plugin(ctx, id, keep_data, Instant::now()));
-        let _ = self.apply_plugin_outcome(out, None, cx);
-        self.sync_viewport_effects(cx);
-        self.notify_all(cx);
+        let plugin_regions = self.apply_plugin_outcome(out, None, cx);
+        let wb_regions = self.apply_workbench_changes(wb, None, cx);
+        self.notify_regions(
+            plugin_regions.union(wb_regions).union(DirtyRegions::ALL),
+            cx,
+        );
     }
 
     pub(super) fn reload_plugins(&mut self, cx: &mut Context<Self>) {
-        let disabled = self.settings.disabled_plugins.clone();
-        let (enabled_ids, out) =
-            self.with_plugin_ctx(|ctrl, ctx| ctrl.reload_plugins(ctx, &disabled, Instant::now()));
+        let (enabled_ids, out) = self.app.reload_plugins(Instant::now());
         let _ = self.apply_plugin_outcome(out, None, cx);
         self.text_inputs
             .retain_enabled_sidebar_fields(|pid| enabled_ids.iter().any(|id| id == pid));

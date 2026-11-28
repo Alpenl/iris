@@ -1,11 +1,11 @@
-//! Handler for the local `IRIS_CONTROL` debug / devtools pipe commands.
+//! Handler for the local `IRIS_CONTROL` debug / devtools pipe commands,
+//! delegating headless diagnostic snapshots & debug commands to [`iris_app::AppModel`].
 
 use std::path::Path;
 
 use gpui::{Context, Window, px, size};
-use iris_core::catalog::MediaFilter;
 
-use super::AppModel;
+use super::WindowShell;
 use super::views::DirtyRegions;
 use crate::platform;
 
@@ -18,7 +18,7 @@ pub(super) fn parse_mouse_command(line: &str) -> Option<(&str, f32, f32)> {
     Some((cmd, it.next()?, it.next()?))
 }
 
-impl AppModel {
+impl WindowShell {
     pub(super) fn debug_command(
         &mut self,
         line: &str,
@@ -44,18 +44,10 @@ impl AppModel {
             }
             "open" => self.open_path(Path::new(arg), cx),
             "filter" => {
-                let filter = match arg {
-                    "video" => MediaFilter::Video,
-                    "photo" => MediaFilter::Photo,
-                    "audio" => MediaFilter::Audio,
-                    "favorites" => MediaFilter::FavoritesOnly,
-                    _ => MediaFilter::All,
-                };
-                let cur_uri = self.session().current_media_uri();
-                self.catalog.set_filter(filter, cur_uri.as_ref());
+                let applied = self.app.debug_apply_filter(arg);
                 self.rebuild_directory_rows();
                 self.scan_visible_favorites(cx);
-                eprintln!("[iris/control] filter {:?}", self.catalog.filter());
+                eprintln!("[iris/control] filter {:?}", applied);
                 self.notify_regions(
                     DirtyRegions {
                         sidebar: true,
@@ -67,28 +59,24 @@ impl AppModel {
                 );
             }
             "state" => {
-                let session = self.session();
-                let state = session.state();
-                let fav = session
-                    .current_media_uri()
-                    .is_some_and(|u| self.catalog.store().is_favorite(&u));
+                let snap = self.app.debug_state_snapshot();
                 let vp_size = window.viewport_size();
                 eprintln!(
                     "[iris/control] state pos={:.2} dur={:.2} paused={} vol={} muted={} speed={:.2} loop={} aspect={:?} sub_delay={:.1} video={:?} hwdec={} dir={} dir_w={:.0} side={:?} popup={} settings={} info={} popover={:?} chrome={} fullscreen={} video_rect={:?} dock={:?} filter={:?} favorite={} renders={} win=({:.1},{:.1})",
-                    state.time_pos,
-                    state.duration,
-                    state.paused,
-                    state.volume,
-                    state.muted,
-                    state.speed,
-                    state.loop_file,
-                    state.aspect,
-                    state.sub_delay,
-                    state.video_size,
-                    state.hwdec,
-                    self.settings.directory_open,
-                    self.settings.directory_width,
-                    self.settings.directory_side,
+                    snap.time_pos,
+                    snap.duration,
+                    snap.paused,
+                    snap.volume,
+                    snap.muted,
+                    snap.speed,
+                    snap.loop_file,
+                    snap.aspect,
+                    snap.sub_delay,
+                    snap.video_size,
+                    snap.hwdec,
+                    snap.directory_open,
+                    snap.directory_width,
+                    snap.directory_side,
                     self.overlays.dir_popup.is_open(),
                     self.overlays.settings_open,
                     self.overlays.info_open,
@@ -102,46 +90,47 @@ impl AppModel {
                         b.size.width,
                         b.size.height
                     )),
-                    self.catalog.filter(),
-                    fav,
+                    snap.filter,
+                    snap.favorite,
                     self.chrome.render_count.get(),
                     f32::from(vp_size.width),
                     f32::from(vp_size.height),
                 );
             }
             "ui" => {
+                let snap = self.app.debug_ui_snapshot();
                 eprintln!(
                     "[iris/control] ui preset={} seek_step={:.1} top={} filmstrip={} thumbs={} sb_mode={:?} rows={} queue={} search_open={} search_q={:?} palette={} palette_q={:?} scheme={:?} theme={} hide_tb={} tb_hover={} ctx_menu={} modal={} sources={} osd={:?} toast={:?}",
-                    self.settings.active_preset,
-                    self.settings.seek_step,
-                    self.settings.always_on_top,
-                    self.settings.photo_filmstrip,
+                    snap.active_preset,
+                    snap.seek_step,
+                    snap.always_on_top,
+                    snap.photo_filmstrip,
                     self.catalog_ui.thumbs.len(),
-                    self.catalog.sidebar_mode(),
-                    self.catalog.rows().len(),
-                    self.catalog.queue().len(),
+                    snap.sidebar_mode,
+                    snap.rows_len,
+                    snap.queue_len,
                     self.text_inputs.search_open,
                     self.text_inputs.search_input.text(),
                     self.overlays.palette_open,
                     self.text_inputs.palette_input.text(),
-                    self.keymap.scheme,
-                    self.settings.theme_id,
-                    self.effective_hide_titlebar(),
+                    snap.keymap_scheme,
+                    snap.theme_id,
+                    snap.hide_titlebar,
                     self.chrome.titlebar_hover,
                     self.overlays.context_menu.is_some(),
-                    self.plugins.active_modal().is_some(),
-                    self.plugins.media_sources().len(),
+                    snap.modal_open,
+                    snap.sources_len,
                     self.chrome.osd,
                     self.chrome.toast,
                 );
             }
-            "get" => match self.session().debug_property(arg) {
+            "get" => match self.app.debug_mpv_property(arg) {
                 Ok(v) => eprintln!("[iris/control] get {arg} = {v}"),
                 Err(e) => eprintln!("[iris/control] get {arg} failed: {e}"),
             },
             "mpv" => {
                 let args: Vec<&str> = arg.split_whitespace().collect();
-                match self.session().debug_command(&args) {
+                match self.app.debug_mpv_command(&args) {
                     Ok(()) => eprintln!("[iris/control] mpv {arg} ok"),
                     Err(e) => eprintln!("[iris/control] mpv {arg} failed: {e}"),
                 }

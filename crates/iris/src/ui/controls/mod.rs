@@ -15,7 +15,7 @@ use gpui::{
 use iris_core::library::Kind;
 use iris_core::settings::Side;
 
-use super::AppModel;
+use super::WindowShell;
 use super::actions::{
     OpenCommandPalette, OpenSettings, ToggleDirectory, ToggleFavorite, ToggleFullscreen,
     ToggleInfo, ToggleMute,
@@ -44,7 +44,7 @@ fn dock_sep(compact: bool, t: ThemeTokens) -> Div {
     }
 }
 
-impl AppModel {
+impl WindowShell {
     pub(in crate::ui) fn act_tip(
         &self,
         label: impl Into<gpui::SharedString>,
@@ -55,8 +55,8 @@ impl AppModel {
 
     fn dock_available_width(&self, window: &Window) -> f32 {
         let total = f32::from(window.viewport_size().width);
-        if !self.chrome.fullscreen && self.settings.directory_open {
-            (total - self.settings.directory_width).max(0.)
+        if !self.chrome.fullscreen && self.settings().directory_open {
+            (total - self.settings().directory_width).max(0.)
         } else {
             total
         }
@@ -64,7 +64,7 @@ impl AppModel {
 }
 
 pub(in crate::ui) fn render_dock_entity(
-    model: &Entity<AppModel>,
+    model: &Entity<WindowShell>,
     floating: bool,
     window: &Window,
     cx: &App,
@@ -72,13 +72,13 @@ pub(in crate::ui) fn render_dock_entity(
     let m = model.read(cx);
     let t = ThemeTokens::of(cx);
     let kind = m.session().kind();
-    let left = m.settings.directory_side == Side::Left;
+    let left = m.settings().directory_side == Side::Left;
     let compact = m.effective_compact_controls();
     let avail_w = m.dock_available_width(window);
     let narrow = avail_w < if compact { 560. } else { 640. };
     let tiny = avail_w < if compact { 440. } else { 500. };
     let dir_open = m.sidebar_is_visible();
-    let directory_open_setting = m.settings.directory_open;
+    let directory_open_setting = m.settings().directory_open;
     let mut dir = Some(
         icon_button(
             ("dir", usize::from(dir_open)),
@@ -177,7 +177,7 @@ pub(in crate::ui) fn render_dock_entity(
 }
 
 pub(super) fn render_volume(
-    model: &Entity<AppModel>,
+    model: &Entity<WindowShell>,
     narrow: bool,
     compact: bool,
     t: ThemeTokens,
@@ -289,7 +289,7 @@ pub(super) fn render_volume(
 }
 
 fn window_buttons(
-    model: &Entity<AppModel>,
+    model: &Entity<WindowShell>,
     tiny: bool,
     compact: bool,
     t: ThemeTokens,
@@ -301,7 +301,7 @@ fn window_buttons(
     let has_media = cur_uri.is_some();
     let favorite = cur_uri
         .as_ref()
-        .is_some_and(|u| m.catalog.store().is_favorite(u));
+        .is_some_and(|u| m.catalog().store().is_favorite(u));
     let palette_open = m.overlays.palette_open;
     let info_open = m.overlays.info_open;
     let settings_open = m.overlays.settings_open;

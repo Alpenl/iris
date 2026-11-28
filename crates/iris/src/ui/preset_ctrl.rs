@@ -1,76 +1,83 @@
-//! Workspace preset switching (`PresetRuntime`), clean personal-baseline
-//! persistence, effective chrome queries, and `ResetAppearance` guardrail.
+//! GPUI workbench bridge: applies [`iris_app::WorkbenchDomainChanges`] onto
+//! `ThemeTokens`, `rebind_keys`, window resize / `always_on_top`, and regional
+//! `DirtyRegions`, delegating all preset/settings/baseline logic to [`iris_app::AppModel`].
 
 use std::time::Instant;
 
 use gpui::{Context, Window, px, size};
+use iris_app::WorkbenchDomainChanges;
 use iris_core::library::{SortBy, SortOrder};
-use iris_core::player::Command;
-use iris_core::preset::{PresetCaptureScope, PresetLayout, PresetManager, SidebarMode};
+use iris_core::preset::{PresetCaptureScope, SidebarMode};
 
-use super::AppModel;
+use super::WindowShell;
+use super::actions::rebind_keys;
 use super::chrome::DirectoryPopup;
-use super::views::DirtyRegions;
+use super::views::{DirtyRegions, dirty_regions_for_workbench};
 use crate::platform;
 use crate::theme::ThemeTokens;
 
-impl AppModel {
+impl WindowShell {
     pub(super) fn sync_theme_tokens(&mut self, cx: &mut Context<Self>) {
-        let (plugin_theme, _) = self.plugins.select_theme(&self.settings.theme_id);
-        let tokens = ThemeTokens::resolve_scaled(
-            &self.settings.theme_id,
-            plugin_theme.as_ref(),
-            self.settings.ui_font_scale,
-        );
+        let (theme_id, plugin_theme, scale) = self.app.select_active_theme();
+        let tokens = ThemeTokens::resolve_scaled(&theme_id, plugin_theme.as_ref(), scale);
         cx.set_global(tokens);
     }
 
-    /// Persists a user-initiated settings edit to the clean personal baseline (`settings.conf`).
-    pub(super) fn persist_user_settings(&mut self) {
-        self.preset_rt.record_user_edit(&self.settings);
+    /// Applies pure headless [`WorkbenchDomainChanges`] onto GPUI globals, key bindings,
+    /// platform window attributes, and returns the live [`DirtyRegions`] set.
+    pub(in crate::ui) fn apply_workbench_changes(
+        &mut self,
+        changes: WorkbenchDomainChanges,
+        mut window: Option<&mut Window>,
+        cx: &mut Context<Self>,
+    ) -> DirtyRegions {
+        if changes.keymap_changed {
+            rebind_keys(cx, self.keymap());
+        }
+        if let Some(pinned) = changes.always_on_top_changed
+            && let Some(w) = window.as_deref_mut()
+        {
+            platform::set_always_on_top(w, pinned);
+        }
+        if let Some((rw, rh)) = changes.window_resize {
+            if self.chrome.fullscreen || window.as_deref().is_some_and(Window::is_fullscreen) {
+                self.chrome.pending_window_size = Some((rw, rh));
+            } else if let Some(w) = window {
+                w.resize(size(px(rw), px(rh)));
+                self.chrome.last_window_size = Some((rw, rh));
+            }
+        }
+        if changes.theme_changed {
+            self.sync_theme_tokens(cx);
+        }
+        if changes.theme_changed
+            || changes.root_layout_changed
+            || changes.dock_changed
+            || changes.viewport_changed
+        {
+            self.sync_viewport_effects(cx);
+        }
+        dirty_regions_for_workbench(&changes, self.ui_visibility())
     }
 
     pub(super) fn effective_hide_titlebar(&self) -> bool {
-        let (_, chrome) = self.plugins.active_ui_overrides();
-        chrome.and_then(|c| c.hide_titlebar).unwrap_or(false)
+        self.app.effective_hide_titlebar()
     }
 
     pub(super) fn effective_floating_dock(&self) -> bool {
-        let (_, chrome) = self.plugins.active_ui_overrides();
-        chrome
-            .and_then(|c| c.floating_dock)
-            .unwrap_or(self.settings.floating_dock)
+        self.app.effective_floating_dock()
     }
 
     pub(super) fn effective_show_titlebar_meta(&self) -> bool {
-        let (_, chrome) = self.plugins.active_ui_overrides();
-        chrome
-            .and_then(|c| c.show_titlebar_meta)
-            .unwrap_or(self.settings.show_titlebar_meta)
+        self.app.effective_show_titlebar_meta()
     }
 
     pub(super) fn effective_compact_controls(&self) -> bool {
-        let (_, chrome) = self.plugins.active_ui_overrides();
-        chrome
-            .and_then(|c| c.compact_controls)
-            .unwrap_or(self.settings.compact_controls)
+        self.app.effective_compact_controls()
     }
 
     pub(super) fn is_dock_button_hidden(&self, button_id: &str) -> bool {
-        if self
-            .settings
-            .hidden_dock_buttons
-            .iter()
-            .any(|b| b.eq_ignore_ascii_case(button_id))
-        {
-            return true;
-        }
-        let (_, chrome) = self.plugins.active_ui_overrides();
-        chrome.is_some_and(|c| {
-            c.hidden_dock_buttons
-                .iter()
-                .any(|b| b.eq_ignore_ascii_case(button_id))
-        })
+        self.app.is_dock_button_hidden(button_id)
     }
 
     /// Guardrail #3: One-click safety escape that disables `UiTheme` plugins, clears
@@ -79,75 +86,45 @@ impl AppModel {
         self.overlays.close_all();
         self.text_inputs.active_form_key = None;
         self.focus.focus(window);
-        let plugins = &mut self.plugins;
-        let session = self.playback.session_mut();
-        let settings = &mut self.settings;
-        let (theme_plugin_ids, out) = self.catalog.with_plugin_parts(|store, active_source| {
-            plugins.reset_theme_plugins_and_modals(
-                session,
-                store,
-                settings,
-                active_source,
-                Instant::now(),
-            )
-        });
-        for pid in &theme_plugin_ids {
+        let outcome = self.app.reset_appearance(Instant::now());
+        for pid in &outcome.cleared_sidebar_plugins {
             self.text_inputs.clear_plugin_sidebar_fields(pid);
         }
-        let _ = self.apply_plugin_outcome(out, Some(window), cx);
-        self.settings.theme_id = "graphite".into();
-        self.settings.floating_dock = false;
-        self.settings.compact_controls = false;
-        self.settings.show_titlebar_meta = true;
-        self.settings.hidden_dock_buttons.clear();
-        self.persist_user_settings();
-        self.sync_theme_tokens(cx);
-        self.sync_viewport_effects(cx);
-        self.notify_all(cx);
+        let plugin_regions = self.apply_plugin_outcome(outcome.plugin_outcome, Some(window), cx);
+        let wb_regions = self.apply_workbench_changes(outcome.workbench, Some(window), cx);
+        self.notify_regions(plugin_regions.union(wb_regions), cx);
         self.show_toast("已恢复默认石墨外观", cx);
     }
 
     pub(super) fn set_sidebar_mode(&mut self, mode: SidebarMode, cx: &mut Context<Self>) {
-        let mut opened_sidebar = false;
-        self.catalog.set_sidebar_mode(mode);
+        self.app.set_sidebar_mode(mode);
+        let mut regions = DirtyRegions {
+            sidebar: true,
+            plugin_panel: mode == SidebarMode::Plugins,
+            ..DirtyRegions::NONE
+        };
         if !self.chrome.fullscreen {
-            if !self.settings.directory_open {
-                self.settings.directory_open = true;
-                self.persist_user_settings();
-                opened_sidebar = true;
+            if let Some(wb) = self.app.ensure_docked_directory_open() {
+                regions = regions.union(self.apply_workbench_changes(wb, None, cx));
             }
         } else {
             self.overlays.dir_popup = DirectoryPopup::Manual;
             self.bump_activity(cx);
-            opened_sidebar = true;
+            regions = DirtyRegions::ALL;
         }
         self.sync_view_timer(cx);
-        if opened_sidebar {
-            self.notify_all(cx);
-        } else {
-            self.notify_regions(
-                DirtyRegions {
-                    sidebar: true,
-                    plugin_panel: mode == SidebarMode::Plugins,
-                    ..DirtyRegions::NONE
-                },
-                cx,
-            );
-        }
+        self.notify_regions(regions, cx);
     }
 
-    fn current_preset_layout(&self, window: &Window) -> PresetLayout {
+    fn current_windowed_size(&self, window: &Window) -> Option<(f32, f32)> {
         let size = window.viewport_size();
-        PresetLayout {
-            sidebar_mode: self.catalog.sidebar_mode(),
-            window_size: self.chrome.pending_window_size.or_else(|| {
-                if window.is_fullscreen() || window.is_maximized() {
-                    self.chrome.last_window_size
-                } else {
-                    Some((f32::from(size.width), f32::from(size.height)))
-                }
-            }),
-        }
+        self.chrome.pending_window_size.or_else(|| {
+            if window.is_fullscreen() || window.is_maximized() {
+                self.chrome.last_window_size
+            } else {
+                Some((f32::from(size.width), f32::from(size.height)))
+            }
+        })
     }
 
     pub(super) fn activate_preset(
@@ -156,87 +133,30 @@ impl AppModel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if id != "default" && self.presets.get(id).is_none() {
+        let preset_name =
+            super::strings::presets::preset_name_by_id(self.presets(), id).to_string();
+        let win_sz = self.current_windowed_size(window);
+        let Some(outcome) = self.app.activate_preset(id, win_sz, Instant::now()) else {
             self.show_toast(format!("未找到预设 · {id}"), cx);
             return;
+        };
+        for pid in &outcome.cleared_sidebar_plugins {
+            self.text_inputs.clear_plugin_sidebar_fields(pid);
         }
-        let preset_name = super::strings::presets::preset_name_by_id(&self.presets, id).to_string();
-        let prev_disabled = self.settings.disabled_plugins.clone();
-        let layout = self.current_preset_layout(window);
-        let trans = self
-            .preset_rt
-            .switch_preset(&self.presets, id, &mut self.settings, layout);
-
-        if !trans.on_exit_commands.is_empty() {
-            let out = self.with_plugin_ctx(|ctrl, ctx| {
-                ctrl.send_exit_commands(ctx, trans.on_exit_commands, Instant::now())
-            });
-            let _ = self.apply_plugin_outcome(out, Some(window), cx);
+        for err in &outcome.command_errors {
+            log::warn!("preset player command failed: {err:#}");
+            self.show_error_toast(super::strings::errors::player_action_error(err), cx);
         }
-
-        if prev_disabled != self.settings.disabled_plugins {
-            let all_ids: Vec<String> = self.plugins.list().iter().map(|p| p.id.clone()).collect();
-            for pid in all_ids {
-                let enable = !self.settings.disabled_plugins.iter().any(|d| d == &pid);
-                if enable == !prev_disabled.iter().any(|d| d == &pid) {
-                    continue;
-                }
-                if !enable {
-                    self.text_inputs.clear_plugin_sidebar_fields(&pid);
-                }
-                let out = self.with_plugin_ctx(|ctrl, ctx| {
-                    ctrl.toggle_plugin_enabled(ctx, &pid, enable, Instant::now())
-                });
-                let _ = self.apply_plugin_outcome(out, Some(window), cx);
-            }
-        }
-
-        if !trans.plugin_commands.is_empty() {
-            let out = self.with_plugin_ctx(|ctrl, ctx| {
-                ctrl.queue_deferred_commands(ctx, trans.plugin_commands, Instant::now())
-            });
-            let _ = self.apply_plugin_outcome(out, Some(window), cx);
-        }
-
-        if let Some(mode) = trans.sidebar_mode {
-            self.catalog.set_sidebar_mode(mode);
-        }
-        if (self.catalog.sort_by(), self.catalog.sort_order())
-            != (self.settings.sort_by, self.settings.sort_order)
-        {
-            let cur_uri = self.playback.session().current_media_uri();
-            let cur_local = self.playback.session().current();
-            self.catalog.set_sort(
-                self.settings.sort_by,
-                self.settings.sort_order,
-                &self.plugins,
-                cur_uri.as_ref(),
-                cur_local,
-            );
-        }
-        self.sync_view_timer(cx);
-        platform::set_always_on_top(window, self.settings.always_on_top);
-        if let Some((w, h)) = trans.window_size {
-            if window.is_fullscreen() {
-                self.chrome.pending_window_size = Some((w, h));
-            } else {
-                window.resize(size(px(w), px(h)));
-                self.chrome.last_window_size = Some((w, h));
-            }
-        }
-        if let Some(sp) = trans.speed {
-            self.command(Command::SetSpeed(sp), cx);
-        }
-        if let Some(asp) = trans.aspect {
-            self.command(Command::SetAspect(asp), cx);
-        }
-
-        self.playback.session_mut().apply_settings(&self.settings);
-        self.sync_theme_tokens(cx);
+        let plugin_regions = self.apply_plugin_outcome(outcome.plugin_outcome, Some(window), cx);
+        let wb_regions = self.apply_workbench_changes(outcome.workbench, Some(window), cx);
+        self.rebuild_directory_rows();
         self.ensure_filmstrip_thumbnails(cx);
         self.overlays.popover = None;
-        self.sync_viewport_effects(cx);
-        self.notify_all(cx);
+        self.sync_view_timer(cx);
+        self.notify_regions(
+            plugin_regions.union(wb_regions).union(DirtyRegions::ALL),
+            cx,
+        );
         self.show_toast(format!("已切换预设 · {preset_name}"), cx);
     }
 
@@ -248,28 +168,34 @@ impl AppModel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let win_sz = self.current_preset_layout(window).window_size;
-        let st = self.session().state();
-        let preset = PresetManager::capture_from_current(
-            String::new(),
-            if name.trim().is_empty() {
-                super::strings::presets::DEFAULT_CUSTOM_PRESET_NAME.into()
-            } else {
-                name.trim().to_string()
-            },
-            description.trim().to_string(),
+        let win_sz = self.current_windowed_size(window);
+        let saved = self.app.save_current_as_preset(
+            name,
+            description,
             scope,
-            &self.settings,
-            &self.preset_rt,
-            self.catalog.sidebar_mode(),
+            super::strings::presets::DEFAULT_CUSTOM_PRESET_NAME,
             win_sz,
-            st.speed,
-            st.aspect,
+            Instant::now(),
         );
-        let label = super::strings::presets::preset_name(&preset).to_string();
-        let saved_id = self.presets.save_custom(preset);
-        self.activate_preset(&saved_id, window, cx);
-        self.show_toast(format!("已保存预设 · {label}"), cx);
+        for pid in &saved.switched.cleared_sidebar_plugins {
+            self.text_inputs.clear_plugin_sidebar_fields(pid);
+        }
+        for err in &saved.switched.command_errors {
+            log::warn!("preset player command failed: {err:#}");
+            self.show_error_toast(super::strings::errors::player_action_error(err), cx);
+        }
+        let plugin_regions =
+            self.apply_plugin_outcome(saved.switched.plugin_outcome, Some(window), cx);
+        let wb_regions = self.apply_workbench_changes(saved.switched.workbench, Some(window), cx);
+        self.rebuild_directory_rows();
+        self.ensure_filmstrip_thumbnails(cx);
+        self.overlays.popover = None;
+        self.sync_view_timer(cx);
+        self.notify_regions(
+            plugin_regions.union(wb_regions).union(DirtyRegions::ALL),
+            cx,
+        );
+        self.show_toast(format!("已保存预设 · {}", saved.saved_name), cx);
     }
 
     pub(super) fn update_preset_from_current(
@@ -279,61 +205,55 @@ impl AppModel {
         window: &Window,
         cx: &mut Context<Self>,
     ) {
-        let win_sz = self.current_preset_layout(window).window_size;
-        let st = self.session().state();
-        if self.presets.update_from_current(
-            id,
-            scope,
-            &self.settings,
-            &self.preset_rt,
-            self.catalog.sidebar_mode(),
-            win_sz,
-            st.speed,
-            st.aspect,
-        ) {
-            if self.settings.active_preset == id
-                && let Some(updated) = self.presets.get(id).cloned()
-            {
-                self.preset_rt
-                    .sync_updated_active_preset(&updated, &self.settings);
-            }
-            self.notify_regions(
-                DirtyRegions {
-                    root: true,
-                    settings: true,
-                    ..DirtyRegions::NONE
-                },
-                cx,
-            );
+        let win_sz = self.current_windowed_size(window);
+        if let Some(wb) = self.app.update_preset_from_current(id, scope, win_sz) {
+            let regions = self.apply_workbench_changes(wb, None, cx);
+            self.notify_regions(regions, cx);
             self.show_toast("已将当前状态更新至预设", cx);
         } else {
             self.show_toast("内置预设不可直接覆盖，请另存为新预设", cx);
         }
     }
 
+    pub(super) fn delete_custom_preset(
+        &mut self,
+        id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let win_sz = self.current_windowed_size(window);
+        let Some(deleted) = self.app.delete_custom_preset(id, win_sz, Instant::now()) else {
+            return;
+        };
+        let mut regions = DirtyRegions::NONE;
+        if let Some(switched) = deleted.fallback_switch {
+            for pid in &switched.cleared_sidebar_plugins {
+                self.text_inputs.clear_plugin_sidebar_fields(pid);
+            }
+            for err in &switched.command_errors {
+                log::warn!("preset player command failed: {err:#}");
+                self.show_error_toast(super::strings::errors::player_action_error(err), cx);
+            }
+            regions = regions
+                .union(self.apply_plugin_outcome(switched.plugin_outcome, Some(window), cx))
+                .union(DirtyRegions::ALL);
+            self.rebuild_directory_rows();
+            self.ensure_filmstrip_thumbnails(cx);
+            self.sync_view_timer(cx);
+        }
+        let wb_regions = self.apply_workbench_changes(deleted.workbench, Some(window), cx);
+        self.notify_regions(regions.union(wb_regions), cx);
+        self.show_toast("已删除自定义工作区预设", cx);
+    }
+
     pub(super) fn cycle_sort(&mut self, cx: &mut Context<Self>) {
-        let cur_uri = self.playback.session().current_media_uri();
-        let cur_local = self.playback.session().current();
-        let (next_by, next_ord) =
-            self.catalog
-                .cycle_sort(&self.plugins, cur_uri.as_ref(), cur_local);
-        self.settings.sort_by = next_by;
-        self.settings.sort_order = next_ord;
-        self.persist_user_settings();
-        if !self.catalog.is_favorite_scan_in_flight() {
+        let (next_by, next_ord, wb) = self.app.cycle_sort();
+        if !self.catalog().is_favorite_scan_in_flight() {
             self.catalog_ui.favorite_scan = None;
         }
         self.ensure_filmstrip_thumbnails(cx);
-        self.notify_regions(
-            DirtyRegions {
-                sidebar: true,
-                settings: true,
-                viewport: true,
-                dock: true,
-                ..DirtyRegions::NONE
-            },
-            cx,
-        );
+        let regions = self.apply_workbench_changes(wb, None, cx);
+        self.notify_regions(regions, cx);
         let by_str = match next_by {
             SortBy::Name => "名称",
             SortBy::Modified => "修改时间",

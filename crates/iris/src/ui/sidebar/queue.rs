@@ -11,7 +11,7 @@ use gpui::{
 use iris_app::resolve_queue_paths;
 use iris_core::media_uri::MediaUri;
 
-use super::super::AppModel;
+use super::super::WindowShell;
 use super::super::context_menu::{ContextMenu, ContextTarget};
 use super::super::kit::bordered_button;
 use super::super::kit::list_row::{MediaRowSpec, media_row, row_action_icon};
@@ -19,7 +19,7 @@ use super::super::views::{DirtyRegions, Sidebar, model_listener};
 use crate::assets::Icon;
 use crate::theme::ThemeTokens;
 
-impl AppModel {
+impl WindowShell {
     pub(super) fn prompt_append_queue(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         let rx = cx.prompt_for_paths(PathPromptOptions {
             files: true,
@@ -41,7 +41,7 @@ impl AppModel {
             let _ = this.update(cx, |this, cx| {
                 let idle =
                     this.session().current_media_uri().is_none() && !this.media_load_pending();
-                let (added, auto_open) = this.catalog.extend_queue_with_idle_check(items, idle);
+                let (added, auto_open) = this.app.extend_queue_with_idle_check(items, idle);
                 if let Some(q) = auto_open {
                     this.open_media_uri(&q.uri, Some(q.title), cx);
                 }
@@ -65,8 +65,8 @@ impl Sidebar {
         let model = self.model.clone();
         let m = model.read(cx);
         let t = ThemeTokens::of(cx);
-        let item_count = m.catalog.queue().len();
-        let has_catalog = m.catalog.items().iter().any(|item| !item.is_folder());
+        let item_count = m.catalog().queue().len();
+        let has_catalog = m.catalog().items().iter().any(|item| !item.is_folder());
 
         div()
             .flex_1()
@@ -93,7 +93,7 @@ impl Sidebar {
                         d.child(
                             bordered_button("q-add-cat", "+ 加入当前目录", false, t).on_click(
                                 model_listener(&model, |this, _, _, cx| {
-                                    let added = this.catalog.extend_queue_from_catalog();
+                                    let added = this.app.extend_queue_from_catalog();
                                     this.notify_regions(
                                         DirtyRegions {
                                             sidebar: true,
@@ -126,7 +126,7 @@ impl Sidebar {
                         let t = ThemeTokens::of(cx);
                         range
                             .filter_map(|ix| {
-                                let item = m.catalog.queue().get(ix)?;
+                                let item = m.catalog().queue().get(ix)?;
                                 let badge: Option<SharedString> = match &item.uri {
                                     MediaUri::Local(_) => None,
                                     MediaUri::Plugin {
@@ -144,7 +144,7 @@ impl Sidebar {
                                     t,
                                 )
                                 .on_click(model_listener(&model, move |this, _, _, cx| {
-                                    this.catalog.remove_queue_at(ix);
+                                    this.app.remove_queue_at(ix);
                                     cx.stop_propagation();
                                     this.notify_regions(
                                         DirtyRegions {
@@ -165,7 +165,7 @@ impl Sidebar {
                                             meta: badge,
                                             is_current: cur_uri.as_ref() == Some(&item.uri),
                                             is_live: false,
-                                            progress: m.catalog.store().progress_ratio(&item.uri),
+                                            progress: m.catalog().store().progress_ratio(&item.uri),
                                             trailing: Some(remove.into_any_element()),
                                         },
                                         t,
@@ -176,7 +176,7 @@ impl Sidebar {
                                             &model,
                                             move |this, ev: &MouseDownEvent, w, cx| {
                                                 if let Some(item) =
-                                                    this.catalog.queue().get(ix).cloned()
+                                                    this.catalog().queue().get(ix).cloned()
                                                 {
                                                     this.overlays.open_context_menu(ContextMenu {
                                                         pos: ev.position,
@@ -198,7 +198,7 @@ impl Sidebar {
                                         &model,
                                         move |this, _, _, cx| {
                                             if let Some(item) =
-                                                this.catalog.queue().get(ix).cloned()
+                                                this.catalog().queue().get(ix).cloned()
                                             {
                                                 this.open_media_uri(
                                                     &item.uri,

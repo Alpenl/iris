@@ -13,7 +13,7 @@ use gpui::{
     ParentElement, StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder, px,
 };
 
-use super::AppModel;
+use super::WindowShell;
 use super::kit::list_row::select_row;
 use super::kit::modal::{ModalCallback, ModalShellSpec, modal_shell};
 use super::state::SettingsTab;
@@ -31,7 +31,7 @@ const NAV_TABS: &[(SettingsTab, &str)] = &[
 ];
 
 pub(in crate::ui) fn render_settings_entity(
-    model: &Entity<AppModel>,
+    model: &Entity<WindowShell>,
     window: &Window,
     cx: &App,
 ) -> impl IntoElement {
@@ -145,11 +145,11 @@ pub(in crate::ui) fn render_settings_entity(
             .key_context(kc)
             .on_key_down(model_listener(
                 model,
-                AppModel::handle_shortcut_recorder_key,
+                WindowShell::handle_shortcut_recorder_key,
             ));
     }
 
-    let cancel_cb: ModalCallback<AppModel> = Rc::new(|this, w, cx| {
+    let cancel_cb: ModalCallback<WindowShell> = Rc::new(|this, w, cx| {
         this.overlays.recording_shortcut = None;
         this.overlays.settings_open = false;
         this.focus.focus(w);

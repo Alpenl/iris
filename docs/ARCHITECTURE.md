@@ -14,8 +14,8 @@ crates/
   iris-plugin-webdav/  官方 WebDAV 数据源插件（iris.webdav）：使用公开 SDK 编译的多实例远程存储 Wasm 包
   iris-core/           无头领域核心：纯状态机播放器会话、统一目录与独立队列、稀疏工作区预设、键位引擎、照片探测、凭据库与日志脱敏；不依赖 GPUI、iris-api 或插件运行时
   iris-plugin-host/    Wasm 插件宿主运行时（pulley64）：显式 PluginHost、单窗口 WindowSession 门面、能力授权、有界网络/私有产物与三模流中继；不依赖 GPUI、iris-mpv 或 Session
-  iris-app/            无头应用编排层：PlaybackController 播放控制纵切、CatalogController 目录/队列/书签/持久化纵切、PluginController 插件纵切及跨层契约测试；传递依赖零 GPUI，不直接依赖 iris-mpv
-  iris/                GPUI 应用：窗口、ThemeTokens 动态令牌、ui/kit 共用原语、统一 VideoSurfaceBackend 平台视频层与系统桥接、单实例、调试管道
+  iris-app/            无头应用编排层：PlaybackController 播放控制纵切、CatalogController 目录/队列/书签/持久化纵切、PluginController 插件纵切、WorkbenchController 工作台设置/稀疏预设/键位/DoH 纵切与全字段非 pub 的统一 AppModel 编排宿主（含两阶段停机与窄 devtools 诊断门禁）；传递依赖零 GPUI，不直接依赖 iris-mpv
+  iris/                GPUI 应用：WindowShell 窗口壳与 5 层输入优先级栈、ThemeTokens 动态令牌、ui/kit 共用原语、统一 VideoSurfaceBackend 平台视频层与系统桥接、单实例、调试管道
 ```
 
 依赖方向严格单向：`iris` → `iris-app` → `iris-plugin-host` → `iris-core` → `iris-base`（`iris-app` 同时直接依赖 `iris-core`、`iris-base` 与 `iris-api`），`iris-core` → `iris-mpv`，且 `iris` / `iris-app` / `iris-plugin-host` → `iris-api`；`iris-plugin-sdk` 仅由 Wasm Guest 插件（含 `iris-plugin-guides`、`iris-plugin-webdav` 及 `examples/plugins/*`）引用，宿主零反向依赖（`iris` 仅在 `src/video/` 中通过 `clippy.toml` 豁免使用窄能力 `iris_mpv::RenderHandle` 与 `Session::video_recovery`，业务与 UI 代码由编译器强制禁止触碰 `iris_mpv` 或构造 `RenderHandle`）。`scripts/check-project.py` 与 `clippy` 自动检查：
@@ -23,9 +23,9 @@ crates/
 1. Cargo 依赖图强制隔离：`iris-base` 零领域依赖，`iris-core` 不依赖 GPUI、`iris-plugin-host`、`iris-app`、`iris-api` 或 `wasmtime`，`iris-plugin-host` 不依赖 GPUI、`iris-app` 或 `iris-mpv`，`iris-app` 直接依赖禁止 `iris-mpv` 且全目标传递依赖零 `gpui`；
 2. `iris-api` 常规依赖仅限 `serde`（不依赖 GPUI 或 `iris-mpv`）；
 3. `crates/iris/clippy.toml`、`crates/iris-app/clippy.toml`、`crates/iris-core/clippy.toml` 与 `crates/iris-plugin-host/clippy.toml` 通过 `disallowed-types` / `disallowed-methods` 强制约束 `iris_mpv::*`、`Session` 与 `RenderHandle::new` / `Session::{render_handle, video_recovery}` 的调用边界，扫描全仓 `crates/*` 的 `src/` 与 `tests/` 禁止越权 `allow/expect(clippy::disallowed_*)`（仅显式豁免 `crates/iris/src/video/` 与 `crates/iris-core/src/player/mod.rs` 的 `render_handle` / `video_recovery` 两处，`iris-app` 与 `iris-plugin-host` 零豁免），且全仓非测试生产代码禁止 `use super::*;`；
-4. `crates/iris/src/ui/` 禁止散落 `target_os` 条件编译，且通用组件库 `crates/iris/src/ui/kit/` 禁止引用根窗口 `IrisWindow` 或业务宿主 `AppModel`；
+4. `crates/iris/src/ui/` 禁止散落 `target_os` 条件编译，且通用组件库 `crates/iris/src/ui/kit/` 禁止引用根窗口 `IrisWindow`、窗口壳 `WindowShell` 或业务编排宿主 `AppModel`；
 5. 全仓生产代码禁止直接调用 `std::thread::spawn` 或未登记的 `std::thread::Builder`，所有 OS 线程必须通过 `iris_base::rt::{spawn_thread, spawn_thread_named}` 按 `ThreadRole` 登记，且每个角色的线程名必须记录在本文第 6 节；
-6. `devtools` 控制管道门禁与 `iris-plugin-host` 的 `test-support` 测试辅助特性未被默认特性或普通发布版绕过；
+6. `devtools` 控制管道门禁（`iris`、`iris-app`、`iris-core`）与 `iris-plugin-host` 的 `test-support` 测试辅助特性均未被默认特性或普通发布版绕过；
 7. 全仓 `.rs` 有效代码行（SLOC，剥离注释与空白行）预算（生产代码超过 650 SLOC 提示、硬上限 850 SLOC，尾部内联 `#[cfg(test)] mod tests` 硬上限 400 SLOC，独立测试文件硬上限 1,500 SLOC）、`crates/*/src` 顶层模块环单向棘轮、本文与双语 `README` 的成员同步门禁，以及图标、官方嵌入插件源码摘要隔离与示例插件清单一致性。
 
 ### 核心模块职责
@@ -46,12 +46,12 @@ crates/
   - `store.rs`：以稳定媒体身份保存收藏、续播和最近记录。写入时取得文件锁，重读磁盘、合并修改字段并原子替换。写入失败保留待保存变更，旧记录在迁移成功后退役。
   - `vault.rs`：系统安全凭据库 `CredentialVault`（macOS Keychain / Windows Credential Manager，单条上限 2048B，失败显式报错）。v2 插件按安装身份 `plugin-v2.<installation_id>` 隔离（兼容读取迁移期 `builtin.<id>` 与 `ext.<id>`），Windows 下采用 `app.iris.vault.v2:` 小写十六进制编码目标名以消除大小写不敏感碰撞并保护作用域/键名边界。`credential_index.json` 只保存作用域与键名，测试可用 `in_memory()`。
   - `preset.rs` + `preset/runtime.rs`：`1B+` 稀疏工作区预设（`Option<T>` 补丁 + 显式插件启停差量与退出指令），`settings.conf` 始终只存纯净个人基线，运行期通过内存 `PresetRevert` 自动回正（全局字号 `ui_font_scale` 属个人偏好不进预设）。
-- `crates/iris-plugin-host/src/`：显式 `PluginHost` 与 `WindowSession` 门面（零全局单例，零 `Session` 依赖，支持同进程多宿主并行测试）、有界 Wasmtime Pulley64 字节码运行时、安装/能力授权、网络、三模流（`DirectHttp` / `RandomAccess` / `VirtualHls`）、轻量私有文件产物与哈希（`FileExecutor`）及媒体增强；`iris-plugin-sdk` 和两个官方插件 crate 使用同一套公开 Guest 入口。
-- `crates/iris-app/src/{catalog,playback,plugins}/`：无头应用编排层——`playback/`（`PlaybackController`）单一拥有 `Session`、`load_generation`、`PendingSubtitles`、加载态、统计缓存、延后 OSD 播报标志、NowPlaying 节流快照、一次性窄 `VideoAttachSlot` 令牌与幂等两阶段停机协调器 `WindowShutdownCoordinator`；`catalog/`（`CatalogController`）单一拥有本地与远程目录条目、筛选/排序/搜索状态、单调递增异步请求代数栅栏、跨源 `PlayQueue`、`LocationStore` 书签以及 `Store` 周期落盘意图/完成回执与退出同步刷盘状态机；`plugins/`（`PluginController`）单一拥有 `PluginHost`、`WindowSession`、模态框提交/错误状态、远程目录浏览与流解析请求表、插件播放列表与清晰度元数据、安装审核/Origin 授权状态、媒体增强/时间轴叠层与远程缩略图缓存状态。三者对外均仅输出纯领域变化摘要与最小平台副作用描述（不接收窗口可见性、不感知 `DirtyRegions`）。
+- `crates/iris-plugin-host/src/`：显式 `PluginHost` 与 `WindowSession` 根部窄门面（`lib.rs` 顶层实现模块全部私有并开启 `#![deny(unreachable_pub, unnameable_types, private_interfaces, private_bounds)]`，由 `check-project.py` 禁止 `pub mod`；零全局单例，零 `Session` 依赖，支持同进程多宿主并行测试）、有界 Wasmtime Pulley64 字节码运行时、安装/能力授权、网络、三模流（`DirectHttp` / `RandomAccess` / `VirtualHls`）、轻量私有文件产物与哈希（`FileExecutor`）及媒体增强；`iris-plugin-sdk` 和两个官方插件 crate 使用同一套公开 Guest 入口。
+- `crates/iris-app/src/{catalog,model,playback,plugins,workbench}/`：无头应用编排层——`playback/`（`PlaybackController`）单一拥有 `Session`、`load_generation`、`PendingSubtitles`、加载态、统计缓存、延后 OSD 播报标志、NowPlaying 节流快照、一次性窄 `VideoAttachSlot` 令牌与幂等两阶段停机协调器 `WindowShutdownCoordinator`；`catalog/`（`CatalogController`）单一拥有本地与远程目录条目、筛选/排序/搜索状态、单调递增异步请求代数栅栏、跨源 `PlayQueue`、`LocationStore` 书签以及 `Store` 周期落盘意图/完成回执与退出同步刷盘状态机；`plugins/`（`PluginController`）单一拥有 `PluginHost`、`WindowSession`、模态框提交/错误状态、远程目录浏览与流解析请求表、插件播放列表与清晰度元数据、安装审核/Origin 授权状态、媒体增强/时间轴叠层与远程缩略图缓存状态；`workbench/`（`WorkbenchController` + 启动期 `StartupWorkbench`）单一拥有 `Settings`、`PresetManager`、`PresetRuntime` 与 `Keymap`，并集中同步 `iris-base::net::http_client::doh`（`sync_doh_settings`）；`model/`（`AppModel<S>`，内部 4 个子控制器字段全部为 `pub(crate)` 禁止外部越界直改）统一收敛跨领域命令、两阶段停机（`shutdown_with_coordinator`）与受 `#[cfg(any(debug_assertions, feature = "devtools"))]` 保护的窄诊断入口（`model/debug.rs`）。全 crate 对外仅输出纯领域变化摘要与最小平台副作用描述（不接收窗口可见性、不感知 `DirtyRegions`）。
 - `crates/iris-core/src/photo/{mod,containers,heif,exif,icc}.rs`：魔数优先单遍照片头解析（JPEG/PNG/WebP/HEIF/TIFF 尺寸、方向、EXIF 摘要与内嵌 ICC 原色匹配）。
 - `crates/iris-core/src/{keymap/,bookmarks,legacy/,logging/,input,geometry,library,settings,fs_util}.rs`：三方案键位目录与结构化 `ConflictTarget`、常驻位置书签与旧版数据兼容、单一集中脱敏日志与结构化事件流（`iris.log` + `events.jsonl`）、指针手势策略、几何变换与慢速共享盘优化扫描。
 - `crates/iris/src/video/{mod,mac,windows}.rs`：跨平台共享的 `VideoSurfaceBackend` trait（`attach`、`set_bounds`、`set_scale`、`set_visible`），在 macOS（`MacVideoSurface`）与 Windows（`WinVideoSurface`）上由编译器验证统一签名，并通过 `VideoSurface` 新类型对窗口层隐藏平台差异。
-- `crates/iris/src/theme.rs` + `ui/`：GPUI `Global` `ThemeTokens` 引擎、与根视图彻底解耦的通用控件库（`ui/kit/`，通过泛型 `Entity<V>` 与 `TextFieldHost` 组合，零 `IrisWindow`/`AppModel` 依赖）、按领域归集的中文文案表（`ui/strings/`），以及围绕 `AppModel` 领域宿主与 5 个独立区域 `Render` 实体（`Sidebar`、`PluginPanel`、`SettingsPanel`、`ViewportView`、`DockView`）构建的零副作用渲染树——窗口尺寸/焦点观察与字幕内边距同步均挂在观察器及帧后回调中，1–4Hz 播放进度与插件槽位变更经 `DirtyRegions` 局部通知对应子视图。
+- `crates/iris/src/theme.rs` + `ui/`：GPUI `Global` `ThemeTokens` 引擎、与根视图彻底解耦的通用控件库（`ui/kit/`，通过泛型 `Entity<V>` 与 `TextFieldHost` 组合，零 `IrisWindow`/`WindowShell`/`AppModel` 依赖）、按领域归集的中文文案表（`ui/strings/`），以及围绕持有无头 `iris_app::AppModel` 的 `WindowShell` 窗口壳、5 层输入优先级栈（`ShortcutRecorder > TextInput > Modal/Overlay Esc > Workspace/Viewport Keymap > Fullscreen Esc`）与 5 个独立区域 `Render` 实体（`Sidebar`、`PluginPanel`、`SettingsPanel`、`ViewportView`、`DockView`）构建的零副作用渲染树——窗口尺寸/焦点观察与字幕内边距同步均挂在观察器及帧后回调中，1–4Hz 播放进度、插件槽位与工作台设置变更经 `views.rs` 的纯映射函数转换为 `DirtyRegions` 局部通知对应子视图。
 - `crates/iris/src/instance.rs`：Windows 单实例，见第 9 节。macOS 由系统把打开请求发给已运行进程，经 GPUI `on_open_urls` 进来，只接受 `file://`。
 - `crates/iris/src/platform/{mod.rs,macos/{mod,imageio}.rs,windows.rs}`：按 OS 拆分的原生系统桥接——自实现窗口拖动、窗口置顶、播放期防休眠 `SleepPreventer`、macOS 触控板双指捏合 `PinchMonitor`、媒体键与系统播放中心桥接 `MediaKeyBridge`（macOS `MediaPlayer.framework` / Windows WinRT `SystemMediaTransportControls`，Windows 统一使用 `windows 0.61` 绑定）、默认截图目录与照片内存缩略图解码 `decode_thumbnail`。
 - `crates/iris/src/debug.rs`：调试控制管道（`IRIS_CONTROL`），见第 8 节。
@@ -236,7 +236,7 @@ DirectHttp、RandomAccess、VirtualManifest 共用受控播放准入。远端及
 
 ## 8. 调试控制管道
 
-`crates/iris/src/debug.rs`：debug 或显式 `--features devtools` 构建中，`IRIS_CONTROL` 指向本地流端点（macOS Unix socket、Windows `\\.\pipe\iris-...`）。逐行读取 `key`、`move`、`click`、`snap`、`resize`、`open`、`filter`、`state`、`ui`、`get`、`mpv`、`sim_device_reset`、`quit`。客户端为 `scripts/control-client.py`；回复保留在 stderr，运行日志另外走 `log`。
+`crates/iris/src/{debug.rs,ui/debug_cmd.rs}` 与 `crates/iris-app/src/model/debug.rs`：仅在 debug 或显式 `--features devtools` 构建中编译启用（普通 `--release` 构建彻底剥离），`IRIS_CONTROL` 指向本地流端点（macOS Unix socket、Windows `\\.\pipe\iris-...`）。逐行读取 `key`、`move`、`click`、`snap`、`resize`、`open`、`filter`、`state`、`ui`、`get`、`mpv`、`sim_device_reset`、`quit`。客户端为 `scripts/control-client.py`；回复保留在 stderr，运行日志另外走 `log`。
 
 - 合成鼠标事件必须在 GPUI update 之外发出：macOS 发送 NSEvent，Windows 发送原生窗口消息，均经 GPUI 正常命中测试。
 - `snap`：macOS 用 `CGWindowListCreateImage`；Windows 捕获窗口占据的可见桌面区域，不能用于被遮挡窗口的自动像素对比。

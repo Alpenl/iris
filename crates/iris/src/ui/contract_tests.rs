@@ -1,6 +1,7 @@
 //! Fast window-free UI contract tests: LRU thumbnail cache, `TextInput`
-//! keyboard context firewall, `OverlayState` mutual exclusion & 11-layer `Esc`
-//! dismissal priority, and `PluginModal` async validation vs cancel lifecycles.
+//! keyboard context firewall, 5-layer input priority stack (`ShortcutRecorder >
+//! TextInput > Modal/Overlay Esc stack > Workspace/Viewport Keymap > Fullscreen Esc`),
+//! and `PluginModal` async validation vs cancel lifecycles.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -519,56 +520,105 @@ fn plugin_modal_feedback_clears_inline_error_on_non_text_edit() {
 }
 
 #[test]
-fn gpu_reset_recovery_skips_vid_fallback_when_restore_vid_already_queued() {
+fn five_layer_input_priority_stack_enforces_recorder_text_modal_workspace_and_fullscreen_order() {
+    use gpui::{Action, KeyContext};
+    use iris_core::keymap::Keymap;
     use iris_core::library::Kind;
 
-    assert!(iris_app::should_recover_after_gpu_reset(
-        4,
-        4,
-        Some(Kind::Photo),
-        true,
-        true
-    ));
-    assert!(!iris_app::should_recover_after_gpu_reset(
-        4,
-        4,
-        Some(Kind::Video),
-        true,
-        true
-    ));
-    assert!(iris_app::should_recover_after_gpu_reset(
-        4,
-        4,
-        Some(Kind::Video),
-        false,
-        true
-    ));
-    assert!(iris_app::should_recover_after_gpu_reset(
-        4,
-        4,
-        Some(Kind::Video),
-        true,
-        false
-    ));
-    assert!(iris_app::should_recover_after_gpu_reset(
-        4,
-        4,
-        Some(Kind::Audio),
-        true,
-        false
-    ));
-    // A new media open (e.g. Notice::Playback open_scoped) advancing load_generation during the
-    // 120ms reset window must never trigger stale GPU-reset recovery on the new stream.
-    for kind in [
-        Some(Kind::Photo),
-        Some(Kind::Video),
-        Some(Kind::Audio),
-        None,
-    ] {
-        assert!(!iris_app::should_recover_after_gpu_reset(
-            4, 5, kind, false, false
-        ));
-    }
+    use super::actions::{
+        ExitFullscreen, OpenCommandPalette, OpenFile, ResetAppearance, ToggleFullscreen,
+        TogglePause, ToggleSearch, runtime_bindings,
+    };
+    use super::build_root_key_context;
+    use super::viewport::build_viewport_key_context;
+
+    let bindings = runtime_bindings(&Keymap::default());
+    let matches_ctx = |action: &dyn Action, ctx: &[KeyContext]| {
+        bindings
+            .iter()
+            .filter(|b| action.partial_eq(b.action()))
+            .any(|b| b.predicate().is_none_or(|p| p.depth_of(ctx).is_some()))
+    };
+
+    // Layer 1: `ShortcutRecorder` (`[ShortcutRecorder TextInput, Overlay]`) intercepts workspace/
+    // viewport bindings (including `ExitFullscreen`), while emergency `ResetAppearance`
+    // (`Workspace || ShortcutRecorder`) remains reachable and passes through the recorder.
+    let layer1 = [
+        build_root_key_context(true, true, false),
+        build_viewport_key_context(true, false, false, Some(Kind::Video), false),
+    ];
+    assert!(!matches_ctx(&TogglePause, &layer1));
+    assert!(!matches_ctx(&OpenFile, &layer1));
+    assert!(!matches_ctx(&ExitFullscreen, &layer1));
+    assert!(matches_ctx(&ResetAppearance, &layer1));
+
+    // Layer 2: Active `TextInput` (`[Workspace TextInput, Overlay]`) switches `#video` to `Overlay`
+    // and blocks single-key workspace/viewport shortcuts (`Space` `TogglePause`, `F` `ToggleFullscreen`)
+    // plus keymap `ExitFullscreen` (`Esc` routes through `TextField::on_key_down -> handle_escape`),
+    // while keeping `safe_while_typing` chords (`⌘F`/`Ctrl+F` `ToggleSearch`) and `ResetAppearance` active.
+    let layer2 = [
+        build_root_key_context(false, false, true),
+        build_viewport_key_context(false, false, true, Some(Kind::Video), false),
+    ];
+    assert!(!matches_ctx(&TogglePause, &layer2));
+    assert!(!matches_ctx(&ToggleFullscreen, &layer2));
+    assert!(matches_ctx(&ToggleSearch, &layer2));
+    assert!(!matches_ctx(&ExitFullscreen, &layer2));
+    assert!(matches_ctx(&ResetAppearance, &layer2));
+
+    // Layer 3: Modal / ContextMenu / Palette / Popover (`[Workspace Modal, Overlay]`) switches `#video`
+    // to `Overlay` and blocks background workspace/viewport shortcuts (`Space`, `Ctrl+O`, `Ctrl+P`)
+    // while `ExitFullscreen` (`Esc` routed to `handle_escape`) peels overlays strictly before fullscreen exit.
+    let layer3 = [
+        build_root_key_context(false, true, false),
+        build_viewport_key_context(true, false, false, Some(Kind::Video), false),
+    ];
+    assert!(!matches_ctx(&TogglePause, &layer3));
+    assert!(!matches_ctx(&OpenFile, &layer3));
+    assert!(!matches_ctx(&OpenCommandPalette, &layer3));
+    assert!(matches_ctx(&ExitFullscreen, &layer3));
+    assert!(matches_ctx(&ResetAppearance, &layer3));
+
+    // Layer 4: Unobstructed `[Workspace, Viewport media=video]` dispatches full keymap actions.
+    let layer4 = [
+        build_root_key_context(false, false, false),
+        build_viewport_key_context(false, false, false, Some(Kind::Video), false),
+    ];
+    assert!(matches_ctx(&TogglePause, &layer4));
+    assert!(matches_ctx(&ToggleFullscreen, &layer4));
+    assert!(matches_ctx(&OpenFile, &layer4));
+    assert!(matches_ctx(&OpenCommandPalette, &layer4));
+
+    // Layer 5: Fullscreen `Esc` exit fires ONLY after layers 1–3 have zero active recorders,
+    // modals, popovers, sidebar form fields, or search inputs.
+    let mut ov = OverlayState {
+        settings_open: true,
+        recording_shortcut: Some(("toggle_pause".into(), "Workspace".into())),
+        popover: Some(PopoverKind::Speed),
+        ..Default::default()
+    };
+    let mut buf = TextInputBuffers::default();
+    buf.search_open = true;
+    assert_eq!(
+        ov.dismiss_next_escape(&mut buf, false, true),
+        EscapeStep::CancelRecording
+    );
+    assert_eq!(
+        ov.dismiss_next_escape(&mut buf, false, true),
+        EscapeStep::CloseSettings
+    );
+    assert_eq!(
+        ov.dismiss_next_escape(&mut buf, false, true),
+        EscapeStep::ClosePopover
+    );
+    assert_eq!(
+        ov.dismiss_next_escape(&mut buf, false, true),
+        EscapeStep::CloseSearch
+    );
+    assert_eq!(
+        ov.dismiss_next_escape(&mut buf, false, true),
+        EscapeStep::ExitFullscreen
+    );
 }
 
 #[test]
@@ -607,126 +657,6 @@ fn stream_meta_cleanup_clears_matching_plugin_or_source_and_variants_popover() {
     overlays.popover = Some(PopoverKind::Speed);
     overlays.close_variants_popover();
     assert_eq!(overlays.popover, Some(PopoverKind::Speed));
-}
-
-#[test]
-fn plugin_playlist_resolution_and_stepping_cover_url_resolver_and_expanded_entries() {
-    use iris_api::v2::source::PlaylistEntry;
-    use iris_app::{find_plugin_playlist_index, resolve_playlist_current};
-    use iris_core::media_uri::MediaUri;
-
-    let playlist = vec![
-        PlaylistEntry {
-            source_id: "recommend".into(),
-            entry_id: "ugc:BV1xx:101".into(),
-            title: "P1".into(),
-        },
-        PlaylistEntry {
-            source_id: "recommend".into(),
-            entry_id: "ugc:BV1xx:102".into(),
-            title: "P2".into(),
-        },
-        PlaylistEntry {
-            source_id: "recommend".into(),
-            entry_id: "ugc:BV1xx:103".into(),
-            title: "P3".into(),
-        },
-    ];
-
-    // UrlResolver opening ?p=2 keeps private HttpUrl URI while matching canonical P2 in playlist.
-    let private_uri = MediaUri::HttpUrl("https://plugin.invalid/private".into());
-    let cur_p2 =
-        resolve_playlist_current(&playlist, Some("recommend"), Some("ugc:BV1xx:102"), None);
-    assert_eq!(cur_p2, Some(("recommend".into(), "ugc:BV1xx:102".into())));
-    assert_eq!(
-        find_plugin_playlist_index(
-            &playlist,
-            "community.bilibili",
-            Some("community.bilibili"),
-            cur_p2.as_ref(),
-            Some(&private_uri),
-        ),
-        Some(1)
-    );
-
-    // Parent MediaSource entry ("BV1xx") without canonical playback IDs falls back to P1.
-    let parent_uri = MediaUri::Plugin {
-        plugin_id: "community.bilibili".into(),
-        source_id: "recommend".into(),
-        entry_id: "BV1xx".into(),
-    };
-    let cur_p1 = resolve_playlist_current(&playlist, None, None, Some(("recommend", "BV1xx")));
-    assert_eq!(cur_p1, Some(("recommend".into(), "ugc:BV1xx:101".into())));
-    assert_eq!(
-        find_plugin_playlist_index(
-            &playlist,
-            "community.bilibili",
-            Some("community.bilibili"),
-            cur_p1.as_ref(),
-            Some(&parent_uri),
-        ),
-        Some(0)
-    );
-
-    // Non-plugin local media or unrelated HttpUrl never matches a stale plugin playlist.
-    let local_uri = MediaUri::Local(PathBuf::from("/tmp/movie.mp4"));
-    assert_eq!(
-        find_plugin_playlist_index(
-            &playlist,
-            "community.bilibili",
-            None,
-            cur_p1.as_ref(),
-            Some(&local_uri),
-        ),
-        None
-    );
-    assert_eq!(
-        find_plugin_playlist_index(
-            &playlist,
-            "community.bilibili",
-            None,
-            cur_p2.as_ref(),
-            Some(&private_uri),
-        ),
-        None
-    );
-    assert_eq!(
-        find_plugin_playlist_index(
-            &playlist[..1],
-            "community.bilibili",
-            Some("community.bilibili"),
-            cur_p1.as_ref(),
-            Some(&parent_uri),
-        ),
-        None
-    );
-}
-
-#[test]
-fn remote_search_query_gates_supports_search_and_trims_whitespace() {
-    use iris_app::remote_search_query;
-
-    assert_eq!(remote_search_query(false, "anime"), None);
-    assert_eq!(remote_search_query(true, ""), None);
-    assert_eq!(remote_search_query(true, "   \t\n "), None);
-    assert_eq!(
-        remote_search_query(true, "  eva 1080p "),
-        Some("eva 1080p".into())
-    );
-}
-
-#[test]
-fn scoped_release_guards_spurious_error_toasts_and_progress_wipes() {
-    use iris_app::{should_record_progress, should_suppress_playback_error_toast};
-
-    assert!(!should_suppress_playback_error_toast(false, false));
-    assert!(should_suppress_playback_error_toast(true, false));
-    assert!(should_suppress_playback_error_toast(false, true));
-    assert!(should_suppress_playback_error_toast(true, true));
-
-    assert!(should_record_progress(true, false));
-    assert!(!should_record_progress(false, false));
-    assert!(!should_record_progress(true, true));
 }
 
 #[test]

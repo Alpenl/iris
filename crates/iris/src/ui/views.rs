@@ -3,12 +3,12 @@
 //! adapter, and centralized domain-to-`DirtyRegions` pure mapping functions.
 
 use gpui::{App, Context, Entity, IntoElement, Render, WeakEntity, Window};
-use iris_app::{PlaybackDomainChanges, PluginDomainChanges};
+use iris_app::{PlaybackDomainChanges, PluginDomainChanges, WorkbenchDomainChanges};
 use iris_core::library::Kind;
 use iris_plugin_host::DirtySlots;
 
 use super::kit::text_field::ActiveSlot;
-use super::{AppModel, IrisWindow};
+use super::{IrisWindow, WindowShell};
 
 /// Bitmask-like regional dirty set routing state changes to only the affected GPUI entities.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -111,6 +111,50 @@ pub(in crate::ui) struct UiVisibility {
     pub(in crate::ui) settings_open: bool,
     pub(in crate::ui) palette_open: bool,
     pub(in crate::ui) popover_open: bool,
+}
+
+/// Centralized pure mapping from headless [`WorkbenchDomainChanges`] onto regional GPUI [`DirtyRegions`].
+pub(in crate::ui) const fn dirty_regions_for_workbench(
+    changes: &WorkbenchDomainChanges,
+    vis: UiVisibility,
+) -> DirtyRegions {
+    if changes.theme_changed {
+        return DirtyRegions::ALL;
+    }
+    let mut out = DirtyRegions::NONE;
+    if changes.root_layout_changed {
+        out.root = true;
+        out.sidebar = true;
+        out.plugin_panel |= vis.sidebar_plugins_visible;
+        out.settings |= vis.settings_open && changes.settings_changed;
+        out.viewport = true;
+        out.dock |= vis.dock_visible;
+    }
+    if changes.titlebar_changed {
+        out.root = true;
+    }
+    if changes.sidebar_changed {
+        out.sidebar = true;
+        out.plugin_panel |= vis.sidebar_plugins_visible && !changes.keymap_changed;
+    }
+    if changes.dock_changed {
+        out.dock |= vis.dock_visible;
+        out.root |= vis.popover_open;
+    }
+    if changes.viewport_changed {
+        out.viewport = true;
+    }
+    if changes.settings_changed {
+        out.settings |= vis.settings_open;
+    }
+    if changes.keymap_changed {
+        out.root = true;
+        out.sidebar = true;
+        out.settings |= vis.settings_open;
+        out.viewport = true;
+        out.dock |= vis.dock_visible;
+    }
+    out
 }
 
 /// Centralized pure mapping from headless plugin batch changes (`DirtySlots`, `status_changed`,
@@ -296,10 +340,10 @@ impl ViewHandles {
     }
 }
 
-/// Bridges any GPUI element/action callback onto `Entity<AppModel>` regardless of the rendering view.
+/// Bridges any GPUI element/action callback onto `Entity<WindowShell>` regardless of the rendering view.
 pub(in crate::ui) fn model_listener<E: 'static>(
-    model: &Entity<AppModel>,
-    f: impl Fn(&mut AppModel, &E, &mut Window, &mut Context<AppModel>) + 'static,
+    model: &Entity<WindowShell>,
+    f: impl Fn(&mut WindowShell, &E, &mut Window, &mut Context<WindowShell>) + 'static,
 ) -> impl Fn(&E, &mut Window, &mut App) + 'static {
     let weak = model.downgrade();
     move |ev, window, cx| {
@@ -309,7 +353,7 @@ pub(in crate::ui) fn model_listener<E: 'static>(
 
 /// Independent GPUI entity for plugin sidebar panels (`SidebarMode::Plugins`).
 pub(in crate::ui) struct PluginPanel {
-    pub(in crate::ui) model: Entity<AppModel>,
+    pub(in crate::ui) model: Entity<WindowShell>,
 }
 
 impl Render for PluginPanel {
@@ -320,7 +364,7 @@ impl Render for PluginPanel {
 
 /// Independent GPUI entity for the docked or fullscreen-floating workbench sidebar.
 pub(in crate::ui) struct Sidebar {
-    pub(in crate::ui) model: Entity<AppModel>,
+    pub(in crate::ui) model: Entity<WindowShell>,
     pub(in crate::ui) plugin_panel: Entity<PluginPanel>,
     pub(in crate::ui) floating: bool,
 }
@@ -333,7 +377,7 @@ impl Render for Sidebar {
 
 /// Independent GPUI entity for the 7-tab centered settings modal.
 pub(in crate::ui) struct SettingsPanel {
-    pub(in crate::ui) model: Entity<AppModel>,
+    pub(in crate::ui) model: Entity<WindowShell>,
 }
 
 impl Render for SettingsPanel {
@@ -344,7 +388,7 @@ impl Render for SettingsPanel {
 
 /// Independent GPUI entity for the responsive transport & timeline control bar.
 pub(in crate::ui) struct DockView {
-    pub(in crate::ui) model: Entity<AppModel>,
+    pub(in crate::ui) model: Entity<WindowShell>,
     pub(in crate::ui) floating: bool,
 }
 
@@ -356,7 +400,7 @@ impl Render for DockView {
 
 /// Independent GPUI entity for the media viewport, HUD overlays, and floating fullscreen chrome.
 pub(in crate::ui) struct ViewportView {
-    pub(in crate::ui) model: Entity<AppModel>,
+    pub(in crate::ui) model: Entity<WindowShell>,
     pub(in crate::ui) floating_sidebar: Entity<Sidebar>,
     pub(in crate::ui) floating_dock: Entity<DockView>,
 }
@@ -371,11 +415,15 @@ impl Render for ViewportView {
 mod tests {
     use super::{
         DirtyRegions, UiVisibility, dirty_regions_for_playback, dirty_regions_for_plugin_outcome,
-        dirty_regions_for_slot_edit,
+        dirty_regions_for_slot_edit, dirty_regions_for_workbench,
     };
     use crate::ui::kit::text_field::ActiveSlot;
-    use iris_app::{PlaybackDomainChanges, PluginDomainChanges};
+    use iris_app::{
+        PlaybackDomainChanges, PluginDomainChanges, ShortcutRecordOutcome, StartupWorkbench,
+        WorkbenchDomainChanges,
+    };
     use iris_core::library::Kind;
+    use iris_core::preset::{PresetLayout, SidebarMode};
     use iris_plugin_host::DirtySlots;
 
     #[test]
@@ -571,5 +619,163 @@ mod tests {
             dirty_regions_for_playback(&idle, true, false, UiVisibility::default()),
             DirtyRegions::NONE
         );
+    }
+
+    #[test]
+    fn fixed_workbench_sequence_preset_theme_shortcut_and_directory_prevents_over_invalidation() {
+        let dir = std::env::temp_dir().join(format!("iris-views-wb-seq-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let dir = iris_core::library::safe_resolve_path(&dir);
+        let startup = StartupWorkbench::from_paths_with_doh_sink(
+            dir.join("settings.conf"),
+            dir.join("presets.json"),
+            dir.join("keymap.json"),
+            |_| {},
+        );
+        let presets = iris_core::preset::PresetManager::load_from(&dir.join("presets.json"));
+        let (active_settings, preset_rt, _) =
+            iris_core::preset::PresetRuntime::restore_on_startup_with_path(
+                &presets,
+                startup.settings().clone(),
+                Some(dir.join("settings.conf")),
+            );
+        let mut wb = iris_app::WorkbenchController::with_doh_sink(
+            active_settings,
+            presets,
+            preset_rt,
+            startup.keymap().clone(),
+            |_| {},
+        );
+
+        let vis_files_closed_settings = UiVisibility {
+            dock_visible: true,
+            sidebar_plugins_visible: false,
+            settings_open: false,
+            palette_open: false,
+            popover_open: false,
+        };
+        let vis_settings_open = UiVisibility {
+            dock_visible: true,
+            sidebar_plugins_visible: true,
+            settings_open: true,
+            palette_open: false,
+            popover_open: false,
+        };
+
+        // 1. Switch preset:
+        //    - Same-theme preset ("study" keeps "graphite" & same disabled_plugins) with settings
+        //      modal closed & Files sidebar active must NOT invalidate `settings` or `plugin_panel`.
+        //    - Theme-changing preset ("cinema" switches to "oled" theme) invalidates `ALL`.
+        let study_step = wb
+            .switch_preset(
+                "study",
+                PresetLayout {
+                    sidebar_mode: SidebarMode::Files,
+                    window_size: Some((1280., 760.)),
+                },
+            )
+            .expect("study preset");
+        assert!(!study_step.changes.theme_changed);
+        assert_eq!(
+            dirty_regions_for_workbench(&study_step.changes, vis_files_closed_settings),
+            DirtyRegions {
+                root: true,
+                sidebar: true,
+                plugin_panel: false,
+                settings: false,
+                viewport: true,
+                dock: true,
+            }
+        );
+
+        let cinema_step = wb
+            .switch_preset(
+                "cinema",
+                PresetLayout {
+                    sidebar_mode: SidebarMode::Plugins,
+                    window_size: Some((1280., 760.)),
+                },
+            )
+            .expect("cinema preset");
+        assert!(cinema_step.changes.theme_changed);
+        assert_eq!(
+            dirty_regions_for_workbench(&cinema_step.changes, vis_files_closed_settings),
+            DirtyRegions::ALL
+        );
+
+        // 2. Adjust theme & UI font scale: global `ThemeTokens` update -> `ALL`.
+        assert_eq!(
+            dirty_regions_for_workbench(&wb.set_theme_id("paper"), vis_files_closed_settings),
+            DirtyRegions::ALL
+        );
+        assert_eq!(
+            dirty_regions_for_workbench(&wb.step_ui_font_scale(0.05), vis_files_closed_settings),
+            DirtyRegions::ALL
+        );
+
+        // 3. Edit shortcut: updates shortcut-bearing chrome & open SettingsPanel,
+        //    but NEVER invalidates `plugin_panel` (nor `dock` when fullscreen chrome is hidden).
+        let ShortcutRecordOutcome::Bound {
+            changes: sc_changes,
+            ..
+        } = wb.record_normalized_shortcut("toggle_info", "Workspace", "secondary-k", false)
+        else {
+            panic!("expected Bound shortcut outcome");
+        };
+        assert_eq!(
+            dirty_regions_for_workbench(&sc_changes, vis_settings_open),
+            DirtyRegions {
+                root: true,
+                sidebar: true,
+                plugin_panel: false,
+                settings: true,
+                viewport: true,
+                dock: true,
+            }
+        );
+        assert_eq!(
+            dirty_regions_for_workbench(&sc_changes, UiVisibility::default()),
+            DirtyRegions {
+                root: true,
+                sidebar: true,
+                plugin_panel: false,
+                settings: false,
+                viewport: true,
+                dock: false,
+            }
+        );
+
+        // 4. Toggle docked directory: with SettingsPanel closed & Files sidebar active,
+        //    neither `plugin_panel` nor `settings` is invalidated; pure settings-only edits
+        //    invalidate ONLY `settings` when open and `NONE` when closed.
+        let (_, dir_changes) = wb.toggle_docked_directory();
+        assert_eq!(
+            dirty_regions_for_workbench(&dir_changes, vis_files_closed_settings),
+            DirtyRegions {
+                root: true,
+                sidebar: true,
+                plugin_panel: false,
+                settings: false,
+                viewport: true,
+                dock: true,
+            }
+        );
+        assert_eq!(
+            dirty_regions_for_workbench(
+                &WorkbenchDomainChanges::settings_only(),
+                vis_settings_open
+            ),
+            DirtyRegions::settings_only()
+        );
+        assert_eq!(
+            dirty_regions_for_workbench(
+                &WorkbenchDomainChanges::settings_only(),
+                vis_files_closed_settings
+            ),
+            DirtyRegions::NONE
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

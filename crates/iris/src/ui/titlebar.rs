@@ -6,7 +6,7 @@ use gpui::{
     ParentElement, StatefulInteractiveElement, Styled, canvas, div, prelude::FluentBuilder, px,
 };
 
-use super::AppModel;
+use super::WindowShell;
 use super::actions::ToggleAlwaysOnTop;
 use super::kit::{icon, tip};
 use super::state::PopoverKind;
@@ -16,7 +16,7 @@ use crate::platform;
 use crate::theme::{FONT_MONO, ThemeTokens};
 
 pub(super) fn render_titlebar(
-    model: &Entity<AppModel>,
+    model: &Entity<WindowShell>,
     overlay_mode: bool,
     cx: &App,
 ) -> impl IntoElement {
@@ -28,19 +28,20 @@ pub(super) fn render_titlebar(
         .and_then(|p| p.file_name())
         .map(|n| n.to_string_lossy().into_owned())
         .or_else(|| session.current_title().map(str::to_string));
-    let remote_badge = !m.catalog.active_source().is_local();
+    let remote_badge = !m.catalog().active_source().is_local();
     let folder = m
-        .catalog
+        .catalog()
         .titlebar_folder_label(session.current_uri().is_some());
-    let pinned = m.settings.always_on_top;
+    let pinned = m.settings().always_on_top;
     let modal_open = m.has_active_modal();
 
     let preset_open = m.overlays.popover == Some(PopoverKind::Presets);
-    let non_default = !m.settings.active_preset.is_empty() && m.settings.active_preset != "default";
-    let preset_modified = m.preset_rt.is_modified(&m.settings);
+    let non_default =
+        !m.settings().active_preset.is_empty() && m.settings().active_preset != "default";
+    let preset_modified = m.is_preset_modified();
     let preset_hi = preset_open || non_default;
     let base_name =
-        super::strings::presets::preset_name_by_id(&m.presets, &m.settings.active_preset);
+        super::strings::presets::preset_name_by_id(m.presets(), &m.settings().active_preset);
     let preset_label = if preset_modified {
         format!("{base_name} · 已微调")
     } else {
@@ -232,7 +233,7 @@ pub(super) fn render_titlebar(
 
     let meta_info = m
         .effective_show_titlebar_meta()
-        .then(|| m.playback.media_info())
+        .then(|| m.playback().media_info())
         .flatten();
 
     let drag_area = div()

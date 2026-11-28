@@ -9,11 +9,10 @@ use gpui::{
 };
 use iris_core::logging;
 use iris_core::settings::{
-    DEFAULT_DIRECTORY_WIDTH, DEFAULT_UI_FONT_SCALE, MAX_DIRECTORY_WIDTH, MAX_UI_FONT_SCALE,
-    MIN_DIRECTORY_WIDTH, MIN_UI_FONT_SCALE, Side, path as settings_path,
+    DEFAULT_DIRECTORY_WIDTH, DEFAULT_UI_FONT_SCALE, Side, path as settings_path,
 };
 
-use super::super::AppModel;
+use super::super::WindowShell;
 use super::super::actions::ToggleAlwaysOnTop;
 use super::super::kit::form::{checkbox, chip_button, segmented, setting_row, stepper, toggle};
 use super::super::kit::{
@@ -43,7 +42,7 @@ fn render_theme_card(
     th: &BuiltinThemeInfo,
     active: bool,
     t: ThemeTokens,
-    model: &Entity<AppModel>,
+    model: &Entity<WindowShell>,
 ) -> AnyElement {
     let (bg_hex, acc_hex) = theme_preview_colors(th.id);
     let (tid, tname) = (th.id, th.name);
@@ -74,10 +73,9 @@ fn render_theme_card(
         .border_color(if active { t.accent } else { t.line })
         .hover(|st| st.bg(t.hover))
         .on_click(model_listener(model, move |this, _, _, cx| {
-            this.settings.theme_id = tid.to_string();
-            this.preset_rt.record_user_edit(&this.settings);
-            this.sync_theme_tokens(cx);
-            this.notify_all(cx);
+            let wb = this.app.set_theme_id(tid);
+            let regions = this.apply_workbench_changes(wb, None, cx);
+            this.notify_regions(regions, cx);
             this.show_toast(format!("已切换主题 · {tname}"), cx);
         }))
         .child(
@@ -139,13 +137,13 @@ fn reveal_path_row(
 }
 
 pub(super) fn settings_appearance(
-    model: &Entity<AppModel>,
+    model: &Entity<WindowShell>,
     t: ThemeTokens,
     cx: &App,
 ) -> impl IntoElement {
     let m = model.read(cx);
-    let s = &m.settings;
-    let (ovr_theme, ovr_chrome) = m.plugins.active_ui_overrides();
+    let s = m.settings();
+    let (ovr_theme, ovr_chrome) = m.plugins().active_ui_overrides();
     let has_plugin_override = ovr_theme.is_some() || ovr_chrome.is_some();
     let cfg_path = settings_path();
     let log_file = logging::log_path();
@@ -189,25 +187,9 @@ pub(super) fn settings_appearance(
                 label,
                 t,
                 model_listener(model, move |this, _, _, cx| {
-                    if let Some(pos) = this
-                        .settings
-                        .hidden_dock_buttons
-                        .iter()
-                        .position(|b| b.eq_ignore_ascii_case(btn_id))
-                    {
-                        this.settings.hidden_dock_buttons.remove(pos);
-                    } else {
-                        this.settings.hidden_dock_buttons.push(btn_id.to_string());
-                    }
-                    this.preset_rt.record_user_edit(&this.settings);
-                    this.notify_regions(
-                        DirtyRegions {
-                            settings: true,
-                            dock: true,
-                            ..DirtyRegions::NONE
-                        },
-                        cx,
-                    );
+                    let wb = this.app.toggle_dock_button_visibility(btn_id);
+                    let regions = this.apply_workbench_changes(wb, None, cx);
+                    this.notify_regions(regions, cx);
                 }),
             )
             .into_any_element()
@@ -226,15 +208,7 @@ pub(super) fn settings_appearance(
     let ui_scale = s.ui_font_scale;
     let fake_ip_doh = s.fake_ip_doh_fallback;
     let doh_resolvers_text = s.doh_resolvers.join(", ");
-    let doh_preset: u8 = if s.doh_resolvers == ["223.5.5.5", "1.12.12.12", "1.1.1.1"] {
-        0
-    } else if s.doh_resolvers == ["223.5.5.5", "1.12.12.12"] {
-        1
-    } else if s.doh_resolvers == ["1.1.1.1", "8.8.8.8", "9.9.9.9"] {
-        2
-    } else {
-        3
-    };
+    let doh_preset = m.app.doh_resolver_preset();
     let confirm_recent = m.is_confirming("clear-recent");
     let confirm_progress = m.is_confirming("clear-progress");
 
@@ -287,7 +261,7 @@ pub(super) fn settings_appearance(
             )
             .on_click(model_listener(model, |this, _, _, cx| {
                 if this.confirm_destructive("clear-recent", cx) {
-                    this.catalog.clear_recent();
+                    this.app.clear_recent();
                     this.notify_regions(
                         DirtyRegions {
                             settings: true,
@@ -321,7 +295,7 @@ pub(super) fn settings_appearance(
             )
             .on_click(model_listener(model, |this, _, _, cx| {
                 if this.confirm_destructive("clear-progress", cx) {
-                    let n = this.catalog.clear_progress();
+                    let n = this.app.clear_progress();
                     let msg = if n > 0 {
                         format!("已清除 {n} 条播放进度")
                     } else {
@@ -388,29 +362,19 @@ pub(super) fn settings_appearance(
                 (ui_scale - DEFAULT_UI_FONT_SCALE).abs() > 0.01,
                 t,
                 model_listener(model, |this, _, _, cx| {
-                    this.settings.ui_font_scale =
-                        (((this.settings.ui_font_scale - 0.05) * 100.).round() / 100.)
-                            .clamp(MIN_UI_FONT_SCALE, MAX_UI_FONT_SCALE);
-                    this.preset_rt.record_user_edit(&this.settings);
-                    this.sync_theme_tokens(cx);
-                    this.sync_viewport_effects(cx);
-                    this.notify_all(cx);
+                    let wb = this.app.step_ui_font_scale(-0.05);
+                    let regions = this.apply_workbench_changes(wb, None, cx);
+                    this.notify_regions(regions, cx);
                 }),
                 model_listener(model, |this, _, _, cx| {
-                    this.settings.ui_font_scale =
-                        (((this.settings.ui_font_scale + 0.05) * 100.).round() / 100.)
-                            .clamp(MIN_UI_FONT_SCALE, MAX_UI_FONT_SCALE);
-                    this.preset_rt.record_user_edit(&this.settings);
-                    this.sync_theme_tokens(cx);
-                    this.sync_viewport_effects(cx);
-                    this.notify_all(cx);
+                    let wb = this.app.step_ui_font_scale(0.05);
+                    let regions = this.apply_workbench_changes(wb, None, cx);
+                    this.notify_regions(regions, cx);
                 }),
                 model_listener(model, |this, _, _, cx| {
-                    this.settings.ui_font_scale = DEFAULT_UI_FONT_SCALE;
-                    this.preset_rt.record_user_edit(&this.settings);
-                    this.sync_theme_tokens(cx);
-                    this.sync_viewport_effects(cx);
-                    this.notify_all(cx);
+                    let wb = this.app.reset_ui_font_scale();
+                    let regions = this.apply_workbench_changes(wb, None, cx);
+                    this.notify_regions(regions, cx);
                 }),
             ),
             t,
@@ -437,48 +401,19 @@ pub(super) fn settings_appearance(
                 (dir_w - DEFAULT_DIRECTORY_WIDTH).abs() > 1.,
                 t,
                 model_listener(model, |this, _, _, cx| {
-                    this.settings.directory_width = (this.settings.directory_width - 20.)
-                        .clamp(MIN_DIRECTORY_WIDTH, MAX_DIRECTORY_WIDTH);
-                    this.preset_rt.record_user_edit(&this.settings);
-                    this.notify_regions(
-                        DirtyRegions {
-                            sidebar: true,
-                            plugin_panel: true,
-                            settings: true,
-                            dock: true,
-                            ..DirtyRegions::NONE
-                        },
-                        cx,
-                    );
+                    let wb = this.app.step_directory_width(-20.);
+                    let regions = this.apply_workbench_changes(wb, None, cx);
+                    this.notify_regions(regions, cx);
                 }),
                 model_listener(model, |this, _, _, cx| {
-                    this.settings.directory_width = (this.settings.directory_width + 20.)
-                        .clamp(MIN_DIRECTORY_WIDTH, MAX_DIRECTORY_WIDTH);
-                    this.preset_rt.record_user_edit(&this.settings);
-                    this.notify_regions(
-                        DirtyRegions {
-                            sidebar: true,
-                            plugin_panel: true,
-                            settings: true,
-                            dock: true,
-                            ..DirtyRegions::NONE
-                        },
-                        cx,
-                    );
+                    let wb = this.app.step_directory_width(20.);
+                    let regions = this.apply_workbench_changes(wb, None, cx);
+                    this.notify_regions(regions, cx);
                 }),
                 model_listener(model, |this, _, _, cx| {
-                    this.settings.directory_width = DEFAULT_DIRECTORY_WIDTH;
-                    this.preset_rt.record_user_edit(&this.settings);
-                    this.notify_regions(
-                        DirtyRegions {
-                            sidebar: true,
-                            plugin_panel: true,
-                            settings: true,
-                            dock: true,
-                            ..DirtyRegions::NONE
-                        },
-                        cx,
-                    );
+                    let wb = this.app.reset_directory_width();
+                    let regions = this.apply_workbench_changes(wb, None, cx);
+                    this.notify_regions(regions, cx);
                 }),
             ),
             t,
@@ -491,23 +426,14 @@ pub(super) fn settings_appearance(
                 dir_open,
                 t,
                 model_listener(model, |this, _, w, cx| {
-                    this.settings.directory_open = !this.settings.directory_open;
-                    this.preset_rt.record_user_edit(&this.settings);
+                    let (dir_open, wb) = this.app.toggle_docked_directory();
                     this.sync_view_timer(cx);
                     this.reconcile_input_focus(w, cx);
-                    if this.settings.directory_open {
+                    if dir_open {
                         this.scroll_directory_to_current();
                     }
-                    this.notify_regions(
-                        DirtyRegions {
-                            root: true,
-                            sidebar: true,
-                            settings: true,
-                            dock: true,
-                            ..DirtyRegions::NONE
-                        },
-                        cx,
-                    );
+                    let regions = this.apply_workbench_changes(wb, Some(w), cx);
+                    this.notify_regions(regions, cx);
                 }),
             ),
             t,
@@ -520,19 +446,9 @@ pub(super) fn settings_appearance(
                 floating_dock,
                 t,
                 model_listener(model, |this, _, _, cx| {
-                    this.settings.floating_dock = !this.settings.floating_dock;
-                    this.preset_rt.record_user_edit(&this.settings);
-                    this.sync_viewport_effects(cx);
-                    this.notify_regions(
-                        DirtyRegions {
-                            root: true,
-                            settings: true,
-                            viewport: true,
-                            dock: true,
-                            ..DirtyRegions::NONE
-                        },
-                        cx,
-                    );
+                    let wb = this.app.toggle_floating_dock();
+                    let regions = this.apply_workbench_changes(wb, None, cx);
+                    this.notify_regions(regions, cx);
                 }),
             ),
             t,
@@ -545,16 +461,9 @@ pub(super) fn settings_appearance(
                 compact_controls,
                 t,
                 model_listener(model, |this, _, _, cx| {
-                    this.settings.compact_controls = !this.settings.compact_controls;
-                    this.preset_rt.record_user_edit(&this.settings);
-                    this.notify_regions(
-                        DirtyRegions {
-                            settings: true,
-                            dock: true,
-                            ..DirtyRegions::NONE
-                        },
-                        cx,
-                    );
+                    let wb = this.app.toggle_compact_controls();
+                    let regions = this.apply_workbench_changes(wb, None, cx);
+                    this.notify_regions(regions, cx);
                 }),
             ),
             t,
@@ -567,16 +476,9 @@ pub(super) fn settings_appearance(
                 show_meta,
                 t,
                 model_listener(model, |this, _, _, cx| {
-                    this.settings.show_titlebar_meta = !this.settings.show_titlebar_meta;
-                    this.preset_rt.record_user_edit(&this.settings);
-                    this.notify_regions(
-                        DirtyRegions {
-                            root: true,
-                            settings: true,
-                            ..DirtyRegions::NONE
-                        },
-                        cx,
-                    );
+                    let wb = this.app.toggle_show_titlebar_meta();
+                    let regions = this.apply_workbench_changes(wb, None, cx);
+                    this.notify_regions(regions, cx);
                 }),
             ),
             t,
@@ -589,9 +491,9 @@ pub(super) fn settings_appearance(
                 rem_win,
                 t,
                 model_listener(model, |this, _, _, cx| {
-                    this.settings.remember_window_size = !this.settings.remember_window_size;
-                    this.preset_rt.record_user_edit(&this.settings);
-                    this.notify_settings(cx);
+                    let wb = this.app.toggle_remember_window_size();
+                    let regions = this.apply_workbench_changes(wb, None, cx);
+                    this.notify_regions(regions, cx);
                 }),
             ),
             t,
@@ -617,12 +519,9 @@ pub(super) fn settings_appearance(
                 fake_ip_doh,
                 t,
                 model_listener(model, |this, _, _, cx| {
-                    this.settings.fake_ip_doh_fallback = !this.settings.fake_ip_doh_fallback;
-                    iris_base::net::http_client::doh::set_fallback_enabled(
-                        this.settings.fake_ip_doh_fallback,
-                    );
-                    this.preset_rt.record_user_edit(&this.settings);
-                    this.notify_settings(cx);
+                    let (_, wb) = this.app.toggle_fake_ip_doh_fallback();
+                    let regions = this.apply_workbench_changes(wb, None, cx);
+                    this.notify_regions(regions, cx);
                 }),
             ),
             t,
@@ -650,23 +549,9 @@ pub(super) fn settings_appearance(
                 t,
                 model,
                 |this, preset, _, cx| {
-                    let next: Option<Vec<String>> = match preset {
-                        0 => Some(vec![
-                            "223.5.5.5".into(),
-                            "1.12.12.12".into(),
-                            "1.1.1.1".into(),
-                        ]),
-                        1 => Some(vec!["223.5.5.5".into(), "1.12.12.12".into()]),
-                        2 => Some(vec!["1.1.1.1".into(), "8.8.8.8".into(), "9.9.9.9".into()]),
-                        _ => None,
-                    };
-                    if let Some(resolvers) = next {
-                        this.settings.doh_resolvers = resolvers;
-                        let _ = iris_base::net::http_client::doh::set_resolvers(
-                            &this.settings.doh_resolvers,
-                        );
-                        this.preset_rt.record_user_edit(&this.settings);
-                        this.notify_settings(cx);
+                    if let Some(wb) = this.app.set_doh_resolver_preset(preset) {
+                        let regions = this.apply_workbench_changes(wb, None, cx);
+                        this.notify_regions(regions, cx);
                     }
                 },
             ),

@@ -10,7 +10,7 @@ use gpui::{
 };
 use iris_core::player::format_time;
 
-use super::super::AppModel;
+use super::super::WindowShell;
 use super::super::views::model_listener;
 use crate::theme::{FONT_MONO, FONT_UI, ThemeTokens};
 
@@ -43,7 +43,7 @@ fn timeline_ratios(
 }
 
 pub(super) fn render_timeline(
-    model: &Entity<AppModel>,
+    model: &Entity<WindowShell>,
     t: ThemeTokens,
     cx: &App,
 ) -> impl IntoElement {
@@ -147,7 +147,7 @@ pub(super) fn render_timeline(
     let annotation_marks: Vec<AnyElement> = session
         .current_media_uri()
         .filter(|_| session.may_share_current_identity() && valid_dur)
-        .and_then(|uri| m.catalog.store().annotations(&uri))
+        .and_then(|uri| m.catalog().store().annotations(&uri))
         .into_iter()
         .flat_map(|a| a.markers.values())
         .filter(|marker| marker.position_ms as f64 / 1000. <= duration)

@@ -1,4 +1,4 @@
-//! `AppModel` text-input host integration: `TextFieldHost`, `EntityInputHandler`
+//! `WindowShell` text-input host integration: `TextFieldHost`, `EntityInputHandler`
 //! IME bridge, and focus-out reconciliation across regional GPUI views.
 
 use std::ops::Range;
@@ -6,7 +6,7 @@ use std::ops::Range;
 use gpui::{Bounds, Context, EntityInputHandler, Pixels, Point, UTF16Selection, Window};
 use iris_core::preset::SidebarMode;
 
-use super::AppModel;
+use super::WindowShell;
 use super::kit::text_buffer::TextInputBuffers;
 use super::kit::text_field::{
     ActiveSlot, TextFieldHost, TextInputHub, ime_character_index_for_point, ime_marked_text_range,
@@ -15,17 +15,17 @@ use super::kit::text_field::{
 };
 use super::views::{DirtyRegions, dirty_regions_for_slot_edit};
 
-impl AppModel {
+impl WindowShell {
     pub(in crate::ui) fn is_form_key_visible(&self, key: &str) -> bool {
-        let modal_visible = self.has_host_consent() || self.plugins.active_modal().is_some();
+        let modal_visible = self.has_host_consent() || self.plugins().active_modal().is_some();
         if key.starts_with("modal:") {
             !self.has_host_consent()
-                && self.plugins.active_modal().is_some_and(|(pid, modal)| {
+                && self.plugins().active_modal().is_some_and(|(pid, modal)| {
                     TextInputBuffers::modal_has_input_key(pid, modal, key)
                 })
         } else if key.starts_with("sb:") {
             self.sidebar_is_visible()
-                && self.catalog.sidebar_mode() == SidebarMode::Plugins
+                && self.catalog().sidebar_mode() == SidebarMode::Plugins
                 && !modal_visible
                 && !self.overlays.has_menu_or_modal()
         } else {
@@ -48,9 +48,9 @@ impl AppModel {
                 DirtyRegions::root_only()
             });
         }
-        let modal_visible = self.has_host_consent() || self.plugins.active_modal().is_some();
+        let modal_visible = self.has_host_consent() || self.plugins().active_modal().is_some();
         let files_visible = self.sidebar_is_visible()
-            && self.catalog.sidebar_mode() == SidebarMode::Files
+            && self.catalog().sidebar_mode() == SidebarMode::Files
             && !modal_visible
             && !self.overlays.has_menu_or_modal();
         let form_visible = self
@@ -88,7 +88,7 @@ impl AppModel {
     }
 }
 
-impl TextFieldHost for AppModel {
+impl TextFieldHost for WindowShell {
     fn text_inputs(&self) -> &TextInputHub {
         &self.text_inputs
     }
@@ -113,7 +113,7 @@ impl TextFieldHost for AppModel {
                 self.overlays.palette_scroll.scroll_to_item(0);
             }
             ActiveSlot::Form => {
-                self.plugins.modal_mut().clear_feedback();
+                self.app.clear_plugin_modal_feedback();
                 self.overlays.dialog_error = None;
             }
         }
@@ -149,7 +149,7 @@ impl TextFieldHost for AppModel {
     }
 }
 
-impl EntityInputHandler for AppModel {
+impl EntityInputHandler for WindowShell {
     fn text_for_range(
         &mut self,
         r16: Range<usize>,

@@ -10,7 +10,7 @@ use iris_core::library::Kind;
 use iris_core::player::{AspectMode, Chapter, Command, format_time};
 use iris_core::preset::PresetCaptureScope;
 
-use super::super::AppModel;
+use super::super::WindowShell;
 use super::super::actions::{RotateCw, TakeScreenshot, ToggleHFlip, ToggleInfo, ToggleVFlip};
 use super::super::kit::form::{segmented, stepper};
 use super::super::kit::list_row::select_row;
@@ -51,7 +51,7 @@ const ASPECT_OPTIONS: &[(&str, AspectMode)] = &[
     ("裁剪", AspectMode::FillCrop),
 ];
 
-impl AppModel {
+impl WindowShell {
     fn adjust_video_eq(&mut self, ch: EqChannel, next_val: i64, cx: &mut Context<Self>) {
         let clamped = next_val.clamp(-100, 100);
         let s = self.session().state();
@@ -89,7 +89,7 @@ impl AppModel {
 }
 
 fn render_eq_section(
-    model: &Entity<AppModel>,
+    model: &Entity<WindowShell>,
     eq_rows: [(&'static str, EqChannel, i64); 4],
     eq_dirty: bool,
     t: ThemeTokens,
@@ -157,7 +157,7 @@ fn render_eq_section(
 }
 
 fn render_chapter_section(
-    model: &Entity<AppModel>,
+    model: &Entity<WindowShell>,
     chapters: Vec<Chapter>,
     current_ch: i64,
     t: ThemeTokens,
@@ -217,7 +217,7 @@ fn render_chapter_section(
 }
 
 pub(super) fn render_more_popover(
-    model: &Entity<AppModel>,
+    model: &Entity<WindowShell>,
     t: ThemeTokens,
     cx: &App,
 ) -> impl IntoElement {
@@ -363,18 +363,18 @@ pub(super) fn render_more_popover(
 }
 
 pub(super) fn render_presets_popover(
-    model: &Entity<AppModel>,
+    model: &Entity<WindowShell>,
     t: ThemeTokens,
     cx: &App,
 ) -> impl IntoElement {
     let m = model.read(cx);
-    let active_id = if m.settings.active_preset.trim().is_empty() {
+    let active_id = if m.settings().active_preset.trim().is_empty() {
         "default".to_string()
     } else {
-        m.settings.active_preset.clone()
+        m.settings().active_preset.clone()
     };
-    let active_is_custom = m.presets.get(&active_id).is_some_and(|p| !p.builtin);
-    let presets: Vec<_> = m.presets.list().to_vec();
+    let active_is_custom = m.presets().get(&active_id).is_some_and(|p| !p.builtin);
+    let presets: Vec<_> = m.presets().list().to_vec();
     let cycle_hint = m
         .key_hint("cycle_preset")
         .map(|k| SharedString::from(format!("{k} 循环切换")));

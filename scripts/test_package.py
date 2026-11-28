@@ -1443,6 +1443,40 @@ class CheckProjectHelperTests(unittest.TestCase):
         with self.assertRaisesRegex(AssertionError, "gpui"):
             check_project.check_no_transitive_gpui("iris-app v0.0.2\n└── gpui v0.2.2\n")
 
+        kit_rel = Path("crates/iris/src/ui/kit/demo.rs")
+        check_project.check_ui_kit_decoupling(kit_rel, "pub fn widget<V: 'static>() {}\n")
+        for forbidden_sym in ("IrisWindow", "WindowShell", "AppModel"):
+            with self.assertRaisesRegex(AssertionError, "couples `ui/kit`"):
+                check_project.check_ui_kit_decoupling(kit_rel, f"fn f(_x: &{forbidden_sym}) {{}}\n")
+
+        with tempfile.TemporaryDirectory() as devtools_dir:
+            dt_root = Path(devtools_dir)
+            gated_rels = (
+                "crates/iris/src/debug.rs",
+                "crates/iris-core/src/player/mod.rs",
+                "crates/iris-app/src/model/debug.rs",
+            )
+            for gated_rel in gated_rels:
+                target = dt_root / gated_rel
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text('#[cfg(any(debug_assertions, feature = "devtools"))]\n', encoding="utf-8")
+            valid_pkgs = {
+                "iris": {"features": {"devtools": ["iris-core/devtools", "iris-app/devtools"]}},
+                "iris-core": {"features": {"devtools": []}},
+                "iris-app": {"features": {"devtools": ["iris-core/devtools"]}},
+            }
+            check_project.check_devtools_gates(valid_pkgs, dt_root)
+            for crate_name in ("iris", "iris-core", "iris-app"):
+                bad_pkgs = {
+                    **valid_pkgs,
+                    crate_name: {"features": {"default": ["devtools"]}},
+                }
+                with self.assertRaisesRegex(AssertionError, "enables devtools by default"):
+                    check_project.check_devtools_gates(bad_pkgs, dt_root)
+            (dt_root / "crates/iris-app/src/model/debug.rs").write_text("pub fn ungated() {}\n", encoding="utf-8")
+            with self.assertRaisesRegex(AssertionError, "missing devtools cfg gate"):
+                check_project.check_devtools_gates(valid_pkgs, dt_root)
+
         # 3. Docs sync gate: strict two-way on ARCHITECTURE.md, token-bounded substring on bilingual READMEs.
         expected = {"iris", "iris-api", "iris-core"}
         arch_ok = "```text\ncrates/\n  iris/\n  iris-api/\n  iris-core/\n```\n"

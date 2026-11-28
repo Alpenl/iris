@@ -9,7 +9,7 @@ use iris_core::library::Kind;
 use iris_core::player::Command;
 use iris_core::preset::SidebarMode;
 
-use super::AppModel;
+use super::WindowShell;
 use super::actions::{
     ActivatePreset, CycleAspect, CyclePreset, ExitFullscreen, FitImage, OpenCommandPalette,
     OpenFile, OpenSettings, OpenStreamUrl, RefreshDirectory, RotateCcw, RotateCw, TakeScreenshot,
@@ -48,25 +48,24 @@ fn format_screenshot_stamp() -> String {
     format!("{year:04}{month:02}{day:02}-{hour:02}{min:02}{sec:02}-{ms:03}")
 }
 
-impl AppModel {
+impl WindowShell {
     pub(super) fn toggle_favorite(
         &mut self,
         _: &ToggleFavorite,
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(uri) = self.session().current_media_uri() else {
+        if self.session().current_media_uri().is_none() {
             return;
-        };
+        }
         if !self.session().may_share_current_identity() {
             self.show_toast("此链接仅用于本次播放，无法收藏", cx);
             return;
         }
-        let cur_local = self.playback.session().current();
-        let added = self
-            .catalog
-            .toggle_favorite(&uri, &self.plugins, Some(&uri), cur_local);
-        if !self.catalog.is_favorite_scan_in_flight() {
+        let Some((_, added)) = self.app.toggle_current_favorite() else {
+            return;
+        };
+        if !self.catalog().is_favorite_scan_in_flight() {
             self.catalog_ui.favorite_scan = None;
         }
         self.scan_visible_favorites(cx);
@@ -110,10 +109,7 @@ impl AppModel {
         if self.has_active_modal() {
             return;
         }
-        let next = self
-            .presets
-            .next_id(&self.settings.active_preset)
-            .to_string();
+        let next = self.app.next_preset_id();
         self.activate_preset(&next, window, cx);
     }
 
@@ -147,19 +143,11 @@ impl AppModel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.settings.always_on_top = !self.settings.always_on_top;
-        platform::set_always_on_top(window, self.settings.always_on_top);
-        self.persist_user_settings();
-        self.notify_regions(
-            DirtyRegions {
-                root: true,
-                settings: true,
-                ..DirtyRegions::NONE
-            },
-            cx,
-        );
+        let (pinned, wb) = self.app.toggle_always_on_top();
+        let regions = self.apply_workbench_changes(wb, Some(window), cx);
+        self.notify_regions(regions, cx);
         self.show_toast(
-            if self.settings.always_on_top {
+            if pinned {
                 "窗口已置顶"
             } else {
                 "已取消窗口置顶"
@@ -171,7 +159,7 @@ impl AppModel {
     pub(super) fn toggle_info(&mut self, _: &ToggleInfo, _: &mut Window, cx: &mut Context<Self>) {
         self.overlays.info_open = !self.overlays.info_open;
         if self.overlays.info_open {
-            self.playback.refresh_cached_stats(true, Instant::now());
+            self.app.refresh_cached_stats(true, Instant::now());
             self.refresh_annotations(cx);
         }
         self.notify_viewport_and_dock(cx);
@@ -214,11 +202,15 @@ impl AppModel {
         let stem = if stem.is_empty() { "iris" } else { &stem };
         let out = platform::default_screenshot_dir()
             .join(format!("Iris-{stem}-{}.png", format_screenshot_stamp()));
-        let with_subs = self.settings.screenshot_subs;
-        if let Err(e) = self.session_mut().execute(Command::Screenshot {
-            path: out.clone(),
-            with_subs,
-        }) {
+        let with_subs = self.settings().screenshot_subs;
+        if let Some(e) = self
+            .app
+            .execute_player_command(Command::Screenshot {
+                path: out.clone(),
+                with_subs,
+            })
+            .error
+        {
             log::warn!("screenshot failed: {e:#}");
             self.show_error_toast("截图失败，请稍后重试", cx);
             return;
@@ -228,7 +220,7 @@ impl AppModel {
     }
 
     pub(super) fn cycle_aspect(&mut self, _: &CycleAspect, _: &mut Window, cx: &mut Context<Self>) {
-        let out = self.playback.cycle_aspect();
+        let out = self.app.cycle_aspect();
         self.apply_playback_action(out, cx);
     }
 
@@ -262,16 +254,16 @@ impl AppModel {
             );
             return;
         }
-        self.settings.directory_open = !self.settings.directory_open;
-        self.persist_user_settings();
+        let (dir_open, wb) = self.app.toggle_docked_directory();
         self.sync_view_timer(cx);
         self.reconcile_input_focus(window, cx);
-        if self.settings.directory_open {
+        if dir_open {
             self.scroll_directory_to_current();
         } else {
             self.show_toast("侧栏已收起", cx);
         }
-        self.notify_all(cx);
+        let regions = self.apply_workbench_changes(wb, Some(window), cx);
+        self.notify_regions(regions, cx);
     }
 
     pub(super) fn toggle_search(
@@ -283,14 +275,20 @@ impl AppModel {
         if self.has_active_modal() {
             return;
         }
+        let mut regions = DirtyRegions {
+            root: true,
+            sidebar: true,
+            viewport: true,
+            dock: true,
+            ..DirtyRegions::NONE
+        };
         if self.chrome.fullscreen {
             self.overlays.dir_popup = DirectoryPopup::Manual;
             self.bump_activity(cx);
-        } else if !self.settings.directory_open {
-            self.settings.directory_open = true;
-            self.persist_user_settings();
+        } else if let Some(wb) = self.app.ensure_docked_directory_open() {
+            regions = regions.union(self.apply_workbench_changes(wb, Some(window), cx));
         }
-        self.catalog.set_sidebar_mode(SidebarMode::Files);
+        self.app.set_sidebar_mode(SidebarMode::Files);
         self.sync_view_timer(cx);
         self.text_inputs.search_open = !self.text_inputs.search_open;
         if self.text_inputs.search_open {
@@ -300,16 +298,7 @@ impl AppModel {
             self.filter_directory_rows();
             self.focus.focus(window);
         }
-        self.notify_regions(
-            DirtyRegions {
-                root: true,
-                sidebar: true,
-                viewport: true,
-                dock: true,
-                ..DirtyRegions::NONE
-            },
-            cx,
-        );
+        self.notify_regions(regions, cx);
     }
 
     pub(super) fn refresh_directory(
@@ -321,18 +310,14 @@ impl AppModel {
         if self.has_active_modal() {
             return;
         }
-        if let ActiveSource::Plugin(ps) = self.catalog.active_source() {
+        if let ActiveSource::Plugin(ps) = self.catalog().active_source() {
             let (pid, sid) = (ps.plugin_id.clone(), ps.source_id.clone());
             self.refresh_plugin_source(&pid, &sid, cx);
             return;
         }
-        if self.playback.pending_path().is_some() {
-            return;
-        }
-        let Some(ticket) = self.catalog.begin_local_directory_refresh() else {
+        let Some((ticket, load_generation)) = self.app.begin_local_directory_refresh() else {
             return;
         };
-        let load_generation = self.playback.load_generation();
         let ticket_scan = ticket.clone();
         let task = cx
             .background_executor()
@@ -340,18 +325,10 @@ impl AppModel {
         self.catalog_ui.directory_refresh = Some(cx.spawn(async move |this, cx| {
             let scan = task.await;
             let _ = this.update(cx, |this, cx| {
-                let media_pending = this.playback.load_generation() != load_generation
-                    || this.playback.pending_path().is_some();
-                let cur_uri = this.session().current_media_uri();
-                let cur_local = this.playback.session().current();
-                if !this.catalog.finish_local_directory_refresh(
-                    &ticket,
-                    scan,
-                    media_pending,
-                    &this.plugins,
-                    cur_uri.as_ref(),
-                    cur_local,
-                ) {
+                if !this
+                    .app
+                    .finish_local_directory_refresh(&ticket, scan, load_generation)
+                {
                     return;
                 }
                 this.catalog_ui.directory_refresh = None;
@@ -378,7 +355,7 @@ impl AppModel {
         cx: &mut Context<Self>,
     ) {
         if self.has_host_consent()
-            || self.plugins.active_modal().is_some()
+            || self.plugins().active_modal().is_some()
             || self.overlays.dialog.is_some()
         {
             return;
@@ -405,7 +382,7 @@ impl AppModel {
         cx: &mut Context<Self>,
     ) {
         if self.has_host_consent()
-            || self.plugins.active_modal().is_some()
+            || self.plugins().active_modal().is_some()
             || self.overlays.dialog.is_some()
         {
             return;
@@ -452,7 +429,7 @@ impl AppModel {
             self.cancel_host_consent(window, cx);
             return;
         }
-        let has_plugin_modal = self.plugins.active_modal().is_some();
+        let has_plugin_modal = self.plugins().active_modal().is_some();
         let step = self.overlays.dismiss_next_escape(
             &mut self.text_inputs,
             has_plugin_modal,
@@ -613,7 +590,7 @@ impl AppModel {
     }
 
     fn rotate_media(&mut self, degrees: i64, label: &'static str, cx: &mut Context<Self>) {
-        let out = self.playback.rotate_media(degrees, label);
+        let out = self.app.rotate_media(degrees, label);
         self.apply_playback_action(out, cx);
     }
 
@@ -626,7 +603,7 @@ impl AppModel {
     }
 
     fn flip_display_axis(&mut self, horizontal: bool, cx: &mut Context<Self>) {
-        let out = self.playback.flip_display_axis(horizontal);
+        let out = self.app.flip_display_axis(horizontal);
         self.apply_playback_action(out, cx);
     }
 
@@ -636,18 +613,10 @@ impl AppModel {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.settings.photo_filmstrip = !self.settings.photo_filmstrip;
-        self.persist_user_settings();
+        let (_, wb) = self.app.toggle_photo_filmstrip();
         self.ensure_filmstrip_thumbnails(cx);
-        self.notify_regions(
-            DirtyRegions {
-                settings: true,
-                viewport: true,
-                dock: true,
-                ..DirtyRegions::NONE
-            },
-            cx,
-        );
+        let regions = self.apply_workbench_changes(wb, None, cx);
+        self.notify_regions(regions, cx);
     }
 
     pub(super) fn zoom_in(&mut self, _: &ZoomIn, _: &mut Window, cx: &mut Context<Self>) {
